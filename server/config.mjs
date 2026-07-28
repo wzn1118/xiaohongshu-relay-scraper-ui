@@ -10,7 +10,7 @@ const runnerPath =
 export const config = Object.freeze({
   host: process.env.HOST || '127.0.0.1',
   port: readPort(process.env.PORT, 4317),
-  pythonBin: process.env.PYTHON_BIN || 'python',
+  pythonBin: process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3'),
   runnerPath,
   runnerAvailable: existsSync(runnerPath),
   staticDir: path.resolve(process.env.XHS_STATIC_DIR || path.join(serverDir, '..', 'dist')),

@@ -14,6 +14,8 @@ if (-not (Get-Command $python -ErrorAction SilentlyContinue)) { throw 'Python 3.
 
 $nodeMajor = [int]((node --version).TrimStart('v').Split('.')[0])
 if ($nodeMajor -lt 22) { throw 'Node.js 22+ is required.' }
+$pythonVersion = [Version](& $python -c 'import sys; print(sys.version_info.major,sys.version_info.minor,sep=chr(46))')
+if ($pythonVersion -lt [Version]'3.11') { throw 'Python 3.11+ is required.' }
 
 npm ci
 & $python -m pip install -r requirements.txt
@@ -28,4 +30,4 @@ if (-not (Test-Path -LiteralPath '.env')) {
 }
 
 Write-Host 'Bootstrap completed. Configure .env if the upstream skill is outside CODEX_HOME.'
-Write-Host 'Start with: powershell -ExecutionPolicy Bypass -File scripts/start.ps1'
+Write-Host 'Start with: start-windows.cmd'

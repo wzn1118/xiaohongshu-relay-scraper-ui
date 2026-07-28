@@ -15,9 +15,32 @@
 
 API Key 只保存在服务进程内存中，默认 8 小时过期；不会写入任务历史、日志、导出文件或 Git。单次 AI 调用默认超时为 600 秒，可在 `.env` 中设置 `XHS_AI_TIMEOUT_SECONDS`；超时会让质量门禁失败，不会把未审完的文案标成可投递。
 
-## 新机器安装
+## 一键启动
 
 依赖：Node.js 22+、Python 3.11+、Codex CLI 或一个受支持的 API Key，以及已配置的 OpenClaw Browser Relay。浏览器需要已登录目标网站并将 Relay 附着到目标标签页。
+
+Windows：从 GitHub [下载 ZIP](https://github.com/wzn1118/xiaohongshu-relay-scraper-ui/archive/refs/heads/master.zip) 并解压，然后双击根目录的 `start-windows.cmd`。启动器会在首次运行时自动安装依赖、构建应用、创建 `.env`，启动成功后自动打开 `http://127.0.0.1:4317`。后续双击会直接复用已经运行的健康实例，不会重复启动服务。
+
+Linux/macOS：
+
+```bash
+git clone https://github.com/wzn1118/xiaohongshu-relay-scraper-ui.git
+cd xiaohongshu-relay-scraper-ui
+chmod +x start-linux-macos.sh
+./start-linux-macos.sh
+```
+
+只检查环境而不启动：
+
+```powershell
+start-windows.cmd -CheckOnly -NoBrowser
+```
+
+```bash
+./start-linux-macos.sh --check-only --no-browser
+```
+
+## 手动安装
 
 Windows：
 
@@ -62,7 +85,7 @@ npm run preflight
 | --- | --- | --- |
 | `HOST` | `127.0.0.1` | 服务监听地址 |
 | `PORT` | `4317` | 服务端口 |
-| `PYTHON_BIN` | `python` | Python 可执行文件 |
+| `PYTHON_BIN` | 自动探测 | Python 可执行文件；Windows 默认 `python`，Linux/macOS 默认 `python3` |
 | `XHS_UPSTREAM_RUNNER` | 自动发现 | 上游入口脚本 |
 | `XHS_UPSTREAM_SCRAPER` | 自动发现 | 正文采集模块 |
 | `XHS_SERVER_DATA_DIR` | `data/jobs` | 私有任务数据 |
