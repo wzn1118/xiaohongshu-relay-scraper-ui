@@ -87,6 +87,7 @@ export type CandidateProfile = {
   skills: string[]
   sourceFiles: string[]
   updatedAt: string
+  candidate_application?: Partial<CandidateApplicationProfile>
 }
 
 export type CandidateApplicationProfile = {

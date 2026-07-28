@@ -80,6 +80,19 @@ function loadCandidateProfile(): CandidateApplicationProfile {
   }
 }
 
+const candidateApplicationFields: Array<keyof CandidateApplicationProfile> = [
+  'name', 'school', 'major', 'degreeYear', 'phoneWeChat', 'email', 'availabilityDays', 'internshipDuration',
+]
+
+function importedCandidateProfileValues(imported?: Partial<CandidateApplicationProfile>): Partial<CandidateApplicationProfile> {
+  const values: Partial<CandidateApplicationProfile> = {}
+  for (const key of candidateApplicationFields) {
+    const value = imported?.[key]
+    if (typeof value === 'string' && value.trim()) values[key] = value.trim()
+  }
+  return values
+}
+
 const defaultRequest: JobRequest = {
   keyword: '实习继任',
   browserProfile: 'openclaw',
@@ -315,6 +328,7 @@ function App() {
   const [backgroundFiles, setBackgroundFiles] = useState<File[]>([])
   const [configuringAi, setConfiguringAi] = useState(false)
   const [importingProfile, setImportingProfile] = useState(false)
+  const [candidateImportStatus, setCandidateImportStatus] = useState<'recognized' | 'empty' | null>(null)
   const cleanupStream = useRef<null | (() => void)>(null)
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
   const relayLastAttemptRef = useRef(0)
@@ -414,9 +428,18 @@ function App() {
     try {
       const files = await Promise.all(backgroundFiles.map(async (file) => ({ name: file.name, base64: await fileBase64(file) })))
       const profile = await api.importProfile({ aiSessionId: aiSession.id, backgroundText, files })
+      const importedCandidateProfile = importedCandidateProfileValues(profile.candidate_application)
+      const importedFieldCount = Object.keys(importedCandidateProfile).length
       setProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)])
-      updateRequest('profileId', profile.id)
-      setNotice(`背景记忆已更新：${profile.display_name || '未命名档案'}`)
+      setRequest((current) => ({
+        ...current,
+        profileId: profile.id,
+        candidateProfile: { ...current.candidateProfile, ...importedCandidateProfile },
+      }))
+      setCandidateImportStatus(importedFieldCount ? 'recognized' : 'empty')
+      setNotice(importedFieldCount
+        ? '简历已识别并回填候选人信息，请核对字段后再启动任务。'
+        : '背景记忆已更新，但未识别到候选人署名字段，请手动填写。')
     } catch (error) {
       setNotice((error as Error).message)
     } finally {
@@ -737,6 +760,8 @@ function App() {
                 <label className="field"><span>每周可实习天数</span><input inputMode="numeric" value={request.candidateProfile.availabilityDays} onChange={(event) => updateCandidateProfile('availabilityDays', event.target.value)} placeholder="5" /></label>
                 <label className="field"><span>预计实习时长</span><input value={request.candidateProfile.internshipDuration} onChange={(event) => updateCandidateProfile('internshipDuration', event.target.value)} placeholder="例如：6个月" /></label>
               </div>
+              {candidateImportStatus === 'recognized' && <div className="candidate-profile-import-note recognized"><Check size={15} /><span>已从简历识别候选人信息，请核对后再启动任务；字段仍可手动修改。</span></div>}
+              {candidateImportStatus === 'empty' && <div className="candidate-profile-import-note"><CircleAlert size={15} /><span>简历已写入背景记忆，但未识别到完整署名信息，请手动补充。</span></div>}
             </section>
           </section>
 

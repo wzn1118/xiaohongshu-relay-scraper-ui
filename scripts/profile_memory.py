@@ -41,9 +41,27 @@ def schema() -> dict[str, Any]:
             "skills": {"type": "array", "items": string},
         },
     }
+    candidate_application = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "name", "school", "major", "degreeYear",
+            "phoneWeChat", "email", "availabilityDays", "internshipDuration",
+        ],
+        "properties": {
+            "name": string,
+            "school": string,
+            "major": string,
+            "degreeYear": string,
+            "phoneWeChat": string,
+            "email": string,
+            "availabilityDays": string,
+            "internshipDuration": string,
+        },
+    }
     return {
         "type": "object", "additionalProperties": False,
-        "required": ["display_name", "summary", "experiences", "projects", "skills", "education"],
+        "required": ["display_name", "summary", "experiences", "projects", "skills", "education", "candidate_application"],
         "properties": {
             "display_name": string,
             "summary": string,
@@ -51,6 +69,7 @@ def schema() -> dict[str, Any]:
             "projects": {"type": "array", "items": experience},
             "skills": {"type": "array", "items": string},
             "education": {"type": "array", "items": string},
+            "candidate_application": candidate_application,
         },
     }
 
@@ -70,6 +89,7 @@ def main() -> int:
     if args.background_text.strip():
         documents.append({"source": "user-background", "text": args.background_text.strip()})
     prompt = (
+        "Also extract candidate_application for cover-letter attribution. Use only explicitly stated facts from the resume or background. Return empty strings when a field is missing. Do not infer contact details, availability days, or internship duration. Fields: name, school, major, degreeYear, phoneWeChat, email, availabilityDays, internshipDuration.\n"
         "把以下候选人背景整理成可复用的事实记忆。只保留材料明确支持的事实，数字和结果不得推测；"
         "每段经历或项目生成稳定 id。summary 用第一人称事实概述，但后续对外文案不得提到材料、附件或简历。\n"
         + json.dumps(documents, ensure_ascii=False)
