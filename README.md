@@ -31,23 +31,25 @@
 
 下面是本地实际运行的产品界面，展示岗位任务配置、Agent 阶段、质量覆盖率、任务历史和交付物导出。公开展示图已移除候选人个人资料内容。
 
+<p align="center">
+  <img src="/completed-run.png" alt="完整采集任务与交付物" width="100%" />
+</p>
+<p align="center"><strong>完整运行态：从岗位采集到任务历史与交付文件，一屏看清产品闭环</strong></p>
+
 <table>
   <tr>
-    <td width="68%" valign="top">
-      <p><strong>桌面端：岗位采集与 Agent 工作台</strong></p>
-      <img src="desktop-workflow.png" alt="桌面端岗位采集与 Agent 工作台" width="100%" />
+    <td width="65%" valign="top">
+      <p><strong>01 · 桌面端工作台</strong><br /><sub>岗位配置、Agent 进度、质量指标和实时日志</sub></p>
+      <img src="/desktop-workflow.png" alt="桌面端岗位采集与 Agent 工作台" width="100%" />
     </td>
-    <td width="32%" valign="top">
-      <p><strong>移动端：响应式求职工作台</strong></p>
-      <img src="mobile-workflow.png" alt="移动端响应式求职工作台" width="100%" />
+    <td width="35%" valign="top">
+      <p><strong>02 · 移动端适配</strong><br /><sub>窄屏下仍可完成配置、运行和结果查看</sub></p>
+      <img src="/mobile-workflow.png" alt="移动端响应式求职工作台" width="100%" />
     </td>
   </tr>
 </table>
 
-<p align="center"><strong>完整任务：从采集状态到质量结果和交付物</strong></p>
-<p align="center">
-  <img src="completed-run.png" alt="完整采集任务与交付物" width="92%" />
-</p>
+<p align="center"><sub>真实产品截图 · 本地优先 · 可追踪 · 可复核 · 可导出</sub></p>
 
 ## 这是什么产品
 
