@@ -1019,7 +1019,10 @@ def _write_xlsx(path: Path, payload: dict[str, Any]) -> None:
 
     quality = workbook.create_sheet("Quality Gate")
     quality.append(["check", "passed", "detail"])
-    issue_by_check = {item["check"]: item["message"] for item in payload["quality_gate"]["issues"]}
+    issue_by_check = {
+        item.get("check") or item.get("code") or "unknown": item.get("message", "")
+        for item in payload["quality_gate"]["issues"]
+    }
     for check, passed in payload["quality_gate"]["checks"].items():
         quality.append([check, passed, issue_by_check.get(check, "")])
     quality.append([])

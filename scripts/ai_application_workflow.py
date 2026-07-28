@@ -272,7 +272,11 @@ def enrich_payload(payload: dict[str, Any], profile: dict[str, Any], threshold: 
     gate.setdefault("checks", {})["all_cover_letters_score_at_least_threshold"] = gate["cover_letter_quality_passed"]
     gate["passed"] = bool(gate.get("passed", True) and gate["cover_letter_quality_passed"])
     if processed != passed:
-        gate.setdefault("issues", []).append({"code": "COVER_LETTER_SCORE_BELOW_90", "message": f"{processed - passed} drafts did not reach {threshold}"})
+        gate.setdefault("issues", []).append({
+            "check": "all_cover_letters_score_at_least_threshold",
+            "code": "COVER_LETTER_SCORE_BELOW_90",
+            "message": f"{processed - passed} drafts did not reach {threshold}",
+        })
     payload["quality_gate"] = gate
     return WorkflowReport(processed, passed, processed - passed, total_attempts)
 

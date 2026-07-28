@@ -105,6 +105,30 @@ class AiApplicationWorkflowTests(unittest.TestCase):
                 self.assertIn("offset_end", item)
         self.assertTrue(payload["quality_gate"]["checks"]["all_cover_letters_score_at_least_threshold"])
 
+    def test_failed_quality_issue_uses_exporter_check_contract(self) -> None:
+        payload = {
+            "quality_gate": {"passed": True, "checks": {}, "issues": []},
+            "records": [{"title": "增长运营实习", "body": "负责增长分析与协作推进。"}],
+        }
+        profile = {
+            "projects": [{
+                "id": "project-1",
+                "title": "校园活动增长",
+                "organization": "学生团队",
+                "actions": ["开展用户调研", "复盘转化数据"],
+                "results": [],
+                "skills": ["数据分析"],
+            }],
+        }
+
+        report = enrich_payload(payload, profile, threshold=95, max_attempts=2, provider=FakeProvider())
+
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(
+            payload["quality_gate"]["issues"][-1]["check"],
+            "all_cover_letters_score_at_least_threshold",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
