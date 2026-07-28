@@ -250,7 +250,7 @@ def main(arguments: list[str] | None = None) -> int:
         raise ValueError("--output-dir is required for project workflow enrichment")
     output_dir = Path(output_dir_value).resolve()
     candidate_profile = Path(os.environ.get("XHS_PROFILE_PATH") or resolve_project_path(wrapper.candidate_profile)).resolve()
-    relay_port = int(option_value(unlimited_arguments, "--relay-port") or 18800)
+    relay_port = int(option_value(unlimited_arguments, "--relay-port") or 18792)
     goto_timeout_ms = int(option_value(unlimited_arguments, "--goto-timeout-ms") or 15000)
     body_summary = complete_bodies(
         output_dir,

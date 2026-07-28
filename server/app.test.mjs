@@ -42,16 +42,25 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     staticDir,
     runnerAvailable: true,
   };
+  let relaySettings = { port: 18792, profile: 'chrome', autoConnect: true };
   const server = http.createServer(createApp({
     manager,
     config,
-    relayConnector: async ({ port }) => ({
+    relayConfig: {
+      get: () => ({ ...relaySettings }),
+      update: async (value) => {
+        relaySettings = { ...relaySettings, ...value };
+        return { ...relaySettings };
+      },
+    },
+    relayConnector: async ({ port, profile }) => ({
       ok: true,
       ready: true,
       running: true,
       cdpReady: true,
       authenticated: true,
       port,
+      profile,
       tabs: 1,
       tabCount: 1,
       message: 'Relay 已智能连接。',
@@ -81,10 +90,20 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     const invalidPort = await fetch(`${origin}/api/relay/status?port=0`);
     assert.equal(invalidPort.status, 400);
 
+    const relayConfig = await fetch(`${origin}/api/relay/config`).then((response) => response.json());
+    assert.deepEqual(relayConfig, { port: 18792, profile: 'chrome', autoConnect: true });
+    const updatedRelayConfig = await fetch(`${origin}/api/relay/config`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ port: 18801, profile: 'work-profile', autoConnect: false }),
+    });
+    assert.equal(updatedRelayConfig.status, 200);
+    assert.deepEqual(await updatedRelayConfig.json(), { port: 18801, profile: 'work-profile', autoConnect: false });
+
     const connected = await fetch(`${origin}/api/relay/connect`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ port: 18800 }),
+      body: JSON.stringify({}),
     });
     assert.equal(connected.status, 200);
     assert.equal((await connected.json()).ready, true);

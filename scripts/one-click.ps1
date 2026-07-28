@@ -63,13 +63,22 @@ function Open-App {
 function Connect-Relay {
     param([string]$Url)
     try {
-        $status = Invoke-RestMethod -Method Post -Uri "$Url/api/relay/connect" -ContentType 'application/json' -Body '{}' -TimeoutSec 35
-        $port = if ($status.port) { $status.port } else { 18800 }
+        $config = Invoke-RestMethod -Method Get -Uri "$Url/api/relay/config" -TimeoutSec 10
+        if ($config.autoConnect -eq $false) {
+            Write-Host "Relay auto-connect is disabled by configuration"
+            return $true
+        }
+        $relayPort = if ($config.port) { [int]$config.port } else { 18792 }
+        $relayProfile = if ($config.profile) { [string]$config.profile } else { "chrome" }
+        $body = @{ port = $relayPort; profile = $relayProfile } | ConvertTo-Json -Compress
+        $status = Invoke-RestMethod -Method Post -Uri "$Url/api/relay/connect" -ContentType "application/json" -Body $body -TimeoutSec 35
+        $port = if ($status.port) { $status.port } else { $relayPort }
         $tabs = if ($status.tabs) { $status.tabs } else { 0 }
-        Write-Host "Relay startup check: ready=$($status.ready) port=$port tabs=$tabs"
-        return $true
+        $ready = $status.ready -or ($status.running -and $status.cdpReady -and $tabs -gt 0)
+        Write-Host "Relay code startup: ready=$ready port=$port tabs=$tabs attempted=$($status.attempted)"
+        return $ready
     } catch {
-        Write-Warning "Relay startup check did not complete: $($_.Exception.Message)"
+        Write-Warning "Relay code startup did not complete: $($_.Exception.Message)"
         return $false
     }
 }

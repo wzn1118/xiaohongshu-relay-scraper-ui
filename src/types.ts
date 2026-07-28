@@ -55,6 +55,12 @@ export type RelayStatus = {
   message?: string
 }
 
+export type RelayConfig = {
+  port: number
+  profile: string
+  autoConnect: boolean
+}
+
 export type Health = {
   ok: boolean
   service?: string

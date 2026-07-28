@@ -1,21 +1,28 @@
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { access } from 'node:fs/promises';
 import { probeRelay } from './relay.mjs';
 
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 let activeConnection = null;
 
 export async function connectRelay({
   port,
   openClawConfigPath,
-  runnerPath,
-  helperPath = process.env.XHS_RELAY_HELPER_PATH || '',
+  profile = 'chrome',
   timeoutMs = 25000,
+  probeRelayImpl = probeRelay,
+  spawnImpl = spawn,
+  openClawCommand = resolveOpenClawCommand(),
 }) {
   if (activeConnection) return activeConnection;
-  activeConnection = performConnection({ port, openClawConfigPath, runnerPath, helperPath, timeoutMs });
+  activeConnection = performConnection({
+    port,
+    openClawConfigPath,
+    profile,
+    timeoutMs,
+    probeRelayImpl,
+    spawnImpl,
+    openClawCommand,
+  });
   try {
     return await activeConnection;
   } finally {
@@ -23,84 +30,78 @@ export async function connectRelay({
   }
 }
 
-async function performConnection({ port, openClawConfigPath, runnerPath, helperPath, timeoutMs }) {
-  const before = await probeRelay({ port, openClawConfigPath });
+async function performConnection({
+  port,
+  openClawConfigPath,
+  profile,
+  timeoutMs,
+  probeRelayImpl,
+  spawnImpl,
+  openClawCommand,
+}) {
+  const before = await probeRelayImpl({ port, openClawConfigPath });
   if (isAttached(before)) {
-    return { ...before, ready: true, attempted: false, message: 'Relay 已连接。' };
+    return { ...before, ready: true, attempted: false, message: 'Relay is already connected.' };
   }
 
-  const resolvedHelper = await resolveHelperPath({ runnerPath, helperPath });
-  if (!resolvedHelper) {
+  const started = await startBrowserService({
+    command: openClawCommand,
+    profile,
+    timeoutMs,
+    spawnImpl,
+  });
+  if (!started.started) {
     return {
       ...before,
       ready: false,
-      attempted: false,
-      message: '未找到 Relay 连接助手，请先安装浏览器中继组件。',
+      attempted: true,
+      startExitCode: started.code,
+      startTimedOut: started.timedOut,
+      message: started.message,
     };
   }
 
-  const helper = await runHelper(resolvedHelper, port, timeoutMs);
-  const after = await probeRelay({ port, openClawConfigPath });
+  const after = await waitForRelay({
+    port,
+    openClawConfigPath,
+    timeoutMs,
+    probeRelayImpl,
+  });
   const ready = isAttached(after);
   return {
     ...after,
     ready,
     attempted: true,
-    helperExitCode: helper.code,
-    helperTimedOut: helper.timedOut,
+    startExitCode: started.code,
+    startTimedOut: false,
     message: ready
-      ? 'Relay 已智能连接。'
+      ? 'Relay connected through the browser service.'
       : after.running && after.cdpReady
-        ? 'Relay 已启动，等待浏览器标签页附着。'
-        : helper.timedOut
-          ? 'Relay 连接助手超时，请检查浏览器和扩展状态。'
-          : 'Relay 尚未连接，请确认浏览器已打开并允许扩展附着。',
+        ? 'Relay service is running; waiting for an attached browser tab.'
+        : 'Relay service start completed; status is still pending.',
   };
 }
 
 function isAttached(status) {
-  return Boolean(status?.running && status?.cdpReady && Number(status?.tabs || 0) > 0);
+  const tabs = Array.isArray(status?.tabs) ? status.tabs.length : Number(status?.tabs || 0);
+  return Boolean(status?.running && status?.cdpReady && tabs > 0);
 }
 
-async function resolveHelperPath({ runnerPath, helperPath }) {
-  const candidates = [
-    helperPath,
-    runnerPath ? path.join(path.dirname(runnerPath), 'enable_openclaw_relay.ps1') : '',
-    path.join(projectRoot, 'scripts', 'enable_openclaw_relay.ps1'),
-    process.env.CODEX_HOME
-      ? path.join(process.env.CODEX_HOME, 'skills', 'xiaohongshu-relay-scrape', 'scripts', 'enable_openclaw_relay.ps1')
-      : '',
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      await access(candidate);
-      return path.resolve(candidate);
-    } catch {
-      // Try the next configured location.
-    }
+async function waitForRelay({ port, openClawConfigPath, timeoutMs, probeRelayImpl }) {
+  const deadline = Date.now() + Math.min(Math.max(timeoutMs, 1000), 5000);
+  let status = await probeRelayImpl({ port, openClawConfigPath });
+  while (!status.ok && Date.now() < deadline) {
+    await delay(250);
+    status = await probeRelayImpl({ port, openClawConfigPath });
   }
-  return null;
+  return status;
 }
 
-function runHelper(helperPath, port, timeoutMs) {
+function startBrowserService({ command, profile, timeoutMs, spawnImpl }) {
   return new Promise((resolve) => {
-    const command = process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
-    const args = [
-      '-NoLogo',
-      '-NoProfile',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-File',
-      helperPath,
-      '-RelayPort',
-      String(port),
-      '-TargetUrl',
-      '',
-    ];
+    let child;
     let settled = false;
     let timer;
-    let child;
     const finish = (result) => {
       if (settled) return;
       settled = true;
@@ -109,15 +110,46 @@ function runHelper(helperPath, port, timeoutMs) {
     };
 
     try {
-      child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'] });
+      child = spawnImpl(
+        command,
+        ['browser', 'start', '--browser-profile', profile, '--json'],
+        { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
       timer = setTimeout(() => {
-        child.kill();
-        finish({ code: null, timedOut: true });
+        child.kill?.();
+        finish({ started: false, code: null, timedOut: true, message: 'Relay service start timed out.' });
       }, timeoutMs);
-      child.once('error', () => finish({ code: null, timedOut: false }));
-      child.once('close', (code) => finish({ code, timedOut: false }));
-    } catch {
-      finish({ code: null, timedOut: false });
+      child.once('error', (error) => finish({
+        started: false,
+        code: null,
+        timedOut: false,
+        message: `Relay service start failed: ${error.message}`,
+      }));
+      child.once('close', (code) => finish({
+        started: code === 0,
+        code,
+        timedOut: false,
+        message: code === 0 ? '' : `Relay service exited with code ${code}.`,
+      }));
+    } catch (error) {
+      finish({
+        started: false,
+        code: null,
+        timedOut: false,
+        message: `Relay service start failed: ${error.message}`,
+      });
     }
   });
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export function resolveOpenClawCommand() {
+  const configured = String(process.env.XHS_OPENCLAW_BIN || '').trim();
+  if (configured) return configured;
+  if (process.platform !== 'win32') return 'openclaw';
+  const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || '', 'AppData', 'Roaming');
+  return path.join(appData, 'npm', 'openclaw.cmd');
 }

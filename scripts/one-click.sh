@@ -52,6 +52,37 @@ if payload.get("ok") is not True or payload.get("service") != "xiaohongshu-relay
 PY
 }
 
+connect_relay() {
+  "$PYTHON_BIN" - "$URL" <<'PY'
+import json
+import sys
+from urllib.request import Request, urlopen
+
+origin = sys.argv[1]
+with urlopen(f"{origin}/api/relay/config", timeout=10) as response:
+    config = json.load(response)
+if config.get("autoConnect") is False:
+    print("Relay auto-connect is disabled by configuration")
+    raise SystemExit(0)
+payload = json.dumps({
+    "port": config.get("port", 18792),
+    "profile": config.get("profile", "chrome"),
+}).encode()
+request = Request(
+    f"{origin}/api/relay/connect",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urlopen(request, timeout=35) as response:
+    status = json.load(response)
+tabs = status.get("tabs", 0)
+ready = status.get("ready") is True or (status.get("running") and status.get("cdpReady") and tabs > 0)
+print(f"Relay code startup: ready={ready} port={status.get('port')} tabs={tabs}")
+raise SystemExit(0 if ready else 1)
+PY
+}
+
 open_app() {
   [ "$NO_BROWSER" -eq 1 ] && return 0
   if command -v open >/dev/null 2>&1; then open "$URL" >/dev/null 2>&1 &
@@ -62,7 +93,7 @@ open_app() {
 
 if command -v "$PYTHON_BIN" >/dev/null 2>&1 && app_healthy; then
   printf '%s\n' "Application is already running at $URL"
-  [ "$CHECK_ONLY" -eq 1 ] || open_app
+  if [ "$CHECK_ONLY" -eq 0 ]; then connect_relay || true; open_app; fi
   exit 0
 fi
 
@@ -153,6 +184,7 @@ done
 [ "$READY" -eq 1 ] || { echo "Application did not become healthy within 60 seconds: $URL" >&2; exit 1; }
 
 printf '%s\n' "Application is ready: $URL"
+connect_relay || true
 open_app
 set +e
 wait "$SERVER_PID"

@@ -4,6 +4,7 @@ import { createApp } from './app.mjs';
 import { JobManager } from './job-manager.mjs';
 import { AiSessionStore } from './ai-session-store.mjs';
 import { ProfileStore } from './profile-store.mjs';
+import { RelayConfigStore } from './relay-config-store.mjs';
 
 const aiSessions = new AiSessionStore();
 const profileStore = new ProfileStore({
@@ -11,11 +12,13 @@ const profileStore = new ProfileStore({
   pythonBin: config.pythonBin,
   scriptPath: config.profileScriptPath,
 });
+const relayConfig = new RelayConfigStore({ filePath: config.relayConfigPath });
 await profileStore.initialize();
+await relayConfig.initialize();
 const manager = new JobManager({ ...config, aiSessions, profileStore });
 await manager.initialize();
 
-const server = http.createServer(createApp({ manager, config, aiSessions, profileStore }));
+const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig }));
 server.listen(config.port, config.host, () => {
   console.log(`Xiaohongshu relay scraper API listening at http://${config.host}:${config.port}`);
 });

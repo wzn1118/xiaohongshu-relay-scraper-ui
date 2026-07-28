@@ -10,7 +10,7 @@ test('validateRunRequest applies bounded production defaults', () => {
   assert.equal(result.limit, 0);
   assert.equal(result.maxScrolls, 40);
   assert.equal(result.stableRounds, 4);
-  assert.equal(result.relayPort, 18800);
+  assert.equal(result.relayPort, 18792);
   assert.equal(result.noAutoAttach, true);
   assert.equal(result.mode, 'fresh');
   assert.equal(result.securityVerificationTimeoutSeconds, 600);

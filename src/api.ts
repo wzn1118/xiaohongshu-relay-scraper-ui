@@ -1,4 +1,4 @@
-import type { AiProviderOption, AiSession, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, RelayStatus } from './types'
+import type { AiProviderOption, AiSession, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, RelayConfig, RelayStatus } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -21,10 +21,12 @@ export const api = {
   profiles: () => request<CandidateProfile[]>('/api/profiles'),
   importProfile: (payload: { aiSessionId: string; backgroundText: string; files: Array<{ name: string; base64: string }> }) =>
     request<CandidateProfile>('/api/profiles/import', { method: 'POST', body: JSON.stringify(payload) }),
+  relayConfig: () => request<RelayConfig>('/api/relay/config'),
+  updateRelayConfig: (payload: RelayConfig) => request<RelayConfig>('/api/relay/config', { method: 'PUT', body: JSON.stringify(payload) }),
   relayStatus: (port: number) => request<RelayStatus>(`/api/relay/status?port=${port}`),
-  connectRelay: (port: number) => request<RelayStatus & { ready?: boolean; attempted?: boolean }>(`/api/relay/connect`, {
+  connectRelay: (port: number, profile: string) => request<RelayStatus & { ready?: boolean; attempted?: boolean }>(`/api/relay/connect`, {
     method: 'POST',
-    body: JSON.stringify({ port }),
+    body: JSON.stringify({ port, profile }),
   }),
   jobs: () => request<Job[]>('/api/jobs'),
   job: (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`),

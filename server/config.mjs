@@ -6,6 +6,7 @@ const serverDir = path.dirname(fileURLToPath(import.meta.url));
 const runnerPath =
   process.env.XHS_RUNNER_PATH ||
   path.resolve(serverDir, '..', 'scripts', 'run_project_workflow.py');
+const dataDir = path.resolve(process.env.XHS_SERVER_DATA_DIR || path.join(serverDir, '..', 'data', 'jobs'));
 
 export const config = Object.freeze({
   host: process.env.HOST || '127.0.0.1',
@@ -14,7 +15,8 @@ export const config = Object.freeze({
   runnerPath,
   runnerAvailable: existsSync(runnerPath),
   staticDir: path.resolve(process.env.XHS_STATIC_DIR || path.join(serverDir, '..', 'dist')),
-  dataDir: path.resolve(process.env.XHS_SERVER_DATA_DIR || path.join(serverDir, '..', 'data', 'jobs')),
+  dataDir,
+  relayConfigPath: path.resolve(process.env.XHS_RELAY_CONFIG_PATH || path.join(dataDir, '..', 'relay-config.json')),
   profileDir: path.resolve(process.env.XHS_PROFILE_DATA_DIR || path.join(serverDir, '..', 'data', 'profiles')),
   profileScriptPath: path.resolve(serverDir, '..', 'scripts', 'profile_memory.py'),
   legacyProfilePath: path.resolve(serverDir, '..', 'profiles', 'candidate_profile.json'),

@@ -343,7 +343,7 @@ def complete_bodies(
 def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Complete Xiaohongshu note bodies with isolated relay pages.")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--relay-port", type=int, default=18800)
+    parser.add_argument("--relay-port", type=int, default=18792)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--goto-timeout-ms", type=int, default=15000)

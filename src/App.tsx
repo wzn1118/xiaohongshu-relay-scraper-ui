@@ -26,6 +26,7 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  Save,
   Search,
   Settings2,
   ShieldCheck,
@@ -51,6 +52,7 @@ import type {
   JobRequest,
   JobStatus,
   RelayStatus,
+  RelayConfig,
   AiProviderOption,
   AiSession,
   CandidateProfile,
@@ -96,7 +98,7 @@ function importedCandidateProfileValues(imported?: Partial<CandidateApplicationP
 const defaultRequest: JobRequest = {
   keyword: '实习继任',
   browserProfile: 'openclaw',
-  relayPort: 18800,
+  relayPort: 18792,
   limit: 0,
   maxScrolls: 60,
   stableRounds: 8,
@@ -115,6 +117,12 @@ const defaultRequest: JobRequest = {
   candidateProfile: defaultCandidateProfile,
   coverLetterThreshold: 90,
   coverLetterMaxAttempts: 4,
+}
+
+const defaultRelayConfig: RelayConfig = {
+  port: 18792,
+  profile: 'chrome',
+  autoConnect: true,
 }
 
 const statusText: Record<JobStatus, string> = {
@@ -302,6 +310,8 @@ function App() {
   const [request, setRequest] = useState<JobRequest>(() => ({ ...defaultRequest, candidateProfile: loadCandidateProfile() }))
   const [health, setHealth] = useState<Health | null>(null)
   const [relay, setRelay] = useState<RelayStatus | null>(null)
+  const [relayConfig, setRelayConfig] = useState<RelayConfig>(defaultRelayConfig)
+  const [relayConfigSaving, setRelayConfigSaving] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
   const [activeJob, setActiveJob] = useState<Job | null>(null)
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
@@ -331,7 +341,6 @@ function App() {
   const [candidateImportStatus, setCandidateImportStatus] = useState<'recognized' | 'empty' | null>(null)
   const cleanupStream = useRef<null | (() => void)>(null)
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
-  const relayLastAttemptRef = useRef(0)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
 
@@ -346,18 +355,19 @@ function App() {
     }))
   }
 
-  const connectRelay = useCallback(async (notify = false) => {
+  const connectRelay = useCallback(async (notify = false, overrides?: Partial<RelayConfig>) => {
     if (relayConnectionRef.current) return relayConnectionRef.current
-    relayLastAttemptRef.current = Date.now()
+    const port = overrides?.port ?? request.relayPort
+    const profile = overrides?.profile ?? relayConfig.profile
     setRelayConnecting(true)
-    const connection = api.connectRelay(request.relayPort)
+    const connection = api.connectRelay(port, profile)
       .then((status) => {
         setRelay(status)
         if (notify) setNotice(status.message || (status.ready ? 'Relay 已连接' : 'Relay 尚未连接'))
         return status
       })
       .catch((error) => {
-        const status: RelayStatus = { running: false, cdpReady: false, port: request.relayPort, message: (error as Error).message }
+        const status: RelayStatus = { running: false, cdpReady: false, port, profile, message: (error as Error).message }
         setRelay(status)
         if (notify) setNotice(status.message || 'Relay 尚未连接')
         return status
@@ -368,20 +378,37 @@ function App() {
       })
     relayConnectionRef.current = connection
     return connection
-  }, [request.relayPort])
+  }, [relayConfig.profile, request.relayPort])
+
+  const updateRelayConfig = <K extends keyof RelayConfig>(key: K, value: RelayConfig[K]) => {
+    setRelayConfig((current) => ({ ...current, [key]: value }))
+    if (key === 'port') updateRequest('relayPort', value as JobRequest['relayPort'])
+  }
+
+  const saveRelayConfig = async () => {
+    setRelayConfigSaving(true)
+    setNotice(null)
+    try {
+      const saved = await api.updateRelayConfig(relayConfig)
+      setRelayConfig(saved)
+      updateRequest('relayPort', saved.port)
+      setNotice('中转站配置已保存')
+      await connectRelay(true, saved)
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setRelayConfigSaving(false)
+    }
+  }
 
   const refreshRelay = useCallback(async () => {
     try {
       const status = await api.relayStatus(request.relayPort)
       setRelay(status)
-      const tabCount = Array.isArray(status.tabs) ? status.tabs.length : Number(status.tabs || 0)
-      const ready = status.running && status.cdpReady && tabCount > 0
-      if (!ready && Date.now() - relayLastAttemptRef.current >= 30000) await connectRelay()
     } catch (error) {
       setRelay({ running: false, cdpReady: false, port: request.relayPort, message: (error as Error).message })
-      if (Date.now() - relayLastAttemptRef.current >= 30000) await connectRelay()
     }
-  }, [connectRelay, request.relayPort])
+  }, [request.relayPort])
 
   const loadJobs = useCallback(async () => {
     try {
@@ -465,20 +492,23 @@ function App() {
   useEffect(() => {
     let mounted = true
     const boot = async () => {
-      const results = await Promise.allSettled([api.health(), api.jobs(), api.relayStatus(request.relayPort)])
+      const results = await Promise.allSettled([api.health(), api.jobs(), api.relayConfig()])
       if (!mounted) return
-      const [healthResult, jobsResult, relayResult] = results
+      const [healthResult, jobsResult, relayConfigResult] = results
       if (healthResult.status === 'fulfilled') setHealth(healthResult.value)
       if (jobsResult.status === 'fulfilled') {
         setJobs(Array.isArray(jobsResult.value) ? jobsResult.value : [])
         setActiveJob(Array.isArray(jobsResult.value) ? jobsResult.value[0] || null : null)
       }
-      if (relayResult.status === 'fulfilled') {
-        setRelay(relayResult.value)
-        const tabCount = Array.isArray(relayResult.value.tabs) ? relayResult.value.tabs.length : Number(relayResult.value.tabs || 0)
-        if (!(relayResult.value.running && relayResult.value.cdpReady && tabCount > 0)) await connectRelay()
-      } else {
-        await connectRelay()
+      const configuredPort = relayConfigResult.status === 'fulfilled' ? relayConfigResult.value.port : request.relayPort
+      if (relayConfigResult.status === 'fulfilled') {
+        setRelayConfig(relayConfigResult.value)
+        setRequest((current) => ({ ...current, relayPort: relayConfigResult.value.port }))
+      }
+      try {
+        setRelay(await api.relayStatus(configuredPort))
+      } catch (error) {
+        setRelay({ running: false, cdpReady: false, port: configuredPort, message: (error as Error).message })
       }
       setLoading(false)
     }
@@ -678,7 +708,7 @@ function App() {
           <button className="nav-button" title="任务历史" onClick={() => document.getElementById('history')?.scrollIntoView({ behavior: 'smooth' })}><Clock3 size={20} /><span>历史</span></button>
           <button className="nav-button" title="导出文件" onClick={() => document.getElementById('artifacts')?.scrollIntoView({ behavior: 'smooth' })}><Table2 size={20} /><span>产物</span></button>
         </nav>
-        <button className="nav-button rail-settings" title="工作台设置"><Settings2 size={20} /><span>设置</span></button>
+        <button className="nav-button rail-settings" title="工作台设置" onClick={() => document.getElementById('relay-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={20} /><span>设置</span></button>
       </aside>
 
       <div className="workspace">
@@ -693,7 +723,7 @@ function App() {
               {relayReady ? <Wifi size={17} /> : relayConnecting ? <LoaderCircle className="spin" size={17} /> : <WifiOff size={17} />}
               <span><strong>{relayReady ? 'Relay 已连接' : relayConnecting ? 'Relay 连接中' : 'Relay 待连接'}</strong><small>CDP {request.relayPort} · {tabCount} 个标签页</small></span>
             </div>
-            <button className="icon-button" onClick={() => void connectRelay(true)} disabled={relayConnecting} title="智能连接 Relay"><RefreshCw className={relayConnecting ? 'spin' : ''} size={17} /></button>
+            <button className="icon-button" onClick={() => void connectRelay(true)} disabled={relayConnecting} title="通过代码启动 Relay"><RefreshCw className={relayConnecting ? 'spin' : ''} size={17} /></button>
             <time title="北京时间（Asia/Shanghai）">{formatTime(clock.toISOString())}</time>
           </div>
         </header>
@@ -718,6 +748,24 @@ function App() {
             <div className="health-stamp">
               <Activity size={18} />
               <span><strong>{health?.ok ? '本地服务正常' : loading ? '正在检查服务' : '服务未响应'}</strong><small>{health?.runnerAvailable === false ? 'Runner 路径待配置' : 'Runner 已纳入受控执行'}</small></span>
+            </div>
+          </section>
+
+          <section className="panel relay-config-panel" id="relay-config" aria-label="中转站配置">
+            <div className="panel-heading compact">
+              <div><span className="step-label">RELAY CONFIGURATION</span><h2>中转站配置</h2></div>
+              <span className={`runtime-badge ${relayReady ? 'passed' : ''}`}>{relayReady ? '已连接' : '待连接'}</span>
+            </div>
+            <div className="relay-config-body">
+              <div className="form-row relay-config-fields">
+                <label className="field"><span>中转端口</span><input type="number" min="1024" max="65535" value={relayConfig.port} onChange={(event) => updateRelayConfig('port', Number(event.target.value))} /></label>
+                <label className="field"><span>浏览器 Profile</span><input value={relayConfig.profile} onChange={(event) => updateRelayConfig('profile', event.target.value)} placeholder="chrome" /></label>
+                <Toggle checked={relayConfig.autoConnect} onChange={(value) => updateRelayConfig('autoConnect', value)} label="开机自动连接" description="启动脚本读取此配置并通过代码连接" />
+              </div>
+              <div className="relay-config-footer">
+                <span className="field-help">端口和 Profile 会同时用于状态探测、连接按钮和新任务。</span>
+                <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
+              </div>
             </div>
           </section>
 

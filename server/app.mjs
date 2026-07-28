@@ -5,10 +5,12 @@ import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/art
 import { ValidationError, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
 import { connectRelay } from './lib/relay-connect.mjs';
+import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConnector = connectRelay }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, relayConnector = connectRelay }) {
+  const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   return async function app(req, res) {
     setSecurityHeaders(res);
     if (req.method === 'OPTIONS') return noContent(res);
@@ -28,23 +30,32 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConn
           activeJob: manager.active?.id || null,
         });
       }
+      if (req.method === 'GET' && url.pathname === '/api/relay/config') {
+        return json(res, 200, getRelayConfig());
+      }
+      if (req.method === 'PUT' && url.pathname === '/api/relay/config') {
+        if (!relayConfig?.update) return json(res, 503, errorBody('RELAY_CONFIG_UNAVAILABLE', 'Relay configuration storage is unavailable.'));
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        return json(res, 200, await relayConfig.update(body));
+      }
       if (req.method === 'GET' && url.pathname === '/api/relay/status') {
+        const configured = getRelayConfig();
         const requested = url.searchParams.get('port');
-        const port = requested === null ? 18800 : Number(requested);
+        const port = requested === null ? configured.port : Number(requested);
         if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
         const status = await probeRelay({ port, openClawConfigPath: config.openClawConfigPath });
         return json(res, status.ok ? 200 : 503, status);
       }
       if (req.method === 'POST' && url.pathname === '/api/relay/connect') {
         const body = await readJsonBody(req, config.maxBodyBytes);
+        const configured = getRelayConfig();
         const requested = body?.port;
-        const port = requested === undefined ? 18800 : Number(requested);
+        const port = requested === undefined ? configured.port : Number(requested);
         if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
         const status = await relayConnector({
           port,
           openClawConfigPath: config.openClawConfigPath,
-          runnerPath: config.runnerPath,
-          helperPath: config.relayHelperPath,
+          profile: body?.profile || configured.profile,
         });
         return json(res, 200, status);
       }
@@ -118,7 +129,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConn
         return json(res, 400, errorBody(error.code, error.message));
       }
       if (error.code === 'BODY_TOO_LARGE') return json(res, 413, errorBody('BODY_TOO_LARGE', 'Request body is too large.'));
-      if (['AI_VALIDATION', 'PROFILE_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
+      if (['AI_VALIDATION', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_IMPORT_FAILED') return json(res, 422, errorBody(error.code, error.message));
       if (error instanceof SyntaxError) return json(res, 400, errorBody('INVALID_JSON', 'Request body must contain valid JSON.'));
