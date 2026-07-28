@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "profileId": "example",
+  "updatedAt": "2026-01-01T00:00:00Z",
+  "display_name": "示例用户",
+  "summary": "我具备内容运营、数据分析和跨团队协作经验。",
+  "experiences": [],
+  "projects": [
+    {
+      "id": "project-example",
+      "title": "示例增长项目",
+      "organization": "示例团队",
+      "period": "",
+      "actions": ["分析用户反馈并推动方案迭代"],
+      "results": [],
+      "skills": ["数据分析", "协作推进"]
+    }
+  ],
+  "skills": ["数据分析", "内容运营"],
+  "education": [],
+  "sourceFiles": []
+}

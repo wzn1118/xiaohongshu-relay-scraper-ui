@@ -1,0 +1,65 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { artifactId, artifactPathFromId, assertPathInside } from './lib/artifacts.mjs';
+import { ValidationError, buildRunnerArgs, validateRunRequest } from './lib/contracts.mjs';
+
+test('validateRunRequest applies bounded production defaults', () => {
+  const result = validateRunRequest({});
+  assert.equal(result.keyword, '实习继任');
+  assert.equal(result.limit, 0);
+  assert.equal(result.maxScrolls, 40);
+  assert.equal(result.stableRounds, 4);
+  assert.equal(result.relayPort, 18800);
+  assert.equal(result.noAutoAttach, true);
+  assert.equal(result.mode, 'fresh');
+  assert.equal(result.securityVerificationTimeoutSeconds, 600);
+  assert.equal(result.useCodexRuntime, true);
+  assert.equal(result.codexBatchSize, 8);
+});
+
+test('validateRunRequest rejects unknown and malformed parameters', () => {
+  assert.throws(() => validateRunRequest({ searchUrl: 'https://example.com' }), ValidationError);
+  assert.throws(() => validateRunRequest({ browserProfile: '../../profile' }), ValidationError);
+  assert.throws(() => validateRunRequest({ limit: 1001 }), ValidationError);
+  assert.throws(() => validateRunRequest({ keyword: 'bad\nvalue' }), ValidationError);
+});
+
+test('validateRunRequest accepts uncapped and high-volume collection', () => {
+  assert.equal(validateRunRequest({ limit: 0 }).limit, 0);
+  assert.equal(validateRunRequest({ limit: 1000 }).limit, 1000);
+});
+
+test('validateRunRequest accepts only valid resume source ids in resume mode', () => {
+  const params = validateRunRequest({ mode: 'resume', resumeFromJobId: '20260728034820-6b942873' });
+  assert.equal(params.resumeFromJobId, '20260728034820-6b942873');
+  assert.throws(() => validateRunRequest({ mode: 'fresh', resumeFromJobId: '20260728034820-6b942873' }), ValidationError);
+  assert.throws(() => validateRunRequest({ mode: 'resume', resumeFromJobId: '../escape' }), ValidationError);
+});
+
+test('buildRunnerArgs only emits the normalized whitelist', () => {
+  const params = validateRunRequest({ keyword: '测试', mode: 'resume', skipPostprocess: true });
+  const args = buildRunnerArgs(params, path.resolve('output'));
+  assert.deepEqual(args.slice(0, 4), ['--keyword', '测试', '--output-dir', path.resolve('output')]);
+  assert.ok(args.includes('--resume'));
+  assert.ok(args.includes('--skip-postprocess'));
+  assert.ok(args.includes('--no-auto-attach'));
+  assert.ok(args.includes('--codex-runtime'));
+  assert.equal(args[args.indexOf('--security-verification-timeout-seconds') + 1], '600');
+  assert.equal(args.some((arg) => /[;&|]/.test(arg)), false);
+});
+
+test('artifact ids round-trip safe nested paths', () => {
+  const root = path.resolve('artifacts');
+  const id = artifactId('reports/result.json');
+  const resolved = artifactPathFromId(root, id);
+  assert.equal(resolved.relative, 'reports/result.json');
+  assert.equal(resolved.absolute, path.join(root, 'reports', 'result.json'));
+});
+
+test('artifact paths reject traversal and absolute paths', () => {
+  const root = path.resolve('artifacts');
+  assert.throws(() => artifactPathFromId(root, Buffer.from('../secret').toString('base64url')));
+  assert.throws(() => artifactPathFromId(root, Buffer.from('C:/secret').toString('base64url')));
+  assert.throws(() => assertPathInside(root, path.resolve(root, '..', 'secret')));
+});

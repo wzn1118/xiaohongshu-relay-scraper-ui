@@ -1,0 +1,30 @@
+{
+  "name": "xiaohongshu-relay-scraper-ui",
+  "private": true,
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c yellow,cyan \"node --watch server/index.mjs\" \"vite\"",
+    "build": "tsc -b && vite build",
+    "start": "node server/index.mjs",
+    "test": "node --test server/*.test.mjs tests/*.test.mjs",
+    "test:agents": "python tests/test_application_intelligence_agents.py -v",
+    "check": "npm run test && npm run build",
+    "preflight": "node scripts/preflight.mjs",
+    "verify:artifacts": "node scripts/verify-artifacts.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.3",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.5"
+  }
+}

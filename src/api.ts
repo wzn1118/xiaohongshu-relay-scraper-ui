@@ -1,0 +1,60 @@
+import type { AiProviderOption, AiSession, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, RelayStatus } from './types'
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...init?.headers },
+  })
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ message: response.statusText }))
+    const errorMessage = typeof body.error === 'string' ? body.error : body.error?.message
+    throw new Error(body.message || errorMessage || `请求失败 (${response.status})`)
+  }
+  return response.json() as Promise<T>
+}
+
+export const api = {
+  health: () => request<Health>('/api/health'),
+  aiProviders: () => request<AiProviderOption[]>('/api/ai/providers'),
+  createAiSession: (payload: { provider: string; apiKey: string; model: string; baseUrl: string }) =>
+    request<AiSession>('/api/ai/sessions', { method: 'POST', body: JSON.stringify(payload) }),
+  profiles: () => request<CandidateProfile[]>('/api/profiles'),
+  importProfile: (payload: { aiSessionId: string; backgroundText: string; files: Array<{ name: string; base64: string }> }) =>
+    request<CandidateProfile>('/api/profiles/import', { method: 'POST', body: JSON.stringify(payload) }),
+  relayStatus: (port: number) => request<RelayStatus>(`/api/relay/status?port=${port}`),
+  jobs: () => request<Job[]>('/api/jobs'),
+  job: (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`),
+  createJob: (payload: JobRequest) =>
+    request<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
+  cancelJob: (id: string) =>
+    request<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+  artifacts: (id: string) => request<Artifact[]>(`/api/jobs/${encodeURIComponent(id)}/artifacts`),
+  results: (id: string, offset = 0, limit = 50, query = '') => {
+    const params = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+    if (query.trim()) params.set('query', query.trim())
+    return request<ApplicationResultsResponse>(`/api/jobs/${encodeURIComponent(id)}/results?${params}`)
+  },
+  setDelivery: (jobId: string, noteId: string, action: 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | 'reset') =>
+    request<{ noteId: string; delivery: { action: string; updatedAt: string } | null }>(`/api/jobs/${encodeURIComponent(jobId)}/delivery`, { method: 'POST', body: JSON.stringify({ noteId, action }) }),
+  artifactUrl: (jobId: string, artifact: Artifact) =>
+    artifact.url || `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifact.id)}`,
+  subscribe: (id: string, onEvent: (event: JobEvent) => void, onDisconnect: () => void) => {
+    const stream = new EventSource(`/api/jobs/${encodeURIComponent(id)}/events`)
+    const handle = (event: MessageEvent) => {
+      try {
+        onEvent(JSON.parse(event.data) as JobEvent)
+      } catch {
+        onEvent({ type: 'log', line: event.data })
+      }
+    }
+    stream.onmessage = handle
+    for (const name of ['snapshot', 'status', 'log', 'artifacts', 'done', 'error']) {
+      stream.addEventListener(name, handle as EventListener)
+    }
+    stream.onerror = () => {
+      stream.close()
+      onDisconnect()
+    }
+    return () => stream.close()
+  },
+}
