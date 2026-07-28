@@ -80,6 +80,7 @@ export class JobManager {
     const outputDir = path.join(jobDir, 'artifacts');
     const logPath = path.join(jobDir, 'run.log');
     await mkdir(outputDir, { recursive: true });
+    const runtimeProfilePath = await createRuntimeProfile(profilePath, params.candidateProfile, jobDir);
     if (params.resumeFromJobId) {
       const source = this.getInternal(params.resumeFromJobId);
       if (!source) {
@@ -110,7 +111,7 @@ export class JobManager {
     this.jobs.unshift(job);
     this.jobs = this.jobs.slice(0, this.maxHistory);
     this.active = job;
-    this.runtimeContexts.set(id, { ai, profilePath });
+    this.runtimeContexts.set(id, { ai, profilePath: runtimeProfilePath });
     await this.persist();
     queueMicrotask(() => this.#run(job));
     return publicJob(job);
@@ -335,4 +336,19 @@ async function copyResumeCheckpoints(sourceDir, destinationDir) {
     error.code = 'RESUME_CHECKPOINTS_MISSING';
     throw error;
   }
+}
+
+async function createRuntimeProfile(profilePath, candidateProfile, jobDir) {
+  const values = candidateProfile && typeof candidateProfile === 'object' ? candidateProfile : {};
+  const hasCandidateValues = Object.values(values).some((value) => typeof value === 'string' && value.trim());
+  if (!profilePath || !hasCandidateValues) return profilePath;
+
+  const base = JSON.parse(await readFile(profilePath, 'utf8'));
+  const runtimePath = path.join(jobDir, 'candidate-profile.runtime.json');
+  const merged = {
+    ...(base && typeof base === 'object' && !Array.isArray(base) ? base : {}),
+    candidate_application: values,
+  };
+  await writeFile(runtimePath, JSON.stringify(merged, null, 2), 'utf8');
+  return runtimePath;
 }

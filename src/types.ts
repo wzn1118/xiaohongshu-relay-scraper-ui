@@ -89,6 +89,17 @@ export type CandidateProfile = {
   updatedAt: string
 }
 
+export type CandidateApplicationProfile = {
+  name: string
+  school: string
+  major: string
+  degreeYear: string
+  phoneWeChat: string
+  email: string
+  availabilityDays: string
+  internshipDuration: string
+}
+
 export type JobRequest = {
   keyword: string
   browserProfile: string
@@ -108,6 +119,7 @@ export type JobRequest = {
   codexTimeoutSeconds: number
   aiSessionId?: string | null
   profileId?: string | null
+  candidateProfile: CandidateApplicationProfile
   coverLetterThreshold: number
   coverLetterMaxAttempts: number
 }

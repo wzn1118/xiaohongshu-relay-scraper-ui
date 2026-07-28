@@ -25,9 +25,36 @@ ACCEPTANCE_RULES = [
     "至少引用一项真实经历证据，并给出可验证的沟通下一步",
 ]
 
+CANDIDATE_PROFILE_RULES = [
+    "Cover Letter 必须包含主题、尊敬的招聘负责人、第一人称正文、此致敬礼和候选人署名信息。",
+    "主题格式优先为：应聘公司名与岗位名｜候选人姓名｜每周可实习可用天数天；公司名或岗位名无法从岗位正文确认时直接省略，不猜测。",
+    "正文优先写学校、专业、年级、相关实习或项目、每周可实习天数和预计实习时长；只使用运行时候选人档案和 candidate_evidence 中的真实字段。",
+    "电话/微信和邮箱只允许使用运行时候选人档案中的值；字段为空时省略整行，不输出 XX、XXXX 或其他占位符。",
+]
+
 
 def _string() -> dict[str, Any]:
     return {"type": "string"}
+
+
+def _candidate_application_profile(profile: dict[str, Any]) -> dict[str, str]:
+    for key in ("candidate_application", "candidateProfile"):
+        value = profile.get(key)
+        if isinstance(value, dict):
+            return {
+                field: str(value.get(field) or "").strip()
+                for field in (
+                    "name",
+                    "school",
+                    "major",
+                    "degreeYear",
+                    "phoneWeChat",
+                    "email",
+                    "availabilityDays",
+                    "internshipDuration",
+                )
+            }
+    return {}
 
 
 def extraction_schema() -> dict[str, Any]:
@@ -150,10 +177,19 @@ def _extract(provider: AIProvider, record: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _write(provider: AIProvider, role: dict[str, Any], evidence: list[dict[str, Any]], previous: dict[str, Any] | None, feedback: list[str]) -> dict[str, Any]:
+def _write(
+    provider: AIProvider,
+    role: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    previous: dict[str, Any] | None,
+    feedback: list[str],
+    candidate_profile: dict[str, str] | None = None,
+) -> dict[str, Any]:
     payload = {
         "role": role,
         "candidate_evidence": evidence,
+        "candidate_application_profile": candidate_profile or {},
+        "candidate_profile_rules": CANDIDATE_PROFILE_RULES,
         "writing_guide": GUIDE_RULES,
         "acceptance_rules": ACCEPTANCE_RULES,
         "previous_draft": previous or {},
@@ -208,12 +244,18 @@ def _deterministic_problems(draft: dict[str, Any], role: dict[str, Any], evidenc
     return problems
 
 
-def _evaluate(provider: AIProvider, role: dict[str, Any], evidence: list[dict[str, Any]], draft: dict[str, Any]) -> dict[str, Any]:
+def _evaluate(
+    provider: AIProvider,
+    role: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    draft: dict[str, Any],
+    candidate_profile: dict[str, str] | None = None,
+) -> dict[str, Any]:
     evaluation = provider.generate_json(
         """你是严格的用人单位终审 Agent。请从招聘决策角度评分，不因语言流畅自动给高分。
 总分 100：岗位相关性25、事实证据25、第一人称与表达15、简洁且不复述15、可信度10、可进入沟通下一步10。
 90 分代表内容真实、岗位专属、可直接发送，而非要求候选人完美覆盖全部职责。只按 candidate_evidence 中可用的事实评价，不得因事实库未提供到岗天数等信息而要求编造；可以评价表达是否充分利用已有事实。低于 90 必须给出具体、可执行的重写要求，且不得提出与 acceptance_rules 冲突的长度或格式标准。rubric 六项之和必须等于 score。严格输出 JSON。""",
-        json.dumps({"role": role, "candidate_evidence": evidence, "draft": draft, "writing_guide": GUIDE_RULES, "acceptance_rules": ACCEPTANCE_RULES}, ensure_ascii=False),
+        json.dumps({"role": role, "candidate_evidence": evidence, "candidate_application_profile": candidate_profile or {}, "candidate_profile_rules": CANDIDATE_PROFILE_RULES, "draft": draft, "writing_guide": GUIDE_RULES, "acceptance_rules": ACCEPTANCE_RULES}, ensure_ascii=False),
         evaluation_schema(),
     )
     rubric = evaluation.get("rubric") or {}
@@ -241,9 +283,17 @@ class WorkflowReport:
     attempts: int
 
 
-def enrich_payload(payload: dict[str, Any], profile: dict[str, Any], threshold: int = 90, max_attempts: int = 4, provider: AIProvider | None = None) -> WorkflowReport:
+def enrich_payload(
+    payload: dict[str, Any],
+    profile: dict[str, Any],
+    threshold: int = 90,
+    max_attempts: int = 4,
+    provider: AIProvider | None = None,
+    candidate_profile: dict[str, str] | None = None,
+) -> WorkflowReport:
     provider = provider or AIProvider()
     evidence = _profile_evidence(profile)
+    candidate_profile = candidate_profile or _candidate_application_profile(profile)
     evidence_ids = {item["id"] for item in evidence}
     processed = passed = total_attempts = 0
     for record in payload.get("records", []):
@@ -272,8 +322,8 @@ def enrich_payload(payload: dict[str, Any], profile: dict[str, Any], threshold: 
         draft: dict[str, Any] = {}
         for attempt in range(1, max_attempts + 1):
             total_attempts += 1
-            draft = _write(provider, role, evidence, previous, feedback)
-            final_evaluation = _evaluate(provider, role, evidence, draft)
+            draft = _write(provider, role, evidence, previous, feedback, candidate_profile)
+            final_evaluation = _evaluate(provider, role, evidence, draft, candidate_profile)
             deterministic = _deterministic_problems(draft, role, evidence_ids)
             if deterministic:
                 final_evaluation["score"] = min(int(final_evaluation.get("score", 0)), 89)

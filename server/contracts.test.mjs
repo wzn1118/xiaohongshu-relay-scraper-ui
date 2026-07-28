@@ -16,6 +16,8 @@ test('validateRunRequest applies bounded production defaults', () => {
   assert.equal(result.securityVerificationTimeoutSeconds, 600);
   assert.equal(result.useCodexRuntime, true);
   assert.equal(result.codexBatchSize, 8);
+  assert.equal(result.candidateProfile.availabilityDays, '5');
+  assert.equal(result.candidateProfile.internshipDuration, '6个月');
 });
 
 test('validateRunRequest rejects unknown and malformed parameters', () => {
@@ -35,6 +37,25 @@ test('validateRunRequest accepts only valid resume source ids in resume mode', (
   assert.equal(params.resumeFromJobId, '20260728034820-6b942873');
   assert.throws(() => validateRunRequest({ mode: 'fresh', resumeFromJobId: '20260728034820-6b942873' }), ValidationError);
   assert.throws(() => validateRunRequest({ mode: 'resume', resumeFromJobId: '../escape' }), ValidationError);
+});
+
+test('validateRunRequest accepts bounded runtime candidate application fields', () => {
+  const result = validateRunRequest({
+    candidateProfile: {
+      name: 'Example Candidate',
+      school: 'Example University',
+      major: 'Data Analytics',
+      degreeYear: 'Year 2',
+      phoneWeChat: 'contact-placeholder',
+      email: 'candidate@example.com',
+      availabilityDays: '5',
+      internshipDuration: '6 months',
+    },
+  });
+  assert.equal(result.candidateProfile.name, 'Example Candidate');
+  assert.equal(result.candidateProfile.email, 'candidate@example.com');
+  assert.throws(() => validateRunRequest({ candidateProfile: { unknown: 'value' } }), ValidationError);
+  assert.throws(() => validateRunRequest({ candidateProfile: { name: 'line\nvalue' } }), ValidationError);
 });
 
 test('buildRunnerArgs only emits the normalized whitelist', () => {

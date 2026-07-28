@@ -18,6 +18,7 @@ const ALLOWED_KEYS = new Set([
   'codexTimeoutSeconds',
   'aiSessionId',
   'profileId',
+  'candidateProfile',
   'coverLetterThreshold',
   'coverLetterMaxAttempts',
 ]);
@@ -77,10 +78,42 @@ export function validateRunRequest(value) {
     codexTimeoutSeconds: integerField(value.codexTimeoutSeconds, 'codexTimeoutSeconds', 300, 30, 1800),
     aiSessionId: optionalUuidField(value.aiSessionId, 'aiSessionId'),
     profileId: optionalPatternField(value.profileId, 'profileId', /^[a-f0-9]{16}$/),
+    candidateProfile: candidateProfileField(value.candidateProfile),
     coverLetterThreshold: integerField(value.coverLetterThreshold, 'coverLetterThreshold', 90, 90, 100),
     coverLetterMaxAttempts: integerField(value.coverLetterMaxAttempts, 'coverLetterMaxAttempts', 4, 1, 6),
     resumeFromJobId,
   });
+}
+
+function candidateProfileField(value) {
+  const defaults = {
+    name: '',
+    school: '',
+    major: '',
+    degreeYear: '研二',
+    phoneWeChat: '',
+    email: '',
+    availabilityDays: '5',
+    internshipDuration: '6个月',
+  };
+  if (value === undefined || value === null) return defaults;
+  if (!isPlainObject(value)) throw fieldError('candidateProfile', 'must_be_object');
+  const allowed = new Set(Object.keys(defaults));
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unknown.length) throw new ValidationError('Unsupported candidate profile fields.', unknown.map((key) => ({ field: `candidateProfile.${key}`, reason: 'not_allowed' })));
+  return Object.fromEntries(Object.entries(defaults).map(([key, fallback]) => [
+    key,
+    boundedCandidateString(value[key], `candidateProfile.${key}`, fallback, key === 'email' ? 254 : 160),
+  ]));
+}
+
+function boundedCandidateString(value, field, defaultValue, max) {
+  if (value === undefined || value === null) return defaultValue;
+  if (typeof value !== 'string') throw fieldError(field, 'must_be_string');
+  const normalized = value.trim();
+  if ([...normalized].length > max) throw fieldError(field, `length_0_to_${max}`);
+  if (/\p{Cc}/u.test(normalized)) throw fieldError(field, 'contains_control_character');
+  return normalized;
 }
 
 export function buildRunnerArgs(params, outputDir) {

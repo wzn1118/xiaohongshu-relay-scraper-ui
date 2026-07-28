@@ -31,7 +31,7 @@ from run_project_workflow import (  # noqa: E402
     rewrite_unlimited_args,
     write_project_manifest,
 )
-from codex_runtime_outreach import CodexRuntimeOutreachAgent  # noqa: E402
+from codex_runtime_outreach import CodexRuntimeOutreachAgent, _prompt  # noqa: E402
 from parallel_body_completion import contains_security_verification, record_is_complete, record_key  # noqa: E402
 
 
@@ -193,6 +193,27 @@ class ApplicationAgentTests(unittest.TestCase):
             self.assertEqual(record["outreach"]["generation_mode"], "codex_cli_runtime")
             self.assertEqual(record["outreach"]["recommended_resume"], "")
 
+    def test_cover_letter_prompt_includes_runtime_candidate_profile(self) -> None:
+        prompt = _prompt(
+            [{"note_id": "n1", "title": "Data analyst intern", "body": "Role evidence."}],
+            "",
+            {
+                "name": "Example Candidate",
+                "school": "Example University",
+                "major": "Data Analytics",
+                "degreeYear": "Year 2",
+                "phoneWeChat": "contact-placeholder",
+                "email": "candidate@example.com",
+                "availabilityDays": "5",
+                "internshipDuration": "6 months",
+            },
+        )
+        self.assertIn("Example Candidate", prompt)
+        self.assertIn("Example University", prompt)
+        self.assertIn("candidate@example.com", prompt)
+        self.assertIn("每周可实习", prompt)
+        self.assertIn("6 months", prompt)
+
     def test_quality_gate_detects_partial_collection_and_missing_body(self) -> None:
         cards = [
             {"note_id": "n1", "title": "one"},
@@ -238,7 +259,7 @@ class ApplicationAgentTests(unittest.TestCase):
             profile_path.write_text(json.dumps(PROFILE, ensure_ascii=False), encoding="utf-8")
             result = run_pipeline(output, profile_path, now=COLLECTED)
             self.assertTrue(result.passed)
-            self.assertEqual(result.payload["codex_runtime"]["prompt_version"], "xhs-outreach-v2")
+            self.assertEqual(result.payload["codex_runtime"]["prompt_version"], "xhs-outreach-v3")
             for name in (
                 "application_intelligence.json",
                 "application_intelligence.csv",

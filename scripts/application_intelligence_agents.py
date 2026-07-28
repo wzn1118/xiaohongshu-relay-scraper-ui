@@ -300,8 +300,31 @@ def _string_values(value: Any) -> Iterable[str]:
             yield from _string_values(item)
 
 
+def _candidate_application_profile(profile: dict[str, Any]) -> dict[str, str]:
+    for key in ("candidate_application", "candidateProfile"):
+        value = profile.get(key)
+        if isinstance(value, dict):
+            return {
+                field: _text(value.get(field))
+                for field in (
+                    "name",
+                    "school",
+                    "major",
+                    "degreeYear",
+                    "phoneWeChat",
+                    "email",
+                    "availabilityDays",
+                    "internshipDuration",
+                )
+            }
+    return {}
+
+
 def _candidate_name(profile: dict[str, Any]) -> str:
-    for key in ("name", "chinese_name", "candidate_name"):
+    application_profile = _candidate_application_profile(profile)
+    if application_profile.get("name"):
+        return application_profile["name"]
+    for key in ("name", "display_name", "chinese_name", "candidate_name"):
         value = _text(profile.get(key))
         if value:
             return value
@@ -793,6 +816,7 @@ def run_pipeline(
             runtime_agent = CodexRuntimeOutreachAgent(
                 output_dir,
                 candidate_name=_candidate_name(profile),
+                candidate_profile=_candidate_application_profile(profile),
                 cli_bin=codex_cli_bin,
                 batch_size=codex_batch_size,
                 timeout_seconds=codex_timeout_seconds,

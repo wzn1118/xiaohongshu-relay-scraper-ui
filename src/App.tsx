@@ -54,7 +54,31 @@ import type {
   AiProviderOption,
   AiSession,
   CandidateProfile,
+  CandidateApplicationProfile,
 } from './types'
+
+const CANDIDATE_PROFILE_STORAGE_KEY = 'xhs-candidate-application-profile'
+
+const defaultCandidateProfile: CandidateApplicationProfile = {
+  name: '',
+  school: '',
+  major: '',
+  degreeYear: '研二',
+  phoneWeChat: '',
+  email: '',
+  availabilityDays: '5',
+  internshipDuration: '6个月',
+}
+
+function loadCandidateProfile(): CandidateApplicationProfile {
+  if (typeof window === 'undefined') return defaultCandidateProfile
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(CANDIDATE_PROFILE_STORAGE_KEY) || '{}')
+    return { ...defaultCandidateProfile, ...(saved && typeof saved === 'object' ? saved : {}) }
+  } catch {
+    return defaultCandidateProfile
+  }
+}
 
 const defaultRequest: JobRequest = {
   keyword: '实习继任',
@@ -75,6 +99,7 @@ const defaultRequest: JobRequest = {
   codexTimeoutSeconds: 300,
   aiSessionId: null,
   profileId: null,
+  candidateProfile: defaultCandidateProfile,
   coverLetterThreshold: 90,
   coverLetterMaxAttempts: 4,
 }
@@ -261,7 +286,7 @@ function fileBase64(file: File) {
 }
 
 function App() {
-  const [request, setRequest] = useState(defaultRequest)
+  const [request, setRequest] = useState<JobRequest>(() => ({ ...defaultRequest, candidateProfile: loadCandidateProfile() }))
   const [health, setHealth] = useState<Health | null>(null)
   const [relay, setRelay] = useState<RelayStatus | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
@@ -298,6 +323,13 @@ function App() {
 
   const updateRequest = <K extends keyof JobRequest>(key: K, value: JobRequest[K]) => {
     setRequest((current) => ({ ...current, [key]: value }))
+  }
+
+  const updateCandidateProfile = <K extends keyof CandidateApplicationProfile>(key: K, value: CandidateApplicationProfile[K]) => {
+    setRequest((current) => ({
+      ...current,
+      candidateProfile: { ...current.candidateProfile, [key]: value },
+    }))
   }
 
   const connectRelay = useCallback(async (notify = false) => {
@@ -449,6 +481,14 @@ function App() {
   }, [])
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem(CANDIDATE_PROFILE_STORAGE_KEY, JSON.stringify(request.candidateProfile))
+    } catch {
+      // Local storage can be disabled; the current form state remains usable.
+    }
+  }, [request.candidateProfile])
+
+  useEffect(() => {
     if (!logs.length || !logConsole.current) return
     logConsole.current.scrollTo({ top: logConsole.current.scrollHeight, behavior: 'smooth' })
   }, [logs])
@@ -518,6 +558,17 @@ function App() {
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
+    const requiredFields: Array<[keyof CandidateApplicationProfile, string]> = [
+      ['name', '姓名'],
+      ['school', '学校'],
+      ['major', '专业'],
+      ['email', '邮箱'],
+    ]
+    const missing = requiredFields.filter(([key]) => !request.candidateProfile[key].trim()).map(([, label]) => label)
+    if (missing.length) {
+      setNotice(`请先填写候选人信息：${missing.join('、')}`)
+      return
+    }
     void runJob({ ...request, checkOnly: false })
   }
 
@@ -674,6 +725,19 @@ function App() {
                 {activeProfile && <div className="memory-preview"><strong>{activeProfile.summary}</strong><span>{(activeProfile.skills || []).slice(0, 6).join(' · ')}</span></div>}
               </section>
             </div>
+            <section className="candidate-profile-section">
+              <div className="setup-title"><UserRoundSearch size={17} /><span><strong>求职信署名信息</strong><small>用于生成主题、称呼、可实习时间和联系方式</small></span></div>
+              <div className="candidate-profile-grid">
+                <label className="field"><span>姓名</span><input value={request.candidateProfile.name} onChange={(event) => updateCandidateProfile('name', event.target.value)} autoComplete="name" placeholder="填写姓名" /></label>
+                <label className="field"><span>学校</span><input value={request.candidateProfile.school} onChange={(event) => updateCandidateProfile('school', event.target.value)} autoComplete="organization" placeholder="填写学校" /></label>
+                <label className="field"><span>专业</span><input value={request.candidateProfile.major} onChange={(event) => updateCandidateProfile('major', event.target.value)} placeholder="填写专业" /></label>
+                <label className="field"><span>年级/学历</span><input value={request.candidateProfile.degreeYear} onChange={(event) => updateCandidateProfile('degreeYear', event.target.value)} placeholder="例如：研二" /></label>
+                <label className="field"><span>电话/微信</span><input value={request.candidateProfile.phoneWeChat} onChange={(event) => updateCandidateProfile('phoneWeChat', event.target.value)} autoComplete="tel" placeholder="填写电话或微信" /></label>
+                <label className="field"><span>邮箱</span><input type="email" value={request.candidateProfile.email} onChange={(event) => updateCandidateProfile('email', event.target.value)} autoComplete="email" placeholder="填写邮箱" /></label>
+                <label className="field"><span>每周可实习天数</span><input inputMode="numeric" value={request.candidateProfile.availabilityDays} onChange={(event) => updateCandidateProfile('availabilityDays', event.target.value)} placeholder="5" /></label>
+                <label className="field"><span>预计实习时长</span><input value={request.candidateProfile.internshipDuration} onChange={(event) => updateCandidateProfile('internshipDuration', event.target.value)} placeholder="例如：6个月" /></label>
+              </div>
+            </section>
           </section>
 
           <div className="primary-grid">
