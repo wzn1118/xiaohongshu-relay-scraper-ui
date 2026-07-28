@@ -71,7 +71,9 @@ async function walk(root, relativeDir, files) {
 function normalizeRelativePath(value) {
   if (typeof value !== 'string' || value.length === 0 || value.includes('\0')) throw new Error('Invalid artifact path.');
   const portable = value.replaceAll('\\', '/');
-  if (path.posix.isAbsolute(portable)) throw new Error('Artifact path must be relative.');
+  if (path.posix.isAbsolute(portable) || path.win32.isAbsolute(value) || /^[A-Za-z]:/.test(portable)) {
+    throw new Error('Artifact path must be relative.');
+  }
   const normalized = path.posix.normalize(portable);
   if (normalized === '.' || normalized === '..' || normalized.startsWith('../')) throw new Error('Path escapes artifact root.');
   return normalized;
