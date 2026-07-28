@@ -40,6 +40,13 @@ start-windows.cmd -CheckOnly -NoBrowser
 ./start-linux-macos.sh --check-only --no-browser
 ```
 
+Windows 可选登录自启动（随时可撤销）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/register-startup.ps1
+powershell -ExecutionPolicy Bypass -File scripts/register-startup.ps1 -Remove
+```
+
 ## 手动安装
 
 Windows：
