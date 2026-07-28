@@ -72,7 +72,12 @@ class AIProvider:
             raise AIProviderError("AI provider response did not contain a message") from error
 
     def _codex(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
-        executable = os.environ.get("CODEX_CLI_BIN") or shutil.which("codex.cmd") or shutil.which("codex")
+        executable = (
+            os.environ.get("CODEX_CLI_BIN")
+            or shutil.which("codex.exe")
+            or shutil.which("codex")
+            or shutil.which("codex.cmd")
+        )
         if not executable:
             raise AIProviderError("Codex CLI was not found")
         with tempfile.TemporaryDirectory(prefix="xhs-ai-") as temporary:

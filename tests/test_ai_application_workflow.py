@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from ai_application_workflow import enrich_payload  # noqa: E402
+from ai_application_workflow import _merge_feedback, enrich_payload  # noqa: E402
 
 
 class FakeProvider:
@@ -72,6 +72,18 @@ class FakeProvider:
 
 
 class AiApplicationWorkflowTests(unittest.TestCase):
+    def test_reviewer_feedback_accumulates_without_duplicates(self) -> None:
+        self.assertEqual(
+            _merge_feedback(["补充岗位判断", "压缩案例"], ["压缩案例", " 写清交付物  "]),
+            ["补充岗位判断", "压缩案例", "写清交付物"],
+        )
+
+    def test_reviewer_feedback_keeps_recent_bounded_context(self) -> None:
+        self.assertEqual(
+            _merge_feedback(["旧要求1", "旧要求2"], ["新要求1", "新要求2"], limit=3),
+            ["旧要求2", "新要求1", "新要求2"],
+        )
+
     def test_low_quality_first_draft_is_rewritten_until_threshold(self) -> None:
         payload = {
             "quality_gate": {"passed": True, "checks": {}, "issues": []},

@@ -208,6 +208,8 @@ def write_project_manifest(output_dir: Path, summary: dict[str, Any]) -> Path:
             continue
         if path.is_symlink():
             raise RuntimeError(f"Refusing to publish symlink artifact: {path}")
+        if path.stat().st_size == 0:
+            continue
         relative = path.relative_to(output_dir).as_posix()
         artifacts.append({"path": relative, "bytes": path.stat().st_size, "sha256": sha256(path)})
     manifest = {

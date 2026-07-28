@@ -17,6 +17,14 @@ GUIDE_RULES = [
     "保持第一人称、简洁、可信，并给出清晰的沟通下一步",
 ]
 
+ACCEPTANCE_RULES = [
+    "私信以第一人称表达，30-180 个中文字符",
+    "邮件正文以第一人称表达，40-300 个中文字符",
+    "Cover Letter 以第一人称表达，220-520 个中文字符，写作目标为 320-460 个中文字符",
+    "不得出现元叙述、虚构事实或逐句复述岗位正文",
+    "至少引用一项真实经历证据，并给出可验证的沟通下一步",
+]
+
 
 def _string() -> dict[str, Any]:
     return {"type": "string"}
@@ -96,6 +104,10 @@ def evaluation_schema() -> dict[str, Any]:
 
 def _profile_evidence(profile: dict[str, Any]) -> list[dict[str, Any]]:
     evidence = []
+    for index, item in enumerate(profile.get("education", []), start=1):
+        text = str(item or "").strip()
+        if text:
+            evidence.append({"id": f"education-{index}", "label": "教育经历", "detail": text})
     for item in profile.get("evidence", []):
         if isinstance(item, dict) and item.get("id"):
             detail = re.sub(
@@ -143,8 +155,16 @@ def _write(provider: AIProvider, role: dict[str, Any], evidence: list[dict[str, 
         "role": role,
         "candidate_evidence": evidence,
         "writing_guide": GUIDE_RULES,
+        "acceptance_rules": ACCEPTANCE_RULES,
         "previous_draft": previous or {},
         "required_revisions": feedback,
+        "revision_contract": [
+            "逐条满足 required_revisions；如与 acceptance_rules 冲突，以 acceptance_rules 为准；事实库没有所需事实时不得虚构",
+            "先在内部把最高优先级职责映射到证据，再输出行动、交付物、结果及其可迁移价值",
+            "加入一条针对当前岗位的工作判断或验证方法，并明确它是入职后的做法而非既往业绩",
+            "区分直接结果与相关结果，不夸大个人归因",
+            "私信、邮件和 Cover Letter 角度互补，避免重复整段内容",
+        ],
     }
     return provider.generate_json(
         """你是资深求职信写作 Agent。为当前岗位写一套真正专属的中文私信、邮件和 Cover Letter。
@@ -152,9 +172,11 @@ def _write(provider: AIProvider, role: dict[str, Any], evidence: list[dict[str, 
 1. 全部以第一人称“我”表达，直接展示与岗位能力契合的行动、协作和结果。
 2. 禁止出现“简历”“附件”“原帖”“岗位提到”“候选人”“材料显示”等元叙述；不复述岗位职责，不引用招聘正文。
 3. 只使用 candidate_evidence 中存在的事实和数字，不暴露 evidence id，不虚构经验，不主动强调短板。
-4. Cover Letter 约 280-500 个中文字符，2-4 段；开头直接切入最相关价值，结尾提出沟通下一步。
-5. 私信控制在 90-180 字；邮件正文与 Cover Letter 角度一致但不可逐字相同。
-6. used_evidence_ids 只能引用给定 id。严格输出 JSON。""",
+4. Cover Letter 控制在 320-460 个中文字符，2-4 段；开头直接切入最相关价值，结尾提出可验证的沟通下一步。
+5. 私信控制在 50-160 字，邮件正文控制在 120-260 字；三者角度互补，不可复制同一段落。
+6. 必须逐条闭环 required_revisions。写岗位方法时使用“我会”，写过往事实时使用“我曾/我负责”，不得混淆计划与业绩。
+7. 对经历写清“问题或目标—我的判断和行动—交付物—结果—岗位迁移价值”，但只使用 candidate_evidence 中的事实。
+8. used_evidence_ids 只能引用给定 id。输出前按上述规则自检，严格输出 JSON。""",
         json.dumps(payload, ensure_ascii=False),
         writing_schema(),
     )
@@ -172,8 +194,14 @@ def _deterministic_problems(draft: dict[str, Any], role: dict[str, Any], evidenc
     if not used or not used.issubset(evidence_ids):
         problems.append("经历证据引用为空或超出事实记忆")
     cover = str(draft.get("cover_letter", ""))
-    if len(cover) < 220 or len(cover) > 900:
-        problems.append("Cover Letter 长度不在有效区间")
+    if len(cover) < 220 or len(cover) > 520:
+        problems.append(f"Cover Letter 当前 {len(cover)} 字，必须重写到 220-520 字，目标 320-460 字")
+    greeting = str(draft.get("greeting", ""))
+    if "我" not in greeting or len(greeting) < 30 or len(greeting) > 180:
+        problems.append(f"私信当前 {len(greeting)} 字，必须以第一人称表达并控制在 30-180 字")
+    email = str(draft.get("email_body", ""))
+    if "我" not in email or len(email) < 40 or len(email) > 300:
+        problems.append(f"邮件正文当前 {len(email)} 字，必须以第一人称表达并控制在 40-300 字")
     source_lines = [item.get("text", "") for key in ("responsibilities", "requirements") for item in role.get(key, [])]
     if any(len(line) >= 24 and line in cover for line in source_lines):
         problems.append("逐句复述了招聘要求")
@@ -184,14 +212,25 @@ def _evaluate(provider: AIProvider, role: dict[str, Any], evidence: list[dict[st
     evaluation = provider.generate_json(
         """你是严格的用人单位终审 Agent。请从招聘决策角度评分，不因语言流畅自动给高分。
 总分 100：岗位相关性25、事实证据25、第一人称与表达15、简洁且不复述15、可信度10、可进入沟通下一步10。
-90 分代表可以直接发送；低于 90 必须给出具体可执行的重写要求。rubric 六项之和必须等于 score。严格输出 JSON。""",
-        json.dumps({"role": role, "candidate_evidence": evidence, "draft": draft, "writing_guide": GUIDE_RULES}, ensure_ascii=False),
+90 分代表内容真实、岗位专属、可直接发送，而非要求候选人完美覆盖全部职责。只按 candidate_evidence 中可用的事实评价，不得因事实库未提供到岗天数等信息而要求编造；可以评价表达是否充分利用已有事实。低于 90 必须给出具体、可执行的重写要求，且不得提出与 acceptance_rules 冲突的长度或格式标准。rubric 六项之和必须等于 score。严格输出 JSON。""",
+        json.dumps({"role": role, "candidate_evidence": evidence, "draft": draft, "writing_guide": GUIDE_RULES, "acceptance_rules": ACCEPTANCE_RULES}, ensure_ascii=False),
         evaluation_schema(),
     )
     rubric = evaluation.get("rubric") or {}
     rubric_sum = sum(int(rubric.get(key, 0)) for key in ("role_relevance", "evidence", "first_person", "concision", "credibility", "action_readiness"))
     evaluation["score"] = min(int(evaluation.get("score", 0)), rubric_sum)
     return evaluation
+
+
+def _merge_feedback(existing: list[str], incoming: list[str], limit: int = 12) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in [*existing, *incoming]:
+        normalized = re.sub(r"\s+", " ", str(item or "")).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            merged.append(normalized)
+    return merged[-max(1, limit):]
 
 
 @dataclass
@@ -246,7 +285,7 @@ def enrich_payload(payload: dict[str, Any], profile: dict[str, Any], threshold: 
                 passed += 1
                 break
             previous = draft
-            feedback = list(final_evaluation.get("rewrite_instructions", []))
+            feedback = _merge_feedback(feedback, list(final_evaluation.get("rewrite_instructions", [])))
         ready = int(final_evaluation.get("score", 0)) >= threshold
         record["outreach"] = {
             **draft,

@@ -332,6 +332,7 @@ class WorkflowWrapperTests(unittest.TestCase):
             (output / "nested").mkdir()
             (output / "one.json").write_text('{"ok":true}', encoding="utf-8")
             (output / "nested" / "two.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+            (output / "workflow.stderr.log").write_text("", encoding="utf-8")
             (output / "artifact-manifest.json").write_text("stale", encoding="utf-8")
             summary = {
                 "checks": {"coverage": True, "quality": True},
