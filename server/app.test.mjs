@@ -42,7 +42,21 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     staticDir,
     runnerAvailable: true,
   };
-  const server = http.createServer(createApp({ manager, config }));
+  const server = http.createServer(createApp({
+    manager,
+    config,
+    relayConnector: async ({ port }) => ({
+      ok: true,
+      ready: true,
+      running: true,
+      cdpReady: true,
+      authenticated: true,
+      port,
+      tabs: 1,
+      tabCount: 1,
+      message: 'Relay 已智能连接。',
+    }),
+  }));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   const origin = `http://127.0.0.1:${port}`;
@@ -66,6 +80,14 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
 
     const invalidPort = await fetch(`${origin}/api/relay/status?port=0`);
     assert.equal(invalidPort.status, 400);
+
+    const connected = await fetch(`${origin}/api/relay/connect`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ port: 18800 }),
+    });
+    assert.equal(connected.status, 200);
+    assert.equal((await connected.json()).ready, true);
 
     const created = await fetch(`${origin}/api/jobs`, {
       method: 'POST',

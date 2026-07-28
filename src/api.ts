@@ -22,6 +22,10 @@ export const api = {
   importProfile: (payload: { aiSessionId: string; backgroundText: string; files: Array<{ name: string; base64: string }> }) =>
     request<CandidateProfile>('/api/profiles/import', { method: 'POST', body: JSON.stringify(payload) }),
   relayStatus: (port: number) => request<RelayStatus>(`/api/relay/status?port=${port}`),
+  connectRelay: (port: number) => request<RelayStatus & { ready?: boolean; attempted?: boolean }>(`/api/relay/connect`, {
+    method: 'POST',
+    body: JSON.stringify({ port }),
+  }),
   jobs: () => request<Job[]>('/api/jobs'),
   job: (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`),
   createJob: (payload: JobRequest) =>

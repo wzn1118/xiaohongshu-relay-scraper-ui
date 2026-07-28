@@ -275,6 +275,7 @@ function App() {
   const [logs, setLogs] = useState<string[]>([])
   const [advanced, setAdvanced] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [relayConnecting, setRelayConnecting] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [clock, setClock] = useState(new Date())
@@ -290,6 +291,8 @@ function App() {
   const [configuringAi, setConfiguringAi] = useState(false)
   const [importingProfile, setImportingProfile] = useState(false)
   const cleanupStream = useRef<null | (() => void)>(null)
+  const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
+  const relayLastAttemptRef = useRef(0)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
 
@@ -297,13 +300,42 @@ function App() {
     setRequest((current) => ({ ...current, [key]: value }))
   }
 
-  const loadRelay = useCallback(async () => {
+  const connectRelay = useCallback(async (notify = false) => {
+    if (relayConnectionRef.current) return relayConnectionRef.current
+    relayLastAttemptRef.current = Date.now()
+    setRelayConnecting(true)
+    const connection = api.connectRelay(request.relayPort)
+      .then((status) => {
+        setRelay(status)
+        if (notify) setNotice(status.message || (status.ready ? 'Relay 已连接' : 'Relay 尚未连接'))
+        return status
+      })
+      .catch((error) => {
+        const status: RelayStatus = { running: false, cdpReady: false, port: request.relayPort, message: (error as Error).message }
+        setRelay(status)
+        if (notify) setNotice(status.message || 'Relay 尚未连接')
+        return status
+      })
+      .finally(() => {
+        relayConnectionRef.current = null
+        setRelayConnecting(false)
+      })
+    relayConnectionRef.current = connection
+    return connection
+  }, [request.relayPort])
+
+  const refreshRelay = useCallback(async () => {
     try {
-      setRelay(await api.relayStatus(request.relayPort))
+      const status = await api.relayStatus(request.relayPort)
+      setRelay(status)
+      const tabCount = Array.isArray(status.tabs) ? status.tabs.length : Number(status.tabs || 0)
+      const ready = status.running && status.cdpReady && tabCount > 0
+      if (!ready && Date.now() - relayLastAttemptRef.current >= 30000) await connectRelay()
     } catch (error) {
       setRelay({ running: false, cdpReady: false, port: request.relayPort, message: (error as Error).message })
+      if (Date.now() - relayLastAttemptRef.current >= 30000) await connectRelay()
     }
-  }, [request.relayPort])
+  }, [connectRelay, request.relayPort])
 
   const loadJobs = useCallback(async () => {
     try {
@@ -377,7 +409,8 @@ function App() {
 
   useEffect(() => {
     let mounted = true
-    Promise.allSettled([api.health(), api.jobs(), api.relayStatus(request.relayPort)]).then((results) => {
+    const boot = async () => {
+      const results = await Promise.allSettled([api.health(), api.jobs(), api.relayStatus(request.relayPort)])
       if (!mounted) return
       const [healthResult, jobsResult, relayResult] = results
       if (healthResult.status === 'fulfilled') setHealth(healthResult.value)
@@ -385,18 +418,25 @@ function App() {
         setJobs(Array.isArray(jobsResult.value) ? jobsResult.value : [])
         setActiveJob(Array.isArray(jobsResult.value) ? jobsResult.value[0] || null : null)
       }
-      if (relayResult.status === 'fulfilled') setRelay(relayResult.value)
+      if (relayResult.status === 'fulfilled') {
+        setRelay(relayResult.value)
+        const tabCount = Array.isArray(relayResult.value.tabs) ? relayResult.value.tabs.length : Number(relayResult.value.tabs || 0)
+        if (!(relayResult.value.running && relayResult.value.cdpReady && tabCount > 0)) await connectRelay()
+      } else {
+        await connectRelay()
+      }
       setLoading(false)
-    })
+    }
+    void boot()
     const clockTimer = window.setInterval(() => setClock(new Date()), 1000)
-    const relayTimer = window.setInterval(loadRelay, 15000)
+    const relayTimer = window.setInterval(() => void refreshRelay(), 15000)
     return () => {
       mounted = false
       window.clearInterval(clockTimer)
       window.clearInterval(relayTimer)
       cleanupStream.current?.()
     }
-  }, [loadRelay, request.relayPort])
+  }, [connectRelay, refreshRelay, request.relayPort])
 
   useEffect(() => {
     Promise.all([api.aiProviders(), api.profiles()]).then(([options, saved]) => {
@@ -498,7 +538,7 @@ function App() {
     if (job.status === 'running' || job.status === 'queued') connectJob(job)
   }
 
-  const relayReady = Boolean(relay?.running && relay?.cdpReady)
+  const relayReady = Boolean(relay?.running && relay?.cdpReady && (Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)) > 0)
   const progress = activeJob?.progress ?? (activeJob ? progressByStatus[activeJob.status] : 0)
   const runningCount = jobs.filter((job) => job.status === 'running' || job.status === 'queued').length
   const completedCount = jobs.filter((job) => job.status === 'completed').length
@@ -575,11 +615,11 @@ function App() {
             <span className="version">v3.0</span>
           </div>
           <div className="topbar-status">
-            <div className={`relay-indicator ${relayReady ? 'ready' : 'offline'}`}>
-              {relayReady ? <Wifi size={17} /> : <WifiOff size={17} />}
-              <span><strong>{relayReady ? 'Relay 就绪' : 'Relay 待连接'}</strong><small>CDP {request.relayPort} · {tabCount} 个标签页</small></span>
+            <div className={`relay-indicator ${relayReady ? 'ready' : relayConnecting ? 'connecting' : 'offline'}`}>
+              {relayReady ? <Wifi size={17} /> : relayConnecting ? <LoaderCircle className="spin" size={17} /> : <WifiOff size={17} />}
+              <span><strong>{relayReady ? 'Relay 已连接' : relayConnecting ? 'Relay 连接中' : 'Relay 待连接'}</strong><small>CDP {request.relayPort} · {tabCount} 个标签页</small></span>
             </div>
-            <button className="icon-button" onClick={loadRelay} title="刷新 Relay 状态"><RefreshCw size={17} /></button>
+            <button className="icon-button" onClick={() => void connectRelay(true)} disabled={relayConnecting} title="智能连接 Relay"><RefreshCw className={relayConnecting ? 'spin' : ''} size={17} /></button>
             <time title="北京时间（Asia/Shanghai）">{formatTime(clock.toISOString())}</time>
           </div>
         </header>

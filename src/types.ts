@@ -48,6 +48,10 @@ export type RelayStatus = {
   port?: number
   profile?: string
   authenticated?: boolean
+  ready?: boolean
+  attempted?: boolean
+  helperTimedOut?: boolean
+  helperExitCode?: number | null
   message?: string
 }
 

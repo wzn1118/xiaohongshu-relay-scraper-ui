@@ -60,12 +60,27 @@ function Open-App {
     if (-not $NoBrowser) { Start-Process $Url }
 }
 
+function Connect-Relay {
+    param([string]$Url)
+    try {
+        $status = Invoke-RestMethod -Method Post -Uri "$Url/api/relay/connect" -ContentType 'application/json' -Body '{}' -TimeoutSec 35
+        $port = if ($status.port) { $status.port } else { 18800 }
+        $tabs = if ($status.tabs) { $status.tabs } else { 0 }
+        Write-Host "Relay startup check: ready=$($status.ready) port=$port tabs=$tabs"
+        return $true
+    } catch {
+        Write-Warning "Relay startup check did not complete: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 Import-DotEnv (Join-Path $root '.env')
 if ($Port -gt 0) { $env:PORT = [string]$Port }
 $url = Get-AppUrl
 
 if (Test-AppHealth $url) {
     Write-Host "Application is already running at $url"
+    if (-not $CheckOnly) { Connect-Relay $url | Out-Null }
     if (-not $CheckOnly) { Open-App $url }
     exit 0
 }
@@ -134,6 +149,7 @@ $url = Get-AppUrl
 
 if (Test-AppHealth $url) {
     Write-Host "Application is already running at $url"
+    Connect-Relay $url | Out-Null
     Open-App $url
     exit 0
 }
@@ -154,6 +170,7 @@ try {
     }
     if (-not $ready) { throw "Application did not become healthy within 60 seconds: $url" }
     Write-Host "Application is ready: $url"
+    Connect-Relay $url | Out-Null
     Open-App $url
     $server.WaitForExit()
     exit $server.ExitCode

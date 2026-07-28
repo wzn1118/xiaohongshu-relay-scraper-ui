@@ -47,12 +47,15 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .relay-indicator { min-width: 180px; display: flex; align-items: center; gap: 9px; color: var(--ink-soft); }
 .relay-indicator.ready > svg { color: var(--green); }
 .relay-indicator.offline > svg { color: var(--red); }
+.relay-indicator.connecting > svg { color: var(--amber); }
 .relay-indicator span { display: flex; flex-direction: column; }
 .relay-indicator strong { color: var(--ink); font-size: 12px; }
 .relay-indicator small { margin-top: 2px; font-size: 10px; color: #7b7d81; }
 .topbar time { padding-left: 12px; border-left: 1px solid var(--line); font-family: Consolas, monospace; font-size: 13px; color: #66686d; }
 .icon-button { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 4px; background: #fff; color: #55585c; }
 .icon-button:hover { border-color: #999; color: var(--ink); }
+.spin { animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .notice { margin: 14px 24px 0; min-height: 42px; padding: 10px 12px; display: flex; align-items: center; gap: 9px; color: #782431; border: 1px solid #e2a5ae; background: #fff0f2; border-radius: var(--radius); font-size: 12px; }
 .notice span { flex: 1; }

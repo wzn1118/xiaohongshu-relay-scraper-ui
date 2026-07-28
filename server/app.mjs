@@ -4,10 +4,11 @@ import { readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
 import { ValidationError, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
+import { connectRelay } from './lib/relay-connect.mjs';
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
 
-export function createApp({ manager, config, aiSessions, profileStore }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConnector = connectRelay }) {
   return async function app(req, res) {
     setSecurityHeaders(res);
     if (req.method === 'OPTIONS') return noContent(res);
@@ -33,6 +34,19 @@ export function createApp({ manager, config, aiSessions, profileStore }) {
         if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
         const status = await probeRelay({ port, openClawConfigPath: config.openClawConfigPath });
         return json(res, status.ok ? 200 : 503, status);
+      }
+      if (req.method === 'POST' && url.pathname === '/api/relay/connect') {
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        const requested = body?.port;
+        const port = requested === undefined ? 18800 : Number(requested);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
+        const status = await relayConnector({
+          port,
+          openClawConfigPath: config.openClawConfigPath,
+          runnerPath: config.runnerPath,
+          helperPath: config.relayHelperPath,
+        });
+        return json(res, 200, status);
       }
       if (req.method === 'GET' && url.pathname === '/api/ai/providers') return json(res, 200, aiSessions.providers());
       if (req.method === 'POST' && url.pathname === '/api/ai/sessions') {
