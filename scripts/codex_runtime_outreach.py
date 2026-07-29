@@ -6,10 +6,14 @@ import os
 import shutil
 import subprocess
 import tempfile
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    from .codex_config import current_codex_runtime_args
+except ImportError:
+    from codex_config import current_codex_runtime_args
 
 
 PROMPT_VERSION = "xhs-outreach-v3"
@@ -34,49 +38,6 @@ def resolve_codex_cli(explicit: str = "") -> str:
         if candidate and Path(candidate).is_file():
             return str(Path(candidate).resolve())
     raise FileNotFoundError("Codex CLI was not found. Set CODEX_CLI_BIN to the codex CLI executable.")
-
-
-def _toml_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def current_codex_runtime_args() -> list[str]:
-    """Carry current model/provider routing without loading user prompt instructions."""
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    try:
-        config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
-        return []
-
-    arguments: list[str] = []
-    model = _text(config.get("model"))
-    if model:
-        arguments.extend(["--model", model])
-
-    provider_name = _text(config.get("model_provider"))
-    provider = (config.get("model_providers") or {}).get(provider_name, {})
-    if provider_name and isinstance(provider, dict):
-        arguments.extend(["--config", f"model_provider={_toml_value(provider_name)}"])
-        for key in ("name", "base_url", "wire_api", "requires_openai_auth"):
-            if key in provider and isinstance(provider[key], (str, bool)):
-                arguments.extend(
-                    ["--config", f"model_providers.{provider_name}.{key}={_toml_value(provider[key])}"]
-                )
-
-    service_tier = _text(config.get("service_tier"))
-    if service_tier:
-        arguments.extend(["--config", f"service_tier={_toml_value(service_tier)}"])
-    arguments.extend(
-        [
-            "--config",
-            'model_reasoning_effort="low"',
-            "--config",
-            "disable_response_storage=true",
-        ]
-    )
-    return arguments
 
 
 def run_with_tree_timeout(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:

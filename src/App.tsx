@@ -57,6 +57,8 @@ import type {
   AiSession,
   CandidateProfile,
   CandidateApplicationProfile,
+  ApplicationRoute,
+  OutreachDraft,
 } from './types'
 
 const CANDIDATE_PROFILE_STORAGE_KEY = 'xhs-candidate-application-profile'
@@ -208,6 +210,62 @@ function formatBytes(bytes = 0) {
   return `${(bytes / 1024 ** 2).toFixed(1)} MB`
 }
 
+type DeliveryRouteView = {
+  channel: 'email' | 'direct_message' | 'link' | 'other'
+  label: string
+  target: string
+  evidence: string
+  confidence?: number
+}
+
+function deliveryRoutes(result: ApplicationResult): DeliveryRouteView[] {
+  const routes = [...(result.application_info?.contacts || []), ...(result.application_info?.application_routes || [])]
+  const normalized = routes.flatMap((route) => normalizeDeliveryRoute(route))
+  const seen = new Set<string>()
+  return normalized.filter((route) => {
+    const key = `${route.channel}:${route.target.toLowerCase()}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function normalizeDeliveryRoute(route: ApplicationRoute): DeliveryRouteView[] {
+  const type = String(route.type || '').toLowerCase()
+  const value = String(route.value || '').trim()
+  const evidence = String(route.evidence || '').trim()
+  const emails = `${value}\n${evidence}`.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []
+  if (emails.length) {
+    return emails.map((target) => ({ channel: 'email', label: '邮件投递', target, evidence: evidence || value, confidence: route.confidence }))
+  }
+  const channel = route.channel
+    || (/私信|站内|direct.?message|\bdm\b|message/.test(`${type} ${value}`) ? 'direct_message'
+      : (/https?:\/\//i.test(value) ? 'link' : 'other'))
+  const label = channel === 'direct_message' ? '站内私信' : channel === 'link' ? '申请链接' : '其他方式'
+  return [{ channel, label, target: value || label, evidence: evidence || value, confidence: route.confidence }]
+}
+
+function outreachDraft(result: ApplicationResult): OutreachDraft {
+  return {
+    greeting: result.outreach.greeting || '',
+    email_subject: result.outreach.email_subject || '',
+    email_body: result.outreach.email_body || '',
+    cover_letter: result.outreach.cover_letter || '',
+  }
+}
+
+function deliveryStatusLabel(action?: string) {
+  return ({
+    draft_saved: '草稿已保存',
+    ready_to_apply: '等待邮件投递',
+    ready_to_message: '私信文案已复制',
+    applied: '已投递',
+    messaged: '已私信',
+    email_sent: '邮件已发送',
+    email_failed: '邮件发送失败',
+  } as Record<string, string>)[action || ''] || '尚未处理'
+}
+
 function elapsed(job?: Job) {
   if (!job?.startedAt) return '-'
   const end = job.finishedAt ? new Date(job.finishedAt).getTime() : Date.now()
@@ -318,6 +376,9 @@ function App() {
   const [coverage, setCoverage] = useState<CoverageSummary | null>(null)
   const [results, setResults] = useState<ApplicationResultsResponse | null>(null)
   const [selectedResult, setSelectedResult] = useState<ApplicationResult | null>(null)
+  const [draftDirty, setDraftDirty] = useState(false)
+  const [draftSaving, setDraftSaving] = useState(false)
+  const [emailSending, setEmailSending] = useState(false)
   const [resultOffset, setResultOffset] = useState(0)
   const [resultsLoading, setResultsLoading] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
@@ -481,6 +542,7 @@ function App() {
       setResults(payload)
       setResultOffset(offset)
       setSelectedResult((current) => payload.items.find((item) => item.note_id === current?.note_id) || payload.items[0] || null)
+      setDraftDirty(false)
     } catch {
       setResults(null)
       setSelectedResult(null)
@@ -666,26 +728,88 @@ function App() {
   const codexRuntime = results?.codexRuntime || (workflowSummary.codexRuntime as Record<string, unknown> | undefined)
   const selectedProvider = providers.find((item) => item.id === providerId)
   const activeProfile = profiles.find((item) => item.id === request.profileId)
+  const candidateReady = [
+    request.candidateProfile.name,
+    request.candidateProfile.school,
+    request.candidateProfile.major,
+    request.candidateProfile.email,
+  ].every((value) => value.trim())
+  const backgroundReady = Boolean(request.profileId && activeProfile)
+  const readinessChecks = [
+    { label: 'AI 会话', ready: Boolean(aiSession), detail: aiSession ? (selectedProvider?.label || providerId) : '等待连接' },
+    { label: '背景记忆', ready: backgroundReady, detail: activeProfile?.display_name || '请选择档案' },
+    { label: '候选人资料', ready: candidateReady, detail: candidateReady ? '必填字段完整' : '姓名、学校、专业、邮箱' },
+    { label: '搜索关键词', ready: Boolean(request.keyword.trim()), detail: request.keyword.trim() || '请输入关键词' },
+  ]
+  const missingReadiness = readinessChecks.filter((item) => !item.ready).map((item) => item.label)
+  const selectedDeliveryRoutes = selectedResult ? deliveryRoutes(selectedResult) : []
+  const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email')
+  const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message')
+
+  const replaceResult = (next: ApplicationResult) => {
+    setSelectedResult(next)
+    setResults((current) => current ? { ...current, items: current.items.map((item) => item.note_id === next.note_id ? next : item) } : current)
+  }
+
+  const chooseResult = (next: ApplicationResult) => {
+    if (draftDirty && selectedResult?.note_id !== next.note_id) {
+      setNotice('当前岗位有未保存的文案修改，请先保存后再切换。')
+      return
+    }
+    setSelectedResult(next)
+    setDraftDirty(false)
+  }
+
+  const updateDraft = (field: keyof OutreachDraft, value: string) => {
+    if (!selectedResult) return
+    replaceResult({ ...selectedResult, outreach: { ...selectedResult.outreach, [field]: value } })
+    setDraftDirty(true)
+  }
 
   const copyText = (value: string) => {
     if (!value) return
     void navigator.clipboard.writeText(value).then(() => setNotice('内容已复制到剪贴板'))
   }
 
-  const prepareDelivery = async (action: 'ready_to_apply' | 'ready_to_message') => {
+  const saveDraft = async () => {
     if (!activeJob || !selectedResult) return
-    const text = action === 'ready_to_message'
-      ? selectedResult.outreach.greeting
-      : `${selectedResult.outreach.email_subject}\n\n${selectedResult.outreach.email_body}`
-    copyText(text)
+    setDraftSaving(true)
     try {
-      const response = await api.setDelivery(activeJob.id, selectedResult.note_id, action)
-      const next = { ...selectedResult, delivery: response.delivery }
-      setSelectedResult(next)
-      setResults((current) => current ? { ...current, items: current.items.map((item) => item.note_id === next.note_id ? next : item) } : current)
-      setNotice(action === 'ready_to_message' ? '私信已复制并标记为准备私聊' : '邮件已复制并标记为准备投递')
+      const response = await api.saveDraft(activeJob.id, selectedResult.note_id, outreachDraft(selectedResult))
+      replaceResult({ ...selectedResult, outreach: { ...selectedResult.outreach, ...response.outreach }, delivery: response.delivery })
+      setDraftDirty(false)
+      setNotice('投递文案已保存到当前任务')
     } catch (error) {
       setNotice((error as Error).message)
+    } finally {
+      setDraftSaving(false)
+    }
+  }
+
+  const prepareMessage = async () => {
+    if (!activeJob || !selectedResult) return
+    copyText(selectedResult.outreach.greeting)
+    try {
+      const response = await api.setDelivery(activeJob.id, selectedResult.note_id, 'ready_to_message')
+      replaceResult({ ...selectedResult, delivery: response.delivery })
+      setNotice('私信文案已复制，可打开原帖发送')
+    } catch (error) {
+      setNotice((error as Error).message)
+    }
+  }
+
+  const sendEmail = async () => {
+    if (!activeJob || !selectedResult || !selectedEmailRoute) return
+    setEmailSending(true)
+    try {
+      const response = await api.sendEmail(activeJob.id, selectedResult.note_id, selectedEmailRoute.target, outreachDraft(selectedResult))
+      replaceResult({ ...selectedResult, outreach: { ...selectedResult.outreach, ...response.outreach }, delivery: response.delivery })
+      setDraftDirty(false)
+      setNotice(`邮件已发送至 ${selectedEmailRoute.target}`)
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setEmailSending(false)
     }
   }
 
@@ -865,8 +989,26 @@ function App() {
                   </div>
                 )}
 
+                <div className="readiness-strip" aria-live="polite">
+                  <div className="readiness-header">
+                    <span className="readiness-title"><ShieldCheck size={15} />启动前检查</span>
+                    <span className={`readiness-relay ${relayReady ? 'ready' : ''}`}><Wifi size={13} />{relayReady ? `Relay 已连接 · ${tabCount} 个标签页` : 'Relay 等待连接'}</span>
+                    <strong className={missingReadiness.length ? 'pending' : 'ready'}>{missingReadiness.length ? `还差 ${missingReadiness.length} 项` : '可以启动'}</strong>
+                  </div>
+                  <div className="readiness-items">
+                    {readinessChecks.map((item) => (
+                      <span className={`readiness-item ${item.ready ? 'ready' : ''}`} key={item.label}>
+                        <span className="readiness-icon">{item.ready ? <Check size={12} /> : <CircleAlert size={12} />}</span>
+                        <b>{item.label}</b>
+                        <small>{item.detail}</small>
+                      </span>
+                    ))}
+                  </div>
+                  {missingReadiness.length > 0 && <p>完成{missingReadiness.join('、')}后，启动按钮会自动解锁。</p>}
+                </div>
+
                 <div className="form-actions">
-                  <button className="primary-button" type="submit" disabled={submitting || !request.keyword.trim() || !aiSession || !request.profileId}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Play size={18} fill="currentColor" />}启动全流程</button>
+                  <button className="primary-button" type="submit" disabled={submitting || !request.keyword.trim() || !aiSession || !backgroundReady || !candidateReady}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Play size={18} fill="currentColor" />}启动全流程</button>
                   <button className="secondary-button" type="button" disabled={submitting} onClick={() => void runJob({ ...request, checkOnly: true })}><Activity size={18} />仅检查链路</button>
                 </div>
               </form>
@@ -938,16 +1080,19 @@ function App() {
                 <div className="result-index">
                   <div className="result-index-head"><span>岗位列表</span><small>{resultOffset + 1}-{Math.min(resultOffset + results.items.length, results.total)} / {results.total}</small></div>
                   <div className="result-rows">
-                    {results.items.map((item) => (
-                      <button key={item.note_id} className={selectedResult?.note_id === item.note_id ? 'selected' : ''} onClick={() => setSelectedResult(item)}>
-                        <span><strong>{item.title || '未命名岗位'}</strong><small>{item.publish_time.value || '日期待核验'} · {item.cover_letter_evaluation?.score ?? '-'} 分 · {item.delivery?.action ? '已准备' : '未操作'}</small></span>
-                        <i className={item.cover_letter_evaluation?.passed ? 'ready' : ''}>{item.cover_letter_evaluation?.passed ? '≥ 90' : '待重写'}</i>
-                      </button>
-                    ))}
+                    {results.items.map((item) => {
+                      const routeLabels = deliveryRoutes(item).map((route) => route.label)
+                      return (
+                        <button key={item.note_id} className={selectedResult?.note_id === item.note_id ? 'selected' : ''} onClick={() => chooseResult(item)}>
+                          <span><strong>{item.title || '未命名岗位'}</strong><small>{item.publish_time.value || '日期待核验'} · {item.cover_letter_evaluation?.score ?? '-'} 分 · {routeLabels.length ? [...new Set(routeLabels)].join(' / ') : '投递方式待确认'}</small></span>
+                          <i className={item.delivery?.action === 'email_sent' ? 'sent' : item.cover_letter_evaluation?.passed ? 'ready' : ''}>{item.delivery?.action === 'email_sent' ? '已发送' : item.cover_letter_evaluation?.passed ? '≥ 90' : '待重写'}</i>
+                        </button>
+                      )
+                    })}
                   </div>
                   <div className="result-pagination">
-                    <button title="上一页" disabled={resultOffset === 0 || resultsLoading} onClick={() => activeJob && void loadResults(activeJob.id, Math.max(0, resultOffset - 20))}><ChevronLeft size={16} /></button>
-                    <button title="下一页" disabled={resultOffset + results.limit >= results.total || resultsLoading} onClick={() => activeJob && void loadResults(activeJob.id, resultOffset + 20)}><ChevronRight size={16} /></button>
+                    <button title={draftDirty ? '请先保存当前文案' : '上一页'} disabled={draftDirty || resultOffset === 0 || resultsLoading} onClick={() => activeJob && void loadResults(activeJob.id, Math.max(0, resultOffset - 20))}><ChevronLeft size={16} /></button>
+                    <button title={draftDirty ? '请先保存当前文案' : '下一页'} disabled={draftDirty || resultOffset + results.limit >= results.total || resultsLoading} onClick={() => activeJob && void loadResults(activeJob.id, resultOffset + 20)}><ChevronRight size={16} /></button>
                   </div>
                 </div>
                 {selectedResult ? (
@@ -960,25 +1105,35 @@ function App() {
                       <section><h4>岗位职责</h4>{selectedResult.application_info.responsibilities.length ? <ul>{selectedResult.application_info.responsibilities.map((item, index) => <li key={index}>{item.text}</li>)}</ul> : <p>正文未识别到明确职责</p>}</section>
                       <section><h4>岗位要求</h4>{selectedResult.application_info.requirements.length ? <ul>{selectedResult.application_info.requirements.map((item, index) => <li key={index}>{item.text}</li>)}</ul> : <p>正文未识别到明确要求</p>}</section>
                       <section className="capability-section"><h4>关键能力</h4>{selectedResult.job_capabilities?.length ? <ul>{selectedResult.job_capabilities.map((item) => <li key={item.id}><strong>{item.capability}</strong><span>{item.why_it_matters}</span></li>)}</ul> : <p>等待 AI 提炼岗位能力</p>}</section>
-                      <section className="route-section"><h4>投递方式</h4>{selectedResult.application_info.contacts.length + selectedResult.application_info.application_routes.length ? <ul>{[...selectedResult.application_info.contacts, ...selectedResult.application_info.application_routes].map((item, index) => <li key={index}><strong>{item.type}</strong><span>{item.value}</span></li>)}</ul> : <p>原文未提供明确投递方式</p>}</section>
+                      <section className="route-section"><h4>AI 提取的投递方式</h4>{selectedDeliveryRoutes.length ? <ul>{selectedDeliveryRoutes.map((route, index) => <li key={`${route.channel}-${route.target}-${index}`}><strong>{route.channel === 'email' ? <Mail size={14} /> : route.channel === 'direct_message' ? <MessageSquare size={14} /> : <ExternalLink size={14} />}{route.label}</strong><span><b>{route.target}</b><small>{route.confidence !== undefined ? `AI 置信度 ${route.confidence}% · ` : ''}{route.evidence || '来自岗位正文'}</small></span></li>)}</ul> : <p>原文未提供明确投递方式，发送操作保持关闭。</p>}</section>
                       <section className="body-section"><h4>采集正文</h4><p>{selectedResult.body || '正文尚未采集'}</p></section>
                     </div>
                     <div className="draft-stack">
-                      <section><div><h4>私信招呼语</h4><button title="复制招呼语" onClick={() => copyText(selectedResult.outreach.greeting)}><Copy size={15} /></button></div><p>{selectedResult.outreach.greeting || '经历事实不足，暂未生成。'}</p></section>
-                      <section><div><h4>投递邮件</h4><button title="复制投递邮件" onClick={() => copyText(`${selectedResult.outreach.email_subject}\n\n${selectedResult.outreach.email_body}`)}><Copy size={15} /></button></div><strong>{selectedResult.outreach.email_subject}</strong><p>{selectedResult.outreach.email_body || '暂未生成。'}</p></section>
-                      <section><div><h4>专属 Cover Letter</h4><button title="复制 Cover Letter" onClick={() => copyText(selectedResult.outreach.cover_letter)}><Copy size={15} /></button></div><p>{selectedResult.outreach.cover_letter || '暂未生成。'}</p></section>
+                      <div className="draft-toolbar">
+                        <div><span className="step-label">EDITABLE APPLICATION COPY</span><h4>投递文案编辑器</h4><p>AI 达标版本可直接修改；发送邮件时使用当前编辑内容。</p></div>
+                        <button className={draftDirty ? 'dirty' : ''} disabled={draftSaving || !draftDirty} onClick={() => void saveDraft()}>{draftSaving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{draftDirty ? '保存修改' : '已保存'}</button>
+                      </div>
+                      <section className="draft-editor"><div><h4><MessageSquare size={15} />私信文案</h4><button title="复制私信文案" onClick={() => copyText(selectedResult.outreach.greeting)}><Copy size={15} /></button></div><textarea aria-label="私信文案" value={selectedResult.outreach.greeting} onChange={(event) => updateDraft('greeting', event.target.value)} rows={4} /><small>{selectedResult.outreach.greeting.length} 字</small></section>
+                      <section className="draft-editor email-editor"><div><h4><Mail size={15} />邮件文案</h4><button title="复制投递邮件" onClick={() => copyText(`${selectedResult.outreach.email_subject}\n\n${selectedResult.outreach.email_body}`)}><Copy size={15} /></button></div><label><span>邮件主题</span><input aria-label="邮件主题" value={selectedResult.outreach.email_subject} onChange={(event) => updateDraft('email_subject', event.target.value)} /></label><label><span>邮件正文（实际发送）</span><textarea aria-label="邮件正文" value={selectedResult.outreach.email_body} onChange={(event) => updateDraft('email_body', event.target.value)} rows={7} /></label><small>{selectedResult.outreach.email_body.length} 字</small></section>
+                      <section className="draft-editor"><div><h4><FileText size={15} />专属 Cover Letter</h4><button title="复制 Cover Letter" onClick={() => copyText(selectedResult.outreach.cover_letter)}><Copy size={15} /></button></div><textarea aria-label="Cover Letter" value={selectedResult.outreach.cover_letter} onChange={(event) => updateDraft('cover_letter', event.target.value)} rows={10} /><small>{selectedResult.outreach.cover_letter.length} 字 · 当前评分基于 AI 达标版本</small></section>
                     </div>
                     <div className="evaluation-panel">
                       <div><span>用人单位评分</span><strong>{selectedResult.cover_letter_evaluation?.score ?? '-'}<small>/ 100</small></strong></div>
                       <div><span>重写轮次</span><strong>{selectedResult.cover_letter_evaluation?.attempts ?? '-'}</strong></div>
                       <p>{selectedResult.cover_letter_evaluation?.passed ? '已通过 90 分投递门槛' : (selectedResult.cover_letter_evaluation?.problems || []).join('；') || '等待评分'}</p>
                     </div>
-                    <div className="delivery-actions">
-                      <button disabled={!selectedResult.cover_letter_evaluation?.passed} onClick={() => void prepareDelivery('ready_to_apply')}><Send size={16} />准备投递</button>
-                      <button disabled={!selectedResult.cover_letter_evaluation?.passed} onClick={() => void prepareDelivery('ready_to_message')}><MessageSquare size={16} />准备私聊</button>
-                      {selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer"><ExternalLink size={16} />打开岗位</a>}
+                    <div className="delivery-console">
+                      <div className="delivery-target">
+                        <span className={selectedEmailRoute ? 'available' : ''}><Mail size={17} /></span>
+                        <div><small>邮件收件人</small><strong>{selectedEmailRoute?.target || '岗位正文未提取到邮箱'}</strong><p>{health?.emailDelivery?.configured ? `SMTP 已就绪 · 发件人 ${health.emailDelivery.from}` : 'SMTP 尚未配置，填写 .env 后重启服务即可启用'}</p></div>
+                      </div>
+                      <div className="delivery-actions">
+                        <button className="send-email-action" disabled={!selectedResult.cover_letter_evaluation?.passed || !selectedEmailRoute || !health?.emailDelivery?.configured || emailSending} onClick={() => void sendEmail()} title={!selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : '立即发送当前邮件正文'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}{emailSending ? '发送中' : '发送邮件'}</button>
+                        <button disabled={!selectedResult.cover_letter_evaluation?.passed || !selectedMessageRoute} onClick={() => void prepareMessage()}><MessageSquare size={16} />复制私信</button>
+                        {selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer"><ExternalLink size={16} />打开岗位</a>}
+                      </div>
                     </div>
-                    <footer><span>生成方式：<strong>{selectedResult.outreach.generation_mode || '-'}</strong></span><span>当前状态：<strong>{selectedResult.delivery?.action || '尚未准备'}</strong></span></footer>
+                    <footer><span>生成方式：<strong>{selectedResult.outreach.generation_mode || '-'}</strong></span><span>当前状态：<strong>{deliveryStatusLabel(selectedResult.delivery?.action)}</strong></span>{selectedResult.delivery?.email?.sentAt && <span>发送时间：<strong>{formatTime(selectedResult.delivery.email.sentAt)}</strong></span>}</footer>
                   </article>
                 ) : <div className="result-empty"><FileText size={28} /><strong>选择一个岗位查看详情</strong></div>}
               </div>

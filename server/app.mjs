@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
@@ -8,9 +9,19 @@ import { connectRelay } from './lib/relay-connect.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
+const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
+const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, relayConnector = connectRelay }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, mailSender, relayConnector = connectRelay }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
+  const deliveryMailer = mailSender || {
+    status: () => ({ configured: false, from: '' }),
+    send: async () => {
+      const error = new Error('请先配置 SMTP 邮件发送。');
+      error.code = 'MAIL_NOT_CONFIGURED';
+      throw error;
+    },
+  };
   return async function app(req, res) {
     setSecurityHeaders(res);
     if (req.method === 'OPTIONS') return noContent(res);
@@ -28,6 +39,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           host: config.host,
           port: config.port,
           activeJob: manager.active?.id || null,
+          emailDelivery: deliveryMailer.status(),
         });
       }
       if (req.method === 'GET' && url.pathname === '/api/relay/config') {
@@ -106,6 +118,15 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           const body = await readJsonBody(req, config.maxBodyBytes);
           return json(res, 200, await updateDeliveryState(internal.outputDir, body));
         }
+        if (req.method === 'POST' && parts[3] === 'draft' && parts.length === 4) {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          return json(res, 200, await updateApplicationDraft(internal.outputDir, body));
+        }
+        if (req.method === 'POST' && parts[3] === 'send-email' && parts.length === 4) {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const replyTo = String(internal.config?.candidateProfile?.email || '').trim();
+          return json(res, 200, await sendApplicationEmail(internal.outputDir, body, deliveryMailer, replyTo));
+        }
         if (req.method === 'GET' && parts[3] === 'artifacts' && parts.length === 4) {
           return json(res, 200, await enumerateArtifacts(internal.outputDir));
         }
@@ -132,6 +153,8 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (['AI_VALIDATION', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_IMPORT_FAILED') return json(res, 422, errorBody(error.code, error.message));
+      if (error.code === 'MAIL_NOT_CONFIGURED') return json(res, 503, errorBody(error.code, error.message));
+      if (error.code === 'MAIL_SEND_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error instanceof SyntaxError) return json(res, 400, errorBody('INVALID_JSON', 'Request body must contain valid JSON.'));
       if (error.code === 'ENOENT' || /artifact/i.test(error.message) || /Path escapes/.test(error.message)) {
         return json(res, 404, errorBody('ARTIFACT_NOT_FOUND', 'Artifact not found.'));
@@ -150,7 +173,7 @@ async function readApplicationResults(outputDir, searchParams) {
     const payload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
     const delivery = await readDeliveryState(outputDir);
     const source = Array.isArray(payload.records)
-      ? payload.records.map((record) => ({ ...record, delivery: delivery[record.note_id] || null }))
+      ? payload.records.map((record) => mergeApplicationState(record, delivery[record.note_id]))
       : [];
     const records = query
       ? source.filter((record) => `${record.title || ''}\n${record.body || ''}`.toLocaleLowerCase('zh-CN').includes(query))
@@ -170,6 +193,13 @@ async function readApplicationResults(outputDir, searchParams) {
   }
 }
 
+async function readApplicationRecord(outputDir, noteId) {
+  const payload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
+  const record = Array.isArray(payload.records) ? payload.records.find((item) => item.note_id === noteId) : null;
+  if (!record) throw new ValidationError('Application record not found.');
+  return record;
+}
+
 async function readDeliveryState(outputDir) {
   try {
     const value = JSON.parse(await readFile(path.join(outputDir, 'delivery-state.json'), 'utf8'));
@@ -183,18 +213,121 @@ async function readDeliveryState(outputDir) {
 async function updateDeliveryState(outputDir, value) {
   const noteId = String(value?.noteId || '').trim();
   const action = String(value?.action || '').trim();
-  if (!/^[\p{L}\p{N}_.:-]{1,160}$/u.test(noteId)) throw new ValidationError('Invalid noteId.');
+  if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
   if (!['ready_to_apply', 'ready_to_message', 'applied', 'messaged', 'reset'].includes(action)) {
     throw new ValidationError('Invalid delivery action.');
   }
+  await readApplicationRecord(outputDir, noteId);
   const state = await readDeliveryState(outputDir);
   if (action === 'reset') delete state[noteId];
-  else state[noteId] = { action, updatedAt: new Date().toISOString() };
+  else state[noteId] = { ...state[noteId], action, updatedAt: new Date().toISOString() };
+  await writeDeliveryState(outputDir, state);
+  return { noteId, delivery: publicDeliveryState(state[noteId]) };
+}
+
+async function updateApplicationDraft(outputDir, value) {
+  const noteId = String(value?.noteId || '').trim();
+  if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+  await readApplicationRecord(outputDir, noteId);
+  const draft = normalizeDraft(value?.outreach);
+  const state = await readDeliveryState(outputDir);
+  state[noteId] = {
+    ...state[noteId],
+    action: 'draft_saved',
+    updatedAt: new Date().toISOString(),
+    draft,
+  };
+  await writeDeliveryState(outputDir, state);
+  return { noteId, outreach: draft, delivery: publicDeliveryState(state[noteId]) };
+}
+
+async function sendApplicationEmail(outputDir, value, mailer, replyTo) {
+  const noteId = String(value?.noteId || '').trim();
+  if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+  const record = await readApplicationRecord(outputDir, noteId);
+  const qualityThreshold = Math.max(90, Number(record.cover_letter_evaluation?.threshold || 90));
+  if (!record.cover_letter_evaluation?.passed || Number(record.cover_letter_evaluation?.score || 0) < qualityThreshold) {
+    throw new ValidationError(`Cover Letter must pass the ${qualityThreshold}-point quality gate before delivery.`);
+  }
+  const extracted = extractedEmails(record);
+  const requested = String(value?.to || '').trim().toLowerCase();
+  const to = extracted.find((item) => item.toLowerCase() === requested) || (!requested ? extracted[0] : '');
+  if (!to) throw new ValidationError('Recipient must be an email extracted from this application record.');
+
+  const state = await readDeliveryState(outputDir);
+  const draft = normalizeDraft(value?.outreach || state[noteId]?.draft || record.outreach);
+  if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
+  state[noteId] = { ...state[noteId], draft, updatedAt: new Date().toISOString() };
+  try {
+    const sent = await mailer.send({
+      to,
+      subject: draft.email_subject,
+      text: draft.email_body,
+      replyTo: EMAIL.test(replyTo) ? replyTo : '',
+    });
+    state[noteId] = {
+      ...state[noteId],
+      action: 'email_sent',
+      updatedAt: new Date().toISOString(),
+      email: {
+        status: 'sent',
+        to,
+        sentAt: new Date().toISOString(),
+        messageId: sent.messageId || '',
+      },
+    };
+    await writeDeliveryState(outputDir, state);
+    return { noteId, outreach: draft, delivery: publicDeliveryState(state[noteId]) };
+  } catch (error) {
+    state[noteId] = {
+      ...state[noteId],
+      action: 'email_failed',
+      updatedAt: new Date().toISOString(),
+      email: { status: 'failed', to, failedAt: new Date().toISOString() },
+    };
+    await writeDeliveryState(outputDir, state);
+    throw error;
+  }
+}
+
+function normalizeDraft(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const limits = { greeting: 2000, email_subject: 240, email_body: 20000, cover_letter: 20000 };
+  const draft = {};
+  for (const [field, limit] of Object.entries(limits)) {
+    const text = String(source[field] || '').trim();
+    if (text.length > limit) throw new ValidationError(`${field} is too long.`);
+    draft[field] = text;
+  }
+  return draft;
+}
+
+function extractedEmails(record) {
+  const routes = [...(record.application_info?.contacts || []), ...(record.application_info?.application_routes || [])];
+  const values = routes.flatMap((route) => `${route?.value || ''}\n${route?.evidence || ''}`.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []);
+  return [...new Set(values.map((value) => value.toLowerCase()))];
+}
+
+function mergeApplicationState(record, state) {
+  if (!state) return { ...record, delivery: null };
+  return {
+    ...record,
+    outreach: { ...record.outreach, ...(state.draft || {}) },
+    delivery: publicDeliveryState(state),
+  };
+}
+
+function publicDeliveryState(state) {
+  if (!state) return null;
+  const { draft, ...publicState } = state;
+  return publicState;
+}
+
+async function writeDeliveryState(outputDir, state) {
   const target = path.join(outputDir, 'delivery-state.json');
-  const temporary = `${target}.${process.pid}.tmp`;
+  const temporary = `${target}.${process.pid}-${randomUUID()}.tmp`;
   await writeFile(temporary, JSON.stringify(state, null, 2), 'utf8');
   await rename(temporary, target);
-  return { noteId, delivery: state[noteId] || null };
 }
 
 function boundedInteger(raw, fallback, min, max) {

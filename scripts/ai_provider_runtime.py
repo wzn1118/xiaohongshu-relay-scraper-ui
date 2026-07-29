@@ -11,6 +11,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+try:
+    from .codex_config import current_codex_runtime_args
+except ImportError:
+    from codex_config import current_codex_runtime_args
+
 
 class AIProviderError(RuntimeError):
     pass
@@ -89,6 +94,7 @@ class AIProvider:
                 executable,
                 "exec",
                 "--ephemeral",
+                "--ignore-user-config",
                 "--ignore-rules",
                 "--sandbox",
                 "read-only",
@@ -96,8 +102,7 @@ class AIProvider:
                 str(schema_path),
                 "--output-last-message",
                 str(output_path),
-                "--config",
-                'model_reasoning_effort="low"',
+                *current_codex_runtime_args(),
                 "--config",
                 "disable_response_storage=true",
             ]

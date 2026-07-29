@@ -7,6 +7,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
 
+& (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -InstallRuntime -InstallTools
+if ($LASTEXITCODE -ne 0) { throw 'Windows prerequisites are not ready.' }
+
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Node.js 22+ is required.' }
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw 'npm is required.' }
 $python = if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { 'python' }

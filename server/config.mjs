@@ -7,6 +7,10 @@ const runnerPath =
   process.env.XHS_RUNNER_PATH ||
   path.resolve(serverDir, '..', 'scripts', 'run_project_workflow.py');
 const dataDir = path.resolve(process.env.XHS_SERVER_DATA_DIR || path.join(serverDir, '..', 'data', 'jobs'));
+const smtpPort = readPort(process.env.SMTP_PORT, 587);
+const smtpUser = String(process.env.SMTP_USER || '').trim();
+const smtpPass = String(process.env.SMTP_PASS || '');
+const smtpFrom = String(process.env.SMTP_FROM || smtpUser).trim();
 
 export const config = Object.freeze({
   host: process.env.HOST || '127.0.0.1',
@@ -20,6 +24,14 @@ export const config = Object.freeze({
   profileDir: path.resolve(process.env.XHS_PROFILE_DATA_DIR || path.join(serverDir, '..', 'data', 'profiles')),
   profileScriptPath: path.resolve(serverDir, '..', 'scripts', 'profile_memory.py'),
   legacyProfilePath: path.resolve(serverDir, '..', 'profiles', 'candidate_profile.json'),
+  smtp: Object.freeze({
+    host: String(process.env.SMTP_HOST || '').trim(),
+    port: smtpPort,
+    secure: readBoolean(process.env.SMTP_SECURE, smtpPort === 465),
+    user: smtpUser,
+    pass: smtpPass,
+    from: smtpFrom,
+  }),
   openClawConfigPath:
     process.env.OPENCLAW_CONFIG_PATH ||
     path.join(process.env.USERPROFILE || process.env.HOME || '', '.openclaw', 'openclaw.json'),
@@ -35,4 +47,9 @@ function readInt(value, fallback, min, max) {
   if (value === undefined || value === '') return fallback;
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
+}
+
+function readBoolean(value, fallback = false) {
+  if (value === undefined || value === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
 }

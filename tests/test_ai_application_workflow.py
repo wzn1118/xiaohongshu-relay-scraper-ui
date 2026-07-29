@@ -25,7 +25,7 @@ class FakeProvider:
                 "role_name": "增长运营实习",
                 "responsibilities": [{"text": "分析活动数据并推动优化", "priority": 1}],
                 "requirements": [{"text": "具备数据分析和跨团队协作能力", "priority": 1}],
-                "application_routes": [{"type": "email", "value": "jobs@example.com"}],
+                "application_routes": [{"type": "email", "value": "jobs@example.com", "channel": "email", "confidence": 100}],
                 "capabilities": [{"id": "cap-1", "capability": "数据驱动运营", "why_it_matters": "支持增长决策", "priority": 5}],
             }
         if "used_evidence_ids" in required:
@@ -108,6 +108,8 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertEqual(provider.writer_calls, 2)
         self.assertEqual(record["cover_letter_evaluation"]["score"], 94)
         self.assertEqual(record["cover_letter_evaluation"]["attempts"], 2)
+        self.assertEqual(record["application_info"]["application_routes"][0]["channel"], "email")
+        self.assertEqual(record["application_info"]["application_routes"][0]["confidence"], 100)
         self.assertNotIn("简历", record["outreach"]["cover_letter"])
         self.assertNotIn("附件", record["outreach"]["cover_letter"])
         for section in ("application_routes", "responsibilities", "requirements"):

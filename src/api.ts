@@ -1,4 +1,4 @@
-import type { AiProviderOption, AiSession, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, RelayConfig, RelayStatus } from './types'
+import type { AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, OutreachDraft, RelayConfig, RelayStatus } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -41,7 +41,11 @@ export const api = {
     return request<ApplicationResultsResponse>(`/api/jobs/${encodeURIComponent(id)}/results?${params}`)
   },
   setDelivery: (jobId: string, noteId: string, action: 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | 'reset') =>
-    request<{ noteId: string; delivery: { action: string; updatedAt: string } | null }>(`/api/jobs/${encodeURIComponent(jobId)}/delivery`, { method: 'POST', body: JSON.stringify({ noteId, action }) }),
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/delivery`, { method: 'POST', body: JSON.stringify({ noteId, action }) }),
+  saveDraft: (jobId: string, noteId: string, outreach: OutreachDraft) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft`, { method: 'POST', body: JSON.stringify({ noteId, outreach }) }),
+  sendEmail: (jobId: string, noteId: string, to: string, outreach: OutreachDraft) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/send-email`, { method: 'POST', body: JSON.stringify({ noteId, to, outreach }) }),
   artifactUrl: (jobId: string, artifact: Artifact) =>
     artifact.url || `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifact.id)}`,
   subscribe: (id: string, onEvent: (event: JobEvent) => void, onDisconnect: () => void) => {

@@ -60,6 +60,18 @@ function Open-App {
     if (-not $NoBrowser) { Start-Process $Url }
 }
 
+function Refresh-ProcessPath {
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $currentPath = $env:Path
+    $pathEntries = @($machinePath, $userPath, $currentPath) |
+        Where-Object { $_ } |
+        ForEach-Object { $_.Split(';') } |
+        Where-Object { $_ } |
+        Select-Object -Unique
+    $env:Path = [string]::Join(';', [string[]]$pathEntries)
+}
+
 function Connect-Relay {
     param([string]$Url)
     try {
@@ -92,6 +104,13 @@ if (Test-AppHealth $url) {
     if (-not $CheckOnly) { Connect-Relay $url | Out-Null }
     if (-not $CheckOnly) { Open-App $url }
     exit 0
+}
+
+if (-not $CheckOnly) {
+    Write-Host 'Preparing Windows runtime and command-line tools...'
+    & (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -InstallRuntime -InstallTools
+    if ($LASTEXITCODE -ne 0) { throw 'Windows prerequisites are not ready.' }
+    Refresh-ProcessPath
 }
 
 $nodeCommand = Get-Command node -ErrorAction SilentlyContinue

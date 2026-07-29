@@ -123,7 +123,9 @@
       ↓
 06 用人单位 Agent 评审与质量门禁
       ↓
-07 人工确认、复制文案、导出结果
+07 人工确认并编辑文案
+      ↓
+08 邮件一键发送 / 私信复制投递 / 导出结果
 ```
 
 ### 8 个 Agent 阶段
@@ -181,6 +183,7 @@
 - 岗位匹配分析和能力模型。
 - 个性化私信、邮件和 Cover Letter。
 - 相关性、证据、表达、可信度和行动就绪度评分。
+- AI 从岗位正文提取的邮件 / 私信渠道、可编辑草稿和本地投递状态。
 
 ### 可复核产物
 
@@ -196,7 +199,7 @@ data/jobs/<JOB_ID>/artifacts/
 
 ## 产品边界与隐私
 
-- 系统只生成、评审和复制文案，**不会自动发送私信、邮件或提交申请**。
+- 系统不会自动投递；只有用户点击“发送邮件”后，才会通过本机配置的 SMTP 把当前编辑稿发送到该岗位正文中提取出的邮箱。私信仍由用户复制文案并打开原帖发送。
 - 上传文件、背景记忆、任务数据和个人证据默认写入本地 Git 忽略目录。
 - API Key 只保存在服务进程内存中，默认 8 小时过期，不写入任务历史、日志、导出文件或 Git。
 - 文案只能使用简历和背景记忆中明确存在的事实，不能把不确定信息写成确定经历。
@@ -215,13 +218,25 @@ data/jobs/<JOB_ID>/artifacts/
 
 从 GitHub [下载 ZIP](https://github.com/wzn1118/xiaohongshu-relay-scraper-ui/archive/refs/heads/master.zip) 并解压，然后双击根目录的 `start-windows.cmd`。
 
-启动器会在首次运行时自动安装依赖、构建应用、创建 `.env`，成功后打开：
+首次运行会先检查并准备 Windows 运行时和命令行工具，再安装项目依赖、构建应用、创建 `.env`，成功后打开：
 
 ```text
 http://127.0.0.1:4317
 ```
 
 后续再次启动会复用已经运行的健康实例，不会重复启动服务。
+
+#### 空机首次配置顺序
+
+目标电脑默认没有开发环境时，Windows 启动器按以下顺序执行：
+
+1. 通过系统包管理器准备 Node.js 22+ 和 Python 3.11+。
+2. 通过 npm 准备项目使用的命令行工具。
+3. 执行 `npm ci`、Python 依赖安装和前端构建。
+4. 创建本地 `.env` 并启动页面与 API。
+5. 在 `.env` 中配置上游入口脚本、中转站端口/Profile、模型配置和浏览器登录状态后，再运行采集任务。
+
+自动准备依赖需要 Windows App Installer 提供的 `winget`。系统包管理器本身缺失时，先安装 App Installer；上游采集 Skill 不随项目 ZIP 分发，浏览器登录和模型中转配置也属于每台电脑的一次性本地配置。
 
 ### Linux / macOS
 
@@ -242,7 +257,7 @@ start-windows.cmd -CheckOnly -NoBrowser
 ./start-linux-macos.sh --check-only --no-browser
 ```
 
-输出中的 `ready: true` 表示应用构建、Python 和上游采集脚本均可用。`codexCli` 与 `openClawConfig` 会单独报告，使用 API 模型时 Codex CLI 可缺省。
+输出中的 `ready: true` 表示运行时和项目安装状态满足启动条件；`npm run preflight` 会继续检查上游采集脚本、模型工具和 Relay 配置。采集链路还需要上游脚本、浏览器登录和中转配置。
 
 <details>
 <summary><strong>手动安装、配置和验证</strong></summary>
@@ -281,6 +296,17 @@ sh scripts/start.sh
 | `OPENCLAW_CONFIG_PATH` | 用户目录自动发现 | 当前 Relay 配置 |
 | `XHS_RELAY_CONFIG_PATH` | `data/relay-config.json` | 中转站端口、浏览器 Profile 和开机连接开关 |
 | `XHS_AI_TIMEOUT_SECONDS` | `600` | 单次 AI 调用超时秒数 |
+| `SMTP_HOST` / `SMTP_PORT` | 留空 / `587` | 可选邮件服务器；留空时发送按钮关闭 |
+| `SMTP_USER` / `SMTP_PASS` | 留空 | 可选 SMTP 账号；仅从本机 `.env` 读取 |
+| `SMTP_FROM` | 留空 | 邮件发件地址或 `名称 <邮箱>` |
+
+邮件发送只在三个条件同时成立时启用：AI 文案通过不低于 90 分的质量门禁、岗位正文提取到有效邮箱、本机 SMTP 配置完整。草稿和发送结果写入任务目录的 `delivery-state.json`，不会改写原始 AI 分析文件。
+
+#### Codex 中转配置
+
+选择 Codex 作为任务 AI 时，项目会读取 `$CODEX_HOME/config.toml` 中的模型提供方配置。把中转站提供的配置放入该文件即可，项目会沿用其中的模型、`review_model`、`base_url`、`wire_api`、鉴权要求、`model_reasoning_effort`、`network_access`、响应存储设置和 `features.goals`；批处理采集、岗位分析、文案生成和简历导入使用同一份配置。不需要把中转地址或凭据写进仓库的 `.env`。
+
+批处理任务会在启动 Codex CLI 时显式转发这些设置；简历导入使用同一份本机 Codex 配置，不再把推理强度固定为 `low`。API Key 仍由 Codex CLI 自己读取，项目不会写入任务历史或日志。
 
 上游 `xiaohongshu-relay-scrape` 采集 Skill 可位于 `$CODEX_HOME/skills/xiaohongshu-relay-scrape/scripts/`；若安装在其他目录，在 `.env` 中填写：
 

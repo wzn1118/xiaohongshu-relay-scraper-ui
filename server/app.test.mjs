@@ -15,7 +15,24 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   await writeFile(path.join(staticDir, 'index.html'), '<!doctype html><title>XHS Control</title>', 'utf8');
   await writeFile(path.join(outputDir, 'result.json'), '{"ok":true}', 'utf8');
   await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
-    records: [{ note_id: 'n1', title: '内容运营实习', body: '负责内容运营' }],
+    records: [{
+      note_id: 'n1',
+      title: '内容运营实习',
+      body: '负责内容运营，请投递 jobs@example.com',
+      application_info: {
+        contacts: [],
+        application_routes: [{ type: 'email', channel: 'email', value: 'email', evidence: '请发送至 jobs@example.com', confidence: 100 }],
+        responsibilities: [],
+        requirements: [],
+      },
+      outreach: {
+        greeting: '您好，我希望申请内容运营实习。',
+        email_subject: '内容运营实习申请',
+        email_body: '您好，我希望申请内容运营实习。',
+        cover_letter: '我具备内容运营和数据分析经验。',
+      },
+      cover_letter_evaluation: { score: 94, passed: true },
+    }],
     codex_runtime: { status: 'completed', generated: 1 },
     quality_gate: { passed: true },
   }), 'utf8');
@@ -25,7 +42,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     status: 'running',
     createdAt: new Date().toISOString(),
   };
-  const internal = { ...job, outputDir, logPath: path.join(fixture, 'run.log') };
+  const internal = { ...job, outputDir, logPath: path.join(fixture, 'run.log'), config: { candidateProfile: { email: 'candidate@example.com' } } };
   const manager = {
     active: null,
     list: () => [],
@@ -43,6 +60,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     runnerAvailable: true,
   };
   let relaySettings = { port: 18792, profile: 'chrome', autoConnect: true };
+  const sentMessages = [];
   const server = http.createServer(createApp({
     manager,
     config,
@@ -65,6 +83,13 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       tabCount: 1,
       message: 'Relay 已智能连接。',
     }),
+    mailSender: {
+      status: () => ({ configured: true, from: 's***@example.com' }),
+      send: async (message) => {
+        sentMessages.push(message);
+        return { messageId: 'mail-1', accepted: [message.to], rejected: [] };
+      },
+    },
   }));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
@@ -74,6 +99,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     const health = await fetch(`${origin}/api/health`).then((response) => response.json());
     assert.equal(health.ok, true);
     assert.equal(health.service, 'xiaohongshu-relay-scraper');
+    assert.equal(health.emailDelivery.configured, true);
 
     const jobs = await fetch(`${origin}/api/jobs`).then((response) => response.json());
     assert.deepEqual(jobs, []);
@@ -129,6 +155,48 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(results.total, 1);
     assert.equal(results.items[0].note_id, 'n1');
     assert.equal(results.codexRuntime.status, 'completed');
+
+    const savedDraft = await fetch(`${origin}/api/jobs/${job.id}/draft`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        noteId: 'n1',
+        outreach: {
+          greeting: '编辑后的私信',
+          email_subject: '编辑后的主题',
+          email_body: '编辑后的邮件正文',
+          cover_letter: '编辑后的求职信',
+        },
+      }),
+    });
+    assert.equal(savedDraft.status, 200);
+    assert.equal((await savedDraft.json()).delivery.action, 'draft_saved');
+
+    const resultsWithDraft = await fetch(`${origin}/api/jobs/${job.id}/results?limit=20`).then((response) => response.json());
+    assert.equal(resultsWithDraft.items[0].outreach.email_subject, '编辑后的主题');
+
+    const sentEmail = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        noteId: 'n1',
+        to: 'jobs@example.com',
+        outreach: resultsWithDraft.items[0].outreach,
+      }),
+    });
+    assert.equal(sentEmail.status, 200);
+    assert.equal((await sentEmail.json()).delivery.action, 'email_sent');
+    assert.equal(sentMessages.length, 1);
+    assert.equal(sentMessages[0].to, 'jobs@example.com');
+    assert.equal(sentMessages[0].replyTo, 'candidate@example.com');
+    assert.equal(sentMessages[0].subject, '编辑后的主题');
+
+    const invalidRecipient = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ noteId: 'n1', to: 'other@example.com', outreach: resultsWithDraft.items[0].outreach }),
+    });
+    assert.equal(invalidRecipient.status, 400);
 
     const homepage = await fetch(`${origin}/`).then((response) => response.text());
     assert.match(homepage, /XHS Control/);

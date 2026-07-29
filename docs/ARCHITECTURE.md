@@ -33,7 +33,7 @@ flowchart LR
 
 ## AI 适配
 
-`AIProvider` 统一使用 JSON Schema。OpenAI、DeepSeek、Qwen 与自定义中转站走 OpenAI 兼容 `/chat/completions`；Codex 走本机 `codex exec`，使用临时 schema 和输出文件。Provider 凭据通过子进程环境传递，不出现在命令行参数中。
+`AIProvider` 统一使用 JSON Schema。OpenAI、DeepSeek、Qwen 与自定义中转站走 OpenAI 兼容 `/chat/completions`；Codex 走本机 `codex exec`，使用临时 schema 和输出文件。所有 Codex 调用都会从 `$CODEX_HOME/config.toml` 转发模型提供方、模型、评审模型、Responses 协议、推理强度、网络、响应存储和 `features.goals` 设置；Provider 凭据通过子进程环境传递，不出现在命令行参数中。
 
 写作与评审相互独立：写作 Agent 只能引用背景记忆中的 evidence id；评审 Agent 按相关性、证据、第一人称、简洁度、可信度和行动就绪度打分。确定性规则会把含元叙述、证据 id 越界、正文复述或长度异常的稿件限制在 89 分以下。
 

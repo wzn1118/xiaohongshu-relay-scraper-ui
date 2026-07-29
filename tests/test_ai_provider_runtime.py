@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -45,13 +47,73 @@ class AiProviderRuntimeTests(unittest.TestCase):
         def complete(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             output = Path(command[command.index("--output-last-message") + 1])
             output.write_text("{}", encoding="utf-8")
-            self.assertEqual(command[command.index("--model") + 1], "portable-model")
+            model_indexes = [index for index, value in enumerate(command) if value == "--model"]
+            self.assertEqual(command[model_indexes[-1] + 1], "portable-model")
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with patch("scripts.ai_provider_runtime.shutil.which", return_value="codex"), patch(
             "scripts.ai_provider_runtime.subprocess.run", side_effect=complete
         ):
             self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
+
+    def test_codex_does_not_override_user_reasoning_effort(self) -> None:
+        provider = AIProvider(provider="codex", timeout=30)
+
+        def complete(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            output = Path(command[command.index("--output-last-message") + 1])
+            output.write_text("{}", encoding="utf-8")
+            self.assertNotIn('model_reasoning_effort="low"', command)
+            self.assertIn("disable_response_storage=true", command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch("scripts.ai_provider_runtime.shutil.which", return_value="codex"), patch(
+            "scripts.ai_provider_runtime.subprocess.run", side_effect=complete
+        ):
+            self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
+
+    def test_codex_forwards_the_configured_relay_profile(self) -> None:
+        provider = AIProvider(provider="codex", timeout=30)
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "config.toml").write_text(
+                """
+model_provider = "OpenAI"
+model = "gpt-5.5"
+review_model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://relay.example.invalid"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+goals = true
+""".strip(),
+                encoding="utf-8",
+            )
+
+            def complete(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+                output = Path(command[command.index("--output-last-message") + 1])
+                output.write_text("{}", encoding="utf-8")
+                self.assertIn("model_provider=\"OpenAI\"", command)
+                self.assertIn("model_providers.OpenAI.base_url=\"https://relay.example.invalid\"", command)
+                self.assertIn("model_providers.OpenAI.wire_api=\"responses\"", command)
+                self.assertIn("review_model=\"gpt-5.5\"", command)
+                self.assertIn("model_reasoning_effort=\"xhigh\"", command)
+                self.assertIn("network_access=\"enabled\"", command)
+                self.assertIn("features.goals=true", command)
+                self.assertIn("--model", command)
+                self.assertIn("gpt-5.5", command)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.dict(os.environ, {"CODEX_HOME": temporary}, clear=False), patch(
+                "scripts.ai_provider_runtime.shutil.which", return_value="codex"
+            ), patch("scripts.ai_provider_runtime.subprocess.run", side_effect=complete):
+                self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
 
 
 if __name__ == "__main__":

@@ -67,6 +67,10 @@ export type Health = {
   version?: string
   runnerAvailable?: boolean
   timestamp?: string
+  emailDelivery?: {
+    configured: boolean
+    from: string
+  }
 }
 
 export type AiProviderOption = {
@@ -137,6 +141,33 @@ export type ProvenanceText = {
   evidence: string
 }
 
+export type ApplicationRoute = {
+  type: string
+  value: string
+  evidence: string
+  channel?: 'email' | 'direct_message' | 'link' | 'other'
+  confidence?: number
+}
+
+export type OutreachDraft = {
+  greeting: string
+  email_subject: string
+  email_body: string
+  cover_letter: string
+}
+
+export type DeliveryState = {
+  action: string
+  updatedAt: string
+  email?: {
+    status: 'sent' | 'failed'
+    to: string
+    sentAt?: string
+    failedAt?: string
+    messageId?: string
+  }
+}
+
 export type ApplicationResult = {
   note_id: string
   title: string
@@ -151,8 +182,8 @@ export type ApplicationResult = {
     is_estimated: boolean
   }
   application_info: {
-    contacts: Array<{ type: string; value: string; evidence: string }>
-    application_routes: Array<{ type: string; value: string; evidence: string }>
+    contacts: ApplicationRoute[]
+    application_routes: ApplicationRoute[]
     responsibilities: ProvenanceText[]
     requirements: ProvenanceText[]
   }
@@ -177,8 +208,14 @@ export type ApplicationResult = {
     problems: string[]
     rubric: Record<string, number>
   }
-  delivery?: { action: string; updatedAt: string } | null
+  delivery?: DeliveryState | null
   quality: Record<string, boolean>
+}
+
+export type ApplicationMutationResponse = {
+  noteId: string
+  outreach?: OutreachDraft
+  delivery: DeliveryState | null
 }
 
 export type ApplicationResultsResponse = {
