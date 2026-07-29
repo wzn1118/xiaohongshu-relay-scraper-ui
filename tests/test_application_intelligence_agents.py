@@ -32,7 +32,12 @@ from run_project_workflow import (  # noqa: E402
     write_project_manifest,
 )
 from codex_runtime_outreach import CodexRuntimeOutreachAgent, _prompt  # noqa: E402
-from parallel_body_completion import contains_security_verification, record_is_complete, record_key  # noqa: E402
+from parallel_body_completion import (  # noqa: E402
+    contains_security_verification,
+    detail_url_candidates,
+    record_is_complete,
+    record_key,
+)
 
 
 TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -300,6 +305,17 @@ class WorkflowWrapperTests(unittest.TestCase):
         self.assertFalse(record_is_complete(fallback))
         self.assertTrue(contains_security_verification("请完成安全验证后继续"))
         self.assertFalse(contains_security_verification("岗位详情正常展示"))
+
+    def test_parallel_completion_prioritizes_and_deduplicates_detail_urls(self) -> None:
+        card = {
+            "explore_url": "https://example.com/explore/n1",
+            "search_result_url": "https://example.com/search/n1",
+            "note_url": "https://example.com/explore/n1",
+        }
+        self.assertEqual(
+            detail_url_candidates(card),
+            ["https://example.com/explore/n1", "https://example.com/search/n1"],
+        )
 
     def test_default_candidate_profile_is_project_relative(self) -> None:
         self.assertEqual(DEFAULT_CANDIDATE_PROFILE, PROJECT_ROOT / "profiles/candidate_profile.json")

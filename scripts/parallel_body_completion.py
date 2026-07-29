@@ -69,6 +69,15 @@ def record_is_complete(record: dict[str, Any]) -> bool:
     )
 
 
+def detail_url_candidates(card: dict[str, Any]) -> list[str]:
+    candidates = [
+        card.get("explore_url", ""),
+        card.get("search_result_url", ""),
+        card.get("note_url", ""),
+    ]
+    return list(dict.fromkeys(str(url).strip() for url in candidates if str(url).strip()))
+
+
 def load_json_list(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
@@ -167,6 +176,37 @@ def complete_bodies(
         successful_since_checkpoint = 0
         print(f"PARALLEL_BODY {len(records)}/{len(cards)} checkpoint", flush=True)
 
+    def scrape_with_url_fallback(page: Any, card: dict[str, Any]) -> dict[str, Any]:
+        last_payload: dict[str, Any] = {}
+        attempted_urls: list[str] = []
+        for target_url in detail_url_candidates(card):
+            attempted_urls.append(target_url)
+            candidate = dict(card)
+            candidate["search_result_url"] = target_url
+            candidate["note_url"] = target_url
+            try:
+                record = upstream.scrape_note(
+                    page,
+                    candidate,
+                    goto_timeout_ms=goto_timeout_ms,
+                    source_search_url=source_search_url,
+                )
+                last_payload = asdict(record) if record is not None else {}
+            except Exception as error:  # noqa: BLE001
+                last_payload = {
+                    "note_id": card.get("note_id", ""),
+                    "note_url": target_url,
+                    "body": "",
+                    "access_status": "detail_worker_error",
+                    "worker_error": str(error),
+                }
+            if record_is_complete(last_payload):
+                return last_payload
+        last_payload.setdefault("note_id", card.get("note_id", ""))
+        last_payload.setdefault("note_url", card.get("note_url", ""))
+        last_payload["attempted_detail_urls"] = attempted_urls
+        return last_payload
+
     def run_worker(worker_id: int, work: queue.Queue[dict[str, Any]]) -> None:
         nonlocal successful_since_checkpoint, security_detected_at, security_status, stop_reason
         try:
@@ -189,13 +229,7 @@ def complete_bodies(
                             break
                         key = record_key(card)
                         try:
-                            record = upstream.scrape_note(
-                                page,
-                                card,
-                                goto_timeout_ms=goto_timeout_ms,
-                                source_search_url=source_search_url,
-                            )
-                            payload = asdict(record) if record is not None else {}
+                            payload = scrape_with_url_fallback(page, card)
                         except Exception as error:  # noqa: BLE001
                             payload = {
                                 "note_id": card.get("note_id", ""),
@@ -241,9 +275,8 @@ def complete_bodies(
                                 with lock:
                                     security_status = "timed_out"
                                     stop_reason = "security_verification_timeout"
-                                stop_event.set()
                                 print(
-                                    "SECURITY_VERIFICATION timed_out; preserving checkpoint and transitioning to analysis",
+                                    "SECURITY_VERIFICATION timed_out; preserving checkpoint and continuing with the next URL/card",
                                     flush=True,
                                 )
                         with lock:
@@ -274,7 +307,7 @@ def complete_bodies(
 
     workers = max(1, min(int(workers), 8))
     attempts = max(1, min(int(attempts), 5))
-    security_verification_timeout_seconds = max(60, min(int(security_verification_timeout_seconds), 3600))
+    security_verification_timeout_seconds = max(5, min(int(security_verification_timeout_seconds), 3600))
     started_at = utc_now()
     for attempt in range(1, attempts + 1):
         if stop_event.is_set():
@@ -352,7 +385,7 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--goto-timeout-ms", type=int, default=15000)
     parser.add_argument("--checkpoint-every", type=int, default=10)
     parser.add_argument("--page-recycle-every", type=int, default=20)
-    parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
+    parser.add_argument("--security-verification-timeout-seconds", type=int, default=30)
     parser.add_argument("--upstream-scraper", default=str(DEFAULT_UPSTREAM_SCRAPER))
     return parser.parse_args(arguments)
 

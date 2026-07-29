@@ -67,6 +67,7 @@ import type {
 } from './types'
 
 const CANDIDATE_PROFILE_STORAGE_KEY = 'xhs-candidate-application-profile'
+const CUSTOM_MODEL_OPTION = '__custom_model__'
 
 const defaultCandidateProfile: CandidateApplicationProfile = {
   name: '',
@@ -494,6 +495,7 @@ function App() {
   const [providerId, setProviderId] = useState<AiProviderOption['id']>('codex')
   const [apiKey, setApiKey] = useState('')
   const [aiModel, setAiModel] = useState('')
+  const [customModelMode, setCustomModelMode] = useState(false)
   const [aiBaseUrl, setAiBaseUrl] = useState('')
   const [aiWireApi, setAiWireApi] = useState<'responses' | 'chat_completions'>('responses')
   const [aiSession, setAiSession] = useState<AiSession | null>(null)
@@ -762,11 +764,24 @@ function App() {
     const selected = options.find((item) => item.id === id)
     if (selected) {
       setAiModel(selected.model)
+      setCustomModelMode(Boolean(selected.model && !selected.models.includes(selected.model)))
       setAiBaseUrl(selected.baseUrl)
       setAiWireApi(selected.wireApi)
     }
     setAiSession(null)
     updateRequest('aiSessionId', null)
+  }
+
+  const selectedModelValue = customModelMode ? CUSTOM_MODEL_OPTION : aiModel
+
+  const selectAiModel = (value: string) => {
+    if (value === CUSTOM_MODEL_OPTION) {
+      setCustomModelMode(true)
+      setAiModel('')
+      return
+    }
+    setCustomModelMode(false)
+    setAiModel(value)
   }
 
   const configureAi = async () => {
@@ -1297,14 +1312,15 @@ function App() {
                 <div className="form-row ai-provider-row">
                   <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
                   <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
-                  <label className="field"><span>模型</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="例如 gpt-5.5" /></label>
+                  <label className="field"><span>模型</span><select value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select></label>
                 </div>
+                {customModelMode && <label className="field custom-model-field"><span>自定义模型 ID</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="例如 provider/model-name" /></label>}
                 <div className="form-row ai-provider-row">
                   <label className="field base-url-field"><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="https://relay.example/v1" /></label>
                   <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
                 </div>
                 <small className="form-hint">{providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写模型服务 Base URL 后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
-                <button type="button" className="secondary-button setup-action" disabled={configuringAi || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}{aiSession ? '重新连接' : '连接 AI'}</button>
+                <button type="button" className="secondary-button setup-action" disabled={configuringAi || !aiModel.trim() || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}{aiSession ? '重新连接' : '连接 AI'}</button>
               </section>
               <section>
                 <div className="setup-title"><Upload size={17} /><span><strong>背景资料</strong><small>{activeProfile ? `${activeProfile.display_name || '个人档案'} · ${activeProfile.sourceFiles?.length || 0} 个来源` : 'PDF / DOCX / TXT / MD / JSON / CSV / RTF'}</small></span></div>

@@ -20,7 +20,10 @@ test('AI provider relay configuration persists without exposing the API key', as
     });
     assert.equal(session.wireApi, 'responses');
     assert.equal('apiKey' in session, false);
-    assert.equal(first.providers().find((item) => item.id === 'codex').hasApiKey, true);
+    const provider = first.providers().find((item) => item.id === 'codex');
+    assert.equal(provider.hasApiKey, true);
+    assert.deepEqual(provider.models, ['gpt-5.5', 'gpt-5', 'gpt-5-mini']);
+    assert.equal('apiKey' in provider, false);
 
     const second = new AiSessionStore({ filePath });
     await second.initialize();

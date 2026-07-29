@@ -133,6 +133,7 @@ export type AiProviderOption = {
   label: string
   baseUrl: string
   model: string
+  models: string[]
   requiresKey: boolean
   wireApi: 'responses' | 'chat_completions'
   bundled?: boolean

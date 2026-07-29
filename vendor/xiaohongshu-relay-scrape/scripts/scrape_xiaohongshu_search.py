@@ -144,6 +144,11 @@ def page_reuse_priority(url: str) -> int:
     return 10
 
 
+def is_blocked_page(url: str) -> bool:
+    lowered = (url or "").casefold()
+    return any(marker in lowered for marker in ("/login", "/captcha", "/website-login", "/404"))
+
+
 def get_reusable_page(context: BrowserContext) -> Page:
     logged_in_xiaohongshu_pages: list[tuple[int, Page]] = []
     xiaohongshu_pages: list[tuple[int, Page]] = []
@@ -157,7 +162,7 @@ def get_reusable_page(context: BrowserContext) -> Page:
                 page.wait_for_load_state("domcontentloaded", timeout=1500)
             except Exception:  # noqa: BLE001
                 pass
-            if not has_login_wall(page):
+            if not is_blocked_page(url) and not has_login_wall(page):
                 logged_in_xiaohongshu_pages.append((priority, page))
             xiaohongshu_pages.append((priority, page))
         else:

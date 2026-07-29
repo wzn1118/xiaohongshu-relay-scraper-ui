@@ -3,11 +3,11 @@ import { mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
 
 const PROVIDERS = Object.freeze({
-  openai: { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4.1-mini', requiresKey: true, wireApi: 'chat_completions', bundled: true },
-  codex: { label: '内置 Codex Runtime', baseUrl: '', model: 'gpt-5.5', requiresKey: true, wireApi: 'responses', bundled: true },
-  deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', requiresKey: true, wireApi: 'chat_completions', bundled: true },
-  qwen: { label: 'Qwen', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', requiresKey: true, wireApi: 'chat_completions', bundled: true },
-  custom: { label: '自定义 OpenAI 兼容服务', baseUrl: '', model: '', requiresKey: true, wireApi: 'chat_completions', bundled: true },
+  openai: { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4.1-mini', models: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini', 'gpt-4o'], requiresKey: true, wireApi: 'chat_completions', bundled: true },
+  codex: { label: '内置 Codex Runtime', baseUrl: '', model: 'gpt-5.5', models: ['gpt-5.5', 'gpt-5', 'gpt-5-mini'], requiresKey: true, wireApi: 'responses', bundled: true },
+  deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', models: ['deepseek-chat', 'deepseek-reasoner'], requiresKey: true, wireApi: 'chat_completions', bundled: true },
+  qwen: { label: 'Qwen', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', models: ['qwen-plus', 'qwen-max', 'qwen-turbo'], requiresKey: true, wireApi: 'chat_completions', bundled: true },
+  custom: { label: '自定义 OpenAI 兼容服务', baseUrl: '', model: '', models: ['gpt-4.1-mini', 'deepseek-chat', 'qwen-plus'], requiresKey: true, wireApi: 'chat_completions', bundled: true },
 });
 
 export class AiSessionStore {
@@ -41,6 +41,7 @@ export class AiSessionStore {
       return {
         id,
         ...value,
+        models: [...value.models],
         baseUrl: saved?.baseUrl || value.baseUrl,
         model: saved?.model || value.model,
         wireApi: saved?.wireApi || value.wireApi,
