@@ -296,11 +296,43 @@ sh scripts/start.sh
 | `OPENCLAW_CONFIG_PATH` | 用户目录自动发现 | 当前 Relay 配置 |
 | `XHS_RELAY_CONFIG_PATH` | `data/relay-config.json` | 中转站端口、浏览器 Profile 和开机连接开关 |
 | `XHS_AI_TIMEOUT_SECONDS` | `600` | 单次 AI 调用超时秒数 |
-| `SMTP_HOST` / `SMTP_PORT` | 留空 / `587` | 可选邮件服务器；留空时发送按钮关闭 |
-| `SMTP_USER` / `SMTP_PASS` | 留空 | 可选 SMTP 账号；仅从本机 `.env` 读取 |
+| `SMTP_HOST` / `SMTP_PORT` | 留空 / `587` | 可选邮件服务器；Microsoft 365 使用 `smtp.office365.com:587` |
+| `SMTP_SECURE` / `SMTP_REQUIRE_TLS` | `false` / `true` | 587 端口通过 STARTTLS 加密连接 |
+| `SMTP_AUTH` | `auto` | `oauth2`、`login` 或无认证本地中继 `none` |
+| `SMTP_USER` / `SMTP_PASS` | 留空 | SMTP 登录账号；Outlook OAuth2 不使用 `SMTP_PASS` |
 | `SMTP_FROM` | 留空 | 邮件发件地址或 `名称 <邮箱>` |
+| `SMTP_OAUTH_TENANT` | `organizations` | Microsoft 365 工作/学校账号；也可填写组织租户 ID |
+| `SMTP_OAUTH_CLIENT_ID` | 留空 | Microsoft Entra 应用 Client ID |
+| `SMTP_OAUTH_CLIENT_SECRET` | 留空 | 机密客户端可选；公共客户端留空 |
+| `SMTP_OAUTH_REFRESH_TOKEN` | 留空 | 获得 `SMTP.Send` 和 `offline_access` 授权后的 Refresh Token |
+| `SMTP_OAUTH_SCOPE` | Outlook SMTP scope | SMTP 发送、离线续期和账号识别权限 |
 
 邮件发送只在三个条件同时成立时启用：AI 文案通过不低于 90 分的质量门禁、岗位正文提取到有效邮箱、本机 SMTP 配置完整。草稿和发送结果写入任务目录的 `delivery-state.json`，不会改写原始 AI 分析文件。
+
+Microsoft 365 Outlook 配置示例（仅写入本机 `.env`，不要提交 Client ID、Refresh Token 或邮箱）：
+
+```dotenv
+SMTP_HOST=smtp.office365.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_REQUIRE_TLS=true
+SMTP_AUTH=oauth2
+SMTP_USER=your-account@outlook.com
+SMTP_FROM=your-account@outlook.com
+SMTP_OAUTH_TENANT=organizations
+SMTP_OAUTH_CLIENT_ID=your-entra-application-client-id
+SMTP_OAUTH_REFRESH_TOKEN=your-refresh-token
+```
+
+推荐用项目内置向导获取授权，不需要在终端输入 Microsoft 密码：
+
+```powershell
+npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
+```
+
+向导会打开 Microsoft 设备登录页；授权完成后仅把邮箱、Client ID 和 Refresh Token 写入 Git 忽略的本机 `.env`，随后验证 SMTP 登录。Entra 应用需要允许目标账号类型和公共客户端流，并配置委托权限 `SMTP.Send`。
+
+个人 Outlook.com 账号则把 `SMTP_HOST` 改为 `smtp-mail.outlook.com`，并把 `SMTP_OAUTH_TENANT` 改为 `consumers`。
 
 #### Codex 中转配置
 

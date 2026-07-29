@@ -7,6 +7,7 @@
     "dev": "concurrently -k -n api,web -c yellow,cyan \"node --watch server/index.mjs\" \"vite\"",
     "build": "tsc -b && vite build",
     "start": "node server/index.mjs",
+    "configure:outlook": "node scripts/configure-outlook-smtp.mjs",
     "test": "node --test server/*.test.mjs tests/*.test.mjs",
     "test:agents": "python tests/test_application_intelligence_agents.py -v",
     "check": "npm run test && npm run build",

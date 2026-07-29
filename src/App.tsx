@@ -1125,7 +1125,7 @@ function App() {
                     <div className="delivery-console">
                       <div className="delivery-target">
                         <span className={selectedEmailRoute ? 'available' : ''}><Mail size={17} /></span>
-                        <div><small>邮件收件人</small><strong>{selectedEmailRoute?.target || '岗位正文未提取到邮箱'}</strong><p>{health?.emailDelivery?.configured ? `SMTP 已就绪 · 发件人 ${health.emailDelivery.from}` : 'SMTP 尚未配置，填写 .env 后重启服务即可启用'}</p></div>
+                        <div><small>邮件收件人</small><strong>{selectedEmailRoute?.target || '岗位正文未提取到邮箱'}</strong><p>{health?.emailDelivery?.configured ? `${health.emailDelivery.authMode === 'oauth2' ? 'Outlook OAuth2' : 'SMTP'} 已就绪 · 发件人 ${health.emailDelivery.from}` : health?.emailDelivery?.authMode === 'oauth2' ? 'Outlook OAuth2 尚未授权，完成本机 .env 配置后重启服务' : 'SMTP 尚未配置，填写 .env 后重启服务即可启用'}</p></div>
                       </div>
                       <div className="delivery-actions">
                         <button className="send-email-action" disabled={!selectedResult.cover_letter_evaluation?.passed || !selectedEmailRoute || !health?.emailDelivery?.configured || emailSending} onClick={() => void sendEmail()} title={!selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : '立即发送当前邮件正文'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}{emailSending ? '发送中' : '发送邮件'}</button>

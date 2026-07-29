@@ -11,6 +11,8 @@ const smtpPort = readPort(process.env.SMTP_PORT, 587);
 const smtpUser = String(process.env.SMTP_USER || '').trim();
 const smtpPass = String(process.env.SMTP_PASS || '');
 const smtpFrom = String(process.env.SMTP_FROM || smtpUser).trim();
+const smtpAuth = String(process.env.SMTP_AUTH || 'auto').trim().toLowerCase();
+const smtpOAuthTenant = normalizeMicrosoftTenant(process.env.SMTP_OAUTH_TENANT);
 
 export const config = Object.freeze({
   host: process.env.HOST || '127.0.0.1',
@@ -28,9 +30,18 @@ export const config = Object.freeze({
     host: String(process.env.SMTP_HOST || '').trim(),
     port: smtpPort,
     secure: readBoolean(process.env.SMTP_SECURE, smtpPort === 465),
+    requireTls: readBoolean(process.env.SMTP_REQUIRE_TLS, smtpPort === 587),
+    auth: ['auto', 'login', 'oauth2', 'none'].includes(smtpAuth) ? smtpAuth : 'auto',
     user: smtpUser,
     pass: smtpPass,
     from: smtpFrom,
+    oauth: Object.freeze({
+      tenant: smtpOAuthTenant,
+      clientId: String(process.env.SMTP_OAUTH_CLIENT_ID || '').trim(),
+      clientSecret: String(process.env.SMTP_OAUTH_CLIENT_SECRET || ''),
+      refreshToken: String(process.env.SMTP_OAUTH_REFRESH_TOKEN || ''),
+      scope: String(process.env.SMTP_OAUTH_SCOPE || 'https://outlook.office.com/SMTP.Send offline_access openid profile email').trim(),
+    }),
   }),
   openClawConfigPath:
     process.env.OPENCLAW_CONFIG_PATH ||
@@ -52,4 +63,9 @@ function readInt(value, fallback, min, max) {
 function readBoolean(value, fallback = false) {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function normalizeMicrosoftTenant(value) {
+  const tenant = String(value || 'organizations').trim();
+  return /^[a-zA-Z0-9.-]+$/.test(tenant) ? tenant : 'organizations';
 }

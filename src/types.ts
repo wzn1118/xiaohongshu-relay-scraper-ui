@@ -70,6 +70,7 @@ export type Health = {
   emailDelivery?: {
     configured: boolean
     from: string
+    authMode?: 'auto' | 'login' | 'oauth2' | 'none'
   }
 }
 
