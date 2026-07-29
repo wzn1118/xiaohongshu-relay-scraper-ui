@@ -160,6 +160,41 @@ export type AiModelDiscovery = {
   fetchedAt: string
 }
 
+export type LocalModelCatalogItem = {
+  id: string
+  label: string
+  description: string
+  downloadBytes: number
+  recommended: boolean
+  installed: boolean
+}
+
+export type LocalModelInstall = {
+  id: string
+  modelId: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  progress: number
+  completedBytes?: number
+  totalBytes?: number
+  message: string
+  createdAt: string
+  startedAt?: string | null
+  finishedAt?: string | null
+}
+
+export type LocalModelStatus = {
+  runtime: {
+    ready: boolean
+    endpoint: string
+    version?: string
+    message: string
+  }
+  catalog: LocalModelCatalogItem[]
+  installedModels: Array<{ name: string; size: number; modifiedAt?: string }>
+  install: LocalModelInstall | null
+  fetchedAt: string
+}
+
 export type CandidateProfile = {
   id: string
   display_name: string

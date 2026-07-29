@@ -20,6 +20,7 @@
 }
 
 * { box-sizing: border-box; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 html { scroll-behavior: smooth; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: #e8e7e3; }
 button, input, select, textarea { font: inherit; letter-spacing: 0; }
@@ -162,11 +163,25 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .setup-title span { min-width: 0; display: flex; flex-direction: column; }
 .setup-title strong { color: var(--ink); font-size: 11px; }
 .setup-title small { margin-top: 3px; color: #77797d; font-size: 9px; overflow-wrap: anywhere; }
-.local-model-offer { margin-top: 12px; padding: 10px 11px; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 9px; border-top: 1px solid #b8c8bf; border-bottom: 1px solid #b8c8bf; background: #f2f7f4; color: var(--green); }
-.local-model-offer > span { min-width: 0; display: flex; flex-direction: column; }
+.local-model-offer { margin-top: 12px; padding: 11px; display: grid; gap: 9px; border-top: 1px solid #b8c8bf; border-bottom: 1px solid #b8c8bf; background: #f2f7f4; color: var(--green); }
+.local-model-copy { min-width: 0; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 9px; }
+.local-model-copy > span:not(.local-runtime-state) { min-width: 0; display: flex; flex-direction: column; }
 .local-model-offer strong { color: var(--ink); font-size: 10px; }
 .local-model-offer small { margin-top: 2px; color: #646a67; font-size: 9px; line-height: 1.45; }
-.local-model-offer button { min-height: 32px; padding: 0 10px; white-space: nowrap; }
+.local-runtime-state { padding: 4px 7px; border: 1px solid #c5c7c5; color: #77797d; background: #fff; font-size: 8px; font-weight: 800; white-space: nowrap; }
+.local-runtime-state.ready { border-color: #7d9f8c; color: #196d4d; background: #e4f0e8; }
+.local-model-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.local-model-actions label, .local-model-actions select { min-width: 0; width: 100%; }
+.local-model-actions select { min-height: 34px; padding: 0 30px 0 9px; border: 1px solid #aeadA8; border-radius: 4px; background: #fff; color: var(--ink); font-size: 10px; }
+.local-model-actions button, .local-runtime-link { min-height: 34px; padding: 0 11px; white-space: nowrap; }
+.local-runtime-link { display: inline-flex; align-items: center; justify-content: center; gap: 6px; text-decoration: none; }
+.local-model-description { margin: 0; color: #606762; font-size: 9px; line-height: 1.45; }
+.local-install-progress { display: grid; gap: 5px; }
+.local-install-progress div { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #565d58; font-size: 9px; }
+.local-install-progress div span { min-width: 0; overflow-wrap: anywhere; }
+.local-install-progress progress { width: 100%; height: 6px; border: 0; background: #dce4df; accent-color: var(--green); }
+.local-install-progress progress::-webkit-progress-bar { background: #dce4df; }
+.local-install-progress progress::-webkit-progress-value { background: var(--green); }
 .local-model-offer.active { border-color: #6d927e; background: #e8f3ec; }
 .ai-provider-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .ai-provider-row .base-url-field { grid-column: span 2; }
@@ -530,8 +545,10 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .form-row.three, .advanced-grid, .pacing-grid { grid-template-columns: 1fr 1fr; }
   .ai-provider-row { grid-template-columns: 1fr; }
   .ai-provider-row .base-url-field { grid-column: auto; }
-  .local-model-offer { grid-template-columns: 18px minmax(0, 1fr); }
-  .local-model-offer button { grid-column: 1 / -1; width: 100%; }
+  .local-model-copy { grid-template-columns: 18px minmax(0, 1fr); }
+  .local-runtime-state { grid-column: 2; justify-self: start; }
+  .local-model-actions { grid-template-columns: 1fr; }
+  .local-model-actions button, .local-runtime-link { width: 100%; }
   .relay-config-fields { grid-template-columns: 1fr 1fr; }
   .relay-config-fields .toggle-row { grid-column: 1 / -1; }
   .smtp-primary-fields, .smtp-advanced-fields { grid-template-columns: 1fr; }

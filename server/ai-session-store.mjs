@@ -4,10 +4,10 @@ import path from 'node:path';
 
 const PROVIDERS = Object.freeze({
   local_qwen: {
-    label: '本地 Qwen（免费）',
+    label: '本地 Qwen3.5（免费）',
     baseUrl: 'http://127.0.0.1:11434/v1',
-    model: 'qwen3:4b',
-    models: ['qwen3:4b'],
+    model: 'qwen3.5:4b',
+    models: ['qwen3.5:0.8b', 'qwen3.5:2b', 'qwen3.5:4b', 'qwen3.5:9b', 'qwen3:4b'],
     requiresKey: false,
     wireApi: 'chat_completions',
     bundled: true,

@@ -75,7 +75,7 @@ test('local free model creates a session and discovers installed models without 
       return {
         ok: true,
         status: 200,
-        json: async () => ({ data: [{ id: 'qwen3:4b' }] }),
+        json: async () => ({ data: [{ id: 'qwen3.5:4b' }] }),
       };
     },
   });
@@ -90,13 +90,15 @@ test('local free model creates a session and discovers installed models without 
     apiKey: '',
     baseUrl: 'http://127.0.0.1:11434/v1',
   });
-  assert.deepEqual(discovered.models, ['qwen3:4b']);
+  assert.equal(provider.model, 'qwen3.5:4b');
+  assert.ok(provider.models.includes('qwen3.5:2b'));
+  assert.deepEqual(discovered.models, ['qwen3.5:4b']);
   assert.deepEqual(calls, [{ url: 'http://127.0.0.1:11434/v1/models', authorization: undefined }]);
 
   const session = await store.create({
     provider: 'local_qwen',
     apiKey: '',
-    model: 'qwen3:4b',
+    model: 'qwen3.5:4b',
     baseUrl: 'http://127.0.0.1:11434/v1',
     wireApi: 'chat_completions',
   });

@@ -62,6 +62,7 @@ import type {
   CandidateApplicationProfile,
   ApplicationRoute,
   OutreachDraft,
+  LocalModelStatus,
   SmtpAuthMode,
   SmtpConfig,
   SmtpProvider,
@@ -303,6 +304,7 @@ function formatTime(value?: string) {
 function formatBytes(bytes = 0) {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`
   return `${(bytes / 1024 ** 2).toFixed(1)} MB`
 }
 
@@ -505,6 +507,9 @@ function App() {
   const [backgroundFiles, setBackgroundFiles] = useState<File[]>([])
   const [configuringAi, setConfiguringAi] = useState(false)
   const [activatingLocalAi, setActivatingLocalAi] = useState(false)
+  const [localModelStatus, setLocalModelStatus] = useState<LocalModelStatus | null>(null)
+  const [localModelChoice, setLocalModelChoice] = useState('qwen3.5:4b')
+  const [startingLocalInstall, setStartingLocalInstall] = useState(false)
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [importingProfile, setImportingProfile] = useState(false)
   const [candidateImportStatus, setCandidateImportStatus] = useState<'recognized' | 'empty' | null>(null)
@@ -512,6 +517,7 @@ function App() {
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
+  const handledLocalInstall = useRef<string | null>(null)
   const detectedSmtpPreset = smtpPresetForEmail(smtpConfig.from)
   const detectedSmtpProvider = detectedSmtpPreset
     ? smtpProviderOptions.find((item) => item.id === detectedSmtpPreset.provider)
@@ -830,7 +836,7 @@ function App() {
     }
   }
 
-  const activateLocalAi = async () => {
+  const activateLocalAi = async (preferredModel?: string) => {
     const localProvider = providers.find((item) => item.id === 'local_qwen')
     if (!localProvider) return setNotice('本地免费模型配置未加载。')
     setActivatingLocalAi(true)
@@ -850,7 +856,9 @@ function App() {
       })
       const localModels = discovered.models.filter((model) => model.toLowerCase().startsWith('qwen'))
       if (!localModels.length) throw new Error('本地服务已运行，但未找到可用的中文整理模型。')
-      const model = localModels.includes(localProvider.model) ? localProvider.model : localModels[0]
+      const model = preferredModel && localModels.includes(preferredModel)
+        ? preferredModel
+        : localModels.includes(localProvider.model) ? localProvider.model : localModels[0]
       setProviders((current) => current.map((item) => item.id === localProvider.id
         ? { ...item, model, models: localModels }
         : item))
@@ -866,9 +874,25 @@ function App() {
       updateRequest('aiSessionId', session.id)
       setNotice(`本地免费模型 ${model} 已就绪，文本整理不产生 API 费用。`)
     } catch (error) {
-      setNotice(`${(error as Error).message} 请先启动本地模型服务并安装一个可用模型。`)
+      setNotice(`${(error as Error).message} 可使用上方入口一键安装。`)
     } finally {
       setActivatingLocalAi(false)
+    }
+  }
+
+  const installLocalModel = async () => {
+    const selected = localModelStatus?.catalog.find((item) => item.id === localModelChoice)
+    if (selected?.installed) return activateLocalAi(selected.id)
+    setStartingLocalInstall(true)
+    setNotice(null)
+    try {
+      const install = await api.installLocalModel(localModelChoice)
+      setLocalModelStatus((current) => current ? { ...current, install } : current)
+      setNotice(install.message)
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setStartingLocalInstall(false)
     }
   }
 
@@ -954,9 +978,15 @@ function App() {
   }, [connectRelay, refreshRelay, request.relayPort])
 
   useEffect(() => {
-    Promise.all([api.aiProviders(), api.profiles()]).then(([options, saved]) => {
+    Promise.all([api.aiProviders(), api.profiles(), api.localModels().catch(() => null)]).then(([options, saved, localStatus]) => {
       setProviders(options)
       setProfiles(saved)
+      if (localStatus) {
+        setLocalModelStatus(localStatus)
+        const recommended = localStatus.catalog.find((item) => item.recommended)
+        const installedRecommended = localStatus.catalog.find((item) => item.recommended && item.installed)
+        setLocalModelChoice(installedRecommended?.id || recommended?.id || localStatus.catalog[0]?.id || 'qwen3.5:4b')
+      }
       const codex = options.find((item) => item.id === 'codex')
       const localProvider = options.find((item) => item.id === 'local_qwen')
       const preferredProvider = codex?.configured && codex.hasApiKey ? codex : localProvider || codex || options[0]
@@ -977,6 +1007,36 @@ function App() {
       if (saved[0]) updateRequest('profileId', saved[0].id)
     }).catch((error) => setNotice((error as Error).message))
   }, [])
+
+  useEffect(() => {
+    const install = localModelStatus?.install
+    if (!install || !['queued', 'running'].includes(install.status)) return
+    let cancelled = false
+    const refresh = () => {
+      void api.localModels().then((status) => {
+        if (!cancelled) setLocalModelStatus(status)
+      }).catch((error) => {
+        if (!cancelled) setNotice((error as Error).message)
+      })
+    }
+    const timer = window.setInterval(refresh, 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [localModelStatus?.install?.id, localModelStatus?.install?.status])
+
+  useEffect(() => {
+    const install = localModelStatus?.install
+    if (!install || !['completed', 'failed'].includes(install.status) || handledLocalInstall.current === install.id) return
+    handledLocalInstall.current = install.id
+    if (install.status === 'completed') {
+      setNotice(install.message)
+      void activateLocalAi(install.modelId)
+    } else {
+      setNotice(install.message)
+    }
+  }, [localModelStatus?.install?.id, localModelStatus?.install?.modelId, localModelStatus?.install?.status])
 
   useEffect(() => {
     try {
@@ -1115,6 +1175,8 @@ function App() {
   const securityTimeoutLabel = securityTimeoutSeconds % 60 === 0 ? `${securityTimeoutSeconds / 60} 分钟` : `${securityTimeoutSeconds} 秒`
   const codexRuntime = results?.codexRuntime || (workflowSummary.codexRuntime as Record<string, unknown> | undefined)
   const selectedProvider = providers.find((item) => item.id === providerId)
+  const selectedLocalModel = localModelStatus?.catalog.find((item) => item.id === localModelChoice)
+  const localInstallActive = Boolean(localModelStatus?.install && ['queued', 'running'].includes(localModelStatus.install.status))
   const activeProfile = profiles.find((item) => item.id === request.profileId)
   const candidateReady = [
     request.candidateProfile.name,
@@ -1382,9 +1444,19 @@ function App() {
               <section>
                 <div className="setup-title"><KeyRound size={17} /><span><strong>AI Runtime</strong><small>{aiSession ? `${selectedProvider?.label || providerId} · 会话内存` : '选择提供方并连接'}</small></span></div>
                 <div className={`local-model-offer ${selectedProvider?.local ? 'active' : ''}`}>
-                  <Cpu size={18} />
-                  <span><strong>本地免费整理</strong><small>在本机处理职位文本与背景资料，不消耗 API 额度</small></span>
-                  <button type="button" className="secondary-button" disabled={activatingLocalAi} onClick={() => void activateLocalAi()}>{activatingLocalAi ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />}{aiSession?.provider === 'local_qwen' ? '重新检测' : '检测并启用'}</button>
+                  <div className="local-model-copy">
+                    <Cpu size={18} />
+                    <span><strong>内置 Qwen3.5 免费整理</strong><small>{localModelStatus?.runtime.ready ? `本地运行器${localModelStatus.runtime.version ? ` v${localModelStatus.runtime.version}` : ''} · 已就绪 · 文本不离开电脑` : '安装后在本机处理职位与简历文本，不产生 API 费用'}</small></span>
+                    <span className={`local-runtime-state ${localModelStatus?.runtime.ready ? 'ready' : ''}`}>{localModelStatus?.runtime.ready ? '运行器在线' : '等待运行器'}</span>
+                  </div>
+                  <div className="local-model-actions">
+                    <label><span className="sr-only">本地模型版本</span><select value={localModelChoice} disabled={localInstallActive} onChange={(event) => setLocalModelChoice(event.target.value)}>{(localModelStatus?.catalog || []).map((item) => <option key={item.id} value={item.id}>{item.label}{item.recommended ? ' · 推荐' : ''} · {formatBytes(item.downloadBytes)}</option>)}</select></label>
+                    {localModelStatus?.runtime.ready
+                      ? <button type="button" className="secondary-button" disabled={startingLocalInstall || activatingLocalAi || localInstallActive || !selectedLocalModel} onClick={() => void installLocalModel()}>{startingLocalInstall || activatingLocalAi || localInstallActive ? <LoaderCircle className="spin" size={15} /> : selectedLocalModel?.installed ? <Play size={15} fill="currentColor" /> : <Download size={15} />}{selectedLocalModel?.installed ? '启用模型' : `一键安装${selectedLocalModel ? ` · ${formatBytes(selectedLocalModel.downloadBytes)}` : ''}`}</button>
+                      : <a className="secondary-button local-runtime-link" href="https://ollama.com/download" target="_blank" rel="noreferrer"><Download size={15} />安装本地运行器</a>}
+                  </div>
+                  {selectedLocalModel && !localInstallActive && <p className="local-model-description">{selectedLocalModel.description}{selectedLocalModel.installed ? ' · 已安装' : ''}</p>}
+                  {localModelStatus?.install && localInstallActive && <div className="local-install-progress" role="status" aria-live="polite"><div><span>{localModelStatus.install.message}</span><strong>{localModelStatus.install.progress}%</strong></div><progress max="100" value={localModelStatus.install.progress} /></div>}
                 </div>
                 <div className="form-row ai-provider-row">
                   <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>

@@ -13,7 +13,7 @@ const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
 const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
@@ -157,6 +157,15 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         return json(res, opened.opened ? 200 : 503, { ...connection, ...opened, profile, url: urlToOpen });
       }
       if (req.method === 'GET' && url.pathname === '/api/ai/providers') return json(res, 200, aiSessions.providers());
+      if (req.method === 'GET' && url.pathname === '/api/ai/local-models') {
+        if (!localModels?.status) return json(res, 503, errorBody('LOCAL_MODEL_UNAVAILABLE', 'Local model management is unavailable.'));
+        return json(res, 200, await localModels.status());
+      }
+      if (req.method === 'POST' && url.pathname === '/api/ai/local-models/install') {
+        if (!localModels?.startInstall) return json(res, 503, errorBody('LOCAL_MODEL_UNAVAILABLE', 'Local model management is unavailable.'));
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        return json(res, 202, await localModels.startInstall(body.modelId));
+      }
       if (req.method === 'POST' && url.pathname === '/api/ai/models') {
         return json(res, 200, await aiSessions.discoverModels(await readJsonBody(req, config.maxBodyBytes)));
       }
@@ -240,6 +249,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'BODY_TOO_LARGE') return json(res, 413, errorBody('BODY_TOO_LARGE', 'Request body is too large.'));
       if (['AI_VALIDATION', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'AI_MODEL_DISCOVERY_FAILED') return json(res, 502, errorBody(error.code, error.message));
+      if (error.code === 'LOCAL_MODEL_VALIDATION') return json(res, 400, errorBody(error.code, error.message));
+      if (error.code === 'LOCAL_MODEL_BUSY') return json(res, 409, { ...errorBody(error.code, error.message), install: error.install });
+      if (error.code === 'LOCAL_MODEL_RUNTIME_UNAVAILABLE') return json(res, 503, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_IMPORT_FAILED') return json(res, 422, errorBody(error.code, error.message));
       if (error.code === 'MAIL_NOT_CONFIGURED') return json(res, 503, errorBody(error.code, error.message));

@@ -350,17 +350,13 @@ npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
 
 **本地免费模型**
 
-页面内置“本地 Qwen（免费）”提供方，通过本机模型服务整理职位文本、背景资料和求职文案，不需要 API Key，也不产生按次调用费用。推荐的默认模型为 `qwen3:4b`，默认地址为 `http://127.0.0.1:11434/v1`。
+页面内置“本地 Qwen3.5（免费）”提供方，通过本机模型服务整理职位文本、背景资料和求职文案，不需要 API Key，也不产生按次调用费用。默认推荐 `qwen3.5:4b`，同时提供 0.8B、2B、4B、9B 四档选择。
 
-1. 在电脑上启动支持 Ollama API 的本地模型服务，并安装 `qwen3:4b` 或其他 `qwen` 系列模型。
-2. 在 AI Runtime 区域点击“检测并启用”。
-3. 系统会读取已安装模型，选中可用的中文模型并创建本机会话。
+1. 首次使用时，页面自动检测本地运行器；尚未安装时可直接打开官方安装入口。
+2. 选择适合电脑配置的模型，点击“一键安装”。页面会持续显示下载与校验进度。
+3. 安装完成后产品自动启用模型，后续无需再次配置。
 
-```bash
-ollama pull qwen3:4b
-```
-
-模型权重由本地模型服务管理，不纳入本 Git 仓库。首次安装会占用数 GB 磁盘空间；推理速度取决于 CPU、GPU 和内存。
+模型权重不会提交到 Git 仓库。Qwen3.5 4B 的下载体积约 3.16 GiB，产品会在用户首次选择时通过本机 Ollama 服务自动下载，避免命令行操作和 GitHub 单文件限制。模型来源可在 [Ollama Qwen3.5 模型页](https://ollama.com/library/qwen3.5) 和 [Qwen 官方仓库](https://github.com/QwenLM/Qwen3.6) 核验；推理速度取决于 CPU、GPU 和内存。
 
 项目内置 AI Runtime，不依赖用户电脑上的 Codex CLI。页面支持 `Responses API` 和 `Chat Completions` 两种协议；选择 Codex 时默认使用 Responses API，直接填写模型服务提供的 Base URL、模型和 API Key 即可。配置保存于本机 `data/ai-config.json`，API Key 不通过配置查询接口返回，也不会写入任务历史、日志或 GitHub。
 

@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, OutreachDraft, RelayConfig, RelayStatus, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, OutreachDraft, RelayConfig, RelayStatus, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -16,6 +16,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<Health>('/api/health'),
   aiProviders: () => request<AiProviderOption[]>('/api/ai/providers'),
+  localModels: () => request<LocalModelStatus>('/api/ai/local-models'),
+  installLocalModel: (modelId: string) => request<LocalModelInstall>('/api/ai/local-models/install', {
+    method: 'POST',
+    body: JSON.stringify({ modelId }),
+  }),
   discoverAiModels: (payload: { provider: string; apiKey: string; baseUrl: string }) =>
     request<AiModelDiscovery>('/api/ai/models', { method: 'POST', body: JSON.stringify(payload) }),
   createAiSession: (payload: { provider: string; apiKey: string; model: string; baseUrl: string; wireApi: 'responses' | 'chat_completions' }) =>

@@ -68,6 +68,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   const sentMessages = [];
   const relaySetupCalls = [];
   const modelDiscoveryCalls = [];
+  const localInstallCalls = [];
   const server = http.createServer(createApp({
     manager,
     config,
@@ -79,6 +80,19 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       },
       create: async () => ({ id: 'ai-session-1', provider: 'openai' }),
       delete: () => true,
+    },
+    localModels: {
+      status: async () => ({
+        runtime: { ready: true, endpoint: 'http://127.0.0.1:11434', version: '0.32.5', message: 'ready' },
+        catalog: [{ id: 'qwen3.5:4b', label: 'Qwen3.5 4B', downloadBytes: 3389983735, recommended: true, installed: false }],
+        installedModels: [],
+        install: null,
+        fetchedAt: new Date().toISOString(),
+      }),
+      startInstall: async (modelId) => {
+        localInstallCalls.push(modelId);
+        return { id: 'local-install-1', modelId, status: 'queued', progress: 0, message: 'queued' };
+      },
     },
     relayConfig: {
       get: () => ({ ...relaySettings }),
@@ -165,6 +179,18 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(discoveredModels.status, 200);
     assert.deepEqual((await discoveredModels.json()).models, ['gpt-5.6-terra', 'gpt-4.1-mini']);
     assert.equal(modelDiscoveryCalls.length, 1);
+
+    const localModels = await fetch(`${origin}/api/ai/local-models`).then((response) => response.json());
+    assert.equal(localModels.runtime.ready, true);
+    assert.equal(localModels.catalog[0].id, 'qwen3.5:4b');
+    const localInstall = await fetch(`${origin}/api/ai/local-models/install`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: 'qwen3.5:4b' }),
+    });
+    assert.equal(localInstall.status, 202);
+    assert.equal((await localInstall.json()).modelId, 'qwen3.5:4b');
+    assert.deepEqual(localInstallCalls, ['qwen3.5:4b']);
 
     const emailConfig = await fetch(`${origin}/api/email/config`).then((response) => response.json());
     assert.equal(emailConfig.configured, true);
