@@ -92,6 +92,9 @@ test('local free model creates a session and discovers installed models without 
   });
   assert.equal(provider.model, 'qwen3.5:4b');
   assert.ok(provider.models.includes('qwen3.5:2b'));
+  assert.ok(provider.models.includes('gemma3:4b'));
+  assert.ok(provider.models.includes('llama3.2:3b'));
+  assert.ok(provider.models.includes('deepseek-r1:7b'));
   assert.deepEqual(discovered.models, ['qwen3.5:4b']);
   assert.deepEqual(calls, [{ url: 'http://127.0.0.1:11434/v1/models', authorization: undefined }]);
 

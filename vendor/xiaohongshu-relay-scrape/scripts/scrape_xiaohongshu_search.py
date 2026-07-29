@@ -2,6 +2,7 @@ import argparse
 import csv
 import hashlib
 import hmac
+import io
 import json
 import os
 import pathlib
@@ -9,9 +10,9 @@ import re
 import sys
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
-from typing import Any
-from urllib.parse import urljoin
+from datetime import datetime, timedelta
+from typing import Any, Callable
+from urllib.parse import unquote, urljoin
 
 from playwright.sync_api import Browser, BrowserContext, Error, Page, TimeoutError, sync_playwright
 
@@ -33,6 +34,88 @@ SEARCH_URL = (
 RELAY_PORT = 18800
 CHECKPOINT_EVERY = 5
 
+RATE_LIMIT_MARKERS = (
+    "error_code=300013",
+    "访问频繁",
+    "请求频繁",
+    "操作频繁",
+    "请稍后再试",
+    "too many requests",
+)
+SECURITY_VERIFICATION_MARKERS = (
+    "/captcha",
+    "安全验证",
+    "请完成验证",
+    "验证后继续",
+    "拖动滑块",
+    "滑块验证",
+    "异常访问",
+    "网络环境存在风险",
+)
+LOGIN_REQUIRED_MARKERS = (
+    "/website-login",
+    "/login",
+    "登录后查看",
+    "手机号登录",
+    "请先登录",
+)
+
+LATEST_SORT_SELECTED_JS = r"""
+() => Array.from(document.querySelectorAll('.filter-panel .tags')).some((element) => {
+  const text = (element.innerText || element.textContent || '').trim();
+  const opacity = Number.parseFloat(getComputedStyle(element).opacity || '1');
+  return text === '最新'
+    && element.classList.contains('active')
+    && element.getAttribute('aria-hidden') !== 'true'
+    && opacity > 0.1;
+})
+"""
+
+OPEN_FILTER_PANEL_JS = r"""
+() => {
+  if (document.querySelector('.filter-panel')) return true;
+  const trigger = Array.from(document.querySelectorAll('.filter')).find((element) => {
+    const text = (element.innerText || element.textContent || '').trim();
+    return text.includes('筛选') || text.includes('已筛选');
+  });
+  if (!trigger) return false;
+  trigger.click();
+  return true;
+}
+"""
+
+CLICK_LATEST_SORT_JS = r"""
+() => {
+  const option = Array.from(document.querySelectorAll('.filter-panel .tags')).find((element) => {
+    const text = (element.innerText || element.textContent || '').trim();
+    const opacity = Number.parseFloat(getComputedStyle(element).opacity || '1');
+    return text === '最新'
+      && element.getAttribute('aria-hidden') !== 'true'
+      && opacity > 0.1;
+  });
+  if (!option) return false;
+  option.click();
+  return true;
+}
+"""
+
+VISIBLE_CARD_IDS_JS = r"""
+() => Array.from(document.querySelectorAll('section.note-item[data-note-id]'))
+  .slice(0, 12)
+  .map((element) => element.getAttribute('data-note-id'))
+  .filter(Boolean)
+"""
+
+CLOSE_FILTER_PANEL_JS = r"""
+() => {
+  if (!document.querySelector('.filter-panel')) return true;
+  const trigger = document.querySelector('.filter');
+  if (!trigger) return false;
+  trigger.click();
+  return true;
+}
+"""
+
 
 @dataclass
 class NoteRecord:
@@ -47,6 +130,8 @@ class NoteRecord:
     comment_count: str
     body: str
     body_html: str
+    detail_image_urls: str
+    detail_image_alts: str
     tags: str
     source_card_text: str
     scraped_at: str
@@ -149,12 +234,21 @@ def is_blocked_page(url: str) -> bool:
     return any(marker in lowered for marker in ("/login", "/captcha", "/website-login", "/404"))
 
 
+def page_is_usable(page: Page) -> bool:
+    try:
+        return not page.is_closed()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def get_reusable_page(context: BrowserContext) -> Page:
     logged_in_xiaohongshu_pages: list[tuple[int, Page]] = []
     xiaohongshu_pages: list[tuple[int, Page]] = []
     fallback_pages: list[tuple[int, Page]] = []
 
     for page in context.pages:
+        if not page_is_usable(page):
+            continue
         url = page.url or ""
         priority = page_reuse_priority(url)
         if "xiaohongshu.com" in url:
@@ -200,25 +294,31 @@ def with_retries(action, *, attempts: int = 3, sleep_seconds: float = 2.0):
 
 def open_search_page(context: BrowserContext, search_url: str) -> Page:
     page = get_reusable_page(context)
-    try:
-        def navigate() -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, 3):
+        try:
             page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
-
-        with_retries(navigate, attempts=3, sleep_seconds=2.0)
-        wait_for_search_results(page)
-        return page
-    except Exception as exc:  # noqa: BLE001
-        log(f"direct goto failed ({exc}); falling back to location.href navigation")
-
-    page.evaluate("(url) => { location.href = url; }", search_url)
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if "xiaohongshu.com/search_result" in (page.url or ""):
             wait_for_search_results(page)
             return page
-        page.wait_for_timeout(1000)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if page_is_usable(page):
+                try:
+                    log(f"direct goto failed ({exc}); falling back to location.href navigation")
+                    page.evaluate("(url) => { location.href = url; }", search_url)
+                    deadline = time.time() + 30
+                    while time.time() < deadline:
+                        if "xiaohongshu.com/search_result" in (page.url or ""):
+                            wait_for_search_results(page)
+                            return page
+                        page.wait_for_timeout(1000)
+                except Exception as fallback_exc:  # noqa: BLE001
+                    last_error = fallback_exc
+            if attempt == 1:
+                log("Reusable search tab became unavailable; retrying in a fresh tab.")
+                page = context.new_page()
 
-    raise RuntimeError("Search page navigation did not settle in time.")
+    raise RuntimeError(f"Search page navigation failed after replacing the tab: {last_error}")
 
 
 def dismiss_common_popups(page: Page) -> None:
@@ -255,6 +355,42 @@ def has_login_wall(page: Page) -> bool:
     return False
 
 
+def search_security_restriction(page: Page) -> str:
+    """Return a restriction kind without issuing any additional page requests."""
+    page_text = unquote(str(getattr(page, "url", "") or ""))
+    try:
+        page_text = f"{page_text} {page.locator('body').inner_text(timeout=1000)}"
+    except Exception:  # noqa: BLE001
+        pass
+    normalized = page_text.casefold()
+    if any(marker.casefold() in normalized for marker in RATE_LIMIT_MARKERS):
+        return "rate_limited"
+    if any(marker.casefold() in normalized for marker in SECURITY_VERIFICATION_MARKERS):
+        return "security_verification"
+    return ""
+
+
+def wait_for_search_security_clearance(page: Page, timeout_seconds: int) -> bool:
+    restriction = search_security_restriction(page)
+    if not restriction:
+        return True
+
+    log(
+        "SECURITY_VERIFICATION "
+        f"detected timeout={timeout_seconds}s; search collection paused while waiting for manual completion"
+    )
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(1000)
+        if not search_security_restriction(page):
+            log("SECURITY_VERIFICATION cleared; resuming collection")
+            wait_for_search_results(page)
+            return True
+
+    log("SECURITY_VERIFICATION timed_out; stopping new collection and preserving checkpoint")
+    return False
+
+
 def wait_for_search_results(page: Page) -> None:
     if has_login_wall(page):
         return
@@ -271,6 +407,159 @@ def wait_for_search_results(page: Page) -> None:
         except Exception:  # noqa: BLE001
             continue
     page.wait_for_timeout(1500)
+
+
+def select_latest_sort(page: Page) -> None:
+    """Select Xiaohongshu's visible latest-first filter and verify its active state."""
+    before_ids = page.evaluate(VISIBLE_CARD_IDS_JS)
+    if not page.evaluate(OPEN_FILTER_PANEL_JS):
+        raise RuntimeError("Xiaohongshu filter control was not found; latest-first sorting was not applied.")
+
+    try:
+        page.wait_for_function("() => Boolean(document.querySelector('.filter-panel'))", timeout=5000)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("Xiaohongshu filter panel did not open; latest-first sorting was not applied.") from exc
+
+    already_selected = bool(page.evaluate(LATEST_SORT_SELECTED_JS))
+    if not already_selected:
+        if not page.evaluate(CLICK_LATEST_SORT_JS):
+            raise RuntimeError("Xiaohongshu latest sort option was not found; collection was stopped before scraping.")
+        try:
+            page.wait_for_function(LATEST_SORT_SELECTED_JS, timeout=5000)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Xiaohongshu did not confirm the latest-first sort selection.") from exc
+
+        if before_ids:
+            try:
+                page.wait_for_function(
+                    """
+                    (before) => {
+                      const current = Array.from(document.querySelectorAll('section.note-item[data-note-id]'))
+                        .slice(0, 12)
+                        .map((element) => element.getAttribute('data-note-id'))
+                        .filter(Boolean);
+                      return current.length > 0 && JSON.stringify(current) !== JSON.stringify(before);
+                    }
+                    """,
+                    arg=before_ids,
+                    timeout=12000,
+                )
+            except Exception:  # noqa: BLE001
+                # An already fresh result set can keep the same leading cards. The active
+                # filter state above remains the authoritative verification.
+                pass
+
+    page.wait_for_timeout(800)
+    if not page.evaluate(LATEST_SORT_SELECTED_JS):
+        raise RuntimeError("Xiaohongshu latest-first sort verification was lost before collection.")
+    log("Search sort verified: 最新 (latest first).")
+
+    page.evaluate(CLOSE_FILTER_PANEL_JS)
+    try:
+        page.wait_for_function("() => !document.querySelector('.filter-panel')", timeout=3000)
+    except Exception:  # noqa: BLE001
+        pass
+    wait_for_search_results(page)
+
+
+def infer_card_publish_datetime(card: dict[str, Any], now: datetime | None = None) -> datetime | None:
+    reference = now or datetime.now()
+    text = " ".join(
+        str(card.get(field, "") or "")
+        for field in ("publish_time", "card_text_segments", "source_card_text")
+    )
+
+    full_date = re.search(r"(?<!\d)(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", text)
+    if full_date:
+        try:
+            return reference.replace(
+                year=int(full_date.group(1)),
+                month=int(full_date.group(2)),
+                day=int(full_date.group(3)),
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+        except ValueError:
+            return None
+
+    if "刚刚" in text:
+        return reference
+    relative_patterns = (
+        (r"(\d+)\s*分钟前", "minutes"),
+        (r"(\d+)\s*小时前", "hours"),
+        (r"(\d+)\s*天前", "days"),
+    )
+    for pattern, unit in relative_patterns:
+        match = re.search(pattern, text)
+        if match:
+            return reference - timedelta(**{unit: int(match.group(1))})
+
+    day_offset = 1 if "昨天" in text else 2 if "前天" in text else None
+    if day_offset is not None:
+        candidate = reference - timedelta(days=day_offset)
+        time_match = re.search(r"(?:昨天|前天)\s*(\d{1,2}):(\d{2})", text)
+        if time_match:
+            candidate = candidate.replace(hour=int(time_match.group(1)), minute=int(time_match.group(2)))
+        return candidate.replace(second=0, microsecond=0)
+
+    month_day = re.search(r"(?<!\d)(\d{1,2})[-/.月](\d{1,2})(?:日)?", text)
+    if month_day:
+        try:
+            candidate = reference.replace(
+                month=int(month_day.group(1)),
+                day=int(month_day.group(2)),
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if candidate > reference + timedelta(days=1):
+                candidate = candidate.replace(year=candidate.year - 1)
+            return candidate
+        except ValueError:
+            return None
+    return None
+
+
+def filter_cards_by_recency(
+    cards: list[dict[str, Any]],
+    max_age_days: int,
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    if max_age_days <= 0:
+        return list(cards), 0, 0
+    reference = now or datetime.now()
+    cutoff = reference - timedelta(days=max_age_days)
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    unknown = 0
+    for card in cards:
+        published_at = infer_card_publish_datetime(card, reference)
+        if published_at is None:
+            unknown += 1
+            kept.append(card)
+        elif published_at >= cutoff:
+            kept.append(card)
+        else:
+            removed += 1
+    return kept, removed, unknown
+
+
+def resume_record_matches_cards(record: NoteRecord, cards: list[dict[str, Any]]) -> bool:
+    card_ids = {str(card.get("note_id", "") or "") for card in cards}
+    card_urls = {
+        str(card.get(field, "") or "")
+        for card in cards
+        for field in ("note_url", "search_result_url", "explore_url")
+    }
+    return bool(
+        (record.note_id and record.note_id in card_ids)
+        or (record.note_url and record.note_url in card_urls)
+        or (record.card_search_result_url and record.card_search_result_url in card_urls)
+        or (record.card_explore_url and record.card_explore_url in card_urls)
+    )
 
 
 def is_navigation_context_error(exc: Exception) -> bool:
@@ -450,7 +739,7 @@ def extract_cards(page: Page) -> list[dict[str, Any]]:
       title,
       author,
       author_profile: authorProfile,
-      publish_time: '',
+      publish_time: textSegments.find(text => /^(?:刚刚|\d+\s*分钟前|\d+\s*小时前|昨天(?:\s+\d{1,2}:\d{2})?|前天(?:\s+\d{1,2}:\d{2})?|\d+\s*天前|\d{1,2}[-/.]\d{1,2}(?:\s+\d{1,2}:\d{2})?|20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})/.test(text)) || '',
       like_count: counts[0] || '',
       collect_count: counts[1] || '',
       comment_count: counts[2] || '',
@@ -479,11 +768,15 @@ def collect_note_links(
     note_delay_seconds: float,
     random_delay_min_seconds: float,
     random_delay_max_seconds: float,
-) -> list[dict[str, Any]]:
+    security_verification_timeout_seconds: int,
+    checkpoint: Callable[[list[dict[str, Any]]], None] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
     all_cards: dict[str, dict[str, Any]] = {}
     unchanged_rounds = 0
 
     for scroll_index in range(max_scrolls):
+        if not wait_for_search_security_clearance(page, security_verification_timeout_seconds):
+            return list(all_cards.values()), True
         dismiss_common_popups(page)
         try:
             cards = extract_cards(page)
@@ -493,11 +786,18 @@ def collect_note_links(
                 wait_for_search_page_to_settle(page)
                 continue
             raise
+        if search_security_restriction(page):
+            if not wait_for_search_security_clearance(page, security_verification_timeout_seconds):
+                return list(all_cards.values()), True
+            continue
         before_count = len(all_cards)
         for card in cards:
             if card["note_url"] not in all_cards:
                 all_cards[card["note_url"]] = card
         after_count = len(all_cards)
+
+        if checkpoint is not None:
+            checkpoint(list(all_cards.values()))
 
         log(f"scroll {scroll_index + 1}/{max_scrolls}: collected {after_count} note links")
 
@@ -526,7 +826,7 @@ def collect_note_links(
                 continue
             raise
 
-    return list(all_cards.values())
+    return list(all_cards.values()), False
 
 
 def scroll_search_results(page: Page, delta_y: int) -> bool:
@@ -615,6 +915,34 @@ def extract_note_payload(page: Page) -> dict[str, Any]:
     return [...new Set(tags)];
   }
 
+  function collectDetailImages() {
+    const images = [];
+    const selectors = [
+      '.note-content img',
+      '.note-slider img',
+      '.swiper img',
+      '#noteContainer img',
+      '[class*=note-content] img',
+      'article img',
+    ];
+    for (const node of document.querySelectorAll(selectors.join(','))) {
+      const source = node.currentSrc || node.getAttribute('src') || node.getAttribute('data-src') || '';
+      if (!source || source.startsWith('data:') || source.startsWith('blob:')) continue;
+      const width = Number(node.naturalWidth || node.width || 0);
+      const height = Number(node.naturalHeight || node.height || 0);
+      if (width && height && (width < 180 || height < 180)) continue;
+      let url = source;
+      try {
+        url = new URL(source, location.href).toString();
+      } catch {
+        // Keep the original URL when the browser cannot normalize it.
+      }
+      images.push({ url, alt: normalizeText(node.getAttribute('alt') || '') });
+      if (images.length >= 20) break;
+    }
+    return [...new Map(images.map((item) => [item.url, item])).values()];
+  }
+
   function authorProfile() {
     const node = document.querySelector('.author-container a, .author a');
     if (!node) return '';
@@ -658,11 +986,14 @@ def extract_note_payload(page: Page) -> dict[str, Any]:
 
   const metaTitle = document.querySelector("meta[property='og:title']")?.getAttribute('content') || '';
   const counts = collectCounts();
+  const detailImages = collectDetailImages();
 
   return {
     title: firstText(titleSelectors) || normalizeText(metaTitle),
     body: firstText(bodySelectors),
     body_html: firstHtml(bodySelectors),
+    detail_image_urls: detailImages.map((item) => item.url),
+    detail_image_alts: detailImages.map((item) => item.alt),
     author: firstText(authorSelectors),
     publish_time: firstText(publishSelectors),
     like_count: counts[0] || '',
@@ -707,6 +1038,8 @@ def extract_note_from_dom(page: Page, fallback_card: dict[str, Any]) -> NoteReco
         comment_count=comment_count,
         body=body,
         body_html=body_html,
+        detail_image_urls=" | ".join(payload.get("detail_image_urls", [])),
+        detail_image_alts=" | ".join(payload.get("detail_image_alts", [])),
         tags=" | ".join(payload.get("tags", [])),
         source_card_text=fallback_card.get("source_card_text", ""),
         scraped_at=datetime.now().isoformat(timespec="seconds"),
@@ -746,6 +1079,8 @@ def build_card_record(card: dict[str, Any], *, access_status: str, source_search
         comment_count=card.get("comment_count", ""),
         body="",
         body_html="",
+        detail_image_urls="",
+        detail_image_alts="",
         tags=card.get("card_tags", ""),
         source_card_text=card.get("source_card_text", ""),
         scraped_at=datetime.now().isoformat(timespec="seconds"),
@@ -795,12 +1130,53 @@ def is_unavailable_record(record: NoteRecord) -> bool:
     return any(marker in haystack for marker in markers)
 
 
+def classify_detail_access(page_url: str, record: NoteRecord) -> str:
+    """Classify pages that rendered HTML but did not expose a usable note body."""
+    combined = unquote(
+        " ".join(
+            part
+            for part in [page_url, record.title, record.body, record.source_card_text]
+            if part
+        )
+    ).casefold()
+    if any(marker.casefold() in combined for marker in RATE_LIMIT_MARKERS):
+        return "detail_rate_limited"
+    if any(marker.casefold() in combined for marker in SECURITY_VERIFICATION_MARKERS):
+        return "detail_security_verification"
+    if any(marker.casefold() in combined for marker in LOGIN_REQUIRED_MARKERS):
+        return "detail_login_required"
+    if is_unavailable_record(record) or "/404" in combined:
+        return "detail_unavailable"
+    if not record.body.strip():
+        return "detail_empty"
+    return "detail_ok"
+
+
 def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, source_search_url: str) -> NoteRecord | None:
     started_at = time.time()
     target_url = card.get("search_result_url") or card.get("note_url", "")
     try:
         goto_started_at = time.time()
-        page.goto(target_url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
+        navigation_candidates = list(dict.fromkeys(filter(None, [target_url, card.get("explore_url", "")])))
+        navigation_error: Exception | None = None
+        for candidate_url in navigation_candidates:
+            try:
+                page.goto(candidate_url, wait_until="commit", timeout=goto_timeout_ms)
+                navigation_error = None
+                break
+            except (TimeoutError, Error) as exc:
+                navigation_error = exc
+                try:
+                    page.wait_for_timeout(500)
+                except Error:
+                    pass
+                if card.get("note_id") and card["note_id"] in page.url:
+                    navigation_error = None
+                    break
+                log(f"detail navigation failed, trying fallback: {candidate_url}: {exc}")
+        if navigation_error is not None:
+            raise navigation_error
+        wait_for_note_ready(page)
         goto_elapsed = time.time() - goto_started_at
         log(f"detail goto finished in {goto_elapsed:.1f}s: {target_url}")
 
@@ -809,8 +1185,10 @@ def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, sourc
         extract_elapsed = time.time() - extract_started_at
         total_elapsed = time.time() - started_at
         log(f"detail extract finished in {extract_elapsed:.1f}s (total {total_elapsed:.1f}s): {target_url}")
-        if is_unavailable_record(record):
-            return build_card_record(card, access_status="detail_unavailable", source_search_url=source_search_url)
+        access_status = classify_detail_access(page.url, record)
+        if access_status != "detail_ok":
+            log(f"detail access classified as {access_status}: {target_url}")
+            return build_card_record(card, access_status=access_status, source_search_url=source_search_url)
         record.source_search_url = source_search_url
         return record
     except TimeoutError:
@@ -824,21 +1202,44 @@ def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, sourc
         return build_card_record(card, access_status="detail_unexpected_error", source_search_url=source_search_url)
 
 
+def write_text_atomically(output_path: pathlib.Path, text: str, *, encoding: str) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(
+        f".{output_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding=encoding, newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_json_payload(payload: Any, output_path: pathlib.Path) -> None:
+    write_text_atomically(
+        output_path,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def write_json(records: list[NoteRecord], output_path: pathlib.Path) -> None:
-    payload = [asdict(record) for record in records]
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_payload([asdict(record) for record in records], output_path)
 
 
 def write_csv(records: list[NoteRecord], output_path: pathlib.Path) -> None:
     if not records:
-        output_path.write_text("", encoding="utf-8")
+        write_text_atomically(output_path, "", encoding="utf-8")
         return
 
-    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(asdict(records[0]).keys()))
-        writer.writeheader()
-        for record in records:
-            writer.writerow(asdict(record))
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=list(asdict(records[0]).keys()))
+    writer.writeheader()
+    for record in records:
+        writer.writerow(asdict(record))
+    write_text_atomically(output_path, buffer.getvalue(), encoding="utf-8-sig")
 
 
 def parse_args() -> argparse.Namespace:
@@ -848,6 +1249,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scrolls", type=int, default=40)
     parser.add_argument("--stable-rounds", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0, help="Optional max note count to scrape. 0 means no cap.")
+    parser.add_argument("--search-sort", choices=("latest", "comprehensive"), default="latest")
+    parser.add_argument("--max-age-days", type=int, default=30, help="Keep cards no older than this many days. 0 disables the date filter.")
     parser.add_argument("--goto-timeout-ms", type=int, default=45000)
     parser.add_argument("--note-delay-seconds", type=float, default=DEFAULT_NOTE_DELAY_SECONDS)
     parser.add_argument("--speed-mode", choices=("steady", "random"), default=DEFAULT_SPEED_MODE)
@@ -855,6 +1258,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-delay-max-seconds", type=float, default=DEFAULT_RANDOM_DELAY_MAX_SECONDS)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--use-card-cache", action="store_true")
+    parser.add_argument("--cards-only", action="store_true", help="Only discover and checkpoint search-result cards.")
+    parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
     parser.add_argument(
         "--output-dir",
         default=str(pathlib.Path.cwd() / "output" / "xiaohongshu-relay-scrape"),
@@ -869,20 +1274,40 @@ def parse_args() -> argparse.Namespace:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    if not 0 <= args.max_age_days <= 365:
+        parser.error("--max-age-days must be between 0 and 365")
+    if not 60 <= args.security_verification_timeout_seconds <= 3600:
+        parser.error("--security-verification-timeout-seconds must be between 60 and 3600")
     return args
 
 
 def load_existing_records(path: pathlib.Path) -> list[NoteRecord]:
     if not path.exists():
         return []
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"Ignoring unreadable resume checkpoint {path}: {exc}")
+        return []
+    if not isinstance(payload, list):
+        log(f"Ignoring invalid resume checkpoint {path}: expected a JSON array.")
+        return []
     records: list[NoteRecord] = []
     for item in payload:
+        if not isinstance(item, dict):
+            continue
         normalized = dict(item)
         for field_name in NoteRecord.__dataclass_fields__:
             normalized.setdefault(field_name, "" if field_name != "card_rank" else 0)
         records.append(NoteRecord(**normalized))
     return records
+
+
+def is_complete_resume_record(record: NoteRecord) -> bool:
+    return (
+        record.access_status == "detail_ok"
+        and classify_detail_access(record.note_url, record) == "detail_ok"
+    )
 
 
 def main() -> int:
@@ -893,6 +1318,8 @@ def main() -> int:
     latest_json = output_dir / "xiaohongshu_notes_latest.json"
     latest_csv = output_dir / "xiaohongshu_notes_latest.csv"
     latest_cards_json = output_dir / "xiaohongshu_cards_latest.json"
+    security_restriction_json = output_dir / "security-restriction.json"
+    security_restriction_json.unlink(missing_ok=True)
 
     log("Connecting to the active Edge relay...")
     with sync_playwright() as playwright:
@@ -907,12 +1334,34 @@ def main() -> int:
             log("Please log into Xiaohongshu in the Edge browser profile first, then rerun the scraper.")
             return 2
 
+        if not wait_for_search_security_clearance(search_page, args.security_verification_timeout_seconds):
+            if not latest_cards_json.exists():
+                write_json_payload([], latest_cards_json)
+            write_json_payload(
+                {
+                    "schemaVersion": 1,
+                    "status": "timed_out",
+                    "phase": "search_discovery",
+                    "timeoutSeconds": args.security_verification_timeout_seconds,
+                    "recoveryAction": "manual_verification_then_resume",
+                },
+                security_restriction_json,
+            )
+            return 3
+
+        if args.search_sort == "latest":
+            log("Selecting latest-first search order before collection...")
+            select_latest_sort(search_page)
+        else:
+            log("Search sort: 综合 (platform default).")
+
+        security_timed_out = False
         if args.use_card_cache and latest_cards_json.exists():
             cards = json.loads(latest_cards_json.read_text(encoding="utf-8"))
             log(f"Loaded {len(cards)} cached note links.")
         else:
             log("Collecting note links from the search results...")
-            cards = collect_note_links(
+            cards, security_timed_out = collect_note_links(
                 search_page,
                 max_scrolls=args.max_scrolls,
                 stable_rounds=args.stable_rounds,
@@ -920,11 +1369,29 @@ def main() -> int:
                 note_delay_seconds=args.note_delay_seconds,
                 random_delay_min_seconds=args.random_delay_min_seconds,
                 random_delay_max_seconds=args.random_delay_max_seconds,
+                security_verification_timeout_seconds=args.security_verification_timeout_seconds,
+                checkpoint=lambda discovered: write_json_payload(discovered, latest_cards_json),
             )
-            latest_cards_json.write_text(
-                json.dumps(cards, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            if security_timed_out:
+                write_json_payload(
+                    {
+                        "schemaVersion": 1,
+                        "status": "timed_out",
+                        "phase": "search_discovery",
+                        "timeoutSeconds": args.security_verification_timeout_seconds,
+                        "recoveryAction": "manual_verification_then_resume",
+                    },
+                    security_restriction_json,
+                )
+        cards, removed_count, unknown_count = filter_cards_by_recency(cards, args.max_age_days)
+        if args.max_age_days > 0:
+            log(
+                f"Recency filter kept {len(cards)} cards within {args.max_age_days} days; "
+                f"removed {removed_count} older cards; kept {unknown_count} cards with unknown dates."
             )
+        write_json_payload(cards, latest_cards_json)
+        if security_timed_out:
+            return 3
         if not cards:
             if has_login_wall(search_page):
                 log("No note links were found because Xiaohongshu is asking for login.")
@@ -932,12 +1399,20 @@ def main() -> int:
             log("No note links were found.")
             return 1
 
+        if args.cards_only:
+            log(f"CARD_DISCOVERY complete={len(cards)}; detail access delegated to guarded body completion")
+            return 0
+
         records: list[NoteRecord] = []
         seen_ids: set[str] = set()
         if args.resume and latest_json.exists():
-            records = load_existing_records(latest_json)
+            loaded_records = load_existing_records(latest_json)
+            records = [record for record in loaded_records if is_complete_resume_record(record)]
+            if args.search_sort == "latest" or args.max_age_days > 0:
+                records = [record for record in records if resume_record_matches_cards(record, cards)]
+            retry_count = len(loaded_records) - len(records)
             seen_ids = {record.note_id for record in records if record.note_id}
-            log(f"Loaded {len(records)} existing records for resume.")
+            log(f"Loaded {len(records)} complete existing records for resume; retrying {retry_count} failed records.")
 
         target_total_records = args.limit if args.limit > 0 else None
         if target_total_records is not None and len(records) >= target_total_records:
@@ -945,11 +1420,12 @@ def main() -> int:
             return 0
 
         log(f"Collected {len(cards)} note links. Starting note extraction...")
-        detail_page = search_page
+        detail_page = context.new_page()
         source_search_url = search_page.url
         for index, card in enumerate(cards, start=1):
             if card["note_id"] and card["note_id"] in seen_ids:
                 log(f"Skipping existing note {index}/{len(cards)}: {card['note_url']}")
+                log(f"NOTE_PROGRESS processed={index} total={len(cards)} saved={len(records)} status=cached")
                 continue
             log(f"Scraping note {index}/{len(cards)}: {card['note_url']}")
             record = scrape_note(
@@ -959,13 +1435,20 @@ def main() -> int:
                 source_search_url=source_search_url,
             )
             if record is None:
+                log(f"NOTE_PROGRESS processed={index} total={len(cards)} saved={len(records)} status=failed")
                 continue
             if not (record.title or record.source_card_text or record.card_text_segments):
                 log(f"Skipping empty record {index}/{len(cards)}: {card['note_url']}")
+                log(f"NOTE_PROGRESS processed={index} total={len(cards)} saved={len(records)} status=empty")
                 continue
             records.append(record)
             if record.note_id:
                 seen_ids.add(record.note_id)
+            progress_status = "saved" if is_complete_resume_record(record) else record.access_status
+            log(
+                f"NOTE_PROGRESS processed={index} total={len(cards)} "
+                f"saved={len(records)} status={progress_status}"
+            )
             if len(records) % CHECKPOINT_EVERY == 0:
                 write_json(records, latest_json)
                 write_csv(records, latest_csv)
@@ -986,7 +1469,14 @@ def main() -> int:
         write_csv(records, csv_path)
         write_json(records, latest_json)
         write_csv(records, latest_csv)
+        detail_page.close()
 
+        complete_count = sum(is_complete_resume_record(record) for record in records)
+        retryable_count = len(records) - complete_count
+        log(
+            f"DETAIL_SUMMARY complete={complete_count} retryable={retryable_count} "
+            f"total={len(records)}"
+        )
         log(f"Saved {len(records)} notes to {json_path}")
         log(f"Saved {len(records)} notes to {csv_path}")
         return 0

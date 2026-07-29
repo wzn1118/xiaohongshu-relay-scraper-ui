@@ -7,6 +7,8 @@ import { ValidationError, buildRunnerArgs, validateRunRequest } from './lib/cont
 test('validateRunRequest applies bounded production defaults', () => {
   const result = validateRunRequest({});
   assert.equal(result.keyword, '实习继任');
+  assert.equal(result.searchSort, 'latest');
+  assert.equal(result.maxAgeDays, 30);
   assert.equal(result.limit, 0);
   assert.equal(result.maxScrolls, 40);
   assert.equal(result.stableRounds, 4);
@@ -28,6 +30,8 @@ test('validateRunRequest rejects unknown and malformed parameters', () => {
   assert.throws(() => validateRunRequest({ browserProfile: '../../profile' }), ValidationError);
   assert.throws(() => validateRunRequest({ limit: 1001 }), ValidationError);
   assert.throws(() => validateRunRequest({ keyword: 'bad\nvalue' }), ValidationError);
+  assert.throws(() => validateRunRequest({ searchSort: 'oldest' }), ValidationError);
+  assert.throws(() => validateRunRequest({ maxAgeDays: 366 }), ValidationError);
 });
 
 test('validateRunRequest always normalizes collection to full-body mode', () => {
@@ -82,6 +86,8 @@ test('buildRunnerArgs only emits the normalized whitelist', () => {
   assert.ok(args.includes('--skip-postprocess'));
   assert.ok(args.includes('--no-auto-attach'));
   assert.ok(args.includes('--codex-runtime'));
+  assert.equal(args[args.indexOf('--search-sort') + 1], 'latest');
+  assert.equal(args[args.indexOf('--max-age-days') + 1], '30');
   assert.equal(args[args.indexOf('--security-verification-timeout-seconds') + 1], '600');
   assert.equal(args[args.indexOf('--speed-mode') + 1], 'random');
   assert.equal(args[args.indexOf('--random-delay-min-seconds') + 1], '0.8');

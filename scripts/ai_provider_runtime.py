@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import ipaddress
 import json
 import os
 import socket
@@ -7,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,10 @@ except ImportError:
 
 class AIProviderError(RuntimeError):
     pass
+
+
+_LOCAL_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+_LOCAL_IMAGE_TOTAL_MAX_BYTES = 20 * 1024 * 1024
 
 
 class AIProvider:
@@ -34,26 +41,105 @@ class AIProvider:
             self.timeout = max(30, int(configured_timeout))
         except (TypeError, ValueError):
             self.timeout = 600
+        self.last_request_used_images = False
 
     @property
     def requires_api_key(self) -> bool:
         return self.provider != "local_qwen"
 
-    def generate_json(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
+    def generate_json(
+        self,
+        system: str,
+        user: str,
+        schema: dict[str, Any],
+        image_urls: list[str] | None = None,
+    ) -> dict[str, Any]:
+        images = [
+            value.strip()
+            for value in (image_urls or [])
+            if isinstance(value, str) and value.strip().lower().startswith(("http://", "https://"))
+        ][:4]
+        self.last_request_used_images = False
         schema_instruction = (
             "\nReturn exactly one JSON object matching this JSON Schema; do not add Markdown:\n"
             + json.dumps(schema, ensure_ascii=False)
         )
         if self.provider == "local_qwen":
+            local_images = self._download_local_images(images)
+            if local_images:
+                try:
+                    result = self._local_chat(system + schema_instruction, user, schema, local_images)
+                    self.last_request_used_images = True
+                    return result
+                except AIProviderError:
+                    # Text-only local models still produce a useful result from the note and image alt text.
+                    pass
             return self._local_chat(system + schema_instruction, user, schema)
         if self.provider == "codex" and not (self.api_key and self.base_url and self.model):
             return self._codex(system + schema_instruction, user, schema)
-        return self._openai_compatible(system + schema_instruction, user, self.wire_api)
+        if not images:
+            return self._openai_compatible(system + schema_instruction, user, self.wire_api)
+        try:
+            result = self._openai_compatible(system + schema_instruction, user, self.wire_api, images)
+            self.last_request_used_images = True
+            return result
+        except AIProviderError:
+            # Some OpenAI-compatible relays expose text-only models under the same API.
+            # Retry without image parts so the record still receives text/alt-text analysis.
+            return self._openai_compatible(system + schema_instruction, user, self.wire_api)
 
-    def _local_chat(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
+    def _download_local_images(self, image_urls: list[str]) -> list[str]:
+        encoded_images: list[str] = []
+        total_bytes = 0
+        for image_url in image_urls:
+            parsed = urllib.parse.urlparse(image_url)
+            hostname = (parsed.hostname or "").strip().lower()
+            if parsed.scheme not in {"http", "https"} or not hostname or hostname == "localhost":
+                continue
+            try:
+                address = ipaddress.ip_address(hostname)
+            except ValueError:
+                address = None
+            if address and (address.is_private or address.is_loopback or address.is_link_local or address.is_reserved):
+                continue
+
+            remaining_bytes = _LOCAL_IMAGE_TOTAL_MAX_BYTES - total_bytes
+            if remaining_bytes <= 0:
+                break
+            byte_limit = min(_LOCAL_IMAGE_MAX_BYTES, remaining_bytes)
+            request = urllib.request.Request(
+                image_url,
+                headers={
+                    "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8",
+                    "User-Agent": "Mozilla/5.0 (compatible; XiaohongshuRelayScraper/1.0)",
+                },
+                method="GET",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=min(self.timeout, 30)) as response:
+                    content_type = str(getattr(response, "headers", {}).get("Content-Type", "")).lower()
+                    image_bytes = response.read(byte_limit + 1)
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError):
+                continue
+            if (content_type and not content_type.startswith("image/")) or not image_bytes or len(image_bytes) > byte_limit:
+                continue
+            encoded_images.append(base64.b64encode(image_bytes).decode("ascii"))
+            total_bytes += len(image_bytes)
+        return encoded_images
+
+    def _local_chat(
+        self,
+        system: str,
+        user: str,
+        schema: dict[str, Any],
+        images: list[str] | None = None,
+    ) -> dict[str, Any]:
         if not self.base_url or not self.model:
             raise AIProviderError("Local AI provider configuration is incomplete")
         root_url = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        user_message: dict[str, Any] = {"role": "user", "content": f"{user}\n/no_think"}
+        if images:
+            user_message["images"] = images
         payload = {
             "model": self.model,
             "stream": False,
@@ -62,7 +148,7 @@ class AIProvider:
             "options": {"temperature": 0},
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": f"{user}\n/no_think"},
+                user_message,
             ],
         }
         request = urllib.request.Request(
@@ -84,19 +170,34 @@ class AIProvider:
         except (KeyError, TypeError) as error:
             raise AIProviderError("Local AI provider response did not contain a message") from error
 
-    def _openai_compatible(self, system: str, user: str, wire_api: str = "chat_completions") -> dict[str, Any]:
+    def _openai_compatible(
+        self,
+        system: str,
+        user: str,
+        wire_api: str = "chat_completions",
+        image_urls: list[str] | None = None,
+    ) -> dict[str, Any]:
         if not self.base_url or not self.model or (self.requires_api_key and not self.api_key):
             raise AIProviderError("AI provider configuration is incomplete")
         if wire_api == "responses":
-            return self._responses(system, user)
+            return self._responses(system, user, image_urls)
         if wire_api != "chat_completions":
             raise AIProviderError("Unsupported AI wire API")
+        user_content: str | list[dict[str, Any]] = user
+        if image_urls:
+            user_content = [
+                {"type": "text", "text": user},
+                *[
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                    for image_url in image_urls
+                ],
+            ]
         payload = {
             "model": self.model,
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user", "content": user_content},
             ],
             "response_format": {"type": "json_object"},
         }
@@ -125,11 +226,23 @@ class AIProvider:
         except (KeyError, IndexError, TypeError) as error:
             raise AIProviderError("AI provider response did not contain a message") from error
 
-    def _responses(self, system: str, user: str) -> dict[str, Any]:
+    def _responses(self, system: str, user: str, image_urls: list[str] | None = None) -> dict[str, Any]:
+        input_value: str | list[dict[str, Any]] = user
+        if image_urls:
+            input_value = [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": user},
+                    *[
+                        {"type": "input_image", "image_url": image_url}
+                        for image_url in image_urls
+                    ],
+                ],
+            }]
         payload = {
             "model": self.model,
             "instructions": system,
-            "input": user,
+            "input": input_value,
             "temperature": 0.2,
             "text": {"format": {"type": "json_object"}},
         }

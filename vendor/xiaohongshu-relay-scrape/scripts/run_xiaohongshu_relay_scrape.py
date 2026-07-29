@@ -187,6 +187,15 @@ def run_command(command: list[str], *, expect_json: bool = False, check: bool = 
     return stdout
 
 
+def run_streaming_command(command: list[str], *, check: bool = True) -> int:
+    """Run a long-lived child while preserving live stdout/stderr progress."""
+    resolved_command = resolve_cli_command(command)
+    completed = subprocess.run(resolved_command, check=False)
+    if check and completed.returncode != 0:
+        raise RuntimeError(f"Command failed with exit code {completed.returncode}")
+    return completed.returncode
+
+
 def run_command_with_timeout(command: list[str], timeout_seconds: int) -> tuple[int | None, str, str, bool]:
     resolved_command = resolve_cli_command(command)
     process = subprocess.Popen(
@@ -375,6 +384,16 @@ def should_resume(args: argparse.Namespace, output_dir: Path) -> bool:
     if args.resume:
         return True
     return (output_dir / "xiaohongshu_notes_latest.json").exists() or (output_dir / "xiaohongshu_cards_latest.json").exists()
+
+
+def should_use_card_cache(resume_mode: bool, output_dir: Path, search_sort: str) -> bool:
+    # Latest mode must rescan the live result page so a previous checkpoint
+    # cannot reintroduce cards from an older search ordering.
+    return (
+        resume_mode
+        and search_sort != "latest"
+        and (output_dir / "xiaohongshu_cards_latest.json").exists()
+    )
 
 
 @dataclass
@@ -1382,6 +1401,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scrolls", type=int, default=40)
     parser.add_argument("--stable-rounds", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--search-sort", choices=("latest", "comprehensive"), default="latest")
+    parser.add_argument("--max-age-days", type=int, default=30)
     parser.add_argument("--goto-timeout-ms", type=int, default=15000)
     parser.add_argument("--note-delay-seconds", type=float, default=DEFAULT_NOTE_DELAY_SECONDS)
     parser.add_argument("--speed-mode", choices=("steady", "random"), default=DEFAULT_SPEED_MODE)
@@ -1390,6 +1411,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Force resume mode.")
     parser.add_argument("--fresh", action="store_true", help="Ignore existing checkpoints and start a fresh scrape.")
     parser.add_argument("--skip-postprocess", action="store_true")
+    parser.add_argument("--cards-only", action="store_true", help="Discover and checkpoint search cards without opening detail pages.")
+    parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
     parser.add_argument("--no-auto-attach", action="store_true", help="Skip the best-effort relay attach helper.")
     parser.add_argument("--check-only", action="store_true", help="Only verify relay readiness and print the planned run configuration.")
     parser.add_argument("--send-to-codex", action="store_true", help="Ask Codex to generate a brief analysis and keep it visible in the local desktop session.")
@@ -1405,6 +1428,10 @@ def parse_args() -> argparse.Namespace:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    if not 0 <= args.max_age_days <= 365:
+        parser.error("--max-age-days must be between 0 and 365")
+    if not 60 <= args.security_verification_timeout_seconds <= 3600:
+        parser.error("--security-verification-timeout-seconds must be between 60 and 3600")
     return args
 
 
@@ -1417,12 +1444,13 @@ def main() -> int:
     search_url = args.search_url or build_search_url(args.keyword, args.source, args.result_type)
     query_label = resolve_query_label(args.keyword, search_url)
     resume_mode = should_resume(args, output_dir)
-    use_card_cache = resume_mode and (output_dir / "xiaohongshu_cards_latest.json").exists()
+    use_card_cache = should_use_card_cache(resume_mode, output_dir, args.search_sort)
 
     log(f"Search URL: {search_url}")
     log(f"Output directory: {output_dir}")
     log(f"Resume mode: {resume_mode}")
     log(f"Use card cache: {use_card_cache}")
+    log(f"Search sort: {args.search_sort}; max age: {args.max_age_days or 'unlimited'} days")
 
     tabs = ensure_relay(
         search_url=search_url,
@@ -1454,6 +1482,10 @@ def main() -> int:
         str(args.stable_rounds),
         "--limit",
         str(args.limit),
+        "--search-sort",
+        args.search_sort,
+        "--max-age-days",
+        str(args.max_age_days),
         "--goto-timeout-ms",
         str(args.goto_timeout_ms),
         "--note-delay-seconds",
@@ -1464,15 +1496,19 @@ def main() -> int:
         str(args.random_delay_min_seconds),
         "--random-delay-max-seconds",
         str(args.random_delay_max_seconds),
+        "--security-verification-timeout-seconds",
+        str(args.security_verification_timeout_seconds),
     ]
     if resume_mode:
         scrape_command.append("--resume")
     if use_card_cache:
         scrape_command.append("--use-card-cache")
+    if args.cards_only:
+        scrape_command.append("--cards-only")
 
     try:
         log("Running scraper...")
-        run_command(scrape_command, check=True)
+        run_streaming_command(scrape_command, check=True)
 
         if not args.skip_postprocess:
             latest_json = output_dir / "xiaohongshu_notes_latest.json"
@@ -1485,7 +1521,7 @@ def main() -> int:
                 str(output_dir),
             ]
             log("Running post-process exports...")
-            run_command(postprocess_command, check=True)
+            run_streaming_command(postprocess_command, check=True)
     except Exception as exc:
         error_message = str(exc).strip() or repr(exc)
         log("Scrape run failed before normal delivery.")

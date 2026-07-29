@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { JobManager } from './job-manager.mjs';
+import { JobManager, publicJob } from './job-manager.mjs';
 import { validateRunRequest } from './lib/contracts.mjs';
 
 test('JobManager persists history and enforces a single active task', async () => {
@@ -23,6 +23,7 @@ test('JobManager persists history and enforces a single active task', async () =
     pythonBin: 'python',
     runnerPath: fakeRunner,
     maxHistory: 10,
+    terminateImpl: async (target) => target.kill('SIGTERM'),
     spawnImpl: (_command, _args, options) => {
       spawnOptions = options;
       return child;
@@ -36,6 +37,41 @@ test('JobManager persists history and enforces a single active task', async () =
     assert.equal(spawnOptions.env.PYTHONIOENCODING, 'utf-8');
     await assert.rejects(manager.start(validateRunRequest({})), (error) => error.code === 'JOB_BUSY');
     assert.equal(manager.get(job.id).status, 'running');
+    const progressStates = [];
+    const unsubscribeProgress = manager.subscribe(job.id, (event) => {
+      if (event.type === 'state') progressStates.push(event.data);
+    });
+    child.stdout.write('scroll 1/40: collected 12 note links\n');
+    child.stdout.write('Scraping note 1/999: https://example.test/1\n');
+    child.stdout.write('Scraping note 2/999: https://example.test/2\n');
+    child.stdout.write('NOTE_PROGRESS processed=2 total=999 saved=1 status=saved\n');
+    child.stdout.write('CARD_DISCOVERY complete=999; detail access delegated to guarded body completion\n');
+    child.stdout.write('PARALLEL_PROGRESS processed=3 total=999 complete=2 status=detail_ok\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    unsubscribeProgress();
+    assert.equal(progressStates.length, 6);
+    assert.equal(manager.get(job.id).progressPhase, 'scraping');
+    assert.equal(manager.get(job.id).progressLabel, '正文已保存 · 已处理 3 / 999 篇');
+    assert.equal(manager.get(job.id).progressCurrent, 3);
+    assert.equal(manager.get(job.id).progressTotal, 999);
+    assert.equal(manager.get(job.id).discoveredCount, 999);
+    assert.equal(manager.get(job.id).scrapedCount, 2);
+    assert.ok(manager.get(job.id).progressUpdatedAt);
+    child.stdout.write('SECURITY_VERIFICATION detected timeout=600s; new collection paused while waiting for manual completion\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.get(job.id).progressPhase, 'security_verification');
+    assert.equal(manager.get(job.id).securityRestriction.status, 'waiting');
+    assert.equal(manager.get(job.id).securityRestriction.timeoutSeconds, 600);
+    child.stdout.write('SECURITY_VERIFICATION cleared; resuming collection\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.get(job.id).progressPhase, 'scraping');
+    assert.equal(manager.get(job.id).securityRestriction.status, 'cleared');
+    child.stdout.write('SECURITY_VERIFICATION detected timeout=600s; new collection paused while waiting for manual completion\n');
+    child.stdout.write('SECURITY_VERIFICATION timed_out; stopping new collection and preserving checkpoint\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.get(job.id).progressPhase, 'security_restricted');
+    assert.equal(manager.get(job.id).securityRestriction.status, 'timed_out');
+    assert.equal(manager.get(job.id).securityRestriction.recoveryAction, 'manual_verification_then_resume');
     const ended = new Promise((resolve) => {
       const unsubscribe = manager.subscribe(job.id, (event) => {
         if (event.type === 'end') {
@@ -50,6 +86,297 @@ test('JobManager persists history and enforces a single active task', async () =
     const history = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
     assert.equal(history[0].id, job.id);
     assert.equal(history[0].status, 'cancelled');
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('security timeout can resume before the first card is discovered', () => {
+  const job = publicJob({
+    id: 'security-before-first-card',
+    status: 'failed',
+    params: { keyword: 'test' },
+    checkpointAvailable: false,
+    workflowSummary: {
+      cardsDiscovered: 0,
+      notesCollected: 0,
+      securityVerification: {
+        status: 'timed_out',
+        timeoutSeconds: 600,
+        recoveryAction: 'manual_verification_then_resume',
+      },
+    },
+  });
+
+  assert.equal(job.discoveredCount, 0);
+  assert.equal(job.securityRestriction.status, 'timed_out');
+  assert.equal(job.resumeAvailable, true);
+});
+
+test('JobManager materializes every discovered job while scraping and preserves it after cancellation', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-checkpoint-analysis-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  await writeFile(fakeRunner, '', 'utf8');
+  const child = new EventEmitter();
+  child.pid = 22334;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+  const analyzed = [];
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => child,
+    terminateImpl: async (target) => target.kill('SIGTERM'),
+    checkpointAnalyzerImpl: async ({ outputDir }) => {
+      const cards = JSON.parse(await readFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), 'utf8'));
+      analyzed.push(cards.length);
+      await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
+        records: cards.map((card) => ({ note_id: card.note_id })),
+      }), 'utf8');
+      await writeFile(path.join(outputDir, 'workflow-summary.json'), JSON.stringify({
+        cardsDiscovered: cards.length,
+        jobCardsGenerated: cards.length,
+        applicationCopyGenerated: cards.length,
+      }), 'utf8');
+      return { stdout: `CHECKPOINT_ANALYSIS records=${cards.length}\n`, stderr: '' };
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const started = await manager.start(validateRunRequest({ checkOnly: true }));
+    const outputDir = manager.getInternal(started.id).outputDir;
+    const cards = Array.from({ length: 3 }, (_, index) => ({ note_id: `note-${index + 1}` }));
+    await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(cards), 'utf8');
+    await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(cards.slice(0, 1)), 'utf8');
+    child.stdout.write('Collected 3 note links. Starting note extraction...\n');
+    for (let attempt = 0; attempt < 100 && manager.get(started.id).applicationCount !== 3; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(analyzed, [3]);
+    assert.equal(manager.get(started.id).status, 'running');
+    assert.equal(manager.get(started.id).applicationCount, 3);
+    const livePayload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
+    assert.equal(livePayload.records.length, 3);
+    const ended = new Promise((resolve) => {
+      const unsubscribe = manager.subscribe(started.id, (event) => {
+        if (event.type === 'end') {
+          unsubscribe();
+          resolve();
+        }
+      });
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await manager.cancel(started.id);
+    await ended;
+
+    const job = manager.get(started.id);
+    assert.equal(job.status, 'cancelled');
+    assert.deepEqual(analyzed, [3]);
+    assert.equal(job.workflowSummary.jobCardsGenerated, 3);
+    assert.equal(job.workflowSummary.applicationCopyGenerated, 3);
+    const payload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
+    assert.equal(payload.records.length, 3);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager cleans persisted process identity before marking a restarted job interrupted', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-restart-'));
+  const outputDir = path.join(dataDir, 'jobs', 'stale-job', 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(Array.from({ length: 10 }, (_, index) => ({ id: index }))), 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(Array.from({ length: 4 }, (_, index) => ({ id: index }))), 'utf8');
+  await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
+    records: Array.from({ length: 10 }, (_, index) => ({
+      note_id: `note-${index}`,
+      body: index < 7 ? 'complete job body' : '',
+      job_card: { parse_basis: index < 7 ? 'full_body' : 'search_card' },
+    })),
+  }), 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: 'stale-job',
+    status: 'running',
+    pid: 45678,
+    outputDir,
+    params: { keyword: 'test' },
+  }]), 'utf8');
+  const recovered = [];
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: path.join(dataDir, 'runner.py'),
+    recoverImpl: async (job) => {
+      recovered.push({ id: job.id, pid: job.pid, outputDir: job.outputDir });
+      return { matched: 2, terminated: 2, method: 'test' };
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const job = manager.get('stale-job');
+    assert.equal(job.status, 'interrupted');
+    assert.equal(job.pid, null);
+    assert.match(job.message, /Server restarted/);
+    assert.match(job.message, /Checkpoint preserved/);
+    assert.equal(job.discoveredCount, 10);
+    assert.equal(job.scrapedCount, 4);
+    assert.equal(job.applicationCount, 10);
+    assert.equal(job.incompleteCount, 3);
+    assert.equal(job.progress, 48);
+    assert.equal(job.resumeAvailable, true);
+    assert.deepEqual(recovered, [{ id: 'stale-job', pid: 45678, outputDir }]);
+    const history = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
+    assert.equal(history[0].cleanupResult.terminated, 2);
+    assert.ok(history[0].cleanupConfirmedAt);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager copies card and note checkpoints into a resumed task', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-resume-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const sourceId = '20260729120000-deadbeef';
+  const sourceOutputDir = path.join(dataDir, 'jobs', sourceId, 'artifacts');
+  const cards = [{ note_id: 'note-1' }, { note_id: 'note-2' }];
+  const notes = [{ note_id: 'note-1', access_status: 'detail_ok' }];
+  const notesCsv = 'note_id,access_status\nnote-1,detail_ok\n';
+  await mkdir(sourceOutputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(cards), 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(notes), 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'xiaohongshu_notes_latest.csv'), notesCsv, 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: sourceId,
+    status: 'interrupted',
+    outputDir: sourceOutputDir,
+    params: { keyword: 'test' },
+  }]), 'utf8');
+
+  const child = new EventEmitter();
+  child.pid = 78901;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => child,
+    terminateImpl: async (target) => target.kill('SIGTERM'),
+  });
+
+  try {
+    await manager.initialize();
+    assert.equal(manager.get(sourceId).resumeAvailable, true);
+    const started = await manager.start(validateRunRequest({
+      checkOnly: true,
+      mode: 'resume',
+      resumeFromJobId: sourceId,
+    }));
+    const resumedOutputDir = manager.getInternal(started.id).outputDir;
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(resumedOutputDir, 'xiaohongshu_cards_latest.json'), 'utf8')),
+      cards,
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(resumedOutputDir, 'xiaohongshu_notes_latest.json'), 'utf8')),
+      notes,
+    );
+    assert.equal(
+      await readFile(path.join(resumedOutputDir, 'xiaohongshu_notes_latest.csv'), 'utf8'),
+      notesCsv,
+    );
+
+    const ended = new Promise((resolve) => {
+      const unsubscribe = manager.subscribe(started.id, (event) => {
+        if (event.type === 'end') {
+          unsubscribe();
+          resolve();
+        }
+      });
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.get(started.id).status, 'running');
+    child.emit('close', 0, null);
+    await ended;
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager blocks new work when restart cleanup cannot be confirmed', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-recovery-block-'));
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: 'orphaned-job',
+    status: 'running',
+    pid: 56789,
+    outputDir: path.join(dataDir, 'jobs', 'orphaned-job', 'artifacts'),
+    params: { keyword: 'test' },
+  }]), 'utf8');
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: path.join(dataDir, 'runner.py'),
+    recoverImpl: async () => {
+      throw new Error('matching process remains');
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const interrupted = manager.get('orphaned-job');
+    assert.equal(interrupted.status, 'interrupted');
+    assert.equal(interrupted.pid, 56789);
+    assert.equal(interrupted.resumeAvailable, false);
+    assert.match(interrupted.message, /Orphan cleanup failed/);
+    await assert.rejects(
+      manager.start(validateRunRequest({ checkOnly: true })),
+      (error) => error.code === 'JOB_RECOVERY_INCOMPLETE' && error.jobs.includes('orphaned-job'),
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager shutdown interrupts active work and waits for its process tree', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-shutdown-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  await writeFile(fakeRunner, '', 'utf8');
+  const child = new EventEmitter();
+  child.pid = 67890;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+  let terminated = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => child,
+    terminateImpl: async (target) => {
+      terminated += 1;
+      target.kill('SIGTERM');
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const started = await manager.start(validateRunRequest({ checkOnly: true }));
+    await new Promise((resolve) => setImmediate(resolve));
+    const result = await manager.shutdown();
+    assert.equal(result.interrupted, true);
+    assert.equal(terminated, 1);
+    assert.equal(manager.get(started.id).status, 'interrupted');
+    assert.equal(manager.get(started.id).resumeAvailable, false);
+    assert.match(manager.get(started.id).message, /resume is available/);
+    const history = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
+    assert.equal(history[0].status, 'interrupted');
+    assert.equal(history[0].pid, null);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

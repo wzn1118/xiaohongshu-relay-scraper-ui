@@ -1,5 +1,7 @@
 const ALLOWED_KEYS = new Set([
   'keyword',
+  'searchSort',
+  'maxAgeDays',
   'browserProfile',
   'relayPort',
   'limit',
@@ -47,6 +49,11 @@ export function validateRunRequest(value) {
   const keyword = stringField(value.keyword, 'keyword', { defaultValue: '实习继任', min: 1, max: 80 });
   if (/\p{Cc}/u.test(keyword)) throw fieldError('keyword', 'contains_control_character');
 
+  const searchSort = value.searchSort ?? 'latest';
+  if (searchSort !== 'latest' && searchSort !== 'comprehensive') {
+    throw fieldError('searchSort', 'must_be_latest_or_comprehensive');
+  }
+
   const browserProfile = stringField(value.browserProfile, 'browserProfile', {
     defaultValue: 'openclaw',
     min: 1,
@@ -72,6 +79,8 @@ export function validateRunRequest(value) {
 
   return Object.freeze({
     keyword,
+    searchSort,
+    maxAgeDays: integerField(value.maxAgeDays, 'maxAgeDays', 30, 0, 365),
     browserProfile,
     relayPort: integerField(value.relayPort, 'relayPort', 18800, 1, 65535),
     // Every production run must collect the body for every discovered card.
@@ -137,6 +146,8 @@ export function buildRunnerArgs(params, outputDir) {
   const args = [
     '--keyword', params.keyword,
     '--output-dir', outputDir,
+    '--search-sort', params.searchSort,
+    '--max-age-days', String(params.maxAgeDays),
     '--browser-profile', params.browserProfile,
     '--relay-port', String(params.relayPort),
     '--limit', String(params.limit),

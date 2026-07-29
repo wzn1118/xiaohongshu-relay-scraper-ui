@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 're
 import {
   Activity,
   Archive,
+  ArrowUpDown,
   CalendarClock,
   Check,
   ChevronDown,
@@ -15,12 +16,14 @@ import {
   FileSpreadsheet,
   FileText,
   Gauge,
+  Images,
   BrainCircuit,
   BookOpenCheck,
   KeyRound,
   ListFilter,
   LoaderCircle,
   Mail,
+  Maximize2,
   MessageSquare,
   Copy,
   Cpu,
@@ -31,6 +34,7 @@ import {
   Save,
   Search,
   Settings2,
+  ShieldAlert,
   ShieldCheck,
   Shuffle,
   SquareTerminal,
@@ -41,6 +45,7 @@ import {
   UserRoundSearch,
   Wifi,
   WifiOff,
+  WandSparkles,
   X,
 } from 'lucide-react'
 import { api } from './api'
@@ -112,6 +117,8 @@ function importedCandidateProfileValues(imported?: Partial<CandidateApplicationP
 
 const defaultRequest: JobRequest = {
   keyword: '实习继任',
+  searchSort: 'latest',
+  maxAgeDays: 30,
   browserProfile: 'openclaw',
   relayPort: 18800,
   limit: 0,
@@ -122,7 +129,7 @@ const defaultRequest: JobRequest = {
   speedMode: 'random',
   randomDelayMinSeconds: 0.8,
   randomDelayMaxSeconds: 2.4,
-  mode: 'resume',
+  mode: 'fresh',
   skipPostprocess: false,
   noAutoAttach: true,
   checkOnly: false,
@@ -230,21 +237,21 @@ const defaultSmtpConfig: SmtpConfig = {
 }
 
 const statusText: Record<JobStatus, string> = {
-  queued: '等待中',
-  running: '运行中',
+  queued: '待开始',
+  running: '进行中',
   completed: '已完成',
-  failed: '失败',
-  cancelled: '已取消',
-  interrupted: '已中断',
+  failed: '执行失败',
+  cancelled: '未完成 · 已取消',
+  interrupted: '未完成 · 已中断',
 }
 
 const progressByStatus: Record<JobStatus, number> = {
   queued: 4,
   running: 48,
   completed: 100,
-  failed: 100,
-  cancelled: 100,
-  interrupted: 100,
+  failed: 0,
+  cancelled: 0,
+  interrupted: 0,
 }
 
 const agentStages = [
@@ -313,6 +320,104 @@ function formatBytes(bytes = 0) {
   return `${(bytes / 1024 ** 2).toFixed(1)} MB`
 }
 
+type PreviewImage = {
+  url: string
+  alt?: string
+  source?: string
+}
+
+type ImagePreviewState = {
+  title: string
+  images: PreviewImage[]
+  index: number
+}
+
+function resultImages(result: ApplicationResult): PreviewImage[] {
+  const candidates = [
+    ...(result.media?.cover_url ? [{ url: result.media.cover_url, alt: `${result.title || '岗位'}封面`, source: 'cover' }] : []),
+    ...(result.media?.images || []),
+  ]
+  return candidates.filter((image, index) => image.url && candidates.findIndex((candidate) => candidate.url === image.url) === index)
+}
+
+function imageSourceLabel(source?: string) {
+  return source === 'detail' ? '正文图片' : source === 'cover' ? '封面' : source === 'card' ? '搜索卡片' : '岗位图片'
+}
+
+function ResultCardMedia({ result, onPreview }: { result: ApplicationResult; onPreview: (images: PreviewImage[], index: number) => void }) {
+  const [failedUrls, setFailedUrls] = useState<string[]>([])
+  const images = useMemo(() => resultImages(result), [result])
+  const preview = images.find((image) => !failedUrls.includes(image.url))
+  const previewIndex = preview ? images.findIndex((image) => image.url === preview.url) : -1
+
+  if (preview) {
+    return (
+      <button className="result-card-media has-image" type="button" aria-label={`在当前页面查看${result.title || '岗位'}的图片`} onClick={() => onPreview(images, previewIndex)}>
+        <img
+          src={preview.url}
+          alt={preview.alt || `${result.title || '岗位'}图片`}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          onError={() => setFailedUrls((current) => current.includes(preview.url) ? current : [...current, preview.url])}
+        />
+        <span className="result-card-media-open"><Maximize2 size={12} /></span>
+        <span className="result-card-media-count"><Images size={11} />{images.length}</span>
+      </button>
+    )
+  }
+
+  return (
+    <span className="result-card-media is-empty" aria-label={images.length ? `${images.length} 张岗位图片暂不可用` : '暂无岗位图片'}>
+      <span className="result-card-media-empty"><Images size={19} /><small>{images.length ? '图片暂不可用' : '暂无岗位图片'}</small></span>
+    </span>
+  )
+}
+
+function ImagePreview({ preview, onClose, onChange }: { preview: ImagePreviewState; onClose: () => void; onChange: (index: number) => void }) {
+  const current = preview.images[preview.index]
+  const multiple = preview.images.length > 1
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+      if (multiple && event.key === 'ArrowLeft') onChange((preview.index - 1 + preview.images.length) % preview.images.length)
+      if (multiple && event.key === 'ArrowRight') onChange((preview.index + 1) % preview.images.length)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      document.body.style.overflow = previousOverflow
+    }
+  }, [multiple, onChange, onClose, preview.images.length, preview.index])
+
+  return (
+    <div className="image-preview-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="image-preview-dialog" role="dialog" aria-modal="true" aria-label={`${preview.title}图片预览`} onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div><span>{imageSourceLabel(current.source)}</span><strong>{preview.title}</strong></div>
+          <div><small>{preview.index + 1} / {preview.images.length}</small><button type="button" onClick={onClose} title="关闭图片预览" aria-label="关闭图片预览"><X size={20} /></button></div>
+        </header>
+        <div className="image-preview-stage">
+          {multiple && <button className="image-preview-nav previous" type="button" onClick={() => onChange((preview.index - 1 + preview.images.length) % preview.images.length)} title="上一张" aria-label="上一张图片"><ChevronLeft size={24} /></button>}
+          <img src={current.url} alt={current.alt || `${preview.title}图片 ${preview.index + 1}`} referrerPolicy="no-referrer" />
+          {multiple && <button className="image-preview-nav next" type="button" onClick={() => onChange((preview.index + 1) % preview.images.length)} title="下一张" aria-label="下一张图片"><ChevronRight size={24} /></button>}
+        </div>
+        {multiple && (
+          <div className="image-preview-strip" aria-label="图片列表">
+            {preview.images.map((image, index) => (
+              <button key={`${image.url}-${index}`} className={index === preview.index ? 'active' : ''} type="button" onClick={() => onChange(index)} aria-label={`查看第 ${index + 1} 张图片`} aria-current={index === preview.index ? 'true' : undefined}>
+                <img src={image.url} alt="" referrerPolicy="no-referrer" />
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
 type DeliveryRouteView = {
   channel: 'email' | 'direct_message' | 'link' | 'other'
   label: string
@@ -377,6 +482,14 @@ function elapsed(job?: Job) {
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
 }
 
+function progressUpdateAge(value: string | null | undefined, now: Date) {
+  if (!value) return '等待首条进度'
+  const seconds = Math.max(0, Math.floor((now.getTime() - new Date(value).getTime()) / 1000))
+  if (seconds < 3) return '刚刚更新'
+  if (seconds < 60) return `${seconds} 秒前更新`
+  return `${Math.floor(seconds / 60)} 分钟前更新`
+}
+
 function artifactIcon(name: string) {
   if (name.endsWith('.xlsx') || name.endsWith('.csv')) return FileSpreadsheet
   if (name.endsWith('.json')) return FileJson
@@ -412,11 +525,16 @@ function parseCoverage(value: unknown): CoverageSummary | null {
     ? root.quality_gate as Record<string, unknown>
     : root
   const records = Array.isArray(root.records) ? root.records as Record<string, unknown>[] : []
-  const readyDrafts = records.filter((record) => {
+  const generatedDrafts = records.filter((record) => {
     const outreach = record.outreach
-    return outreach && typeof outreach === 'object' && (outreach as Record<string, unknown>).status === 'ready'
+    if (!outreach || typeof outreach !== 'object') return false
+    const copy = outreach as Record<string, unknown>
+    return ['greeting', 'email_subject', 'email_body', 'cover_letter'].every((field) => String(copy[field] || '').trim())
   }).length
-  const processedApplicationInfo = records.filter((record) => record.application_info && typeof record.application_info === 'object').length
+  const generatedJobCards = records.filter((record) => (
+    (record.job_card && typeof record.job_card === 'object')
+    || (record.application_info && typeof record.application_info === 'object')
+  )).length
   const normalizedTimes = records.filter((record) => {
     const time = record.publish_time
     return time && typeof time === 'object' && Boolean((time as Record<string, unknown>).value ?? (time as Record<string, unknown>).normalized)
@@ -430,8 +548,9 @@ function parseCoverage(value: unknown): CoverageSummary | null {
     bodyAttempted: pickNumber(index, ['record_count', 'bodyAttempted', 'attempted', 'detailAttempted']),
     bodySucceeded: pickNumber(index, ['body_count', 'bodySucceeded', 'fullBodies', 'detailSucceeded']),
     timesNormalized: records.length ? normalizedTimes : pickNumber(index, ['timesNormalized', 'normalizedTimes']),
-    applicationInfo: records.length ? processedApplicationInfo : pickNumber(index, ['applicationInfo', 'applicationInfoCount']),
-    draftsGenerated: records.length ? readyDrafts : pickNumber(index, ['draftsGenerated', 'outreachDrafts']),
+    applicationInfo: records.length ? generatedJobCards : pickNumber(index, ['jobCardsGenerated', 'applicationInfo', 'applicationInfoCount']),
+    draftsGenerated: records.length ? generatedDrafts : pickNumber(index, ['applicationCopyGenerated', 'draftsGenerated', 'outreachDrafts']),
+    generationCoveragePercent: records.length ? Math.round((generatedDrafts / records.length) * 10000) / 100 : pickNumber(index, ['generationCoveragePercent']),
     qualityPassed: records.length ? passedRecords : pickNumber(index, ['qualityPassed']),
     gatePassed: typeof qualityGate.passed === 'boolean' ? qualityGate.passed : undefined,
     issueCount: Array.isArray(qualityGate.issues) ? qualityGate.issues.length : undefined,
@@ -473,6 +592,8 @@ function App() {
   const [relay, setRelay] = useState<RelayStatus | null>(null)
   const [relayConfig, setRelayConfig] = useState<RelayConfig>(defaultRelayConfig)
   const [relayConfigSaving, setRelayConfigSaving] = useState(false)
+  const [relayGuideOpen, setRelayGuideOpen] = useState(false)
+  const [relayLoginOpening, setRelayLoginOpening] = useState(false)
   const [smtpConfig, setSmtpConfig] = useState<SmtpConfig>(defaultSmtpConfig)
   const [smtpPassword, setSmtpPassword] = useState('')
   const [smtpOAuthClientSecret, setSmtpOAuthClientSecret] = useState('')
@@ -491,6 +612,9 @@ function App() {
   const [emailSending, setEmailSending] = useState(false)
   const [resultOffset, setResultOffset] = useState(0)
   const [resultsLoading, setResultsLoading] = useState(false)
+  const [resultSort, setResultSort] = useState<'newest' | 'oldest'>('newest')
+  const [resultTimeRange, setResultTimeRange] = useState<'all' | '7' | '30' | '90' | 'unknown'>('all')
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [logs, setLogs] = useState<string[]>([])
   const [advanced, setAdvanced] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -514,6 +638,7 @@ function App() {
   const [activatingLocalAi, setActivatingLocalAi] = useState(false)
   const [localModelStatus, setLocalModelStatus] = useState<LocalModelStatus | null>(null)
   const [localModelChoice, setLocalModelChoice] = useState('qwen3.5:4b')
+  const [localCustomModelId, setLocalCustomModelId] = useState('')
   const [startingLocalInstall, setStartingLocalInstall] = useState(false)
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [aiConnectionCheck, setAiConnectionCheck] = useState<AiConnectionCheck | null>(null)
@@ -521,6 +646,7 @@ function App() {
   const [candidateImportStatus, setCandidateImportStatus] = useState<'recognized' | 'empty' | null>(null)
   const cleanupStream = useRef<null | (() => void)>(null)
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
+  const relayGuideAutoOpened = useRef(false)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
   const handledLocalInstall = useRef<string | null>(null)
@@ -746,12 +872,19 @@ function App() {
   }
 
   const openRelayLogin = async () => {
+    setRelayLoginOpening(true)
+    setNotice(null)
     try {
-      const result = await api.openRelayLogin(relayConfig.profile)
-      setNotice(result.message || '已在独立浏览器中打开登录页，登录完成后点击右上角刷新。')
+      const saved = await api.updateRelayConfig(relayConfig)
+      setRelayConfig(saved)
+      updateRequest('relayPort', saved.port)
+      const result = await api.openRelayLogin(saved.profile)
+      setNotice(result.message || '目标页已在独立浏览器中打开，请在该浏览器内完成登录。')
       window.setTimeout(() => void refreshRelay(), 1500)
     } catch (error) {
       setNotice((error as Error).message)
+    } finally {
+      setRelayLoginOpening(false)
     }
   }
 
@@ -763,6 +896,27 @@ function App() {
       setRelay({ running: false, cdpReady: false, port: request.relayPort, message: (error as Error).message })
     }
   }, [request.relayPort])
+
+  const checkSecurityRelay = async () => {
+    setRelayConnecting(true)
+    setNotice(null)
+    try {
+      const status = await api.relayStatus(relayConfig.port)
+      setRelay(status)
+      const tabs = Array.isArray(status.tabs) ? status.tabs.length : Number(status.tabs || 0)
+      const targetTabs = Number(status.xiaohongshuTabs || 0)
+      if (status.running && status.cdpReady && tabs > 0 && targetTabs > 0) {
+        setNotice('Relay 与小红书页面已连通。运行中的任务会自动恢复；已超时任务可从检查点续跑。')
+      } else {
+        setNotice('尚未检测到可用的小红书页面，请先打开验证页并完成登录或安全验证。')
+      }
+    } catch (error) {
+      setRelay({ running: false, cdpReady: false, port: relayConfig.port, message: (error as Error).message })
+      setNotice((error as Error).message)
+    } finally {
+      setRelayConnecting(false)
+    }
+  }
 
   const loadJobs = useCallback(async () => {
     try {
@@ -904,11 +1058,13 @@ function App() {
         apiKey: '',
         baseUrl: localProvider.baseUrl,
       })
-      const localModels = discovered.models.filter((model) => model.toLowerCase().startsWith('qwen'))
-      if (!localModels.length) throw new Error('本地服务已运行，但未找到可用的中文整理模型。')
-      const model = preferredModel && localModels.includes(preferredModel)
-        ? preferredModel
-        : localModels.includes(localProvider.model) ? localProvider.model : localModels[0]
+      const localModels = [...new Set(discovered.models.map((model) => model.trim()).filter(Boolean))]
+      if (!localModels.length) throw new Error('本地服务已运行，但尚未找到已安装模型。')
+      const preferredMatch = preferredModel
+        ? localModels.find((model) => model.toLowerCase() === preferredModel.toLowerCase())
+        : undefined
+      const defaultMatch = localModels.find((model) => model.toLowerCase() === localProvider.model.toLowerCase())
+      const model = preferredMatch || defaultMatch || localModels[0]
       setProviders((current) => current.map((item) => item.id === localProvider.id
         ? { ...item, model, models: localModels }
         : item))
@@ -930,14 +1086,23 @@ function App() {
     }
   }
 
-  const installLocalModel = async () => {
-    const selected = localModelStatus?.catalog.find((item) => item.id === localModelChoice)
+  const installLocalModel = async (requestedModelId = localModelChoice) => {
+    const modelId = requestedModelId.trim()
+    if (!modelId) return setNotice('请输入 Ollama 模型 ID。')
+    const selected = localModelStatus?.catalog.find((item) => item.id.toLowerCase() === modelId.toLowerCase())
     if (selected?.installed) return activateLocalAi(selected.id)
     setStartingLocalInstall(true)
     setNotice(null)
     try {
-      const install = await api.installLocalModel(localModelChoice)
-      setLocalModelStatus((current) => current ? { ...current, install } : current)
+      const install = await api.installLocalModel(modelId)
+      if (install.status === 'completed') {
+        const status = await api.localModels()
+        setLocalModelStatus(status)
+        setLocalModelChoice(install.modelId)
+      } else {
+        setLocalModelStatus((current) => current ? { ...current, install } : current)
+      }
+      setLocalCustomModelId('')
       setNotice(install.message)
     } catch (error) {
       setNotice((error as Error).message)
@@ -976,7 +1141,7 @@ function App() {
   const loadResults = useCallback(async (jobId: string, offset = 0) => {
     setResultsLoading(true)
     try {
-      const payload = await api.results(jobId, offset, 20)
+      const payload = await api.results(jobId, offset, 20, { sort: resultSort, timeRange: resultTimeRange })
       setResults(payload)
       setResultOffset(offset)
       setSelectedResult((current) => payload.items.find((item) => item.note_id === current?.note_id) || payload.items[0] || null)
@@ -987,7 +1152,7 @@ function App() {
     } finally {
       setResultsLoading(false)
     }
-  }, [])
+  }, [resultSort, resultTimeRange])
 
   useEffect(() => {
     let mounted = true
@@ -1000,7 +1165,7 @@ function App() {
         setJobs(Array.isArray(jobsResult.value) ? jobsResult.value : [])
         setActiveJob(Array.isArray(jobsResult.value) ? jobsResult.value[0] || null : null)
       }
-      const configuredPort = relayConfigResult.status === 'fulfilled' ? relayConfigResult.value.port : request.relayPort
+      const configuredPort = relayConfigResult.status === 'fulfilled' ? relayConfigResult.value.port : defaultRequest.relayPort
       if (relayConfigResult.status === 'fulfilled') {
         setRelayConfig(relayConfigResult.value)
         setRequest((current) => ({ ...current, relayPort: relayConfigResult.value.port }))
@@ -1017,19 +1182,45 @@ function App() {
       setLoading(false)
     }
     void boot()
-    const clockTimer = window.setInterval(() => setClock(new Date()), 1000)
-    const relayTimer = window.setInterval(() => void refreshRelay(), 15000)
     return () => {
       mounted = false
-      window.clearInterval(clockTimer)
-      window.clearInterval(relayTimer)
-      cleanupStream.current?.()
     }
-  }, [connectRelay, refreshRelay, request.relayPort])
+  }, [])
+
+  useEffect(() => {
+    const clockTimer = window.setInterval(() => setClock(new Date()), 1000)
+    return () => window.clearInterval(clockTimer)
+  }, [])
+
+  useEffect(() => {
+    const relayTimer = window.setInterval(() => void refreshRelay(), 15000)
+    return () => window.clearInterval(relayTimer)
+  }, [refreshRelay])
+
+  useEffect(() => () => cleanupStream.current?.(), [])
+
+  useEffect(() => {
+    if (!relayGuideOpen) return
+    void refreshRelay()
+    const guideTimer = window.setInterval(() => void refreshRelay(), 3000)
+    return () => window.clearInterval(guideTimer)
+  }, [relayGuideOpen, refreshRelay])
+
+  useEffect(() => {
+    const tabs = Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)
+    const siteReady = Boolean(relay?.running && relay?.cdpReady && tabs > 0 && Number(relay?.xiaohongshuTabs || 0) > 0)
+    if (!loading && relay && !siteReady && !relayGuideAutoOpened.current) {
+      relayGuideAutoOpened.current = true
+      setRelayGuideOpen(true)
+    }
+  }, [loading, relay])
 
   useEffect(() => {
     Promise.all([api.aiProviders(), api.profiles(), api.localModels().catch(() => null)]).then(([options, saved, localStatus]) => {
-      setProviders(options)
+      const expandedOptions = localStatus ? options.map((item) => item.id === 'local_qwen'
+        ? { ...item, models: [...new Set([...item.models, ...localStatus.installedModels.map((model) => model.name)])] }
+        : item) : options
+      setProviders(expandedOptions)
       setProfiles(saved)
       if (localStatus) {
         setLocalModelStatus(localStatus)
@@ -1037,10 +1228,10 @@ function App() {
         const installedRecommended = localStatus.catalog.find((item) => item.recommended && item.installed)
         setLocalModelChoice(installedRecommended?.id || recommended?.id || localStatus.catalog[0]?.id || 'qwen3.5:4b')
       }
-      const codex = options.find((item) => item.id === 'codex')
-      const localProvider = options.find((item) => item.id === 'local_qwen')
+      const codex = expandedOptions.find((item) => item.id === 'codex')
+      const localProvider = expandedOptions.find((item) => item.id === 'local_qwen')
       const preferredProvider = codex?.configured && codex.hasApiKey ? codex : localProvider || codex || options[0]
-      if (preferredProvider) selectProvider(preferredProvider.id, options)
+      if (preferredProvider) selectProvider(preferredProvider.id, expandedOptions)
       if (codex?.configured && codex.hasApiKey) {
         void api.createAiSession({
           provider: codex.id,
@@ -1064,7 +1255,12 @@ function App() {
     let cancelled = false
     const refresh = () => {
       void api.localModels().then((status) => {
-        if (!cancelled) setLocalModelStatus(status)
+        if (!cancelled) {
+          setLocalModelStatus(status)
+          setProviders((current) => current.map((item) => item.id === 'local_qwen'
+            ? { ...item, models: [...new Set([...item.models, ...status.installedModels.map((model) => model.name)])] }
+            : item))
+        }
       }).catch((error) => {
         if (!cancelled) setNotice((error as Error).message)
       })
@@ -1081,6 +1277,7 @@ function App() {
     if (!install || !['completed', 'failed'].includes(install.status) || handledLocalInstall.current === install.id) return
     handledLocalInstall.current = install.id
     if (install.status === 'completed') {
+      setLocalModelChoice(install.modelId)
       setNotice(install.message)
       void activateLocalAi(install.modelId)
     } else {
@@ -1111,7 +1308,7 @@ function App() {
     }
     api.artifacts(activeJob.id).then(setArtifacts).catch(() => setArtifacts(activeJob.artifacts || []))
     void loadResults(activeJob.id, 0)
-  }, [activeJob?.id, activeJob?.status, loadResults])
+  }, [activeJob?.id, activeJob?.status, activeJob?.applicationCount, loadResults])
 
   useEffect(() => {
     if (!activeJob || activeJob.coverage || activeJob.workflowSummary || coverage) return
@@ -1137,7 +1334,10 @@ function App() {
     }
     if (event.artifacts) setArtifacts(event.artifacts)
     if (event.message && event.type === 'error') setNotice(event.message)
-    if (event.type === 'done' || event.job?.status === 'completed' || event.job?.status === 'failed') void loadJobs()
+    if (
+      event.type === 'done'
+      || ['completed', 'failed', 'cancelled', 'interrupted'].includes(event.job?.status || '')
+    ) void loadJobs()
   }, [loadJobs])
 
   const connectJob = useCallback((job: Job) => {
@@ -1146,6 +1346,15 @@ function App() {
       window.setTimeout(() => void loadJobs(), 800)
     })
   }, [applyEvent, loadJobs])
+
+  useEffect(() => {
+    if (!activeJob || !['queued', 'running'].includes(activeJob.status)) return
+    connectJob(activeJob)
+    return () => {
+      cleanupStream.current?.()
+      cleanupStream.current = null
+    }
+  }, [activeJob?.id, activeJob?.status, connectJob])
 
   const runJob = async (payload: JobRequest) => {
     setSubmitting(true)
@@ -1195,19 +1404,125 @@ function App() {
     }
   }
 
+  const resumeJob = async (job: Job) => {
+    if (!job.resumeAvailable) return
+    if (!aiSession) {
+      setNotice('请先连接 AI，再从检查点续跑任务。')
+      document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth' })
+      return
+    }
+    const source = job.config
+    if (!source) {
+      setNotice('该任务缺少原始配置，无法构造续跑请求。')
+      return
+    }
+    const profileId = source.profileId || request.profileId
+    if (!profileId) {
+      setNotice('请先选择背景记忆，再从检查点续跑。')
+      return
+    }
+    const payload: JobRequest = {
+      ...defaultRequest,
+      ...source,
+      mode: 'resume',
+      resumeFromJobId: job.id,
+      checkOnly: false,
+      aiSessionId: aiSession.id,
+      profileId,
+      candidateProfile: {
+        ...defaultCandidateProfile,
+        ...(source.candidateProfile || request.candidateProfile),
+      },
+    }
+    await runJob(payload)
+  }
+
+  const completeMissingResults = async () => {
+    if (!activeJob) return
+    if (draftDirty) {
+      setNotice('当前岗位有未保存的文案修改，请先保存后再补全。')
+      return
+    }
+    if (!results?.filters.stats.incomplete) {
+      setNotice('当前筛选范围内没有需要补全的岗位。')
+      return
+    }
+    if (!activeJob.resumeAvailable) {
+      setNotice('当前任务没有可用采集检查点，请重新运行一次智能采集。')
+      return
+    }
+    await resumeJob(activeJob)
+  }
+
   const selectJob = (job: Job) => {
     setActiveJob(job)
     setLogs([])
     if (job.status === 'running' || job.status === 'queued') connectJob(job)
   }
 
-  const relayReady = Boolean(relay?.running && relay?.cdpReady && (Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)) > 0)
-  const relaySiteReady = relayReady && Number(relay?.xiaohongshuTabs || 0) > 0
+  const tabCount = Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)
+  const xiaohongshuTabCount = Number(relay?.xiaohongshuTabs || 0)
+  const relayConfigValid = Number.isInteger(relayConfig.port) && relayConfig.port >= 1024 && relayConfig.port <= 65535 && Boolean(relayConfig.profile.trim())
+  const relayStatusMatchesConfig = relay?.port === relayConfig.port
+  const relayServiceReady = Boolean(relayStatusMatchesConfig && relay?.running && relay?.cdpReady)
+  const relayReady = relayServiceReady && tabCount > 0
+  const relaySiteReady = relayReady && xiaohongshuTabCount > 0
+  const relayGuideTitle = relaySiteReady
+    ? 'Relay 已连通，目标页已打开'
+    : relayServiceReady
+      ? 'Relay 服务已启动，继续打开目标页'
+      : '从这里完成 Relay 手动连接'
+  const relayGuideDescription = relaySiteReady
+    ? `端口 ${relayConfig.port} 正常，已发现 ${xiaohongshuTabCount} 个小红书标签页。`
+    : relayServiceReady
+      ? `端口 ${relayConfig.port} 已响应；下一步在托管浏览器中打开小红书并完成登录。`
+      : `已有 Relay 可填写实际端口；首次使用可保留 ${defaultRelayConfig.port} / ${defaultRelayConfig.profile}。`
+  const relayGuideSteps = [
+    {
+      label: '连接参数',
+      detail: relayConfigValid ? `${relayConfig.port} · ${relayConfig.profile}` : '检查端口和 Profile',
+      state: relayConfigValid ? 'done' : 'current',
+    },
+    {
+      label: 'Relay 服务',
+      detail: relayServiceReady ? 'CDP 端口响应正常' : '等待启动或接入',
+      state: relayServiceReady ? 'done' : relayConfigValid ? 'current' : 'waiting',
+    },
+    {
+      label: '浏览器标签页',
+      detail: relayReady ? `已接入 ${tabCount} 个标签页` : '等待浏览器连接',
+      state: relayReady ? 'done' : relayServiceReady ? 'current' : 'waiting',
+    },
+    {
+      label: '目标页面',
+      detail: relaySiteReady ? `已发现 ${xiaohongshuTabCount} 个小红书页面` : '打开页面并在浏览器内登录',
+      state: relaySiteReady ? 'done' : relayReady ? 'current' : 'waiting',
+    },
+  ]
   const progress = activeJob?.progress ?? (activeJob ? progressByStatus[activeJob.status] : 0)
+  const progressCurrent = Number(activeJob?.progressCurrent || 0)
+  const progressTotal = Number(activeJob?.progressTotal || 0)
+  const discoveredCount = Number(activeJob?.discoveredCount || 0)
+  const scrapedCount = Number(activeJob?.scrapedCount || 0)
+  const remainingCount = Math.max(0, discoveredCount - scrapedCount)
+  const progressLabel = activeJob?.progressLabel || (({
+    queued: '任务已排队，等待启动',
+    running: '正在等待下一条实时进度',
+    completed: '任务已完成',
+    interrupted: '未完成：任务已中断，检查点已保留',
+    failed: '执行失败：请查看失败原因',
+    cancelled: '未完成：任务已取消',
+  } as Record<string, string>)[activeJob?.status || ''] ?? '尚未开始')
+  const progressAge = progressUpdateAge(activeJob?.progressUpdatedAt, clock)
   const runningCount = jobs.filter((job) => job.status === 'running' || job.status === 'queued').length
   const completedCount = jobs.filter((job) => job.status === 'completed').length
   const failedCount = jobs.filter((job) => job.status === 'failed').length
-  const tabCount = Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)
+  const incompleteCount = jobs.filter((job) => job.status === 'cancelled' || job.status === 'interrupted').length
+  const activeOutcome = activeJob?.status === 'failed'
+    ? 'failed'
+    : activeJob?.status === 'cancelled' || activeJob?.status === 'interrupted'
+      ? 'incomplete'
+      : activeJob?.status || 'idle'
   const currentArtifacts = artifacts.length ? artifacts : activeJob?.artifacts || []
   const exportCount = useMemo(() => jobs.reduce((sum, job) => sum + (job.artifactCount ?? job.artifacts?.length ?? 0), 0), [jobs])
   const allMode = request.limit === 0
@@ -1221,11 +1536,24 @@ function App() {
   const workflowSummary = activeJob?.workflowSummary || {}
   const partialAnalysis = workflowSummary.analysisMode === 'security_timeout_partial'
   const securityVerification = (workflowSummary.securityVerification || {}) as Record<string, unknown>
-  const securityTimeoutSeconds = Number(securityVerification.timeoutSeconds || activeJob?.config?.securityVerificationTimeoutSeconds || 600)
+  const securityStatus = activeJob?.securityRestriction?.status || String(securityVerification.status || '')
+  const securityWaiting = securityStatus === 'waiting'
+  const securityTimedOut = securityStatus === 'timed_out' || (
+    partialAnalysis
+    && (workflowSummary.collectionStopReason === 'security_verification_timeout' || securityVerification.status === 'timed_out')
+  )
+  const securityNeedsAttention = securityWaiting || securityTimedOut
+  const securityTimeoutSeconds = Number(activeJob?.securityRestriction?.timeoutSeconds || securityVerification.timeoutSeconds || activeJob?.config?.securityVerificationTimeoutSeconds || 600)
   const securityTimeoutLabel = securityTimeoutSeconds % 60 === 0 ? `${securityTimeoutSeconds / 60} 分钟` : `${securityTimeoutSeconds} 秒`
   const codexRuntime = results?.codexRuntime || (workflowSummary.codexRuntime as Record<string, unknown> | undefined)
   const selectedProvider = providers.find((item) => item.id === providerId)
   const selectedLocalModel = localModelStatus?.catalog.find((item) => item.id === localModelChoice)
+  const localModelGroups = (localModelStatus?.catalog || []).reduce<Array<{ family: string; models: LocalModelStatus['catalog'] }>>((groups, model) => {
+    const group = groups.find((item) => item.family === model.family)
+    if (group) group.models.push(model)
+    else groups.push({ family: model.family, models: [model] })
+    return groups
+  }, [])
   const localInstallActive = Boolean(localModelStatus?.install && ['queued', 'running'].includes(localModelStatus.install.status))
   const activeProfile = profiles.find((item) => item.id === request.profileId)
   const candidateReady = [
@@ -1245,6 +1573,20 @@ function App() {
   const selectedDeliveryRoutes = selectedResult ? deliveryRoutes(selectedResult) : []
   const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email')
   const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message')
+  const selectedResultIncomplete = Boolean(
+    selectedResult
+    && (!selectedResult.body.trim()
+      || selectedResult.job_card?.parse_basis === 'search_card'
+      || selectedResult.outreach.runtime_status.startsWith('fallback_missing')),
+  )
+  const openImagePreview = useCallback((title: string, images: PreviewImage[], index = 0) => {
+    if (!images.length) return
+    setImagePreview({ title, images, index: Math.min(Math.max(index, 0), images.length - 1) })
+  }, [])
+  const changePreviewImage = useCallback((index: number) => {
+    setImagePreview((current) => current ? { ...current, index } : current)
+  }, [])
+  const closeImagePreview = useCallback(() => setImagePreview(null), [])
   const replaceResult = (next: ApplicationResult) => {
     setSelectedResult(next)
     setResults((current) => current ? { ...current, items: current.items.map((item) => item.note_id === next.note_id ? next : item) } : current)
@@ -1317,8 +1659,8 @@ function App() {
     { label: '正文尝试', value: coverage?.bodyAttempted, icon: FileText },
     { label: '正文成功', value: coverage?.bodySucceeded, icon: Check },
     { label: '时间归一化', value: coverage?.timesNormalized, icon: CalendarClock },
-    { label: '投递信息分析', value: coverage?.applicationInfo, icon: UserRoundSearch },
-    { label: '定制文案', value: coverage?.draftsGenerated, icon: Mail },
+    { label: '岗位卡', value: coverage?.applicationInfo, icon: UserRoundSearch },
+    { label: '投递语', value: coverage?.draftsGenerated, icon: Mail },
     { label: '质量通过', value: coverage?.qualityPassed, icon: ShieldCheck },
   ]
 
@@ -1382,8 +1724,9 @@ function App() {
               <strong>{runningCount ? `${runningCount} 个任务正在推进` : '工作台已待命'}</strong>
             </div>
             <div className="metric"><span>成功任务</span><strong>{completedCount}</strong><small>当前历史</small></div>
+            <div className="metric"><span>未完成任务</span><strong className={incompleteCount ? 'warning-text' : ''}>{incompleteCount}</strong><small>中断或主动取消</small></div>
+            <div className="metric"><span>失败任务</span><strong className={failedCount ? 'danger-text' : ''}>{failedCount}</strong><small>执行错误并保留原因</small></div>
             <div className="metric"><span>导出文件</span><strong>{exportCount}</strong><small>JSON / CSV / XLSX / MD</small></div>
-            <div className="metric"><span>失败任务</span><strong className={failedCount ? 'danger-text' : ''}>{failedCount}</strong><small>保留失败原因</small></div>
             <div className="health-stamp">
               <Activity size={18} />
               <span><strong>{health?.ok ? '本地服务正常' : loading ? '正在检查服务' : '服务未响应'}</strong><small>{health?.runnerAvailable === false ? 'Runner 路径待配置' : 'Runner 已纳入受控执行'}</small></span>
@@ -1393,22 +1736,53 @@ function App() {
           <section className="panel relay-config-panel" id="relay-config" aria-label="Relay 配置">
             <div className="panel-heading compact">
               <div><span className="step-label">RELAY CONFIGURATION</span><h2>Relay 配置</h2></div>
-              <span className={`runtime-badge ${relaySiteReady ? 'passed' : ''}`}>{relaySiteReady ? '登录已就绪' : relayReady ? '服务已启动' : '待配置'}</span>
+              <div className="relay-heading-actions">
+                <span className={`runtime-badge ${relaySiteReady ? 'passed' : ''}`}>{relaySiteReady ? '目标页已打开' : relayServiceReady ? '服务已启动' : '待连接'}</span>
+                <button type="button" className="relay-guide-toggle" aria-expanded={relayGuideOpen} aria-controls="relay-manual-guide" onClick={() => setRelayGuideOpen((open) => !open)}>
+                  <BookOpenCheck size={15} />{relayGuideOpen ? '收起向导' : '手动连接向导'}<ChevronDown className={relayGuideOpen ? 'expanded' : ''} size={14} />
+                </button>
+              </div>
             </div>
             <div className="relay-config-body">
+              <div className={`relay-guide-summary ${relaySiteReady ? 'ready' : relayServiceReady ? 'active' : ''}`}>
+                <span className="relay-guide-icon">{relaySiteReady ? <Check size={18} /> : relayConnecting || relaySettingUp || relayLoginOpening ? <LoaderCircle className="spin" size={18} /> : <Wifi size={18} />}</span>
+                <span><small>MANUAL CONNECTION</small><strong>{relayGuideTitle}</strong><p>{relayGuideDescription}</p></span>
+                <b>{relaySiteReady ? '4 / 4' : relayReady ? '3 / 4' : relayServiceReady ? '2 / 4' : relayConfigValid ? '1 / 4' : '0 / 4'}</b>
+              </div>
               <div className="form-row relay-config-fields">
                 <label className="field"><span>Relay 端口</span><input type="number" min="1024" max="65535" value={relayConfig.port} onChange={(event) => updateRelayConfig('port', Number(event.target.value))} /></label>
                 <label className="field"><span>浏览器 Profile</span><input value={relayConfig.profile} onChange={(event) => updateRelayConfig('profile', event.target.value)} placeholder="chrome" /></label>
                 <Toggle checked={relayConfig.autoConnect} onChange={(value) => updateRelayConfig('autoConnect', value)} label="开机自动连接" description="启动脚本读取此配置并通过代码连接" />
               </div>
-              <div className="relay-config-footer">
+              {relayGuideOpen && <div className="relay-manual-guide" id="relay-manual-guide">
+                <ol className="relay-guide-steps" aria-label="Relay 手动连接进度">
+                  {relayGuideSteps.map((step, index) => <li className={step.state} key={step.label}>
+                    <i>{step.state === 'done' ? <Check size={14} /> : index + 1}</i>
+                    <span><strong>{step.label}</strong><small>{step.detail}</small></span>
+                  </li>)}
+                </ol>
+                <div className="relay-guide-actionbar">
+                  <span className="relay-guide-diagnostic">
+                    <Wifi size={17} />
+                    <span><strong>{relaySiteReady ? '连接链路正常' : relayServiceReady ? 'Relay 已响应，等待目标页' : `端口 ${relayConfig.port} 暂未连通`}</strong><small>{relay?.checkedAt ? `最近检测 ${formatTime(relay.checkedAt)}` : '正在等待首次检测'}{relay?.message && !relayServiceReady ? ` · ${relay.message}` : ''}</small></span>
+                  </span>
+                  <div className="relay-guide-actions">
+                    <button type="button" className="secondary-button" disabled={relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void connectRelay(true, relayConfig)}>{relayConnecting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}检测连接</button>
+                    {!relayServiceReady && <button type="button" className="primary-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并启动 Relay</button>}
+                    {relayServiceReady && <button type="button" className="primary-button" disabled={relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void openRelayLogin()}>{relayLoginOpening ? <LoaderCircle className="spin" size={16} /> : <ExternalLink size={16} />}{relaySiteReady ? '再开一个目标页' : '打开小红书登录页'}</button>}
+                    <button type="button" className="secondary-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void setupAndConnectRelay()}>{relaySettingUp ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{relaySettingUp ? '正在准备环境' : '自动准备本机环境'}</button>
+                  </div>
+                </div>
+                <p className="relay-login-note"><CircleAlert size={14} />Relay 只能确认目标页面已经打开；账号是否登录，请以托管浏览器中的页面为准。登录完成后本页会自动检测连接，无需刷新。</p>
+              </div>}
+              {!relayGuideOpen && <div className="relay-config-footer">
                 <span className="field-help">端口和 Profile 会同时用于状态探测、连接按钮和新任务。</span>
                 <div className="relay-config-actions">
-                  <button type="button" className="secondary-button" disabled={relayConnecting || relaySettingUp} onClick={() => void openRelayLogin()}><ExternalLink size={16} />打开登录页</button>
-                  <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting || relaySettingUp} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
-                  <button type="button" className="primary-button relay-install-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp} onClick={() => void setupAndConnectRelay()}>{relaySettingUp ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{relaySettingUp ? '正在安装并接入' : '一键安装并接入'}</button>
+                  <button type="button" className="secondary-button" disabled={relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void openRelayLogin()}>{relayLoginOpening ? <LoaderCircle className="spin" size={16} /> : <ExternalLink size={16} />}打开登录页</button>
+                  <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
+                  <button type="button" className="primary-button relay-install-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void setupAndConnectRelay()}>{relaySettingUp ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{relaySettingUp ? '正在安装并接入' : '一键安装并接入'}</button>
                 </div>
-              </div>
+              </div>}
             </div>
           </section>
 
@@ -1485,7 +1859,7 @@ function App() {
             </div>
           </section>
 
-          <section className="panel ai-setup-panel" aria-label="AI 与背景记忆">
+          <section id="ai-memory" className="panel ai-setup-panel" aria-label="AI 与背景记忆">
             <div className="panel-heading compact">
               <div><span className="step-label">AI & MEMORY</span><h2>模型连接与个人背景记忆</h2></div>
               <span className={`runtime-badge ${aiSession && activeProfile ? 'passed' : ''}`}>{aiSession && activeProfile ? '执行条件已就绪' : '等待配置'}</span>
@@ -1496,16 +1870,17 @@ function App() {
                 <div className={`local-model-offer ${selectedProvider?.local ? 'active' : ''}`}>
                   <div className="local-model-copy">
                     <Cpu size={18} />
-                    <span><strong>内置 Qwen3.5 免费整理</strong><small>{localModelStatus?.runtime.ready ? `本地运行器${localModelStatus.runtime.version ? ` v${localModelStatus.runtime.version}` : ''} · 已就绪 · 文本不离开电脑` : '安装后在本机处理职位与简历文本，不产生 API 费用'}</small></span>
+                    <span><strong>本地免费模型库</strong><small>{localModelStatus?.runtime.ready ? `${localModelStatus.catalog.length} 款可选 · 运行器${localModelStatus.runtime.version ? ` v${localModelStatus.runtime.version}` : ''} · 文本不离开电脑` : '覆盖中文、双语与推理模型，安装后不产生 API 费用'}</small></span>
                     <span className={`local-runtime-state ${localModelStatus?.runtime.ready ? 'ready' : ''}`}>{localModelStatus?.runtime.ready ? '运行器在线' : '等待运行器'}</span>
                   </div>
                   <div className="local-model-actions">
-                    <label><span className="sr-only">本地模型版本</span><select value={localModelChoice} disabled={localInstallActive} onChange={(event) => setLocalModelChoice(event.target.value)}>{(localModelStatus?.catalog || []).map((item) => <option key={item.id} value={item.id}>{item.label}{item.recommended ? ' · 推荐' : ''} · {formatBytes(item.downloadBytes)}</option>)}</select></label>
+                    <label><span className="sr-only">本地模型版本</span><select value={localModelChoice} disabled={localInstallActive} onChange={(event) => setLocalModelChoice(event.target.value)}>{localModelGroups.map((group) => <optgroup key={group.family} label={`${group.family} · ${group.models.length} 款`}>{group.models.map((item) => <option key={item.id} value={item.id}>{item.label} · {item.tier}{item.recommended ? ' · 推荐' : ''}{item.installed ? ' · 已安装' : ''} · 约 {formatBytes(item.downloadBytes)}</option>)}</optgroup>)}</select></label>
                     {localModelStatus?.runtime.ready
-                      ? <button type="button" className="secondary-button" disabled={startingLocalInstall || activatingLocalAi || localInstallActive || !selectedLocalModel} onClick={() => void installLocalModel()}>{startingLocalInstall || activatingLocalAi || localInstallActive ? <LoaderCircle className="spin" size={15} /> : selectedLocalModel?.installed ? <Play size={15} fill="currentColor" /> : <Download size={15} />}{selectedLocalModel?.installed ? '启用模型' : `一键安装${selectedLocalModel ? ` · ${formatBytes(selectedLocalModel.downloadBytes)}` : ''}`}</button>
+                      ? <button type="button" className="secondary-button" disabled={startingLocalInstall || activatingLocalAi || localInstallActive || !selectedLocalModel} onClick={() => void installLocalModel()}>{startingLocalInstall || activatingLocalAi || localInstallActive ? <LoaderCircle className="spin" size={15} /> : selectedLocalModel?.installed ? <Play size={15} fill="currentColor" /> : <Download size={15} />}{selectedLocalModel?.installed ? '启用模型' : `一键安装${selectedLocalModel?.downloadBytes ? ` · ${formatBytes(selectedLocalModel.downloadBytes)}` : ''}`}</button>
                       : <a className="secondary-button local-runtime-link" href="https://ollama.com/download" target="_blank" rel="noreferrer"><Download size={15} />安装本地运行器</a>}
                   </div>
-                  {selectedLocalModel && !localInstallActive && <p className="local-model-description">{selectedLocalModel.description}{selectedLocalModel.installed ? ' · 已安装' : ''}</p>}
+                  {localModelStatus?.runtime.ready && <div className="local-model-expand"><label><span>扩展模型</span><input value={localCustomModelId} disabled={localInstallActive} onChange={(event) => setLocalCustomModelId(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void installLocalModel(localCustomModelId) } }} placeholder="Ollama 模型 ID，如 qwen3-vl:4b" spellCheck={false} /></label><button type="button" className="secondary-button" disabled={startingLocalInstall || activatingLocalAi || localInstallActive || !localCustomModelId.trim()} onClick={() => void installLocalModel(localCustomModelId)}><Download size={15} />安装扩展</button></div>}
+                  {selectedLocalModel && !localInstallActive && <div className="local-model-detail"><p className="local-model-description">{selectedLocalModel.description}{selectedLocalModel.installed ? ' · 已安装' : ''}</p><div className="local-model-meta"><span>{selectedLocalModel.family}</span><span>{selectedLocalModel.tier}</span>{selectedLocalModel.downloadBytes > 0 && <span>约 {formatBytes(selectedLocalModel.downloadBytes)}</span>}</div></div>}
                   {localModelStatus?.install && localInstallActive && <div className="local-install-progress" role="status" aria-live="polite"><div><span>{localModelStatus.install.message}</span><strong>{localModelStatus.install.progress}%</strong></div><progress max="100" value={localModelStatus.install.progress} /></div>}
                 </div>
                 {selectedProvider?.relay && <div className={`ai-relay-status ${aiConnectionCheck?.status || 'idle'}`}>
@@ -1594,12 +1969,22 @@ function App() {
                   <label className="field"><span>Relay 端口</span><input type="number" min="1024" max="65535" value={request.relayPort} onChange={(event) => updateRequest('relayPort', Number(event.target.value))} /></label>
                 </div>
 
-                <div className="field mode-field">
-                  <span>执行模式</span>
-                  <div className="segmented">
-                    <button type="button" className={request.mode === 'resume' ? 'selected' : ''} onClick={() => updateRequest('mode', 'resume')}><RotateCcw size={15} />断点续采</button>
-                    <button type="button" className={request.mode === 'fresh' ? 'selected' : ''} onClick={() => updateRequest('mode', 'fresh')}><Play size={15} />全新任务</button>
+                <div className="field sort-policy-field">
+                  <span>搜索排序</span>
+                  <div className="segmented sort-segmented" role="group" aria-label="小红书搜索排序">
+                    <button type="button" className={request.searchSort === 'latest' ? 'selected' : ''} aria-pressed={request.searchSort === 'latest'} onClick={() => updateRequest('searchSort', 'latest')}><Clock3 size={15} />最新发布</button>
+                    <button type="button" className={request.searchSort === 'comprehensive' ? 'selected' : ''} aria-pressed={request.searchSort === 'comprehensive'} onClick={() => updateRequest('searchSort', 'comprehensive')}><ListFilter size={15} />综合推荐</button>
                   </div>
+                  <div className={`sort-policy ${request.searchSort === 'latest' ? 'latest' : 'comprehensive'}`}><Clock3 size={17} /><span><strong>{request.searchSort === 'latest' ? '任务启动后点击小红书“最新”' : '使用小红书综合排序'}</strong><small>{request.searchSort === 'latest' ? '自动打开“筛选”，点击“最新”并校验选中状态后才开始抓取' : '保留平台默认推荐顺序，不执行“最新”筛选'}</small></span><em>{request.searchSort === 'latest' ? '强制校验' : '平台默认'}</em></div>
+                  <small className="field-help">选择“最新发布”后，页面未确认选中状态时任务会停止并保留原因，不会静默按综合排序抓取。</small>
+                </div>
+
+                <div className="field recency-field">
+                  <span>帖子时间范围</span>
+                  <div className="segmented recency-segmented" role="group" aria-label="帖子时间范围">
+                    {[7, 30, 90, 0].map((days) => <button type="button" key={days} className={request.maxAgeDays === days ? 'selected' : ''} aria-pressed={request.maxAgeDays === days} onClick={() => updateRequest('maxAgeDays', days)}>{days ? `近 ${days} 天` : '不限时间'}</button>)}
+                  </div>
+                  <small className="field-help">默认仅保留近 30 天帖子；发布时间无法识别的帖子会保留，避免漏掉有效岗位。</small>
                 </div>
 
                 <div className="field mode-field pacing-mode-field">
@@ -1670,8 +2055,50 @@ function App() {
               {activeJob ? (
                 <>
                   <div className="mission-title"><span>关键词</span><strong>{activeJob.keyword}</strong><small>#{activeJob.id.slice(0, 8)}</small></div>
-                  <div className="scope-stamp"><Target size={15} /><span><strong>{activeAllMode ? '全量模式' : `最多 ${activeJob.config?.limit ?? '-'} 篇`}</strong><small>{activeAllMode ? `连续 ${activeJob.config?.stableRounds ?? '-'} 轮稳定后停止` : '达到数量上限后停止'}</small></span></div>
-                  <div className="progress-block"><div><span>总体进度</span><strong>{Math.round(progress)}%</strong></div><div className="progress-track"><i style={{ width: `${Math.min(100, progress)}%` }} /></div></div>
+                  <div className="scope-stamp"><Target size={15} /><span><strong>{activeAllMode ? '全量模式' : `最多 ${activeJob.config?.limit ?? '-'} 篇`}</strong><small>{activeAllMode ? `最新优先 · 连续 ${activeJob.config?.stableRounds ?? '-'} 轮稳定后停止` : '最新优先 · 达到数量上限后停止'}</small></span></div>
+                  <div className={`progress-block outcome-${activeOutcome}`} aria-live="polite">
+                    <div className="progress-heading">
+                      <span className={activeJob.status === 'running' ? 'live-progress-title active' : 'live-progress-title'}><i />实时进度<small>{progressAge}</small></span>
+                      <strong>{Math.round(progress)}%</strong>
+                    </div>
+                    <div className="progress-track"><i style={{ width: `${Math.min(100, progress)}%` }} /></div>
+                    <div className="live-progress-status">
+                      <Activity size={16} />
+                      <span><b>{progressLabel}</b><small>{activeJob.status === 'running' ? 'SSE 实时推送中' : activeOutcome === 'failed' ? '错误终止 · 查看失败原因' : activeOutcome === 'incomplete' ? '流程未走完 · 可从检查点继续' : '任务状态快照'}</small></span>
+                      {progressTotal > 0 && <em>{Math.min(progressCurrent, progressTotal)} / {progressTotal}</em>}
+                    </div>
+                    <div className="live-progress-counts">
+                      <span><small>已发现</small><b>{discoveredCount || '-'}</b></span>
+                      <span><small>已完成正文</small><b>{scrapedCount || '-'}</b></span>
+                      <span><small>剩余正文</small><b>{discoveredCount ? remainingCount : '-'}</b></span>
+                    </div>
+                  </div>
+                  {securityNeedsAttention && (
+                    <div className={`security-recovery-panel ${securityWaiting ? 'waiting' : 'timed-out'}`} role="status">
+                      <div className="security-recovery-heading">
+                        <ShieldAlert size={20} />
+                        <span>
+                          <strong>{securityWaiting ? '等待人工完成安全验证' : '安全限制未解除，任务未完成'}</strong>
+                          <small>{securityWaiting ? '所有新增访问已暂停；在受管浏览器完成验证后，本任务会自动继续。' : `已等待 ${securityTimeoutLabel}并停止新增访问；现有岗位卡和检查点均已保留。`}</small>
+                        </span>
+                        <em>{securityWaiting ? '等待中' : '待恢复'}</em>
+                      </div>
+                      <ol className="security-recovery-steps">
+                        <li className="done"><span><Check size={13} /></span><div><strong>访问熔断</strong><small>暂停所有采集 worker，避免继续触发限制</small></div></li>
+                        <li className="current"><span>2</span><div><strong>完成页面验证</strong><small>在受管浏览器中完成登录或安全验证</small></div></li>
+                        <li className={relaySiteReady ? 'done' : ''}><span>{relaySiteReady ? <Check size={13} /> : 3}</span><div><strong>检测 Relay</strong><small>{relaySiteReady ? 'Relay 与小红书页面已连通' : '确认 Relay 和小红书页面均可访问'}</small></div></li>
+                        <li className={securityTimedOut && activeJob.resumeAvailable && relaySiteReady ? 'current' : ''}><span>4</span><div><strong>{securityWaiting ? '自动恢复' : '检查点续跑'}</strong><small>{securityWaiting ? '验证解除后从当前任务继续' : '跳过已完成正文，仅采集剩余岗位'}</small></div></li>
+                      </ol>
+                      <div className="security-recovery-actions">
+                        <button type="button" onClick={() => void openRelayLogin()} disabled={relayLoginOpening}><ExternalLink size={15} />{relayLoginOpening ? '正在打开' : '打开验证页'}</button>
+                        <button type="button" onClick={() => void checkSecurityRelay()} disabled={relayConnecting}><RefreshCw className={relayConnecting ? 'spin' : ''} size={15} />检测 Relay</button>
+                        {securityTimedOut && <button type="button" className="primary-button" onClick={() => void resumeJob(activeJob)} disabled={submitting || !activeJob.resumeAvailable || !relaySiteReady} title={!relaySiteReady ? '请先完成验证并检测到小红书页面' : !activeJob.resumeAvailable ? '等待当前任务完成并写入检查点' : '从检查点续跑'}><Play size={15} fill="currentColor" />从检查点续跑</button>}
+                      </div>
+                      <p><ShieldCheck size={14} />不自动绕过验证，不在受限状态下反复请求；恢复时沿用已保存检查点。</p>
+                    </div>
+                  )}
+                  {activeOutcome === 'failed' && <div className="task-outcome-callout failed"><CircleAlert size={18} /><span><strong>执行失败</strong><small>{activeJob.message || (activeJob.resumeAvailable ? '任务因错误终止，检查点仍可用于重试。' : '任务因错误终止，请查看运行日志定位原因。')}</small></span></div>}
+                  {activeOutcome === 'incomplete' && <div className="task-outcome-callout incomplete"><Pause size={18} /><span><strong>任务未完成</strong><small>{activeJob.status === 'interrupted' ? '运行被中断，已完成内容和检查点仍然保留。' : '任务被主动取消，已完成内容仍然保留。'}{activeJob.resumeAvailable ? ' 可从检查点续跑。' : ''}</small></span></div>}
                   <ol className="pipeline agent-pipeline">
                     {agentStages.map((stage, index) => {
                       const gateFailed = index === agentStages.length - 1 && activeJob.status === 'completed' && coverage?.gatePassed === false
@@ -1682,6 +2109,12 @@ function App() {
                   </ol>
                   <div className="mission-meta"><div><span>开始时间（北京时间）</span><strong>{formatTime(activeJob.startedAt || activeJob.createdAt)}</strong></div><div><span>运行时长</span><strong>{elapsed(activeJob)}</strong></div></div>
                   {(activeJob.status === 'running' || activeJob.status === 'queued') && <button className="cancel-button" onClick={cancel}><Pause size={16} />终止任务</button>}
+                  {activeJob.resumeAvailable && (
+                    <div className="resume-strip">
+                      <span><RotateCcw size={18} /><span><strong>{activeJob.status === 'failed' ? '失败检查点已保留' : '未完成检查点已保留'}</strong><small>已采集 {activeJob.scrapedCount ?? 0} / {activeJob.discoveredCount ?? 0} 篇，{activeJob.status === 'failed' ? '重试' : '续跑'}会跳过已完成正文。</small></span></span>
+                      <button type="button" onClick={() => void resumeJob(activeJob)} disabled={submitting}><Play size={16} fill="currentColor" />{activeJob.status === 'failed' ? '从检查点重试' : '从检查点续跑'}</button>
+                    </div>
+                  )}
                 </>
               ) : (
                 <div className="empty-state"><SquareTerminal size={32} /><strong>等待任务</strong><span>配置关键词与采集参数后启动</span></div>
@@ -1709,7 +2142,7 @@ function App() {
               <div className="coverage-grid">
                 {coverageCards.map(({ label, value, icon: Icon }) => <div className="coverage-metric" key={label}><Icon size={17} /><span>{label}</span><strong>{value ?? '-'}</strong></div>)}
               </div>
-              <p className={`coverage-note ${partialAnalysis ? 'warning' : ''}`}><ShieldCheck size={16} />{partialAnalysis ? `安全验证在 ${securityTimeoutLabel}内未解除，采集已按规则停止；当前结果来自已保存正文的整理与分析，未采集链接保留缺失状态。` : '所有已发现卡片均会尝试打开正文；失败、访问受限或缺少联系方式的记录保留状态与原因，不补造内容。'}</p>
+              <p className={`coverage-note ${securityTimedOut ? 'warning' : ''}`}><ShieldCheck size={16} />{securityTimedOut ? `安全验证在 ${securityTimeoutLabel}内未解除，采集已按规则停止；当前结果来自已保存正文的整理与分析，未采集链接保留缺失状态。` : '所有已发现卡片均会尝试打开正文；失败、访问受限或缺少联系方式的记录保留状态与原因，不补造内容。'}</p>
             </div>
           </section>
 
@@ -1718,23 +2151,54 @@ function App() {
               <div><span className="step-label">PER-LINK APPLICATION INTELLIGENCE</span><h2>逐链接岗位与投递文案</h2></div>
               <div className="result-heading-meta">
                 <span className={`runtime-badge ${codexRuntime?.status === 'completed' ? 'passed' : ''}`}>AI 质量流 · {String(codexRuntime?.status || '等待结果')}</span>
-                <span className="count-badge">{results?.total ?? 0}</span>
+                <span className="count-badge">{results?.total ?? activeJob?.applicationCount ?? 0}</span>
               </div>
             </div>
             {!results?.available ? (
-              <div className="result-empty"><UserRoundSearch size={28} /><strong>{resultsLoading ? '正在读取分析结果' : '当前任务还没有结构化分析结果'}</strong></div>
+              <div className="result-empty"><UserRoundSearch size={28} /><strong>{resultsLoading ? '正在读取分析结果' : activeJob?.status === 'running' ? '发现岗位后将自动解析到这里' : '当前任务还没有结构化分析结果'}</strong></div>
             ) : (
+              <>
+              <div className="results-control-bar">
+                <div className="result-stats" aria-label="岗位卡统计">
+                  <span><strong>{results.filters.stats.all}</strong>全部岗位</span>
+                  <span className={results.filters.stats.incomplete ? 'warning' : ''}><strong>{results.filters.stats.incomplete}</strong>信息未完整</span>
+                  <span><strong>{results.filters.stats.withImages}</strong>含图片</span>
+                  <span><strong>{results.filters.stats.unknown}</strong>日期待确认</span>
+                </div>
+                <div className="result-controls">
+                  <label><ArrowUpDown size={15} /><span>排序</span><select aria-label="岗位卡时间排序" value={resultSort} onChange={(event) => { setResultOffset(0); setResultSort(event.target.value as typeof resultSort) }}><option value="newest">最新发布优先</option><option value="oldest">最早发布优先</option></select></label>
+                  <label><CalendarClock size={15} /><span>时间</span><select aria-label="岗位卡时间筛选" value={resultTimeRange} onChange={(event) => { setResultOffset(0); setResultTimeRange(event.target.value as typeof resultTimeRange) }}><option value="all">全部时间</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option><option value="unknown">日期待确认</option></select></label>
+                  <button className="complete-missing-button" type="button" disabled={!results.filters.stats.incomplete || submitting || resultsLoading || activeJob?.status === 'running' || activeJob?.status === 'queued'} onClick={() => void completeMissingResults()} title="从检查点智能采集缺失正文并重新解析图片和岗位信息"><WandSparkles size={16} />一键智能补全</button>
+                </div>
+              </div>
               <div className="results-workspace">
                 <div className="result-index">
                   <div className="result-index-head"><span>岗位列表</span><small>{resultOffset + 1}-{Math.min(resultOffset + results.items.length, results.total)} / {results.total}</small></div>
                   <div className="result-rows">
                     {results.items.map((item) => {
                       const routeLabels = deliveryRoutes(item).map((route) => route.label)
+                      const draftState = item.delivery?.action === 'email_sent'
+                        ? '已发送'
+                        : item.cover_letter_evaluation?.passed
+                          ? '≥ 90'
+                          : item.outreach.runtime_status === 'fallback_missing_job_body'
+                            ? '信息未完整'
+                            : item.outreach.runtime_status === 'fallback_model_error'
+                              ? 'AI 失败 · 有初稿'
+                              : '待重写'
                       return (
-                        <button key={item.note_id} className={selectedResult?.note_id === item.note_id ? 'selected' : ''} onClick={() => chooseResult(item)}>
-                          <span><strong>{item.title || '未命名岗位'}</strong><small>{item.publish_time.value || '日期待核验'} · {item.cover_letter_evaluation?.score ?? '-'} 分 · {routeLabels.length ? [...new Set(routeLabels)].join(' / ') : '投递方式待确认'}</small></span>
-                          <i className={item.delivery?.action === 'email_sent' ? 'sent' : item.cover_letter_evaluation?.passed ? 'ready' : ''}>{item.delivery?.action === 'email_sent' ? '已发送' : item.cover_letter_evaluation?.passed ? '≥ 90' : '待重写'}</i>
-                        </button>
+                        <div key={item.note_id} className={`result-row ${selectedResult?.note_id === item.note_id ? 'selected' : ''}`}>
+                          <ResultCardMedia result={item} onPreview={(images, index) => openImagePreview(item.title || '未命名岗位', images, index)} />
+                          <button className="result-card-select" type="button" onClick={() => chooseResult(item)} aria-label={`查看岗位：${item.title || '未命名岗位'}`}>
+                            <span className="result-card-copy">
+                            <span className="result-card-heading">
+                              <strong>{item.title || '未命名岗位'}</strong>
+                              <i className={item.delivery?.action === 'email_sent' ? 'sent' : item.cover_letter_evaluation?.passed ? 'ready' : ''}>{draftState}</i>
+                            </span>
+                            <small>{item.publish_time.value || '日期待核验'} · {item.cover_letter_evaluation?.score ?? '-'} 分 · {routeLabels.length ? [...new Set(routeLabels)].join(' / ') : '投递方式待确认'}</small>
+                            </span>
+                          </button>
+                        </div>
                       )
                     })}
                   </div>
@@ -1746,9 +2210,24 @@ function App() {
                 {selectedResult ? (
                   <article className="result-detail">
                     <header>
-                      <div><span>{selectedResult.publish_time.value || '日期待核验'}</span><h3>{selectedResult.title || '未命名岗位'}</h3><small>采集时间 {formatTime(selectedResult.collected_at)} · 原始时间 {selectedResult.publish_time.raw || '-'}</small></div>
+                      <div><span>{selectedResult.publish_time.value || '日期待核验'} · {selectedResult.job_card?.parse_basis === 'search_card' || !selectedResult.body ? '卡片信息兜底' : '正文解析'}</span><h3>{selectedResult.title || '未命名岗位'}</h3><small>采集时间 {formatTime(selectedResult.collected_at)} · 原始时间 {selectedResult.publish_time.raw || '-'}</small></div>
                       {selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer" title="打开原链接"><ExternalLink size={17} /></a>}
                     </header>
+                    {selectedResultIncomplete && (
+                      <div className="completion-callout">
+                        <span><WandSparkles size={18} /><span><strong>该岗位信息尚未完整</strong><small>将从已保存检查点继续采集缺失正文，并重新执行图片理解、岗位卡整理和投递文案生成。</small></span></span>
+                        <button type="button" disabled={submitting || activeJob?.status === 'running' || activeJob?.status === 'queued'} onClick={() => void completeMissingResults()}>一键补全全部缺失岗位</button>
+                      </div>
+                    )}
+                    {Boolean(selectedResult.media?.images?.length) && (
+                      <section className="result-media" aria-label="岗位图片与理解结果">
+                        <div className="result-media-heading"><span><Images size={16} /><strong>采集图片</strong><small>{selectedResult.media?.images.length} 张</small></span><i>{selectedResult.media?.analysis?.source === 'vision_model' ? 'AI 已看图' : selectedResult.media?.analysis?.source === 'image_alt_text' ? '基于图片文字' : '等待图片理解'}</i></div>
+                        <div className="result-media-grid">
+                          {selectedResult.media?.images.map((image, index) => <button key={`${image.url}-${index}`} type="button" onClick={() => openImagePreview(selectedResult.title || '未命名岗位', selectedResult.media?.images || [], index)} title={image.alt || `查看第 ${index + 1} 张岗位图片`}><img src={image.url} alt={image.alt || `${selectedResult.title || '岗位'}图片 ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" /><small>{imageSourceLabel(image.source)}</small><span><Maximize2 size={13} /></span></button>)}
+                        </div>
+                        <div className="image-analysis"><strong>图片信息理解</strong><p>{selectedResult.media?.analysis?.summary || '已保存原图，当前模型尚未返回可验证的图片岗位信息。'}</p>{Boolean(selectedResult.media?.analysis?.job_signals?.length) && <ul>{selectedResult.media?.analysis?.job_signals?.map((signal, index) => <li key={`${signal}-${index}`}>{signal}</li>)}</ul>}</div>
+                      </section>
+                    )}
                     <div className="result-facts">
                       <section><h4>岗位职责</h4>{selectedResult.application_info.responsibilities.length ? <ul>{selectedResult.application_info.responsibilities.map((item, index) => <li key={index}>{item.text}</li>)}</ul> : <p>正文未识别到明确职责</p>}</section>
                       <section><h4>岗位要求</h4>{selectedResult.application_info.requirements.length ? <ul>{selectedResult.application_info.requirements.map((item, index) => <li key={index}>{item.text}</li>)}</ul> : <p>正文未识别到明确要求</p>}</section>
@@ -1758,12 +2237,12 @@ function App() {
                     </div>
                     <div className="draft-stack">
                       <div className="draft-toolbar">
-                        <div><span className="step-label">EDITABLE APPLICATION COPY</span><h4>投递文案编辑器</h4><p>AI 达标版本可直接修改；发送邮件时使用当前编辑内容。</p></div>
+                        <div><span className="step-label">EDITABLE APPLICATION COPY</span><h4>投递文案编辑器</h4><p>每个岗位均生成可编辑初稿；90 分以上方可发送，发送时使用当前内容。</p></div>
                         <button className={draftDirty ? 'dirty' : ''} disabled={draftSaving || !draftDirty} onClick={() => void saveDraft()}>{draftSaving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{draftDirty ? '保存修改' : '已保存'}</button>
                       </div>
                       <section className="draft-editor"><div><h4><MessageSquare size={15} />私信文案</h4><button title="复制私信文案" onClick={() => copyText(selectedResult.outreach.greeting)}><Copy size={15} /></button></div><textarea aria-label="私信文案" value={selectedResult.outreach.greeting} onChange={(event) => updateDraft('greeting', event.target.value)} rows={4} /><small>{selectedResult.outreach.greeting.length} 字</small></section>
                       <section className="draft-editor email-editor"><div><h4><Mail size={15} />邮件文案</h4><button title="复制投递邮件" onClick={() => copyText(`${selectedResult.outreach.email_subject}\n\n${selectedResult.outreach.email_body}`)}><Copy size={15} /></button></div><label><span>邮件主题</span><input aria-label="邮件主题" value={selectedResult.outreach.email_subject} onChange={(event) => updateDraft('email_subject', event.target.value)} /></label><label><span>邮件正文（实际发送）</span><textarea aria-label="邮件正文" value={selectedResult.outreach.email_body} onChange={(event) => updateDraft('email_body', event.target.value)} rows={7} /></label><small>{selectedResult.outreach.email_body.length} 字</small></section>
-                      <section className="draft-editor"><div><h4><FileText size={15} />专属 Cover Letter</h4><button title="复制 Cover Letter" onClick={() => copyText(selectedResult.outreach.cover_letter)}><Copy size={15} /></button></div><textarea aria-label="Cover Letter" value={selectedResult.outreach.cover_letter} onChange={(event) => updateDraft('cover_letter', event.target.value)} rows={10} /><small>{selectedResult.outreach.cover_letter.length} 字 · 当前评分基于 AI 达标版本</small></section>
+                      <section className="draft-editor"><div><h4><FileText size={15} />专属 Cover Letter</h4><button title="复制 Cover Letter" onClick={() => copyText(selectedResult.outreach.cover_letter)}><Copy size={15} /></button></div><textarea aria-label="Cover Letter" value={selectedResult.outreach.cover_letter} onChange={(event) => updateDraft('cover_letter', event.target.value)} rows={10} /><small>{selectedResult.outreach.cover_letter.length} 字 · 初稿可编辑，发送仍需通过 90 分门槛</small></section>
                     </div>
                     <div className="evaluation-panel">
                       <div><span>用人单位评分</span><strong>{selectedResult.cover_letter_evaluation?.score ?? '-'}<small>/ 100</small></strong></div>
@@ -1786,6 +2265,7 @@ function App() {
                   </article>
                 ) : <div className="result-empty"><FileText size={28} /><strong>选择一个岗位查看详情</strong></div>}
               </div>
+              </>
             )}
           </section>
 
@@ -1797,13 +2277,14 @@ function App() {
               </div>
               <div className="table-wrap">
                 <table>
-                  <thead><tr><th>状态</th><th>关键词</th><th>创建时间（北京时间）</th><th>范围</th><th>产物</th><th><ListFilter size={15} /></th></tr></thead>
+                  <thead><tr><th>状态</th><th>关键词</th><th>创建时间（北京时间）</th><th>范围</th><th>产物</th><th>操作</th></tr></thead>
                   <tbody>
-                    {jobs.length ? jobs.slice(0, 10).map((job) => (
-                      <tr key={job.id} className={activeJob?.id === job.id ? 'selected-row' : ''} onClick={() => selectJob(job)}>
-                        <td><StatusPill status={job.status} /></td><td><strong>{job.keyword}</strong><small>#{job.id.slice(0, 8)}</small></td><td>{formatTime(job.createdAt)}</td><td>{job.config?.limit === 0 ? '全量' : `最多 ${job.config?.limit ?? '-'} 篇`}</td><td>{job.artifactCount ?? job.artifacts?.length ?? 0}</td><td><button className="row-open" title="查看任务"><ChevronDown size={15} /></button></td>
+                    {jobs.length ? jobs.slice(0, 10).map((job) => {
+                      const retryFailedJob = job.status === 'failed'
+                      return <tr key={job.id} className={activeJob?.id === job.id ? 'selected-row' : ''} onClick={() => selectJob(job)}>
+                        <td><StatusPill status={job.status} /></td><td><strong>{job.keyword}</strong><small>#{job.id.slice(0, 8)}</small></td><td>{formatTime(job.createdAt)}</td><td>{job.config?.limit === 0 ? '全量' : `最多 ${job.config?.limit ?? '-'} 篇`} · {job.config?.searchSort === 'comprehensive' ? '综合' : '最新'}{Number(job.config?.maxAgeDays) > 0 ? ` · ${job.config?.maxAgeDays}天` : ''}</td><td>{job.artifactCount ?? job.artifacts?.length ?? 0}</td><td>{job.resumeAvailable ? <button className="row-resume" title={retryFailedJob ? '从检查点重试' : '从检查点续跑'} onClick={(event) => { event.stopPropagation(); void resumeJob(job) }} disabled={submitting}><RotateCcw size={14} />{retryFailedJob ? '重试' : '续跑'}</button> : <button className="row-open" title="查看任务"><ChevronDown size={15} /></button>}</td>
                       </tr>
-                    )) : <tr className="empty-row"><td colSpan={6}>{loading ? '正在读取任务记录...' : '还没有任务记录'}</td></tr>}
+                    }) : <tr className="empty-row"><td colSpan={6}>{loading ? '正在读取任务记录...' : '还没有任务记录'}</td></tr>}
                   </tbody>
                 </table>
               </div>
@@ -1824,6 +2305,7 @@ function App() {
           </div>
         </main>
       </div>
+      {imagePreview && <ImagePreview preview={imagePreview} onClose={closeImagePreview} onChange={changePreviewImage} />}
     </div>
   )
 }

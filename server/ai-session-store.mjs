@@ -1,13 +1,14 @@
 import crypto from 'node:crypto';
 import { mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
+import { LOCAL_MODEL_CATALOG } from './local-model-manager.mjs';
 
 const PROVIDERS = Object.freeze({
   local_qwen: {
-    label: '本地 Qwen3.5（免费）',
+    label: '本地免费模型库',
     baseUrl: 'http://127.0.0.1:11434/v1',
     model: 'qwen3.5:4b',
-    models: ['qwen3.5:0.8b', 'qwen3.5:2b', 'qwen3.5:4b', 'qwen3.5:9b', 'qwen3:4b'],
+    models: LOCAL_MODEL_CATALOG.map((item) => item.id),
     requiresKey: false,
     wireApi: 'chat_completions',
     bundled: true,

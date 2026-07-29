@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, OutreachDraft, RelayConfig, RelayStatus, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, OutreachDraft, RelayConfig, RelayStatus, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -54,9 +54,11 @@ export const api = {
   cancelJob: (id: string) =>
     request<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
   artifacts: (id: string) => request<Artifact[]>(`/api/jobs/${encodeURIComponent(id)}/artifacts`),
-  results: (id: string, offset = 0, limit = 50, query = '') => {
+  results: (id: string, offset = 0, limit = 50, options: ApplicationResultsQuery = {}) => {
     const params = new URLSearchParams({ offset: String(offset), limit: String(limit) })
-    if (query.trim()) params.set('query', query.trim())
+    if (options.query?.trim()) params.set('query', options.query.trim())
+    if (options.sort) params.set('sort', options.sort)
+    if (options.timeRange) params.set('timeRange', options.timeRange)
     return request<ApplicationResultsResponse>(`/api/jobs/${encodeURIComponent(id)}/results?${params}`)
   },
   setDelivery: (jobId: string, noteId: string, action: 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | 'reset') =>
@@ -81,7 +83,8 @@ export const api = {
       stream.addEventListener(name, handle as EventListener)
     }
     stream.onerror = () => {
-      stream.close()
+      // Native EventSource reconnects automatically. Keep it open and use the
+      // callback only to refresh the latest persisted snapshot while offline.
       onDisconnect()
     }
     return () => stream.close()

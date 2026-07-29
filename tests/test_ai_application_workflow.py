@@ -17,16 +17,23 @@ class FakeProvider:
 
     def __init__(self) -> None:
         self.writer_calls = 0
+        self.last_request_used_images = False
 
-    def generate_json(self, system, user, schema):
+    def generate_json(self, system, user, schema, image_urls=None):
         required = set(schema.get("required", []))
         if "role_name" in required:
+            self.last_request_used_images = bool(image_urls)
             return {
                 "role_name": "增长运营实习",
                 "responsibilities": [{"text": "分析活动数据并推动优化", "priority": 1}],
                 "requirements": [{"text": "具备数据分析和跨团队协作能力", "priority": 1}],
                 "application_routes": [{"type": "email", "value": "jobs@example.com", "channel": "email", "confidence": 100}],
                 "capabilities": [{"id": "cap-1", "capability": "数据驱动运营", "why_it_matters": "支持增长决策", "priority": 5}],
+                "image_analysis": {
+                    "status": "analyzed" if image_urls else "unavailable",
+                    "summary": "海报标注数据分析岗位" if image_urls else "",
+                    "job_signals": ["数据分析"] if image_urls else [],
+                },
             }
         if "used_evidence_ids" in required:
             self.writer_calls += 1
@@ -69,6 +76,11 @@ class FakeProvider:
             "problems": [],
             "rewrite_instructions": [],
         }
+
+
+class FailingProvider(FakeProvider):
+    def generate_json(self, system, user, schema, image_urls=None):
+        raise ValueError("invalid model output")
 
 
 class AiApplicationWorkflowTests(unittest.TestCase):
@@ -119,6 +131,30 @@ class AiApplicationWorkflowTests(unittest.TestCase):
                 self.assertIn("offset_end", item)
         self.assertTrue(payload["quality_gate"]["checks"]["all_cover_letters_score_at_least_threshold"])
 
+    def test_image_only_record_still_gets_image_enriched_job_card(self) -> None:
+        payload = {
+            "quality_gate": {"passed": True, "checks": {}, "issues": []},
+            "records": [{
+                "note_id": "image-only",
+                "title": "招聘海报",
+                "body": "",
+                "media": {
+                    "images": [{"url": "https://img.example/job.jpg", "alt": "数据分析实习", "source": "detail"}],
+                },
+            }],
+        }
+        profile = {"projects": []}
+
+        report = enrich_payload(payload, profile, threshold=90, max_attempts=1, provider=FakeProvider())
+
+        record = payload["records"][0]
+        self.assertEqual(report.processed, 1)
+        self.assertEqual(record["job_card"]["enrichment_status"], "image_enriched")
+        self.assertTrue(record["job_card"]["image_context_used"])
+        self.assertEqual(record["media"]["analysis"]["source"], "vision_model")
+        self.assertEqual(record["application_info"]["responsibilities"][0]["source_field"], "image")
+        self.assertEqual(record["outreach"]["runtime_status"], "fallback_missing_job_body")
+
     def test_failed_quality_issue_uses_exporter_check_contract(self) -> None:
         payload = {
             "quality_gate": {"passed": True, "checks": {}, "issues": []},
@@ -142,6 +178,94 @@ class AiApplicationWorkflowTests(unittest.TestCase):
             payload["quality_gate"]["issues"][-1]["check"],
             "all_cover_letters_score_at_least_threshold",
         )
+
+    def test_every_scraped_record_is_processed_even_without_application_signal(self) -> None:
+        payload = {
+            "quality_gate": {"passed": True, "checks": {}, "issues": []},
+            "records": [
+                {"title": "数据分析实习招聘", "body": "招聘数据分析实习生，请投递邮箱 jobs@example.com"},
+                {"title": "实习复盘", "body": "记录今天学习数据透视表的心得。"},
+            ],
+        }
+        profile = {
+            "projects": [{
+                "id": "project-1",
+                "title": "校园活动增长",
+                "organization": "学生团队",
+                "actions": ["开展用户调研", "复盘转化数据", "协同团队迭代方案"],
+                "results": [],
+                "skills": ["数据分析", "协作"],
+            }],
+        }
+
+        report = enrich_payload(
+            payload,
+            profile,
+            threshold=90,
+            max_attempts=3,
+            provider=FakeProvider(),
+            require_application_signal=True,
+        )
+
+        self.assertEqual(report.processed, 2)
+        self.assertEqual(report.skipped, 0)
+        self.assertEqual(payload["records"][1]["ai_triage"]["status"], "processed")
+        for record in payload["records"]:
+            self.assertEqual(record["job_card"]["status"], "generated")
+            self.assertTrue(record["quality"]["job_card_generated"])
+            self.assertTrue(record["quality"]["outreach_generated"])
+            self.assertTrue(all(record["outreach"][field] for field in ("greeting", "email_subject", "email_body", "cover_letter")))
+        self.assertEqual(payload["ai_workflow"]["generationCoveragePercent"], 100.0)
+
+    def test_progress_callback_and_per_record_model_failure_are_isolated(self) -> None:
+        payload = {
+            "quality_gate": {"passed": True, "checks": {}, "issues": []},
+            "records": [{"title": "数据分析实习招聘", "body": "招聘实习生，请投递 jobs@example.com"}],
+        }
+        events = []
+
+        report = enrich_payload(
+            payload,
+            {"projects": []},
+            provider=FailingProvider(),
+            require_application_signal=True,
+            progress_callback=lambda current, total, status, record: events.append((current, total, status)),
+        )
+
+        self.assertEqual(report.processed, 1)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(events, [(1, 1, "failed")])
+        record = payload["records"][0]
+        self.assertEqual(record["outreach"]["runtime_status"], "fallback_model_error")
+        self.assertEqual(record["job_card"]["status"], "generated")
+        self.assertTrue(record["quality"]["outreach_generated"])
+        self.assertTrue(all(record["outreach"][field] for field in ("greeting", "email_subject", "email_body", "cover_letter")))
+
+    def test_missing_body_uses_search_card_and_still_generates_copy(self) -> None:
+        payload = {
+            "quality_gate": {"passed": True, "checks": {}, "issues": []},
+            "records": [{
+                "note_id": "card-only-1",
+                "title": "数据分析实习",
+                "source_card_text": "数据分析实习，负责报表整理，每周到岗五天",
+                "body": "",
+                "access_status": "detail_timeout",
+            }],
+        }
+        provider = FakeProvider()
+
+        report = enrich_payload(payload, {"projects": []}, provider=provider)
+
+        record = payload["records"][0]
+        self.assertEqual(report.processed, 1)
+        self.assertEqual(report.skipped, 0)
+        self.assertEqual(provider.writer_calls, 0)
+        self.assertEqual(record["ai_triage"]["status"], "fallback_missing_job_body")
+        self.assertEqual(record["job_card"]["parse_basis"], "search_card")
+        self.assertTrue(record["application_info"]["responsibilities"])
+        self.assertTrue(record["quality"]["outreach_generated"])
+        self.assertEqual(payload["ai_workflow"]["jobCardsGenerated"], 1)
+        self.assertEqual(payload["ai_workflow"]["applicationCopyGenerated"], 1)
 
 
 if __name__ == "__main__":

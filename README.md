@@ -204,7 +204,7 @@ data/jobs/<JOB_ID>/artifacts/
 - 上传文件、背景记忆、任务数据和个人证据默认写入本地 Git 忽略目录。
 - API Key 只保存在服务进程内存中，默认 8 小时过期，不写入任务历史、日志、导出文件或 Git。
 - 文案只能使用简历和背景记忆中明确存在的事实，不能把不确定信息写成确定经历。
-- 遇到安全验证或采集超时，会保留检查点和失败原因，不把不完整结果标成可投递。
+- 遇到安全验证时会暂停全部新增访问并等待人工处理；解除后自动恢复，超时则熔断并保留检查点。首页提供打开验证页、检测 Relay、从检查点续跑的完整恢复入口，不把受限或不完整结果标成可投递。
 
 ## 快速开始
 
@@ -350,13 +350,13 @@ npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
 
 **本地免费模型**
 
-页面内置“本地 Qwen3.5（免费）”提供方，通过本机模型服务整理职位文本、背景资料和求职文案，不需要 API Key，也不产生按次调用费用。默认推荐 `qwen3.5:4b`，同时提供 0.8B、2B、4B、9B 四档选择。
+页面内置“本地免费模型库”提供方，通过本机模型服务整理职位文本、背景资料和求职文案，不需要 API Key，也不产生按次调用费用。默认推荐 `qwen3.5:4b`，内置 14 个可一键安装的推荐规格，并允许用户直接填写任意 Ollama 模型 ID 扩展模型库。运行器中已安装的新模型会自动出现在列表中，无需修改代码。
 
 1. 首次使用时，页面自动检测本地运行器；尚未安装时可直接打开官方安装入口。
 2. 选择适合电脑配置的模型，点击“一键安装”。页面会持续显示下载与校验进度。
-3. 安装完成后产品自动启用模型，后续无需再次配置。
+3. 推荐目录外的模型可在“扩展模型”输入 Ollama 模型 ID；安装完成后产品会自动启用。
 
-模型权重不会提交到 Git 仓库。Qwen3.5 4B 的下载体积约 3.16 GiB，产品会在用户首次选择时通过本机 Ollama 服务自动下载，避免命令行操作和 GitHub 单文件限制。模型来源可在 [Ollama Qwen3.5 模型页](https://ollama.com/library/qwen3.5) 和 [Qwen 官方仓库](https://github.com/QwenLM/Qwen3.6) 核验；推理速度取决于 CPU、GPU 和内存。
+模型权重不会提交到 Git 仓库。产品会在用户首次选择时通过本机 Ollama 服务自动下载，避免命令行操作和 GitHub 单文件限制。模型来源可在 Ollama 的 [Qwen3.5](https://ollama.com/library/qwen3.5)、[Qwen3](https://ollama.com/library/qwen3)、[Gemma 3](https://ollama.com/library/gemma3)、[Llama 3.2](https://ollama.com/library/llama3.2) 与 [DeepSeek-R1](https://ollama.com/library/deepseek-r1) 模型页核验；实际下载体积与推理速度取决于量化版本、CPU、GPU 和内存。
 
 **OpenAI 兼容中转服务**
 

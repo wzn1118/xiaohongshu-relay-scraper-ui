@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import os
 import json
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +14,40 @@ from scripts.ai_provider_runtime import AIProvider, AIProviderError
 
 
 class AiProviderRuntimeTests(unittest.TestCase):
+    def test_openai_compatible_chat_request_includes_image_parts(self) -> None:
+        provider = AIProvider(
+            provider="openai",
+            api_key="test-key",
+            base_url="https://api.example/v1",
+            model="vision-model",
+            wire_api="chat_completions",
+            timeout=30,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", return_value=Response()) as open_url:
+            result = provider.generate_json(
+                "system",
+                "user",
+                {"type": "object"},
+                image_urls=["https://img.example/job.jpg"],
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertTrue(provider.last_request_used_images)
+        payload = json.loads(open_url.call_args.args[0].data)
+        self.assertEqual(payload["messages"][-1]["content"][0]["type"], "text")
+        self.assertEqual(payload["messages"][-1]["content"][1]["image_url"]["url"], "https://img.example/job.jpg")
+
     def test_local_model_uses_native_structured_api_without_key(self) -> None:
         provider = AIProvider(
             provider="local_qwen",
@@ -44,6 +80,96 @@ class AiProviderRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["think"], False)
         self.assertEqual(payload["options"]["temperature"], 0)
         self.assertTrue(payload["messages"][-1]["content"].endswith("/no_think"))
+
+    def test_local_model_downloads_and_sends_image_bytes(self) -> None:
+        provider = AIProvider(
+            provider="local_qwen",
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3-vl:4b",
+            timeout=30,
+        )
+        image_bytes = b"fake-image-bytes"
+        requests: list[object] = []
+
+        class Response:
+            def __init__(self, body: bytes, content_type: str = "application/json") -> None:
+                self.body = body
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, *_args: object) -> bytes:
+                return self.body
+
+        def open_url(request: object, **_kwargs: object) -> Response:
+            requests.append(request)
+            if getattr(request, "method", "") == "GET":
+                return Response(image_bytes, "image/jpeg")
+            return Response(b'{"message":{"content":"{\\"summary\\":\\"vision-ready\\"}"}}')
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", side_effect=open_url):
+            result = provider.generate_json(
+                "system",
+                "user",
+                {"type": "object"},
+                image_urls=["https://img.example/job.jpg"],
+            )
+
+        self.assertEqual(result, {"summary": "vision-ready"})
+        self.assertTrue(provider.last_request_used_images)
+        self.assertEqual(len(requests), 2)
+        payload = json.loads(getattr(requests[-1], "data"))
+        self.assertEqual(payload["messages"][-1]["images"], [base64.b64encode(image_bytes).decode("ascii")])
+
+    def test_local_model_retries_without_images_when_model_is_text_only(self) -> None:
+        provider = AIProvider(
+            provider="local_qwen",
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3:4b",
+            timeout=30,
+        )
+        chat_payloads: list[dict[str, object]] = []
+
+        class Response:
+            def __init__(self, body: bytes, content_type: str = "application/json") -> None:
+                self.body = body
+                self.headers = {"Content-Type": content_type}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, *_args: object) -> bytes:
+                return self.body
+
+        def open_url(request: object, **_kwargs: object) -> Response:
+            if getattr(request, "method", "") == "GET":
+                return Response(b"fake-image-bytes", "image/webp")
+            payload = json.loads(getattr(request, "data"))
+            chat_payloads.append(payload)
+            if "images" in payload["messages"][-1]:
+                raise urllib.error.URLError("model does not support images")
+            return Response(b'{"message":{"content":"{\\"summary\\":\\"text-ready\\"}"}}')
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", side_effect=open_url):
+            result = provider.generate_json(
+                "system",
+                "user",
+                {"type": "object"},
+                image_urls=["https://img.example/job.webp"],
+            )
+
+        self.assertEqual(result, {"summary": "text-ready"})
+        self.assertFalse(provider.last_request_used_images)
+        self.assertEqual(len(chat_payloads), 2)
+        self.assertIn("images", chat_payloads[0]["messages"][-1])
+        self.assertNotIn("images", chat_payloads[1]["messages"][-1])
 
     def test_codex_uses_bundled_responses_runtime_when_relay_is_configured(self) -> None:
         provider = AIProvider(

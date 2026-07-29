@@ -34,6 +34,10 @@ def default_upstream_scraper() -> Path:
 
 DEFAULT_UPSTREAM_SCRAPER = default_upstream_scraper()
 FAILURE_STATUSES = {
+    "detail_empty",
+    "detail_login_required",
+    "detail_rate_limited",
+    "detail_security_verification",
     "detail_unavailable",
     "detail_timeout",
     "detail_playwright_error",
@@ -62,10 +66,15 @@ def record_key(record: dict[str, Any]) -> str:
 
 
 def record_is_complete(record: dict[str, Any]) -> bool:
+    detail_text = " ".join(
+        str(record.get(field) or "")
+        for field in ("note_url", "title", "body")
+    )
     return (
         bool(record_key(record))
         and bool(str(record.get("body") or "").strip())
         and str(record.get("access_status") or "").strip() == "detail_ok"
+        and not contains_security_verification(detail_text)
     )
 
 
@@ -151,12 +160,16 @@ def complete_bodies(
     complete_by_key = {record_key(record): record for record in existing if record_is_complete(record)}
     complete_by_key = {key: value for key, value in complete_by_key.items() if key in set(card_keys)}
     last_failures: dict[str, dict[str, Any]] = {}
+    attempted_keys: set[str] = set()
     upstream = None
     lock = threading.Lock()
     stop_event = threading.Event()
+    security_gate = threading.Event()
+    security_gate.set()
     successful_since_checkpoint = 0
     security_detected_at = ""
     security_status = "not_detected"
+    security_owner_id: int | None = None
     stop_reason = ""
 
     source_search_url = next(
@@ -208,7 +221,7 @@ def complete_bodies(
         return last_payload
 
     def run_worker(worker_id: int, work: queue.Queue[dict[str, Any]]) -> None:
-        nonlocal successful_since_checkpoint, security_detected_at, security_status, stop_reason
+        nonlocal successful_since_checkpoint, security_detected_at, security_status, security_owner_id, stop_reason
         try:
             from playwright.sync_api import sync_playwright
 
@@ -221,6 +234,9 @@ def complete_bodies(
                 print(f"PARALLEL_WORKER {worker_id} ready", flush=True)
                 try:
                     while True:
+                        while not security_gate.wait(timeout=0.25):
+                            if stop_event.is_set():
+                                break
                         if stop_event.is_set():
                             break
                         try:
@@ -245,13 +261,28 @@ def complete_bodies(
                             except Exception:  # noqa: BLE001
                                 pass
                             if contains_security_verification(challenge_text):
+                                owns_verification = False
                                 with lock:
-                                    if not security_detected_at:
-                                        security_detected_at = utc_now()
-                                    security_status = "waiting"
+                                    last_failures[key] = payload
+                                    if security_owner_id is None and not stop_event.is_set():
+                                        security_owner_id = worker_id
+                                        owns_verification = True
+                                        if not security_detected_at:
+                                            security_detected_at = utc_now()
+                                        security_status = "waiting"
+                                        security_gate.clear()
+                                if not owns_verification:
+                                    print(
+                                        f"SECURITY_VERIFICATION worker={worker_id} paused; verifier={security_owner_id}",
+                                        flush=True,
+                                    )
+                                    work.put(card)
+                                    work.task_done()
+                                    continue
                                 print(
                                     "SECURITY_VERIFICATION detected "
-                                    f"timeout={security_verification_timeout_seconds}s; waiting for manual completion",
+                                    f"timeout={security_verification_timeout_seconds}s; "
+                                    "new collection paused while waiting for manual completion",
                                     flush=True,
                                 )
                                 deadline = time.monotonic() + security_verification_timeout_seconds
@@ -268,6 +299,8 @@ def complete_bodies(
                                 if cleared:
                                     with lock:
                                         security_status = "cleared"
+                                        security_owner_id = None
+                                        security_gate.set()
                                     print("SECURITY_VERIFICATION cleared; resuming collection", flush=True)
                                     work.put(card)
                                     work.task_done()
@@ -275,11 +308,17 @@ def complete_bodies(
                                 with lock:
                                     security_status = "timed_out"
                                     stop_reason = "security_verification_timeout"
+                                    stop_event.set()
+                                    security_gate.set()
+                                    checkpoint(force=True)
                                 print(
-                                    "SECURITY_VERIFICATION timed_out; preserving checkpoint and continuing with the next URL/card",
+                                    "SECURITY_VERIFICATION timed_out; stopping new collection and preserving checkpoint",
                                     flush=True,
                                 )
+                                work.task_done()
+                                break
                         with lock:
+                            attempted_keys.add(key)
                             if record_is_complete(payload):
                                 complete_by_key[key] = payload
                                 last_failures.pop(key, None)
@@ -287,6 +326,14 @@ def complete_bodies(
                                 checkpoint()
                             else:
                                 last_failures[key] = payload
+                            processed_count = len(attempted_keys)
+                            complete_count = len(complete_by_key)
+                        print(
+                            "PARALLEL_PROGRESS "
+                            f"processed={processed_count} total={len(cards)} complete={complete_count} "
+                            f"status={payload.get('access_status') or 'missing_record'}",
+                            flush=True,
+                        )
                         page_uses += 1
                         if page_uses >= page_recycle_every or not record_is_complete(payload):
                             replacement = context.new_page()
@@ -360,11 +407,13 @@ def complete_bodies(
         "attempts": attempts,
         "failureStatuses": status_counts,
         "transitionedToAnalysis": stop_reason == "security_verification_timeout",
+        "newAccessStopped": stop_reason == "security_verification_timeout",
         "stopReason": stop_reason,
         "securityVerification": {
             "detectedAt": security_detected_at,
             "timeoutSeconds": security_verification_timeout_seconds,
             "status": security_status,
+            "recoveryAction": "manual_verification_then_resume" if security_status == "timed_out" else "",
         },
         "passed": not missing,
     }
@@ -385,7 +434,7 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--goto-timeout-ms", type=int, default=15000)
     parser.add_argument("--checkpoint-every", type=int, default=10)
     parser.add_argument("--page-recycle-every", type=int, default=20)
-    parser.add_argument("--security-verification-timeout-seconds", type=int, default=30)
+    parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
     parser.add_argument("--upstream-scraper", default=str(DEFAULT_UPSTREAM_SCRAPER))
     return parser.parse_args(arguments)
 

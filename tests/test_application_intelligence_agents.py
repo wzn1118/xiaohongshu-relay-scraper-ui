@@ -6,10 +6,12 @@ import io
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +34,8 @@ from run_project_workflow import (  # noqa: E402
     write_project_manifest,
 )
 from codex_runtime_outreach import CodexRuntimeOutreachAgent, _prompt  # noqa: E402
+import parallel_body_completion as body_completion  # noqa: E402
+import run_project_workflow as workflow  # noqa: E402
 from parallel_body_completion import (  # noqa: E402
     contains_security_verification,
     detail_url_candidates,
@@ -154,8 +158,17 @@ class ApplicationAgentTests(unittest.TestCase):
         result = ApplicationIntelligencePipeline(PROFILE, now=COLLECTED).run([card], [note])
         self.assertFalse(result.passed)
         self.assertEqual(result.payload["quality_gate"]["body_count"], 0)
-        self.assertFalse(result.payload["records"][0]["quality"]["body_present"])
-        self.assertEqual(result.payload["records"][0]["outreach"]["status"], "blocked_missing_job_body")
+        record = result.payload["records"][0]
+        self.assertFalse(record["quality"]["body_present"])
+        self.assertEqual(record["outreach"]["status"], "needs_review")
+        self.assertEqual(record["outreach"]["runtime_status"], "fallback_missing_job_body")
+        self.assertEqual(record["job_card"]["parse_basis"], "search_card")
+        self.assertEqual(record["job_card"]["status"], "generated")
+        self.assertTrue(record["quality"]["job_card_generated"])
+        self.assertTrue(record["quality"]["outreach_generated"])
+        self.assertTrue(all(record["outreach"][field] for field in ("greeting", "email_subject", "email_body", "cover_letter")))
+        self.assertTrue(result.payload["quality_gate"]["checks"]["all_scraped_jobs_have_job_cards"])
+        self.assertTrue(result.payload["quality_gate"]["checks"]["all_scraped_jobs_have_application_copy"])
 
     def test_codex_runtime_applies_structured_per_link_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -239,6 +252,11 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(gate["covered_discovered_count"], 1)
         self.assertFalse(gate["checks"]["all_discovered_notes_have_records"])
         self.assertFalse(gate["checks"]["all_records_have_bodies"])
+        self.assertEqual(len(result.payload["records"]), 2)
+        self.assertEqual(gate["job_cards_generated"], 2)
+        self.assertEqual(gate["application_copy_generated"], 2)
+        self.assertTrue(gate["checks"]["all_scraped_jobs_have_job_cards"])
+        self.assertTrue(gate["checks"]["all_scraped_jobs_have_application_copy"])
 
     def test_writes_all_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -300,9 +318,15 @@ class WorkflowWrapperTests(unittest.TestCase):
     def test_parallel_completion_requires_full_detail_body(self) -> None:
         complete = {"note_id": "n1", "body": "full body", "access_status": "detail_ok"}
         fallback = {"note_id": "n1", "body": "card text", "access_status": "detail_timeout"}
+        legacy_false_success = {
+            "note_id": "n1",
+            "body": "访问频繁，请稍后再试",
+            "access_status": "detail_ok",
+        }
         self.assertEqual(record_key(complete), "n1")
         self.assertTrue(record_is_complete(complete))
         self.assertFalse(record_is_complete(fallback))
+        self.assertFalse(record_is_complete(legacy_false_success))
         self.assertTrue(contains_security_verification("请完成安全验证后继续"))
         self.assertFalse(contains_security_verification("岗位详情正常展示"))
 
@@ -316,6 +340,94 @@ class WorkflowWrapperTests(unittest.TestCase):
             detail_url_candidates(card),
             ["https://example.com/explore/n1", "https://example.com/search/n1"],
         )
+
+    def test_security_timeout_stops_new_access_and_preserves_checkpoint(self) -> None:
+        class FakeLocator:
+            def inner_text(self, **_kwargs):
+                return "请完成安全验证后继续"
+
+        class FakePage:
+            def locator(self, _selector):
+                return FakeLocator()
+
+            def close(self):
+                return None
+
+        class FakeContext:
+            def new_page(self):
+                return FakePage()
+
+        class FakePlaywright:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, *_args):
+                return False
+
+        calls = []
+        context = FakeContext()
+
+        class FakeUpstream:
+            @staticmethod
+            def connect_browser(_playwright, _relay_port):
+                return object()
+
+            @staticmethod
+            def get_or_create_context(_browser):
+                return context
+
+            @staticmethod
+            def scrape_note(_page, card, **_kwargs):
+                calls.append(card["note_id"])
+                raise RuntimeError("请完成安全验证后继续")
+
+        playwright_package = types.ModuleType("playwright")
+        playwright_sync = types.ModuleType("playwright.sync_api")
+        playwright_sync.sync_playwright = FakePlaywright
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            cards = [
+                {"note_id": "n1", "note_url": "https://example.test/explore/n1"},
+                {"note_id": "n2", "note_url": "https://example.test/explore/n2"},
+            ]
+            (output / "xiaohongshu_cards_latest.json").write_text(
+                json.dumps(cards, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            monotonic_values = iter((0.0, 10.0, 20.0, 30.0))
+            original_loader = body_completion.load_upstream
+            original_monotonic = body_completion.time.monotonic
+            original_sleep = body_completion.time.sleep
+            try:
+                body_completion.load_upstream = lambda _path: FakeUpstream()
+                body_completion.time.monotonic = lambda: next(monotonic_values)
+                body_completion.time.sleep = lambda _seconds: None
+                with mock.patch.dict(
+                    sys.modules,
+                    {"playwright": playwright_package, "playwright.sync_api": playwright_sync},
+                ):
+                    summary = body_completion.complete_bodies(
+                        output,
+                        relay_port=18792,
+                        workers=2,
+                        attempts=3,
+                        security_verification_timeout_seconds=5,
+                    )
+            finally:
+                body_completion.load_upstream = original_loader
+                body_completion.time.monotonic = original_monotonic
+                body_completion.time.sleep = original_sleep
+
+            self.assertEqual(summary["stopReason"], "security_verification_timeout")
+            self.assertTrue(summary["newAccessStopped"])
+            self.assertEqual(summary["securityVerification"]["status"], "timed_out")
+            self.assertEqual(summary["securityVerification"]["recoveryAction"], "manual_verification_then_resume")
+            self.assertLessEqual(len(calls), 2)
+            self.assertEqual(
+                json.loads((output / "xiaohongshu_notes_latest.json").read_text(encoding="utf-8")),
+                [],
+            )
 
     def test_default_candidate_profile_is_project_relative(self) -> None:
         self.assertEqual(DEFAULT_CANDIDATE_PROFILE, PROJECT_ROOT / "profiles/candidate_profile.json")
@@ -361,7 +473,88 @@ class WorkflowWrapperTests(unittest.TestCase):
         self.assertGreaterEqual(summary["contactsFound"], 1)
         self.assertEqual(summary["greetingsGenerated"], 2)
         self.assertEqual(summary["emailsGenerated"], 2)
+        self.assertEqual(summary["jobCardsGenerated"], 2)
+        self.assertEqual(summary["applicationCopyGenerated"], 2)
+        self.assertEqual(summary["generationCoveragePercent"], 100.0)
+        self.assertEqual(summary["applicationInfo"], 2)
+        self.assertEqual(summary["draftsGenerated"], 2)
         self.assertEqual(len(summary["agentStages"]), 8)
+
+    def test_workflow_summary_does_not_misclassify_generic_partial_collection(self) -> None:
+        cards = [{"note_id": "n1", "title": "AI one"}]
+        result = ApplicationIntelligencePipeline(PROFILE, now=COLLECTED).run(cards, [])
+        summary = build_workflow_summary(
+            result.payload,
+            {"transitionedToAnalysis": True, "stopReason": "scrape_runner_failed"},
+        )
+
+        self.assertEqual(summary["status"], "completed_partial")
+        self.assertEqual(summary["analysisMode"], "partial_collection")
+        self.assertEqual(summary["collectionStopReason"], "scrape_runner_failed")
+        self.assertEqual(summary["securityVerification"], {})
+
+    def test_workflow_summary_marks_only_explicit_security_timeout(self) -> None:
+        cards = [{"note_id": "n1", "title": "AI one"}]
+        result = ApplicationIntelligencePipeline(PROFILE, now=COLLECTED).run(cards, [])
+        summary = build_workflow_summary(
+            result.payload,
+            {
+                "transitionedToAnalysis": True,
+                "stopReason": "security_verification_timeout",
+                "securityVerification": {"status": "timed_out", "timeoutSeconds": 90},
+            },
+        )
+
+        self.assertEqual(summary["analysisMode"], "security_timeout_partial")
+        self.assertEqual(summary["securityVerification"]["status"], "timed_out")
+
+    def test_search_security_exit_materializes_partial_results_for_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "run" / "artifacts"
+            output.mkdir(parents=True)
+            profile = Path(temporary) / "profile.json"
+            profile.write_text(json.dumps(PROFILE, ensure_ascii=False), encoding="utf-8")
+            (output / "xiaohongshu_cards_latest.json").write_text(
+                json.dumps(
+                    [{"note_id": "n1", "note_url": "https://example.test/n1", "title": "AI 岗位"}],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (output / "security-restriction.json").write_text(
+                json.dumps(
+                    {
+                        "status": "timed_out",
+                        "phase": "search_discovery",
+                        "timeoutSeconds": 600,
+                        "recoveryAction": "manual_verification_then_resume",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(workflow, "resolve_upstream_runner", return_value=Path("runner.py")):
+                with mock.patch.object(
+                    workflow.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(["runner"], 3),
+                ):
+                    return_code = workflow.main(
+                        [
+                            "--output-dir",
+                            str(output),
+                            "--candidate-profile",
+                            str(profile),
+                        ]
+                    )
+
+            summary = json.loads((output / "workflow-summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(return_code, 3)
+            self.assertEqual(summary["analysisMode"], "security_timeout_partial")
+            self.assertEqual(summary["collectionStopReason"], "security_verification_timeout")
+            self.assertEqual(summary["securityVerification"]["phase"], "search_discovery")
+            self.assertEqual(summary["jobCardsGenerated"], 1)
+            self.assertEqual(summary["applicationCopyGenerated"], 1)
 
     def test_project_manifest_hashes_every_artifact_except_itself(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -9,6 +9,7 @@
     "start": "node server/index.mjs",
     "configure:outlook": "node scripts/configure-outlook-smtp.mjs",
     "test": "node --test server/*.test.mjs tests/*.test.mjs",
+    "test:python": "python -m pytest -q",
     "test:agents": "python tests/test_application_intelligence_agents.py -v",
     "check": "npm run test && npm run build",
     "preflight": "node scripts/preflight.mjs",

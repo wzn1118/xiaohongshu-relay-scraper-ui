@@ -21,6 +21,69 @@ def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _media_values(value: Any) -> list[str]:
+    if isinstance(value, list):
+        candidates = value
+    elif isinstance(value, str):
+        candidates = re.split(r"\s*\|\s*", value)
+    else:
+        candidates = []
+    return [str(item).strip() for item in candidates if str(item).strip()]
+
+
+def _is_content_image_url(value: str) -> bool:
+    lowered = value.lower()
+    return bool(re.match(r"^https?://", value)) and not any(
+        marker in lowered for marker in ("sns-avatar", "/avatar/", "avatar_")
+    )
+
+
+def build_media(note: dict[str, Any]) -> dict[str, Any]:
+    sources = [
+        ("detail", _media_values(note.get("detail_image_urls")), _media_values(note.get("detail_image_alts"))),
+        ("card", _media_values(note.get("card_image_urls")), []),
+        ("cover", _media_values(note.get("card_cover_url")), [_text(note.get("card_cover_alt"))]),
+    ]
+    images: list[dict[str, str]] = []
+    seen: set[str] = set()
+    alt_texts: list[str] = []
+    for source, urls, alts in sources:
+        for index, url in enumerate(urls):
+            if url in seen or not _is_content_image_url(url):
+                continue
+            seen.add(url)
+            alt = alts[index] if index < len(alts) else ""
+            images.append({"url": url, "alt": alt, "source": source})
+            if alt and alt not in alt_texts:
+                alt_texts.append(alt)
+    if images and alt_texts:
+        analysis = {
+            "status": "alt_text_available",
+            "summary": " | ".join(alt_texts[:6]),
+            "job_signals": [],
+            "source": "image_alt_text",
+        }
+    elif images:
+        analysis = {
+            "status": "pending_ai",
+            "summary": "",
+            "job_signals": [],
+            "source": "image_urls",
+        }
+    else:
+        analysis = {
+            "status": "no_images",
+            "summary": "",
+            "job_signals": [],
+            "source": "none",
+        }
+    return {
+        "cover_url": _text(note.get("card_cover_url")) or (images[0]["url"] if images else ""),
+        "images": images,
+        "analysis": analysis,
+    }
+
+
 def _sheet_safe(value: Any) -> Any:
     if isinstance(value, str):
         value = ILLEGAL_SHEET_CHARACTERS.sub("", value)
@@ -261,7 +324,14 @@ class ApplicationInfoAgent:
 
         requirements: list[dict[str, Any]] = []
         responsibilities: list[dict[str, Any]] = []
-        body = _text(note.get("body"))
+        source_field = "body"
+        body = _text(note.get(source_field))
+        if not body:
+            for fallback_field in ("source_card_text", "card_text_segments", "title", "card_title"):
+                body = _text(note.get(fallback_field))
+                if body:
+                    source_field = fallback_field
+                    break
         for match in re.finditer(r"[^。！？；;\n]+[。！？；;]?", body):
             sentence = match.group(0).strip()
             lowered = sentence.lower()
@@ -269,7 +339,7 @@ class ApplicationInfoAgent:
                 continue
             item = {
                 "text": sentence,
-                "source_field": "body",
+                "source_field": source_field,
                 "evidence": sentence,
                 "offset_start": match.start(),
                 "offset_end": match.end(),
@@ -461,6 +531,31 @@ class OutreachWriterAgent:
     def __init__(self, profile: dict[str, Any]):
         self.profile = profile
         self.name = _candidate_name(profile)
+        self.application_profile = _candidate_application_profile(profile)
+
+    def _profile_sentences(self) -> list[str]:
+        profile = self.application_profile
+        sentences: list[str] = []
+        education = "".join(
+            part
+            for part in (
+                profile.get("school", ""),
+                profile.get("major", ""),
+                profile.get("degreeYear", ""),
+            )
+            if part
+        )
+        if education:
+            sentences.append(f"我目前就读于{education}。")
+        availability = profile.get("availabilityDays", "")
+        duration = profile.get("internshipDuration", "")
+        if availability and duration:
+            sentences.append(f"我每周可实习{availability}天，预计可连续实习{duration}。")
+        elif availability:
+            sentences.append(f"我每周可实习{availability}天。")
+        elif duration:
+            sentences.append(f"我预计可连续实习{duration}。")
+        return sentences
 
     def run(
         self,
@@ -475,18 +570,25 @@ class OutreachWriterAgent:
         greeting = f"{salutation}，我希望就「{title}」进一步沟通。"
         evidence_ids = [item["id"] for item in fit_evidence]
         if not fit_evidence:
+            profile_text = "".join(self._profile_sentences())
+            email_body = (
+                f"{salutation}：\n\n"
+                f"我希望申请「{title}」。{profile_text}"
+                "我愿意进一步介绍与岗位相关的学习、项目和实践经历，并配合沟通到岗安排。\n\n"
+                f"谢谢！\n{self.name}"
+            )
             return {
-                "greeting": greeting,
+                "greeting": f"{greeting}我愿意进一步说明相关经历和到岗安排，期待您的回复。",
                 "email_subject": f"应聘「{title}」-{self.name}",
-                "email_body": "",
-                "cover_letter": "",
+                "email_body": email_body,
+                "cover_letter": email_body,
                 "used_evidence_ids": [],
                 "requirement_matches": [],
                 "recommended_resume": "",
                 "resume_reason": "",
-                "generation_mode": "deterministic",
-                "runtime_status": "not_requested",
-                "status": "blocked_missing_candidate_evidence",
+                "generation_mode": "deterministic_fallback",
+                "runtime_status": "fallback_missing_candidate_evidence",
+                "status": "needs_review",
             }
 
         evidence_lines = []
@@ -500,6 +602,8 @@ class OutreachWriterAgent:
             source_block = "\n可核验项目：\n" + "\n".join(f"- {url}" for url in dict.fromkeys(source_links)) + "\n"
         email_body = (
             f"{salutation}：\n\n"
+            + "".join(self._profile_sentences())
+            + "\n"
             + "\n".join(evidence_lines)
             + "\n\n"
             + f"我期待把这些工作方法用于实际任务，并就团队当前目标进一步沟通。{source_block}\n"
@@ -521,6 +625,37 @@ class OutreachWriterAgent:
             "runtime_status": "not_requested",
             "status": "ready",
         }
+
+
+def build_job_card(
+    note: dict[str, Any],
+    application_info: dict[str, Any],
+    *,
+    body_present: bool,
+) -> dict[str, Any]:
+    source_excerpt = next(
+        (
+            _text(note.get(field))
+            for field in ("body", "source_card_text", "card_text_segments", "title", "card_title")
+            if _text(note.get(field))
+        ),
+        "",
+    )
+    contacts = application_info.get("contacts", [])
+    routes = application_info.get("application_routes", [])
+    return {
+        "title": _text(note.get("title")) or _text(note.get("card_title")) or "未命名岗位",
+        "source_url": _text(note.get("note_url"))
+        or _text(note.get("search_result_url"))
+        or _text(note.get("card_search_result_url")),
+        "source_status": _text(note.get("access_status")) or "unknown",
+        "parse_basis": "full_body" if body_present else "search_card",
+        "source_excerpt": source_excerpt[:280],
+        "responsibility_count": len(application_info.get("responsibilities", [])),
+        "requirement_count": len(application_info.get("requirements", [])),
+        "route_count": len(contacts) + len(routes),
+        "status": "generated",
+    }
 
 
 def _record_key(item: dict[str, Any]) -> str:
@@ -577,7 +712,7 @@ class ApplicationIntelligencePipeline:
             if note is None:
                 merged.append((dict(card), False))
             else:
-                merged.append((note, True))
+                merged.append(({**card, **note}, True))
                 used_keys.add(_record_key(note))
         for note in notes:
             if _record_key(note) not in used_keys:
@@ -624,12 +759,14 @@ class ApplicationIntelligencePipeline:
             if not body_present:
                 empty_bodies += 1
                 outreach.update(
-                    greeting="",
-                    email_body="",
-                    cover_letter="",
-                    status="blocked_missing_job_body",
-                    runtime_status="not_eligible",
+                    status="needs_review",
+                    runtime_status="fallback_missing_job_body",
                 )
+            job_card = build_job_card(note, info, body_present=body_present)
+            outreach_generated = all(
+                _text(outreach.get(field))
+                for field in ("greeting", "email_subject", "email_body", "cover_letter")
+            )
             results.append(
                 {
                     "note_id": _text(note.get("note_id")),
@@ -640,6 +777,8 @@ class ApplicationIntelligencePipeline:
                     "collected_at": collected_at.isoformat(timespec="seconds"),
                     "collection_time_source": collection_method,
                     "publish_time": normalized_time,
+                    "media": build_media(note),
+                    "job_card": job_card,
                     "application_info": info,
                     "fit_evidence": fit,
                     "outreach": outreach,
@@ -648,6 +787,8 @@ class ApplicationIntelligencePipeline:
                         "body_present": body_present,
                         "time_normalized_when_present": not raw_time or bool(normalized_time["value"]),
                         "provenance_valid": True,
+                        "job_card_generated": True,
+                        "outreach_generated": outreach_generated,
                     },
                 }
             )
@@ -689,9 +830,15 @@ class ApplicationIntelligencePipeline:
 
         invalid_provenance = 0
         blocked_drafts = 0
+        job_cards_generated = 0
+        outreach_drafts_generated = 0
         valid_evidence_ids = {item["id"] for item in self.fit_agent.evidence}
         for record in results:
             outreach = record["outreach"]
+            if record.get("job_card", {}).get("status") == "generated":
+                job_cards_generated += 1
+            if all(_text(outreach.get(field)) for field in ("greeting", "email_subject", "email_body", "cover_letter")):
+                outreach_drafts_generated += 1
             if outreach["status"] != "ready":
                 blocked_drafts += 1
             record_valid = not any(
@@ -721,6 +868,8 @@ class ApplicationIntelligencePipeline:
             "all_records_have_source_collection_time": missing_scraped_at == 0,
             "all_extractions_and_drafts_have_provenance": invalid_provenance == 0,
             "candidate_evidence_loaded": bool(self.fit_agent.evidence),
+            "all_scraped_jobs_have_job_cards": job_cards_generated == len(results),
+            "all_scraped_jobs_have_application_copy": outreach_drafts_generated == len(results),
             "all_outreach_drafts_ready": blocked_drafts == 0,
         }
         if self.runtime_required:
@@ -735,6 +884,8 @@ class ApplicationIntelligencePipeline:
             "all_records_have_source_collection_time": f"{missing_scraped_at} records lack source scraped_at and use a marked fallback",
             "all_extractions_and_drafts_have_provenance": f"{invalid_provenance} provenance references are invalid",
             "candidate_evidence_loaded": "candidate profile contains no usable resume or GitHub evidence",
+            "all_scraped_jobs_have_job_cards": f"{len(results) - job_cards_generated} scraped jobs have no generated job card",
+            "all_scraped_jobs_have_application_copy": f"{len(results) - outreach_drafts_generated} scraped jobs have no editable application copy",
             "all_outreach_drafts_ready": f"{blocked_drafts} outreach drafts are blocked",
             "all_outreach_generated_by_codex_runtime": (
                 f"Codex Runtime generated or reused {runtime_report['generated'] + runtime_report['cached']} "
@@ -753,6 +904,9 @@ class ApplicationIntelligencePipeline:
             "record_count": len(notes),
             "covered_discovered_count": covered_discovered,
             "body_count": sum(1 for item in results if item["quality"]["body_present"]),
+            "job_cards_generated": job_cards_generated,
+            "application_copy_generated": outreach_drafts_generated,
+            "generation_coverage_rate": (outreach_drafts_generated / len(results)) if results else 1.0,
             "coverage_rate": (covered_discovered / discovered_count) if discovered_count else 1.0,
             "body_coverage_rate": (sum(1 for item in results if item["quality"]["body_present"]) / discovered_count) if discovered_count else 1.0,
             "checks": checks,
@@ -760,7 +914,7 @@ class ApplicationIntelligencePipeline:
         }
         return PipelineResult(
             payload={
-                "schema_version": "1.1",
+                "schema_version": "1.3",
                 "candidate_name": _candidate_name(self.profile),
                 "agents": [
                     {"id": "coverage-agent", "status": "completed", "output": "discovery and body coverage"},

@@ -31,11 +31,23 @@ server.listen(config.port, config.host, () => {
   console.log(`Xiaohongshu relay scraper API listening at http://${config.host}:${config.port}`);
 });
 
-function shutdown(signal) {
-  console.log(`${signal} received; closing HTTP server.`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000).unref();
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received; stopping active work before closing the HTTP server.`);
+  const forcedExit = setTimeout(() => process.exit(1), 15000);
+  forcedExit.unref();
+  server.close();
+  try {
+    await manager.shutdown();
+    clearTimeout(forcedExit);
+    process.exit(0);
+  } catch (error) {
+    console.error(`Graceful shutdown failed: ${error?.message || error}`);
+    process.exit(1);
+  }
 }
 
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => void shutdown('SIGINT'));
+process.once('SIGTERM', () => void shutdown('SIGTERM'));

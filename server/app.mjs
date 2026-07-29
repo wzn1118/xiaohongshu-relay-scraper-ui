@@ -271,28 +271,151 @@ async function readApplicationResults(outputDir, searchParams) {
   const offset = boundedInteger(searchParams.get('offset'), 0, 0, 1000000);
   const limit = boundedInteger(searchParams.get('limit'), 50, 1, 100);
   const query = String(searchParams.get('query') || '').trim().toLocaleLowerCase('zh-CN').slice(0, 100);
+  const sort = searchParams.get('sort') === 'oldest' ? 'oldest' : 'newest';
+  const requestedTimeRange = String(searchParams.get('timeRange') || 'all');
+  const timeRange = ['all', '7', '30', '90', 'unknown'].includes(requestedTimeRange) ? requestedTimeRange : 'all';
   try {
     const payload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
     const delivery = await readDeliveryState(outputDir);
+    const legacyMedia = await readLegacyMediaSources(outputDir);
     const source = Array.isArray(payload.records)
-      ? payload.records.map((record) => mergeApplicationState(record, delivery[record.note_id]))
+      ? payload.records.map((record) => mergeApplicationState(
+        hydrateApplicationMedia(record, legacyMedia.get(record.note_id)),
+        delivery[record.note_id],
+      ))
       : [];
-    const records = query
+    const queried = query
       ? source.filter((record) => `${record.title || ''}\n${record.body || ''}`.toLocaleLowerCase('zh-CN').includes(query))
       : source;
+    const filterStats = {
+      all: queried.length,
+      dated: queried.filter((record) => applicationTimestamp(record) !== null).length,
+      unknown: queried.filter((record) => applicationTimestamp(record) === null).length,
+      incomplete: queried.filter(isIncompleteApplicationRecord).length,
+      withImages: queried.filter((record) => Array.isArray(record.media?.images) && record.media.images.length > 0).length,
+    };
+    const cutoff = /^\d+$/.test(timeRange)
+      ? Date.now() - (Number(timeRange) * 24 * 60 * 60 * 1000)
+      : null;
+    const filtered = queried.filter((record) => {
+      const timestamp = applicationTimestamp(record);
+      if (timeRange === 'unknown') return timestamp === null;
+      if (cutoff !== null) return timestamp !== null && timestamp >= cutoff;
+      return true;
+    });
+    const records = filtered
+      .map((record, index) => ({ record, index, timestamp: applicationTimestamp(record) }))
+      .sort((left, right) => {
+        if (left.timestamp === null && right.timestamp !== null) return 1;
+        if (left.timestamp !== null && right.timestamp === null) return -1;
+        if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) {
+          return sort === 'oldest' ? left.timestamp - right.timestamp : right.timestamp - left.timestamp;
+        }
+        return left.index - right.index;
+      })
+      .map(({ record }) => record);
     return {
       available: true,
       total: records.length,
       offset,
       limit,
       items: records.slice(offset, offset + limit),
+      filters: { sort, timeRange, stats: filterStats },
       codexRuntime: payload.ai_workflow || payload.codex_runtime || null,
       qualityGate: payload.quality_gate || null,
     };
   } catch (error) {
-    if (error.code === 'ENOENT') return { available: false, total: 0, offset, limit, items: [], codexRuntime: null, qualityGate: null };
+    if (error.code === 'ENOENT') return {
+      available: false,
+      total: 0,
+      offset,
+      limit,
+      items: [],
+      filters: { sort, timeRange, stats: { all: 0, dated: 0, unknown: 0, incomplete: 0, withImages: 0 } },
+      codexRuntime: null,
+      qualityGate: null,
+    };
     throw error;
   }
+}
+
+async function readLegacyMediaSources(outputDir) {
+  const files = ['xiaohongshu_cards_latest.json', 'xiaohongshu_notes_latest.json'];
+  const sources = new Map();
+  for (const file of files) {
+    try {
+      const payload = JSON.parse(await readFile(path.join(outputDir, file), 'utf8'));
+      for (const item of Array.isArray(payload) ? payload : []) {
+        const noteId = String(item?.note_id || '').trim();
+        if (noteId) sources.set(noteId, { ...(sources.get(noteId) || {}), ...item });
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+    }
+  }
+  return sources;
+}
+
+function hydrateApplicationMedia(record, legacy = {}) {
+  const existing = record?.media && typeof record.media === 'object' ? record.media : {};
+  const existingImages = Array.isArray(existing.images)
+    ? existing.images.filter((item) => isContentImageUrl(String(item?.url || '')))
+    : [];
+  if (existingImages.length) {
+    return { ...record, media: { ...existing, images: existingImages } };
+  }
+  const detailUrls = mediaValues(legacy.detail_image_urls);
+  const detailAlts = mediaValues(legacy.detail_image_alts);
+  const candidates = [
+    ...detailUrls.map((url, index) => ({ url, alt: detailAlts[index] || '', source: 'detail' })),
+    ...mediaValues(legacy.card_image_urls).map((url) => ({ url, alt: '', source: 'card' })),
+    ...mediaValues(legacy.card_cover_url).map((url) => ({ url, alt: String(legacy.card_cover_alt || ''), source: 'cover' })),
+  ];
+  const seen = new Set();
+  const images = candidates.filter((item) => {
+    if (!isContentImageUrl(item.url) || seen.has(item.url)) return false;
+    seen.add(item.url);
+    return true;
+  }).slice(0, 20);
+  return {
+    ...record,
+    media: {
+      ...existing,
+      images,
+      cover_url: String(existing.cover_url || legacy.card_cover_url || images[0]?.url || ''),
+      analysis: existing.analysis || {
+        status: images.some((item) => item.alt) ? 'alt_text_available' : images.length ? 'pending_ai' : 'no_images',
+        summary: '',
+        job_signals: [],
+        source: images.some((item) => item.alt) ? 'image_alt_text' : 'none',
+      },
+    },
+  };
+}
+
+function mediaValues(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item || '').trim()).filter(Boolean);
+  return String(value || '').split('|').map((item) => item.trim()).filter(Boolean);
+}
+
+function isContentImageUrl(value) {
+  const lowered = String(value || '').toLowerCase();
+  return /^https?:\/\//i.test(lowered)
+    && !['sns-avatar', '/avatar/', 'avatar_'].some((marker) => lowered.includes(marker));
+}
+
+function applicationTimestamp(record) {
+  const value = String(record?.publish_time?.value || '').trim();
+  if (!value) return null;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(value) ? value.replace(' ', 'T') : value;
+  const timestamp = Date.parse(normalized);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function isIncompleteApplicationRecord(record) {
+  return !String(record?.body || '').trim()
+    || record?.job_card?.parse_basis === 'search_card'
+    || String(record?.outreach?.runtime_status || '').startsWith('fallback_missing');
 }
 
 async function readApplicationRecord(outputDir, noteId) {

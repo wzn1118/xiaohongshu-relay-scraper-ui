@@ -1,5 +1,15 @@
 export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
 
+export type SecurityRestriction = {
+  detected: boolean
+  status: 'waiting' | 'cleared' | 'timed_out'
+  detectedAt?: string | null
+  clearedAt?: string | null
+  timedOutAt?: string | null
+  timeoutSeconds?: number
+  recoveryAction?: 'manual_verification' | 'manual_verification_then_resume' | null
+}
+
 export type Artifact = {
   id: string
   name: string
@@ -22,11 +32,20 @@ export type Job = {
   outputDir?: string
   artifacts?: Artifact[]
   artifactCount?: number
+  applicationCount?: number
   config?: Partial<JobRequest>
   coverage?: CoverageSummary
   workflowSummary?: Record<string, unknown> | null
   discoveredCount?: number
   scrapedCount?: number
+  incompleteCount?: number
+  progressPhase?: string | null
+  progressLabel?: string | null
+  progressCurrent?: number
+  progressTotal?: number
+  progressUpdatedAt?: string | null
+  securityRestriction?: SecurityRestriction | null
+  resumeAvailable?: boolean
 }
 
 export type CoverageSummary = {
@@ -36,6 +55,7 @@ export type CoverageSummary = {
   timesNormalized?: number
   applicationInfo?: number
   draftsGenerated?: number
+  generationCoveragePercent?: number
   qualityPassed?: number
   gatePassed?: boolean
   issueCount?: number
@@ -55,6 +75,7 @@ export type RelayStatus = {
   xiaohongshuTabs?: number
   setupRequired?: boolean
   setupStep?: 'install' | 'start' | 'login' | 'ready'
+  checkedAt?: string
   message?: string
 }
 
@@ -166,8 +187,11 @@ export type LocalModelCatalogItem = {
   label: string
   description: string
   downloadBytes: number
-  recommended: boolean
-  installed: boolean
+  family: string
+    tier: string
+    recommended: boolean
+    custom: boolean
+    installed: boolean
 }
 
 export type LocalModelInstall = {
@@ -218,9 +242,12 @@ export type CandidateApplicationProfile = {
 }
 
 export type CollectionSpeedMode = 'steady' | 'random'
+export type SearchSortMode = 'latest' | 'comprehensive'
 
 export type JobRequest = {
   keyword: string
+  searchSort: SearchSortMode
+  maxAgeDays: number
   browserProfile: string
   relayPort: number
   limit: number
@@ -280,6 +307,22 @@ export type DeliveryState = {
   }
 }
 
+export type ApplicationMedia = {
+  cover_url?: string
+  images: Array<{
+    url: string
+    alt?: string
+    source: 'detail' | 'card' | 'cover' | string
+  }>
+  analysis?: {
+    status: 'analyzed' | 'alt_text_only' | 'alt_text_available' | 'pending_ai' | 'no_images' | 'unavailable'
+    summary?: string
+    job_signals?: string[]
+    source?: 'vision_model' | 'image_alt_text' | 'model_error' | 'none' | string
+    reason?: string
+  }
+}
+
 export type ApplicationResult = {
   note_id: string
   title: string
@@ -293,6 +336,21 @@ export type ApplicationResult = {
     precision: string
     is_estimated: boolean
   }
+  job_card?: {
+    title: string
+    source_url: string
+    source_status: string
+    parse_basis: 'full_body' | 'search_card'
+    source_excerpt: string
+    responsibility_count: number
+    requirement_count: number
+    route_count: number
+    status: string
+    role_name?: string
+    enrichment_status?: string
+    image_context_used?: boolean
+  }
+  media?: ApplicationMedia
   application_info: {
     contacts: ApplicationRoute[]
     application_routes: ApplicationRoute[]
@@ -336,8 +394,25 @@ export type ApplicationResultsResponse = {
   offset: number
   limit: number
   items: ApplicationResult[]
+  filters: {
+    sort: 'newest' | 'oldest'
+    timeRange: 'all' | '7' | '30' | '90' | 'unknown'
+    stats: {
+      all: number
+      dated: number
+      unknown: number
+      incomplete: number
+      withImages: number
+    }
+  }
   codexRuntime: Record<string, unknown> | null
   qualityGate: Record<string, unknown> | null
+}
+
+export type ApplicationResultsQuery = {
+  query?: string
+  sort?: 'newest' | 'oldest'
+  timeRange?: 'all' | '7' | '30' | '90' | 'unknown'
 }
 
 export type JobEvent = {
