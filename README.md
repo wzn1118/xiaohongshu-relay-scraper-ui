@@ -348,6 +348,16 @@ npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
 
 #### AI 服务配置
 
+**本地免费模型**
+
+页面内置“本地 Qwen（免费）”提供方，通过本机模型服务整理职位文本、背景资料和求职文案，不需要 API Key，也不产生按次调用费用。推荐的默认模型为 `qwen3:4b`，默认地址为 `http://127.0.0.1:11434/v1`。
+
+1. 在电脑上启动支持 Ollama API 的本地模型服务，并安装 `qwen3:4b` 或其他 `qwen` 系列模型。
+2. 在 AI Runtime 区域点击“检测并启用”。
+3. 系统会读取已安装模型，选中可用的中文模型并创建本机会话。
+
+模型权重由本地模型服务管理，不纳入本 Git 仓库。首次安装会占用数 GB 磁盘空间；推理速度取决于 CPU、GPU 和内存。
+
 项目内置 AI Runtime，不依赖用户电脑上的 Codex CLI。页面支持 `Responses API` 和 `Chat Completions` 两种协议；选择 Codex 时默认使用 Responses API，直接填写模型服务提供的 Base URL、模型和 API Key 即可。配置保存于本机 `data/ai-config.json`，API Key 不通过配置查询接口返回，也不会写入任务历史、日志或 GitHub。
 
 例如模型服务文档给出 `wire_api = "responses"` 时，在页面选择 `内置 Codex Runtime`、填写模型 `gpt-5.5`、对应 Base URL，协议选择 `Responses API`，再粘贴 API Key。原有 `$CODEX_HOME/config.toml` 和外部 CLI 仍可作为兼容回退，但不是新电脑启动条件。

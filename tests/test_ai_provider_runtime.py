@@ -12,6 +12,39 @@ from scripts.ai_provider_runtime import AIProvider, AIProviderError
 
 
 class AiProviderRuntimeTests(unittest.TestCase):
+    def test_local_model_uses_native_structured_api_without_key(self) -> None:
+        provider = AIProvider(
+            provider="local_qwen",
+            api_key="",
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3:4b",
+            wire_api="chat_completions",
+            timeout=30,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"message":{"content":"{\\"summary\\":\\"ready\\"}"}}'
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", return_value=Response()) as open_url:
+            result = provider.generate_json("system", "user", {"type": "object"})
+
+        self.assertEqual(result, {"summary": "ready"})
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/chat")
+        self.assertNotIn("Authorization", request.headers)
+        payload = json.loads(request.data)
+        self.assertEqual(payload["format"], {"type": "object"})
+        self.assertEqual(payload["think"], False)
+        self.assertEqual(payload["options"]["temperature"], 0)
+        self.assertTrue(payload["messages"][-1]["content"].endswith("/no_think"))
+
     def test_codex_uses_bundled_responses_runtime_when_relay_is_configured(self) -> None:
         provider = AIProvider(
             provider="codex",

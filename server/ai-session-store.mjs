@@ -3,6 +3,17 @@ import { mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
 
 const PROVIDERS = Object.freeze({
+  local_qwen: {
+    label: '本地 Qwen（免费）',
+    baseUrl: 'http://127.0.0.1:11434/v1',
+    model: 'qwen3:4b',
+    models: ['qwen3:4b'],
+    requiresKey: false,
+    wireApi: 'chat_completions',
+    bundled: true,
+    local: true,
+    free: true,
+  },
   openai: {
     label: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
@@ -87,7 +98,7 @@ export class AiSessionStore {
         baseUrl: saved?.baseUrl || value.baseUrl,
         model: saved?.model || value.model,
         wireApi: saved?.wireApi || value.wireApi,
-        configured: Boolean(saved?.apiKey),
+        configured: Boolean(saved && (!value.requiresKey || saved.apiKey)),
         hasApiKey: Boolean(saved?.apiKey),
       };
     });
@@ -137,9 +148,11 @@ export class AiSessionStore {
 
     let response;
     try {
+      const headers = { Accept: 'application/json' };
+      if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
       response = await this.fetchImpl(`${baseUrl}/models`, {
         method: 'GET',
-        headers: { Accept: 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers,
         signal: AbortSignal.timeout(this.modelDiscoveryTimeoutMs),
       });
     } catch (error) {

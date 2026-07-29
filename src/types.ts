@@ -129,7 +129,7 @@ export type Health = {
 }
 
 export type AiProviderOption = {
-  id: 'openai' | 'codex' | 'deepseek' | 'qwen' | 'custom'
+  id: 'local_qwen' | 'openai' | 'codex' | 'deepseek' | 'qwen' | 'custom'
   label: string
   baseUrl: string
   model: string
@@ -137,6 +137,8 @@ export type AiProviderOption = {
   requiresKey: boolean
   wireApi: 'responses' | 'chat_completions'
   bundled?: boolean
+  local?: boolean
+  free?: boolean
   configured?: boolean
   hasApiKey?: boolean
 }

@@ -35,17 +35,57 @@ class AIProvider:
         except (TypeError, ValueError):
             self.timeout = 600
 
+    @property
+    def requires_api_key(self) -> bool:
+        return self.provider != "local_qwen"
+
     def generate_json(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
         schema_instruction = (
             "\nReturn exactly one JSON object matching this JSON Schema; do not add Markdown:\n"
             + json.dumps(schema, ensure_ascii=False)
         )
+        if self.provider == "local_qwen":
+            return self._local_chat(system + schema_instruction, user, schema)
         if self.provider == "codex" and not (self.api_key and self.base_url and self.model):
             return self._codex(system + schema_instruction, user, schema)
         return self._openai_compatible(system + schema_instruction, user, self.wire_api)
 
+    def _local_chat(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
+        if not self.base_url or not self.model:
+            raise AIProviderError("Local AI provider configuration is incomplete")
+        root_url = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "think": False,
+            "format": schema,
+            "options": {"temperature": 0},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"{user}\n/no_think"},
+            ],
+        }
+        request = urllib.request.Request(
+            f"{root_url}/api/chat",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:500]
+            raise AIProviderError(f"Local AI provider returned HTTP {error.code}: {detail}") from error
+        except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as error:
+            raise AIProviderError(f"Local AI provider request failed: {error}") from error
+        try:
+            return _parse_json_object(str(result["message"]["content"]))
+        except (KeyError, TypeError) as error:
+            raise AIProviderError("Local AI provider response did not contain a message") from error
+
     def _openai_compatible(self, system: str, user: str, wire_api: str = "chat_completions") -> dict[str, Any]:
-        if not self.api_key or not self.base_url or not self.model:
+        if not self.base_url or not self.model or (self.requires_api_key and not self.api_key):
             raise AIProviderError("AI provider configuration is incomplete")
         if wire_api == "responses":
             return self._responses(system, user)
@@ -60,10 +100,13 @@ class AIProvider:
             ],
             "response_format": {"type": "json_object"},
         }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:

@@ -23,6 +23,7 @@ import {
   Mail,
   MessageSquare,
   Copy,
+  Cpu,
   Pause,
   Play,
   RefreshCw,
@@ -503,6 +504,7 @@ function App() {
   const [backgroundText, setBackgroundText] = useState('')
   const [backgroundFiles, setBackgroundFiles] = useState<File[]>([])
   const [configuringAi, setConfiguringAi] = useState(false)
+  const [activatingLocalAi, setActivatingLocalAi] = useState(false)
   const [refreshingModels, setRefreshingModels] = useState(false)
   const [importingProfile, setImportingProfile] = useState(false)
   const [candidateImportStatus, setCandidateImportStatus] = useState<'recognized' | 'empty' | null>(null)
@@ -793,7 +795,10 @@ function App() {
       setAiSession(session)
       updateRequest('aiSessionId', session.id)
       setApiKey('')
-      setNotice(`${providers.find((item) => item.id === providerId)?.label || providerId} 已连接，密钥仅保存在当前服务进程内`)
+      const connectedProvider = providers.find((item) => item.id === providerId)
+      setNotice(connectedProvider?.local
+        ? `${connectedProvider.label} 已连接，文本仅在本机处理。`
+        : `${connectedProvider?.label || providerId} 已连接，密钥仅保存在当前服务进程内`)
     } catch (error) {
       setNotice((error as Error).message)
     } finally {
@@ -815,11 +820,55 @@ function App() {
       } else if (customModelMode && result.models.includes(aiModel)) {
         setCustomModelMode(false)
       }
-      setNotice(`已从当前账号读取 ${result.models.length} 个可用模型。`)
+      setNotice(selectedProvider?.local
+        ? `已从本机读取 ${result.models.length} 个可用模型。`
+        : `已从当前账号读取 ${result.models.length} 个可用模型。`)
     } catch (error) {
       setNotice((error as Error).message)
     } finally {
       setRefreshingModels(false)
+    }
+  }
+
+  const activateLocalAi = async () => {
+    const localProvider = providers.find((item) => item.id === 'local_qwen')
+    if (!localProvider) return setNotice('本地免费模型配置未加载。')
+    setActivatingLocalAi(true)
+    setNotice(null)
+    setProviderId(localProvider.id)
+    setAiBaseUrl(localProvider.baseUrl)
+    setAiWireApi(localProvider.wireApi)
+    setCustomModelMode(false)
+    setApiKey('')
+    setAiSession(null)
+    updateRequest('aiSessionId', null)
+    try {
+      const discovered = await api.discoverAiModels({
+        provider: localProvider.id,
+        apiKey: '',
+        baseUrl: localProvider.baseUrl,
+      })
+      const localModels = discovered.models.filter((model) => model.toLowerCase().startsWith('qwen'))
+      if (!localModels.length) throw new Error('本地服务已运行，但未找到可用的中文整理模型。')
+      const model = localModels.includes(localProvider.model) ? localProvider.model : localModels[0]
+      setProviders((current) => current.map((item) => item.id === localProvider.id
+        ? { ...item, model, models: localModels }
+        : item))
+      setAiModel(model)
+      const session = await api.createAiSession({
+        provider: localProvider.id,
+        apiKey: '',
+        model,
+        baseUrl: localProvider.baseUrl,
+        wireApi: localProvider.wireApi,
+      })
+      setAiSession(session)
+      updateRequest('aiSessionId', session.id)
+      setNotice(`本地免费模型 ${model} 已就绪，文本整理不产生 API 费用。`)
+    } catch (error) {
+      setNotice(`${(error as Error).message} 请先启动本地模型服务并安装一个可用模型。`)
+    } finally {
+      setActivatingLocalAi(false)
     }
   }
 
@@ -908,22 +957,22 @@ function App() {
     Promise.all([api.aiProviders(), api.profiles()]).then(([options, saved]) => {
       setProviders(options)
       setProfiles(saved)
-      const codex = options.find((item) => item.id === 'codex') || options[0]
-      if (codex) {
-        selectProvider(codex.id, options)
-        if (codex.configured && codex.hasApiKey) {
-          void api.createAiSession({
-            provider: codex.id,
-            apiKey: '',
-            model: codex.model,
-            baseUrl: codex.baseUrl,
-            wireApi: codex.wireApi,
-          }).then((session) => {
-            setAiSession(session)
-            updateRequest('aiSessionId', session.id)
-            setNotice('已自动连接本机保存的 Codex Runtime 配置')
-          }).catch(() => undefined)
-        }
+      const codex = options.find((item) => item.id === 'codex')
+      const localProvider = options.find((item) => item.id === 'local_qwen')
+      const preferredProvider = codex?.configured && codex.hasApiKey ? codex : localProvider || codex || options[0]
+      if (preferredProvider) selectProvider(preferredProvider.id, options)
+      if (codex?.configured && codex.hasApiKey) {
+        void api.createAiSession({
+          provider: codex.id,
+          apiKey: '',
+          model: codex.model,
+          baseUrl: codex.baseUrl,
+          wireApi: codex.wireApi,
+        }).then((session) => {
+          setAiSession(session)
+          updateRequest('aiSessionId', session.id)
+          setNotice('已自动连接本机保存的 Codex Runtime 配置')
+        }).catch(() => undefined)
       }
       if (saved[0]) updateRequest('profileId', saved[0].id)
     }).catch((error) => setNotice((error as Error).message))
@@ -1332,17 +1381,24 @@ function App() {
             <div className="ai-setup-grid">
               <section>
                 <div className="setup-title"><KeyRound size={17} /><span><strong>AI Runtime</strong><small>{aiSession ? `${selectedProvider?.label || providerId} · 会话内存` : '选择提供方并连接'}</small></span></div>
+                <div className={`local-model-offer ${selectedProvider?.local ? 'active' : ''}`}>
+                  <Cpu size={18} />
+                  <span><strong>本地免费整理</strong><small>在本机处理职位文本与背景资料，不消耗 API 额度</small></span>
+                  <button type="button" className="secondary-button" disabled={activatingLocalAi} onClick={() => void activateLocalAi()}>{activatingLocalAi ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />}{aiSession?.provider === 'local_qwen' ? '重新检测' : '检测并启用'}</button>
+                </div>
                 <div className="form-row ai-provider-row">
                   <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-                  <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
-                  <div className="field model-field"><span id="ai-model-label">模型</span><div className="model-picker"><select aria-labelledby="ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select><button type="button" className="model-refresh-button" title="读取当前账号可用模型" aria-label="读取当前账号可用模型" disabled={refreshingModels || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}</button></div><small>{selectedProvider?.models.length || 0} 个可选模型</small></div>
+                  {selectedProvider?.requiresKey
+                    ? <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
+                    : <div className="field local-access-field"><span>运行方式</span><strong><Cpu size={14} />本机免密 · 零 API 费用</strong></div>}
+                  <div className="field model-field"><span id="ai-model-label">模型</span><div className="model-picker"><select aria-labelledby="ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select><button type="button" className="model-refresh-button" title={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} aria-label={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} disabled={refreshingModels || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}</button></div><small>{selectedProvider?.models.length || 0} 个可选模型</small></div>
                 </div>
                 {customModelMode && <label className="field custom-model-field"><span>自定义模型 ID</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="例如 provider/model-name" /></label>}
                 <div className="form-row ai-provider-row">
                   <label className="field base-url-field"><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="https://relay.example/v1" /></label>
                   <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
                 </div>
-                <small className="form-hint">{providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写模型服务 Base URL 后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
+                <small className="form-hint">{selectedProvider?.local ? '适合职位信息提炼、简历事实整理和初稿生成；速度取决于本机硬件。' : providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写模型服务 Base URL 后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
                 <button type="button" className="secondary-button setup-action" disabled={configuringAi || !aiModel.trim() || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}{aiSession ? '重新连接' : '连接 AI'}</button>
               </section>
               <section>
