@@ -129,7 +129,7 @@ export type Health = {
 }
 
 export type AiProviderOption = {
-  id: 'local_qwen' | 'openai' | 'codex' | 'deepseek' | 'qwen' | 'custom'
+  id: 'local_qwen' | 'relay' | 'openai' | 'codex' | 'deepseek' | 'qwen' | 'custom'
   label: string
   baseUrl: string
   model: string
@@ -139,6 +139,7 @@ export type AiProviderOption = {
   bundled?: boolean
   local?: boolean
   free?: boolean
+  relay?: boolean
   configured?: boolean
   hasApiKey?: boolean
 }

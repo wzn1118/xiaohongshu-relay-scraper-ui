@@ -105,3 +105,82 @@ test('local free model creates a session and discovers installed models without 
   assert.equal(session.provider, 'local_qwen');
   assert.equal(session.configured, true);
 });
+
+test('relay provider normalizes a pasted endpoint and exposes relay capabilities', async () => {
+  const calls = [];
+  const store = new AiSessionStore({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ result: { models: [{ name: 'relay-model-2' }, { id: 'relay-model-1' }] } }),
+      };
+    },
+  });
+
+  const provider = store.providers().find((item) => item.id === 'relay');
+  assert.equal(provider.relay, true);
+  assert.equal(provider.wireApi, 'chat_completions');
+
+  const discovered = await store.discoverModels({
+    provider: 'relay',
+    apiKey: 'relay-key',
+    baseUrl: 'https://gateway.example/v1/chat/completions?ignored=true',
+  });
+  assert.equal(discovered.baseUrl, 'https://gateway.example/v1');
+  assert.deepEqual(discovered.models, ['relay-model-1', 'relay-model-2']);
+  assert.deepEqual(calls, ['https://gateway.example/v1/models']);
+
+  const session = await store.create({
+    provider: 'relay',
+    apiKey: 'relay-key',
+    baseUrl: 'https://gateway.example/v1/responses',
+    model: 'relay-model-1',
+    wireApi: 'chat_completions',
+  });
+  assert.equal(session.baseUrl, 'https://gateway.example/v1');
+  assert.equal(session.provider, 'relay');
+});
+
+test('relay model discovery falls back from a host root to the v1 endpoint', async () => {
+  const calls = [];
+  const store = new AiSessionStore({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      if (url === 'https://gateway.example/models') {
+        return { ok: false, status: 404, json: async () => ({}) };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ([{ id: 'fallback-model' }]),
+      };
+    },
+  });
+
+  const discovered = await store.discoverModels({
+    provider: 'relay',
+    apiKey: 'relay-key',
+    baseUrl: 'https://gateway.example',
+  });
+  assert.equal(discovered.baseUrl, 'https://gateway.example/v1');
+  assert.deepEqual(discovered.models, ['fallback-model']);
+  assert.deepEqual(calls, ['https://gateway.example/models', 'https://gateway.example/v1/models']);
+});
+
+test('relay model discovery explains authentication failures without trying another path', async () => {
+  const calls = [];
+  const store = new AiSessionStore({
+    fetchImpl: async (url) => {
+      calls.push(url);
+      return { ok: false, status: 401, json: async () => ({}) };
+    },
+  });
+
+  await assert.rejects(
+    store.discoverModels({ provider: 'relay', apiKey: 'bad-key', baseUrl: 'https://gateway.example' }),
+    (error) => error.code === 'AI_MODEL_DISCOVERY_FAILED' && /API Key/u.test(error.message),
+  );
+  assert.deepEqual(calls, ['https://gateway.example/models']);
+});

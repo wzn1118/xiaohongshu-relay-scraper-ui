@@ -358,6 +358,16 @@ npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
 
 模型权重不会提交到 Git 仓库。Qwen3.5 4B 的下载体积约 3.16 GiB，产品会在用户首次选择时通过本机 Ollama 服务自动下载，避免命令行操作和 GitHub 单文件限制。模型来源可在 [Ollama Qwen3.5 模型页](https://ollama.com/library/qwen3.5) 和 [Qwen 官方仓库](https://github.com/QwenLM/Qwen3.6) 核验；推理速度取决于 CPU、GPU 和内存。
 
+**OpenAI 兼容中转服务**
+
+在 AI Runtime 的提供方中选择“API 中转站（OpenAI 兼容）”，填写服务商提供的 API Base URL 和 API Key，然后点击“检测模型”。产品会读取账号实际可用的模型列表，并自动处理以下常见地址格式：
+
+- API 根地址，例如 `https://gateway.example/v1`
+- 未包含版本路径的地址，例如 `https://gateway.example`，会继续尝试 `/v1`
+- 完整接口地址，例如 `https://gateway.example/v1/chat/completions`，会自动整理为 API 根地址
+
+检测成功后选择模型并点击“验证并连接”。鉴权失败、接口路径错误、额度或限流、上游服务异常会显示不同提示。中转配置仅保存在当前设备的 `data/ai-config.json`，查询接口不会返回 API Key，任务历史、日志和 GitHub 也不会包含密钥。
+
 项目内置 AI Runtime，不依赖用户电脑上的 Codex CLI。页面支持 `Responses API` 和 `Chat Completions` 两种协议；选择 Codex 时默认使用 Responses API，直接填写模型服务提供的 Base URL、模型和 API Key 即可。配置保存于本机 `data/ai-config.json`，API Key 不通过配置查询接口返回，也不会写入任务历史、日志或 GitHub。
 
 例如模型服务文档给出 `wire_api = "responses"` 时，在页面选择 `内置 Codex Runtime`、填写模型 `gpt-5.5`、对应 Base URL，协议选择 `Responses API`，再粘贴 API Key。原有 `$CODEX_HOME/config.toml` 和外部 CLI 仍可作为兼容回退，但不是新电脑启动条件。

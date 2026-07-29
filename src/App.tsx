@@ -71,6 +71,11 @@ import type {
 const CANDIDATE_PROFILE_STORAGE_KEY = 'xhs-candidate-application-profile'
 const CUSTOM_MODEL_OPTION = '__custom_model__'
 
+type AiConnectionCheck = {
+  status: 'checking' | 'verified' | 'error'
+  message: string
+}
+
 const defaultCandidateProfile: CandidateApplicationProfile = {
   name: '',
   school: '',
@@ -511,6 +516,7 @@ function App() {
   const [localModelChoice, setLocalModelChoice] = useState('qwen3.5:4b')
   const [startingLocalInstall, setStartingLocalInstall] = useState(false)
   const [refreshingModels, setRefreshingModels] = useState(false)
+  const [aiConnectionCheck, setAiConnectionCheck] = useState<AiConnectionCheck | null>(null)
   const [importingProfile, setImportingProfile] = useState(false)
   const [candidateImportStatus, setCandidateImportStatus] = useState<'recognized' | 'empty' | null>(null)
   const cleanupStream = useRef<null | (() => void)>(null)
@@ -770,6 +776,8 @@ function App() {
 
   const selectProvider = (id: AiProviderOption['id'], options = providers) => {
     setProviderId(id)
+    setApiKey('')
+    setAiConnectionCheck(null)
     const selected = options.find((item) => item.id === id)
     if (selected) {
       setAiModel(selected.model)
@@ -793,19 +801,60 @@ function App() {
     setAiModel(value)
   }
 
+  const updateAiBaseUrl = (value: string) => {
+    setAiBaseUrl(value)
+    setAiConnectionCheck(null)
+    const provider = providers.find((item) => item.id === providerId)
+    if (provider?.relay) {
+      setProviders((current) => current.map((item) => item.id === providerId ? { ...item, models: [] } : item))
+      setAiModel('')
+      setCustomModelMode(false)
+    }
+  }
+
+  const applyDiscoveredModels = (result: { baseUrl: string; models: string[] }) => {
+    const currentProvider = providers.find((item) => item.id === providerId)
+    const models = currentProvider?.relay
+      ? result.models
+      : [...new Set([...(currentProvider?.models || []), ...result.models])]
+    setProviders((current) => current.map((item) => item.id === providerId ? { ...item, models } : item))
+    setAiBaseUrl(result.baseUrl)
+    if (!aiModel && models[0]) {
+      setAiModel(models[0])
+      setCustomModelMode(false)
+    } else if (customModelMode && result.models.includes(aiModel)) {
+      setCustomModelMode(false)
+    }
+    return aiModel || models[0] || ''
+  }
+
   const configureAi = async () => {
     setConfiguringAi(true)
     setNotice(null)
     try {
-      const session = await api.createAiSession({ provider: providerId, apiKey, model: aiModel, baseUrl: aiBaseUrl, wireApi: aiWireApi })
+      const currentProvider = providers.find((item) => item.id === providerId)
+      let resolvedBaseUrl = aiBaseUrl
+      let resolvedModel = aiModel
+      if (currentProvider?.relay) {
+        setAiConnectionCheck({ status: 'checking', message: '正在验证地址、密钥和模型列表…' })
+        const result = await api.discoverAiModels({ provider: providerId, apiKey, baseUrl: aiBaseUrl })
+        resolvedBaseUrl = result.baseUrl
+        resolvedModel = applyDiscoveredModels(result)
+        setAiConnectionCheck({ status: 'verified', message: `连接可用 · ${result.models.length} 个模型 · ${result.baseUrl}` })
+      }
+      if (!resolvedModel) throw new Error('未找到可用模型，请先检测模型或填写模型 ID。')
+      const session = await api.createAiSession({ provider: providerId, apiKey, model: resolvedModel, baseUrl: resolvedBaseUrl, wireApi: aiWireApi })
       setAiSession(session)
+      setAiBaseUrl(session.baseUrl)
       updateRequest('aiSessionId', session.id)
       setApiKey('')
-      const connectedProvider = providers.find((item) => item.id === providerId)
-      setNotice(connectedProvider?.local
-        ? `${connectedProvider.label} 已连接，文本仅在本机处理。`
-        : `${connectedProvider?.label || providerId} 已连接，密钥仅保存在当前服务进程内`)
+      setNotice(currentProvider?.local
+        ? `${currentProvider.label} 已连接，文本仅在本机处理。`
+        : `${currentProvider?.label || providerId} 已验证并连接，密钥仅保存在当前设备。`)
     } catch (error) {
+      if (providers.find((item) => item.id === providerId)?.relay) {
+        setAiConnectionCheck({ status: 'error', message: (error as Error).message })
+      }
       setNotice((error as Error).message)
     } finally {
       setConfiguringAi(false)
@@ -815,21 +864,22 @@ function App() {
   const refreshAiModels = async () => {
     setRefreshingModels(true)
     setNotice(null)
+    if (providers.find((item) => item.id === providerId)?.relay) {
+      setAiConnectionCheck({ status: 'checking', message: '正在检测接口并读取模型…' })
+    }
     try {
       const result = await api.discoverAiModels({ provider: providerId, apiKey, baseUrl: aiBaseUrl })
-      const currentProvider = providers.find((item) => item.id === providerId)
-      const models = [...new Set([...(currentProvider?.models || []), ...result.models])]
-      setProviders((current) => current.map((item) => item.id === providerId ? { ...item, models } : item))
-      if (!aiModel && models[0]) {
-        setAiModel(models[0])
-        setCustomModelMode(false)
-      } else if (customModelMode && result.models.includes(aiModel)) {
-        setCustomModelMode(false)
+      applyDiscoveredModels(result)
+      if (providers.find((item) => item.id === providerId)?.relay) {
+        setAiConnectionCheck({ status: 'verified', message: `连接可用 · ${result.models.length} 个模型 · ${result.baseUrl}` })
       }
       setNotice(selectedProvider?.local
         ? `已从本机读取 ${result.models.length} 个可用模型。`
-        : `已从当前账号读取 ${result.models.length} 个可用模型。`)
+        : `已验证连接并读取 ${result.models.length} 个可用模型。`)
     } catch (error) {
+      if (providers.find((item) => item.id === providerId)?.relay) {
+        setAiConnectionCheck({ status: 'error', message: (error as Error).message })
+      }
       setNotice((error as Error).message)
     } finally {
       setRefreshingModels(false)
@@ -1458,20 +1508,36 @@ function App() {
                   {selectedLocalModel && !localInstallActive && <p className="local-model-description">{selectedLocalModel.description}{selectedLocalModel.installed ? ' · 已安装' : ''}</p>}
                   {localModelStatus?.install && localInstallActive && <div className="local-install-progress" role="status" aria-live="polite"><div><span>{localModelStatus.install.message}</span><strong>{localModelStatus.install.progress}%</strong></div><progress max="100" value={localModelStatus.install.progress} /></div>}
                 </div>
-                <div className="form-row ai-provider-row">
-                  <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-                  {selectedProvider?.requiresKey
-                    ? <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
-                    : <div className="field local-access-field"><span>运行方式</span><strong><Cpu size={14} />本机免密 · 零 API 费用</strong></div>}
-                  <div className="field model-field"><span id="ai-model-label">模型</span><div className="model-picker"><select aria-labelledby="ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select><button type="button" className="model-refresh-button" title={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} aria-label={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} disabled={refreshingModels || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}</button></div><small>{selectedProvider?.models.length || 0} 个可选模型</small></div>
-                </div>
+                {selectedProvider?.relay && <div className={`ai-relay-status ${aiConnectionCheck?.status || 'idle'}`}>
+                  <div className="ai-relay-status-heading"><Shuffle size={17} /><span><strong>OpenAI 兼容中转</strong><small>自动校正接口路径并读取账号可用模型</small></span><b>{aiConnectionCheck?.status === 'checking' ? '检测中' : aiConnectionCheck?.status === 'verified' ? '连接可用' : aiConnectionCheck?.status === 'error' ? '需要修正' : '待检测'}</b></div>
+                  <div className="ai-relay-progress" aria-label="中转配置进度"><span className={aiBaseUrl.trim() ? 'done' : ''}>01 地址</span><span className={apiKey || selectedProvider.hasApiKey ? 'done' : ''}>02 密钥</span><span className={aiConnectionCheck?.status === 'verified' ? 'done' : ''}>03 模型</span></div>
+                </div>}
+                {selectedProvider?.relay ? <>
+                  <div className="form-row ai-relay-address-row">
+                    <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+                    <label className="field relay-base-url-field"><span>API Base URL</span><div className="relay-url-control"><input value={aiBaseUrl} onChange={(event) => updateAiBaseUrl(event.target.value)} placeholder="https://gateway.example/v1" inputMode="url" spellCheck={false} /><button type="button" className="secondary-button relay-model-test" disabled={refreshingModels || !aiBaseUrl.trim() || (!apiKey && !selectedProvider.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}检测模型</button></div><small className={`relay-check-message ${aiConnectionCheck?.status || 'idle'}`} aria-live="polite">{aiConnectionCheck?.message || '支持粘贴 API 根地址或完整的 /chat/completions 接口地址'}</small></label>
+                  </div>
+                  <div className="form-row ai-provider-row ai-relay-credentials-row">
+                    <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAiConnectionCheck(null) }} placeholder={selectedProvider.hasApiKey ? '已保存，留空即可复用' : '粘贴中转服务 API Key'} /></label>
+                    <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="chat_completions">Chat Completions</option><option value="responses">Responses API</option></select></label>
+                    <div className="field model-field"><span id="relay-ai-model-label">模型</span><div className="model-picker single"><select aria-labelledby="relay-ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>检测后选择模型</option>{(selectedProvider.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select></div><small>{selectedProvider.models.length || 0} 个可选模型</small></div>
+                  </div>
+                </> : <>
+                  <div className="form-row ai-provider-row">
+                    <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+                    {selectedProvider?.requiresKey
+                      ? <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
+                      : <div className="field local-access-field"><span>运行方式</span><strong><Cpu size={14} />本机免密 · 零 API 费用</strong></div>}
+                    <div className="field model-field"><span id="ai-model-label">模型</span><div className="model-picker"><select aria-labelledby="ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select><button type="button" className="model-refresh-button" title={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} aria-label={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} disabled={refreshingModels || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}</button></div><small>{selectedProvider?.models.length || 0} 个可选模型</small></div>
+                  </div>
+                  <div className="form-row ai-provider-row">
+                    <label className="field base-url-field"><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => updateAiBaseUrl(event.target.value)} placeholder="https://gateway.example/v1" /></label>
+                    <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
+                  </div>
+                </>}
                 {customModelMode && <label className="field custom-model-field"><span>自定义模型 ID</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="例如 provider/model-name" /></label>}
-                <div className="form-row ai-provider-row">
-                  <label className="field base-url-field"><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="https://relay.example/v1" /></label>
-                  <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
-                </div>
-                <small className="form-hint">{selectedProvider?.local ? '适合职位信息提炼、简历事实整理和初稿生成；速度取决于本机硬件。' : providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写模型服务 Base URL 后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
-                <button type="button" className="secondary-button setup-action" disabled={configuringAi || !aiModel.trim() || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}{aiSession ? '重新连接' : '连接 AI'}</button>
+                <small className="form-hint">{selectedProvider?.local ? '适合职位信息提炼、简历事实整理和初稿生成；速度取决于本机硬件。' : selectedProvider?.relay ? '密钥仅保存在当前设备；连接时会再次验证地址和模型，不写入任务历史或 GitHub。' : providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写模型服务 Base URL 后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
+                <button type="button" className="secondary-button setup-action" disabled={configuringAi || (!selectedProvider?.relay && !aiModel.trim()) || (selectedProvider?.relay && customModelMode && !aiModel.trim()) || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : selectedProvider?.relay ? <Wifi size={16} /> : <BrainCircuit size={16} />}{selectedProvider?.relay ? (aiSession ? '重新验证并连接' : '验证并连接') : aiSession ? '重新连接' : '连接 AI'}</button>
               </section>
               <section>
                 <div className="setup-title"><Upload size={17} /><span><strong>背景资料</strong><small>{activeProfile ? `${activeProfile.display_name || '个人档案'} · ${activeProfile.sourceFiles?.length || 0} 个来源` : 'PDF / DOCX / TXT / MD / JSON / CSV / RTF'}</small></span></div>

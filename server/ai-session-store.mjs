@@ -14,6 +14,16 @@ const PROVIDERS = Object.freeze({
     local: true,
     free: true,
   },
+  relay: {
+    label: 'API 中转站（OpenAI 兼容）',
+    baseUrl: '',
+    model: '',
+    models: [],
+    requiresKey: true,
+    wireApi: 'chat_completions',
+    bundled: true,
+    relay: true,
+  },
   openai: {
     label: 'OpenAI',
     baseUrl: 'https://api.openai.com/v1',
@@ -146,32 +156,45 @@ export class AiSessionStore {
     }
     if (typeof this.fetchImpl !== 'function') throw discoveryFailure('Model discovery is unavailable in this runtime.');
 
-    let response;
-    try {
-      const headers = { Accept: 'application/json' };
-      if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-      response = await this.fetchImpl(`${baseUrl}/models`, {
-        method: 'GET',
-        headers,
-        signal: AbortSignal.timeout(this.modelDiscoveryTimeoutMs),
-      });
-    } catch (error) {
-      const reason = error?.name === 'TimeoutError' ? 'request timed out' : 'the model service could not be reached';
-      throw discoveryFailure(`Could not read the model list because ${reason}.`);
-    }
-    if (!response.ok) throw discoveryFailure(`The model service returned HTTP ${response.status}.`);
+    const headers = { Accept: 'application/json' };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const candidates = modelDiscoveryCandidates(baseUrl);
 
-    let payload;
-    try {
-      payload = await response.json();
-    } catch {
-      throw discoveryFailure('The model service returned an invalid JSON response.');
+    for (const [index, candidate] of candidates.entries()) {
+      let response;
+      try {
+        response = await this.fetchImpl(`${candidate.baseUrl}/models`, {
+          method: 'GET',
+          headers,
+          signal: AbortSignal.timeout(this.modelDiscoveryTimeoutMs),
+        });
+      } catch (error) {
+        const reason = error?.name === 'TimeoutError' ? '连接超时' : '无法访问模型服务';
+        throw discoveryFailure(`读取模型列表失败：${reason}，请检查 Base URL 和网络连接。`);
+      }
+
+      if (!response.ok) {
+        if (response.status === 404 && index < candidates.length - 1) continue;
+        throw discoveryFailure(discoveryStatusMessage(response.status));
+      }
+
+      let payload;
+      try {
+        payload = await response.json();
+      } catch {
+        if (index < candidates.length - 1) continue;
+        throw discoveryFailure('模型服务未返回有效 JSON，请确认填写的是 API Base URL，而不是网站首页。');
+      }
+      const models = [...new Set(modelEntries(payload).map(modelId).filter(Boolean))]
+        .sort((left, right) => left.localeCompare(right, 'en', { numeric: true }));
+      if (!models.length) {
+        if (index < candidates.length - 1) continue;
+        throw discoveryFailure('模型服务已连接，但响应中没有可用的模型 ID。');
+      }
+      return { provider, baseUrl: candidate.baseUrl, models, fetchedAt: new Date().toISOString() };
     }
-    const entries = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : [];
-    const models = [...new Set(entries.map(modelId).filter(Boolean))]
-      .sort((left, right) => left.localeCompare(right, 'en', { numeric: true }));
-    if (!models.length) throw discoveryFailure('The model service returned no usable model IDs.');
-    return { provider, baseUrl, models, fetchedAt: new Date().toISOString() };
+
+    throw discoveryFailure('未找到兼容的模型列表接口，请检查 Base URL。');
   }
 
   resolve(id) {
@@ -214,7 +237,7 @@ export class AiSessionStore {
 }
 
 function normalizeBaseUrl(value) {
-  const text = String(value || '').trim().replace(/\/+$/, '');
+  const text = String(value || '').trim();
   if (!text) throw validation('Base URL is required.');
   let parsed;
   try { parsed = new URL(text); } catch { throw validation('Base URL must be a valid URL.'); }
@@ -222,7 +245,13 @@ function normalizeBaseUrl(value) {
   if (parsed.protocol !== 'https:' && !(local && parsed.protocol === 'http:')) {
     throw validation('Base URL must use HTTPS, except localhost development endpoints.');
   }
-  return text;
+  if (parsed.username || parsed.password) throw validation('Base URL must not contain account credentials.');
+  parsed.search = '';
+  parsed.hash = '';
+  parsed.pathname = parsed.pathname
+    .replace(/\/(?:chat\/completions|responses|models)\/?$/iu, '')
+    .replace(/\/+$/u, '');
+  return parsed.toString().replace(/\/+$/u, '');
 }
 
 function normalizeWireApi(value) {
@@ -237,7 +266,7 @@ function sanitizeConfiguration(provider, value) {
     provider,
     apiKey: String(value.apiKey || '').trim(),
     model: String(value.model || definition.model || '').trim(),
-    baseUrl: String(value.baseUrl || definition.baseUrl || '').trim().replace(/\/+$/, ''),
+    baseUrl: normalizeBaseUrl(value.baseUrl || definition.baseUrl),
     wireApi: normalizeWireApi(value.wireApi || definition.wireApi),
     updatedAt: String(value.updatedAt || ''),
   };
@@ -259,6 +288,29 @@ function modelId(value) {
   const candidate = typeof value === 'string' ? value : value?.id || value?.name || value?.model;
   const text = String(candidate || '').trim();
   return /^[^\s<>"']{1,160}$/u.test(text) ? text : '';
+}
+
+function modelDiscoveryCandidates(baseUrl) {
+  const candidates = [{ baseUrl }];
+  const parsed = new URL(baseUrl);
+  if (!parsed.pathname.toLowerCase().endsWith('/v1')) {
+    candidates.push({ baseUrl: `${baseUrl}/v1` });
+  }
+  return candidates;
+}
+
+function modelEntries(payload) {
+  if (Array.isArray(payload)) return payload;
+  const candidates = [payload?.data, payload?.models, payload?.result?.data, payload?.result?.models];
+  return candidates.find(Array.isArray) || [];
+}
+
+function discoveryStatusMessage(status) {
+  if (status === 401 || status === 403) return `模型服务返回 HTTP ${status}：API Key 无效或没有访问权限。`;
+  if (status === 404) return '模型列表接口不存在，请确认 Base URL；系统已自动尝试当前地址和 /v1。';
+  if (status === 429) return '模型服务返回 HTTP 429：请求过于频繁或账号额度不足。';
+  if (status >= 500) return `模型服务返回 HTTP ${status}：中转服务或其上游暂时不可用。`;
+  return `模型服务返回 HTTP ${status}，请检查 Base URL、API Key 和服务状态。`;
 }
 
 function validation(message) {
