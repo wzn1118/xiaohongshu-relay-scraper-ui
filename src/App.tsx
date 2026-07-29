@@ -16,6 +16,7 @@ import {
   FileText,
   Gauge,
   BrainCircuit,
+  BookOpenCheck,
   KeyRound,
   ListFilter,
   LoaderCircle,
@@ -154,6 +155,42 @@ const smtpDomainPresets: Record<string, Pick<SmtpConfig, 'provider' | 'host' | '
   'hotmail.com': { provider: 'outlook', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true },
   'live.com': { provider: 'outlook', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true },
   'msn.com': { provider: 'outlook', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true },
+}
+
+type SmtpGuideProvider = '163' | 'qq'
+
+const smtpSetupGuides: Record<SmtpGuideProvider, {
+  label: string
+  accountLabel: string
+  host: string
+  officialUrl: string
+  steps: Array<{ title: string; detail: string }>
+  reminder: string
+}> = {
+  '163': {
+    label: '163 / 126 / yeah',
+    accountLabel: '网易邮箱',
+    host: 'smtp.163.com',
+    officialUrl: 'https://help.mail.163.com/faqDetail.do?code=d7a5dc8471cd0c0e8b4b8f4f8e49998b374173cfe9171305fa1ce630d7f67ac286624f309a1a7089',
+    steps: [
+      { title: '进入客户端授权设置', detail: '登录网页版邮箱，打开“设置 → POP3/SMTP/IMAP”。' },
+      { title: '生成授权密码', detail: '点击“新增授权密码”，按页面提示完成身份验证。' },
+      { title: '回到本页完成测试', detail: '复制授权密码，填入上方“客户端授权密码”，再点击“配置并测试”。' },
+    ],
+    reminder: '授权密码只显示一次，请及时保存；这里不要填写网易邮箱的网页登录密码。',
+  },
+  qq: {
+    label: 'QQ / Foxmail',
+    accountLabel: 'QQ 邮箱',
+    host: 'smtp.qq.com',
+    officialUrl: 'https://help.mail.qq.com/detail/106/985',
+    steps: [
+      { title: '打开账号安全设置', detail: '登录 QQ 邮箱，进入“设置 → 账号与安全 → 安全设置”。' },
+      { title: '开启服务并生成授权码', detail: '开启 POP3/IMAP/SMTP 服务，按提示验证身份并生成 16 位授权码。' },
+      { title: '回到本页完成测试', detail: '将完整邮箱和 16 位授权码填入上方，再点击“配置并测试”。' },
+    ],
+    reminder: '授权码不是 QQ 登录密码；QQ 密码变更后，已有授权码可能失效，需要重新生成。',
+  },
 }
 
 function smtpPresetForEmail(email: string) {
@@ -432,6 +469,7 @@ function App() {
   const [smtpOAuthClientSecret, setSmtpOAuthClientSecret] = useState('')
   const [smtpOAuthRefreshToken, setSmtpOAuthRefreshToken] = useState('')
   const [smtpManualMode, setSmtpManualMode] = useState(false)
+  const [smtpGuideProvider, setSmtpGuideProvider] = useState<SmtpGuideProvider>('163')
   const [smtpSaving, setSmtpSaving] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
   const [activeJob, setActiveJob] = useState<Job | null>(null)
@@ -483,6 +521,13 @@ function App() {
       ? smtpConfig.host.trim() && smtpConfig.port > 0 && smtpManualAuthReady
       : detectedSmtpPreset && smtpHasLoginCredential
   ))
+  const smtpSetupGuide = smtpSetupGuides[smtpGuideProvider]
+  const smtpGuideHost = smtpConfig.provider === smtpGuideProvider && smtpConfig.host ? smtpConfig.host : smtpSetupGuide.host
+
+  useEffect(() => {
+    const provider = detectedSmtpPreset?.provider || smtpConfig.provider
+    if (provider === '163' || provider === 'qq') setSmtpGuideProvider(provider)
+  }, [detectedSmtpPreset?.provider, smtpConfig.provider])
 
   const updateRequest = <K extends keyof JobRequest>(key: K, value: JobRequest[K]) => {
     setRequest((current) => ({ ...current, [key]: value }))
@@ -1208,6 +1253,28 @@ function App() {
                   <label className="field smtp-oauth-scope"><span>Scope</span><input value={smtpConfig.oauth.scope} onChange={(event) => updateSmtpOAuth('scope', event.target.value)} /></label>
                 </div>}
               </div>}
+              <section className="smtp-setup-guide" aria-labelledby="smtp-setup-guide-title">
+                <div className="smtp-guide-header">
+                  <div className="smtp-guide-title"><BookOpenCheck size={18} /><span><small>授权码获取教程</small><strong id="smtp-setup-guide-title">3 步完成 163 / QQ 邮箱配置</strong></span></div>
+                  <div className="smtp-guide-tabs" role="group" aria-label="选择邮箱教程">
+                    {(Object.keys(smtpSetupGuides) as SmtpGuideProvider[]).map((provider) => <button key={provider} type="button" className={smtpGuideProvider === provider ? 'active' : ''} aria-pressed={smtpGuideProvider === provider} onClick={() => setSmtpGuideProvider(provider)}>{smtpSetupGuides[provider].label}</button>)}
+                  </div>
+                </div>
+                <div className="smtp-guide-content">
+                  <ol className="smtp-guide-steps">
+                    {smtpSetupGuide.steps.map((step, index) => <li key={step.title}><span className="smtp-guide-index">{index + 1}</span><div><strong>{step.title}</strong><p>{step.detail}</p></div></li>)}
+                  </ol>
+                  <div className="smtp-guide-connection" aria-label={`${smtpSetupGuide.accountLabel} SMTP 参数`}>
+                    <dl>
+                      <div><dt>SMTP 主机</dt><dd>{smtpGuideHost}</dd></div>
+                      <div><dt>端口</dt><dd>465</dd></div>
+                      <div><dt>加密</dt><dd>SSL/TLS</dd></div>
+                    </dl>
+                    <a href={smtpSetupGuide.officialUrl} target="_blank" rel="noreferrer"><ExternalLink size={15} />打开{smtpSetupGuide.accountLabel}官方教程</a>
+                  </div>
+                </div>
+                <p className="smtp-guide-reminder"><ShieldCheck size={15} /><span>{smtpSetupGuide.reminder}</span></p>
+              </section>
               <div className="smtp-config-footer">
                 <div className="smtp-guidance"><ShieldCheck size={16} /><span><strong>{smtpManualMode ? '高级参数仅保存在当前设备' : '邮箱凭据仅保存在当前设备'}</strong><small>{smtpManualMode ? smtpProviderOptions.find((item) => item.id === smtpConfig.provider)?.guidance : detectedSmtpProvider?.guidance || '输入完整邮箱后即可自动配置；企业邮箱请使用高级设置。'}</small></span></div>
                 <div className="smtp-config-actions">
