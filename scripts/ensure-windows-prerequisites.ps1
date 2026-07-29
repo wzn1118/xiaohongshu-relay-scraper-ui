@@ -3,7 +3,12 @@ param(
     [switch]$InstallRuntime,
     [switch]$InstallTools,
     [switch]$CheckOnly,
-    [switch]$EnsureBrowserRelay
+    [switch]$EnsureBrowserRelay,
+    [ValidateRange(1024, 65535)]
+    [int]$RelayPort = 18800,
+    [ValidatePattern('^[\p{L}\p{N}_.-]+$')]
+    [string]$RelayProfile = 'openclaw',
+    [string]$BrowserDataDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -110,11 +115,18 @@ function Get-ToolStatus {
 }
 
 function Get-ManagedRelayStatus {
-    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Status, [switch]$CheckOnly)
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Status,
+        [switch]$CheckOnly,
+        [int]$Port = $RelayPort,
+        [string]$Profile = $RelayProfile,
+        [string]$DataDir = $BrowserDataDir
+    )
     if (-not $Status.node) { return $null }
     try {
         $browserScript = Join-Path $PSScriptRoot 'start-managed-browser.mjs'
-        $arguments = @($browserScript, '--port', '18800', '--profile', 'openclaw', '--data-dir', (Join-Path $projectRoot 'data\browser'))
+        $managedDataDir = if ($DataDir) { $DataDir } else { Join-Path $projectRoot 'data\browser' }
+        $arguments = @($browserScript, '--port', [string]$Port, '--profile', $Profile, '--data-dir', $managedDataDir)
         if ($CheckOnly) { $arguments += '--check-only' }
         $output = @(& $Status.node @arguments 2>&1)
         if ($LASTEXITCODE -ne 0) { return $null }
@@ -168,13 +180,14 @@ if ($EnsureBrowserRelay -and -not $status.browser) {
     Write-Warning 'A Chromium-based browser is required for the managed browser profile.'
 }
 
-$managedRelay = Get-ManagedRelayStatus -Status $status -CheckOnly:$CheckOnly
+$managedRelay = Get-ManagedRelayStatus -Status $status -CheckOnly:$CheckOnly -Port $RelayPort -Profile $RelayProfile -DataDir $BrowserDataDir
 if ($EnsureBrowserRelay -and -not $CheckOnly) {
     if (-not $status.node) { throw 'Node.js is required to start the managed browser.' }
     if (-not $status.browser) { throw 'A Chromium-based browser is required for the managed browser profile.' }
     Write-Host 'Starting the project-managed browser through native CDP...'
     $browserScript = Join-Path $PSScriptRoot 'start-managed-browser.mjs'
-    $output = @(& $status.node $browserScript --port 18800 --profile openclaw --data-dir (Join-Path $projectRoot 'data\browser') 2>&1)
+    $managedDataDir = if ($BrowserDataDir) { $BrowserDataDir } else { Join-Path $projectRoot 'data\browser' }
+    $output = @(& $status.node $browserScript --port $RelayPort --profile $RelayProfile --data-dir $managedDataDir 2>&1)
     if ($LASTEXITCODE -ne 0) {
         throw "Project-managed browser startup failed (exit code $LASTEXITCODE)."
     }
@@ -191,8 +204,8 @@ $status.toolsReady = [bool]$status.codex
 $status.browserReady = [bool]$status.browser
 $status.relayCommandReady = [bool]$status.node
 $status.relayBackend = 'native-cdp'
-$status.relayProfile = 'openclaw'
-$status.relayPort = 18800
+$status.relayProfile = $RelayProfile
+$status.relayPort = $RelayPort
 $status.relayServiceReady = [bool]($managedRelay -and $managedRelay.running -and $managedRelay.cdpReady)
 $status | ConvertTo-Json -Depth 4
 

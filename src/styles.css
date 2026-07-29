@@ -95,8 +95,10 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .relay-config-body { padding: 16px 18px; }
 .relay-config-fields { grid-template-columns: .75fr 1fr 1.5fr; align-items: end; }
 .relay-config-footer { margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
-.relay-config-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.relay-config-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; flex-wrap: wrap; }
 .relay-config-actions .setup-action { margin-top: 0; }
+.relay-install-button { min-height: 36px; padding: 0 14px; background: var(--red); border-color: var(--red-deep); color: #fff; }
+.relay-install-button:hover { background: var(--red-deep); border-color: var(--red-deep); }
 .email-config-panel { margin-top: 14px; }
 .email-config-body { padding: 16px 18px; }
 .smtp-primary-fields { grid-template-columns: .9fr 1.2fr 1.2fr 1.2fr; align-items: end; }
@@ -273,6 +275,9 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 
 .results-panel { margin-top: 14px; }
 .result-heading-meta { display: flex; align-items: center; gap: 8px; }
+.body-repair-button { color: var(--red-deep); border-color: #d8a4ac; background: #fff7f8; }
+.body-repair-button:hover { border-color: var(--red-deep); background: #fbe9ec; }
+.body-repair-button:disabled { color: #8c8e92; border-color: #c8c7c1; background: #eeede9; }
 .runtime-badge { padding: 4px 7px; border: 1px solid #c8c7c1; border-radius: 3px; color: #686a6e; background: #eeede9; font-size: 9px; font-weight: 800; white-space: nowrap; }
 .runtime-badge.passed { color: var(--green); border-color: #91bdad; background: #e4f2ed; }
 .results-workspace { display: grid; grid-template-columns: minmax(260px, .7fr) minmax(0, 2.3fr); min-height: 520px; }

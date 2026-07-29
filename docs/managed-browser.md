@@ -15,6 +15,10 @@
 
 项目通过 `/json/version`、`/json/list` 和 CDP WebSocket 读取浏览器，不需要安装浏览器扩展。第一次使用时，在项目打开的登录页完成一次小红书登录；Cookie 只写入本机的 `data/browser`，不会进入 Git，也不会随仓库传给其他电脑。
 
+## 页面一键接入
+
+打开项目页面的 Relay 配置区，点击 **一键安装并接入**：项目会保存当前端口和 Profile，Windows 下自动执行依赖检查、准备 Chrome/Edge 和项目浏览器，再连接 Relay。已有可用的 Relay 会直接复用；没有 OpenClaw 时使用项目自己的原生 CDP 浏览器。整个流程由后端代码执行，不会模拟点击或抢占鼠标。
+
 ## 配置
 
 `.env` 支持以下可选项：

@@ -414,6 +414,7 @@ function App() {
   const [advanced, setAdvanced] = useState(false)
   const [loading, setLoading] = useState(true)
   const [relayConnecting, setRelayConnecting] = useState(false)
+  const [relaySettingUp, setRelaySettingUp] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [clock, setClock] = useState(new Date())
@@ -488,6 +489,23 @@ function App() {
       setNotice((error as Error).message)
     } finally {
       setRelayConfigSaving(false)
+    }
+  }
+
+  const setupAndConnectRelay = async () => {
+    setRelaySettingUp(true)
+    setNotice(null)
+    try {
+      const saved = await api.updateRelayConfig(relayConfig)
+      setRelayConfig(saved)
+      updateRequest('relayPort', saved.port)
+      const status = await api.setupRelay(saved.port, saved.profile)
+      setRelay(status)
+      setNotice(status.message || (status.ready ? 'Relay 已安装并连接' : 'Relay 已准备，等待连接'))
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setRelaySettingUp(false)
     }
   }
 
@@ -770,6 +788,25 @@ function App() {
     }
   }
 
+  const resumeBodyCollection = () => {
+    if (!activeJob || submitting) return
+    const sourceConfig = activeJob.config || {}
+    const payload: JobRequest = {
+      ...request,
+      ...sourceConfig,
+      keyword: activeJob.keyword || request.keyword,
+      mode: 'resume',
+      resumeFromJobId: activeJob.id,
+      limit: 0,
+      skipPostprocess: false,
+      checkOnly: false,
+      aiSessionId: request.aiSessionId,
+      profileId: request.profileId,
+      candidateProfile: request.candidateProfile,
+    }
+    void runJob(payload)
+  }
+
   const submit = (event: FormEvent) => {
     event.preventDefault()
     const requiredFields: Array<[keyof CandidateApplicationProfile, string]> = [
@@ -845,6 +882,15 @@ function App() {
   const selectedDeliveryRoutes = selectedResult ? deliveryRoutes(selectedResult) : []
   const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email')
   const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message')
+  const bodyGap = Boolean(
+    (coverage?.discovered !== undefined && coverage.bodySucceeded !== undefined && coverage.bodySucceeded < coverage.discovered)
+    || results?.items.some((item) => !item.body),
+  )
+  const bodyRepairBlocked = !activeJob
+    || submitting
+    || activeJob.status === 'running'
+    || activeJob.status === 'queued'
+  const canResumeBodyCollection = bodyGap && !bodyRepairBlocked
 
   const replaceResult = (next: ApplicationResult) => {
     setSelectedResult(next)
@@ -1005,8 +1051,9 @@ function App() {
               <div className="relay-config-footer">
                 <span className="field-help">端口和 Profile 会同时用于状态探测、连接按钮和新任务。</span>
                 <div className="relay-config-actions">
-                  <button type="button" className="secondary-button" disabled={relayConnecting} onClick={() => void openRelayLogin()}><ExternalLink size={16} />打开登录页</button>
-                  <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
+                  <button type="button" className="secondary-button" disabled={relayConnecting || relaySettingUp} onClick={() => void openRelayLogin()}><ExternalLink size={16} />打开登录页</button>
+                  <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting || relaySettingUp} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
+                  <button type="button" className="primary-button relay-install-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp} onClick={() => void setupAndConnectRelay()}>{relaySettingUp ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{relaySettingUp ? '正在安装并接入' : '一键安装并接入'}</button>
                 </div>
               </div>
             </div>
@@ -1216,6 +1263,15 @@ function App() {
             <div className="panel-heading compact">
               <div><span className="step-label">PER-LINK APPLICATION INTELLIGENCE</span><h2>逐链接岗位与投递文案</h2></div>
               <div className="result-heading-meta">
+                {bodyGap && <button
+                  className="icon-text-button body-repair-button"
+                  disabled={!canResumeBodyCollection}
+                  onClick={resumeBodyCollection}
+                  title={bodyRepairBlocked ? '当前任务仍在运行，或补采任务正在创建' : '从当前任务的检查点继续采集缺失正文'}
+                >
+                  {submitting ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
+                  {submitting ? '创建补采任务' : '补采缺失正文'}
+                </button>}
                 <span className={`runtime-badge ${codexRuntime?.status === 'completed' ? 'passed' : ''}`}>AI 质量流 · {String(codexRuntime?.status || '等待结果')}</span>
                 <span className="count-badge">{results?.total ?? 0}</span>
               </div>

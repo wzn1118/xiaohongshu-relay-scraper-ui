@@ -31,6 +31,10 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ port, profile }),
   }),
+  setupRelay: (port: number, profile: string) => request<RelayStatus & { ready?: boolean; attempted?: boolean; setup?: { ok: boolean; message?: string } }>(`/api/relay/setup`, {
+    method: 'POST',
+    body: JSON.stringify({ port, profile }),
+  }),
   openRelayLogin: (profile: string) => request<{ opened: boolean; message?: string; profile?: string; url?: string }>('/api/relay/login', {
     method: 'POST',
     body: JSON.stringify({ profile, url: 'https://www.xiaohongshu.com' }),

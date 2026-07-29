@@ -65,6 +65,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     auth: 'login', user: 'sender@example.com', from: 'sender@example.com', hasPassword: true,
   };
   const sentMessages = [];
+  const relaySetupCalls = [];
   const server = http.createServer(createApp({
     manager,
     config,
@@ -87,6 +88,10 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       tabCount: 1,
       message: 'Relay 已智能连接。',
     }),
+    relaySetup: async (options) => {
+      relaySetupCalls.push(options);
+      return { ok: true, supported: true, installed: true, message: 'Relay runtime prepared.' };
+    },
     relayLoginOpener: async ({ profile, url }) => ({
       opened: true,
       profile,
@@ -175,6 +180,18 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     });
     assert.equal(connected.status, 200);
     assert.equal((await connected.json()).ready, true);
+
+    const setup = await fetch(`${origin}/api/relay/setup`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ port: 18802, profile: 'work-profile' }),
+    });
+    assert.equal(setup.status, 200);
+    const setupPayload = await setup.json();
+    assert.equal(setupPayload.ready, true);
+    assert.equal(setupPayload.setup.installed, true);
+    assert.equal(relaySetupCalls[0].relayPort, 18802);
+    assert.equal(relaySetupCalls[0].profile, 'work-profile');
 
     const loginPage = await fetch(`${origin}/api/relay/login`, {
       method: 'POST',

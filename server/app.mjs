@@ -6,13 +6,14 @@ import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/art
 import { ValidationError, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
 import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
+import { setupRelayRuntime } from './lib/relay-setup.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
 const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, relayConnector = connectRelay, relayLoginOpener = openRelayLogin }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
@@ -94,6 +95,30 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           profile: body?.profile || configured.profile,
         });
         return json(res, 200, status);
+      }
+      if (req.method === 'POST' && url.pathname === '/api/relay/setup') {
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        const configured = getRelayConfig();
+        const requested = body?.port;
+        const port = requested === undefined ? configured.port : Number(requested);
+        const profile = String(body?.profile || configured.profile || 'openclaw').trim();
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
+        if (!/^[\p{L}\p{N}_.-]+$/u.test(profile)) return json(res, 400, errorBody('INVALID_PROFILE', 'Invalid browser profile.'));
+        const setup = await relaySetup({
+          projectRoot: config.projectRoot,
+          scriptPath: config.windowsPrerequisiteScriptPath,
+          relayPort: port,
+          profile,
+          browserDataDir: config.managedBrowserDataDir,
+        });
+        if (!setup.ok) return json(res, 503, { ...setup, ready: false, port, profile });
+        const status = await relayConnector({
+          port,
+          openClawConfigPath: config.openClawConfigPath,
+          managedBrowserDataDir: config.managedBrowserDataDir,
+          profile,
+        });
+        return json(res, status.ready ? 200 : 503, { ...status, ...setup, setup, port, profile });
       }
       if (req.method === 'POST' && url.pathname === '/api/relay/login') {
         const configured = getRelayConfig();

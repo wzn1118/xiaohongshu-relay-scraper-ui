@@ -21,6 +21,8 @@ export const config = Object.freeze({
   runnerPath,
   runnerAvailable: existsSync(runnerPath),
   staticDir: path.resolve(process.env.XHS_STATIC_DIR || path.join(serverDir, '..', 'dist')),
+  projectRoot: path.resolve(serverDir, '..'),
+  windowsPrerequisiteScriptPath: path.resolve(serverDir, '..', 'scripts', 'ensure-windows-prerequisites.ps1'),
   dataDir,
   managedBrowserDataDir: path.resolve(process.env.XHS_BROWSER_DATA_DIR || path.join(dataDir, '..', 'browser')),
   relayConfigPath: path.resolve(process.env.XHS_RELAY_CONFIG_PATH || path.join(dataDir, '..', 'relay-config.json')),

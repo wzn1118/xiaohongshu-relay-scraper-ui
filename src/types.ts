@@ -157,6 +157,7 @@ export type JobRequest = {
   gotoTimeoutMs: number
   noteDelaySeconds: number
   mode: 'fresh' | 'resume'
+  resumeFromJobId?: string | null
   skipPostprocess: boolean
   noAutoAttach: boolean
   checkOnly: boolean
