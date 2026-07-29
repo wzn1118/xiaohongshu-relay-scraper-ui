@@ -356,6 +356,10 @@ npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
 2. 在 AI Runtime 区域点击“检测并启用”。
 3. 系统会读取已安装模型，选中可用的中文模型并创建本机会话。
 
+```bash
+ollama pull qwen3:4b
+```
+
 模型权重由本地模型服务管理，不纳入本 Git 仓库。首次安装会占用数 GB 磁盘空间；推理速度取决于 CPU、GPU 和内存。
 
 项目内置 AI Runtime，不依赖用户电脑上的 Codex CLI。页面支持 `Responses API` 和 `Chat Completions` 两种协议；选择 Codex 时默认使用 Responses API，直接填写模型服务提供的 Base URL、模型和 API Key 即可。配置保存于本机 `data/ai-config.json`，API Key 不通过配置查询接口返回，也不会写入任务历史、日志或 GitHub。
