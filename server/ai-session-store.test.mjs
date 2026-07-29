@@ -22,7 +22,8 @@ test('AI provider relay configuration persists without exposing the API key', as
     assert.equal('apiKey' in session, false);
     const provider = first.providers().find((item) => item.id === 'codex');
     assert.equal(provider.hasApiKey, true);
-    assert.deepEqual(provider.models, ['gpt-5.5', 'gpt-5', 'gpt-5-mini']);
+    assert.ok(provider.models.includes('gpt-5.6-terra'));
+    assert.ok(provider.models.includes('gpt-5.5'));
     assert.equal('apiKey' in provider, false);
 
     const second = new AiSessionStore({ filePath });
@@ -33,4 +34,35 @@ test('AI provider relay configuration persists without exposing the API key', as
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('AI model discovery reuses a saved key only for its saved Base URL', async () => {
+  const calls = [];
+  const store = new AiSessionStore({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, authorization: options.headers.Authorization });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [{ id: 'model-10' }, { id: 'model-2' }, { id: 'model-2' }, { id: 'invalid model' }] }),
+      };
+    },
+  });
+  await store.create({
+    provider: 'openai',
+    apiKey: 'secret-key',
+    baseUrl: 'https://api.example/v1',
+    model: 'model-2',
+    wireApi: 'chat_completions',
+  });
+
+  const result = await store.discoverModels({ provider: 'openai', apiKey: '', baseUrl: 'https://api.example/v1/' });
+  assert.deepEqual(result.models, ['model-2', 'model-10']);
+  assert.deepEqual(calls, [{ url: 'https://api.example/v1/models', authorization: 'Bearer secret-key' }]);
+  assert.equal('apiKey' in result, false);
+
+  await assert.rejects(
+    store.discoverModels({ provider: 'openai', apiKey: '', baseUrl: 'https://other.example/v1' }),
+    (error) => error.code === 'AI_VALIDATION',
+  );
 });

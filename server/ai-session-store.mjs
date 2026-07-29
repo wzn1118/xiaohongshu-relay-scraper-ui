@@ -3,17 +3,59 @@ import { mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
 
 const PROVIDERS = Object.freeze({
-  openai: { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4.1-mini', models: ['gpt-4.1-mini', 'gpt-4.1', 'gpt-4o-mini', 'gpt-4o'], requiresKey: true, wireApi: 'chat_completions', bundled: true },
-  codex: { label: '内置 Codex Runtime', baseUrl: '', model: 'gpt-5.5', models: ['gpt-5.5', 'gpt-5', 'gpt-5-mini'], requiresKey: true, wireApi: 'responses', bundled: true },
-  deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', models: ['deepseek-chat', 'deepseek-reasoner'], requiresKey: true, wireApi: 'chat_completions', bundled: true },
-  qwen: { label: 'Qwen', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', models: ['qwen-plus', 'qwen-max', 'qwen-turbo'], requiresKey: true, wireApi: 'chat_completions', bundled: true },
-  custom: { label: '自定义 OpenAI 兼容服务', baseUrl: '', model: '', models: ['gpt-4.1-mini', 'deepseek-chat', 'qwen-plus'], requiresKey: true, wireApi: 'chat_completions', bundled: true },
+  openai: {
+    label: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4.1-mini',
+    models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5', 'gpt-5-mini', 'gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini'],
+    requiresKey: true,
+    wireApi: 'chat_completions',
+    bundled: true,
+  },
+  codex: {
+    label: '内置 Codex Runtime',
+    baseUrl: '',
+    model: 'gpt-5.5',
+    models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5', 'gpt-5-mini'],
+    requiresKey: true,
+    wireApi: 'responses',
+    bundled: true,
+  },
+  deepseek: {
+    label: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com',
+    model: 'deepseek-chat',
+    models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-reasoner', 'deepseek-chat'],
+    requiresKey: true,
+    wireApi: 'chat_completions',
+    bundled: true,
+  },
+  qwen: {
+    label: 'Qwen',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-plus',
+    models: ['qwen3.8-max-preview', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.7-flash', 'qwen-plus', 'qwen-max', 'qwen-turbo'],
+    requiresKey: true,
+    wireApi: 'chat_completions',
+    bundled: true,
+  },
+  custom: {
+    label: '自定义 OpenAI 兼容服务',
+    baseUrl: '',
+    model: '',
+    models: ['gpt-5.6-terra', 'gpt-5.5', 'gpt-4.1-mini', 'deepseek-v4-pro', 'deepseek-chat', 'qwen3.7-plus', 'qwen-plus'],
+    requiresKey: true,
+    wireApi: 'chat_completions',
+    bundled: true,
+  },
 });
 
 export class AiSessionStore {
-  constructor({ ttlMs = 8 * 60 * 60 * 1000, filePath = null } = {}) {
+  constructor({ ttlMs = 8 * 60 * 60 * 1000, filePath = null, fetchImpl = globalThis.fetch, modelDiscoveryTimeoutMs = 10000 } = {}) {
     this.ttlMs = ttlMs;
     this.filePath = filePath;
+    this.fetchImpl = fetchImpl;
+    this.modelDiscoveryTimeoutMs = modelDiscoveryTimeoutMs;
     this.sessions = new Map();
     this.configurations = new Map();
   }
@@ -77,6 +119,46 @@ export class AiSessionStore {
     };
     this.sessions.set(session.id, session);
     return publicSession(session);
+  }
+
+  async discoverModels(value = {}) {
+    const provider = String(value.provider || '').trim().toLowerCase();
+    const definition = PROVIDERS[provider];
+    if (!definition) throw validation('Unsupported AI provider.');
+    const saved = this.configurations.get(provider) || {};
+    const suppliedApiKey = String(value.apiKey || '').trim();
+    const apiKey = suppliedApiKey || String(saved.apiKey || '').trim();
+    const baseUrl = normalizeBaseUrl(value.baseUrl || saved.baseUrl || definition.baseUrl);
+    if (definition.requiresKey && !apiKey) throw validation('API key is required to read the model list.');
+    if (!suppliedApiKey && saved.apiKey && saved.baseUrl && baseUrl !== normalizeBaseUrl(saved.baseUrl)) {
+      throw validation('Enter the API key again after changing the Base URL.');
+    }
+    if (typeof this.fetchImpl !== 'function') throw discoveryFailure('Model discovery is unavailable in this runtime.');
+
+    let response;
+    try {
+      response = await this.fetchImpl(`${baseUrl}/models`, {
+        method: 'GET',
+        headers: { Accept: 'application/json', Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(this.modelDiscoveryTimeoutMs),
+      });
+    } catch (error) {
+      const reason = error?.name === 'TimeoutError' ? 'request timed out' : 'the model service could not be reached';
+      throw discoveryFailure(`Could not read the model list because ${reason}.`);
+    }
+    if (!response.ok) throw discoveryFailure(`The model service returned HTTP ${response.status}.`);
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      throw discoveryFailure('The model service returned an invalid JSON response.');
+    }
+    const entries = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : [];
+    const models = [...new Set(entries.map(modelId).filter(Boolean))]
+      .sort((left, right) => left.localeCompare(right, 'en', { numeric: true }));
+    if (!models.length) throw discoveryFailure('The model service returned no usable model IDs.');
+    return { provider, baseUrl, models, fetchedAt: new Date().toISOString() };
   }
 
   resolve(id) {
@@ -160,8 +242,20 @@ function publicSession(session) {
   };
 }
 
+function modelId(value) {
+  const candidate = typeof value === 'string' ? value : value?.id || value?.name || value?.model;
+  const text = String(candidate || '').trim();
+  return /^[^\s<>"']{1,160}$/u.test(text) ? text : '';
+}
+
 function validation(message) {
   const error = new Error(message);
   error.code = 'AI_VALIDATION';
+  return error;
+}
+
+function discoveryFailure(message) {
+  const error = new Error(message);
+  error.code = 'AI_MODEL_DISCOVERY_FAILED';
   return error;
 }

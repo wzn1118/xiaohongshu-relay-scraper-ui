@@ -67,9 +67,19 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   let smtpDeliveryStatus = { configured: true, from: 's***@example.com', authMode: 'login' };
   const sentMessages = [];
   const relaySetupCalls = [];
+  const modelDiscoveryCalls = [];
   const server = http.createServer(createApp({
     manager,
     config,
+    aiSessions: {
+      providers: () => [{ id: 'openai', models: ['gpt-4.1-mini'] }],
+      discoverModels: async (value) => {
+        modelDiscoveryCalls.push(value);
+        return { provider: value.provider, baseUrl: value.baseUrl, models: ['gpt-5.6-terra', 'gpt-4.1-mini'], fetchedAt: new Date().toISOString() };
+      },
+      create: async () => ({ id: 'ai-session-1', provider: 'openai' }),
+      delete: () => true,
+    },
     relayConfig: {
       get: () => ({ ...relaySettings }),
       update: async (value) => {
@@ -146,6 +156,15 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(health.ok, true);
     assert.equal(health.service, 'xiaohongshu-relay-scraper');
     assert.equal(health.emailDelivery.configured, true);
+
+    const discoveredModels = await fetch(`${origin}/api/ai/models`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'openai', apiKey: 'test-key', baseUrl: 'https://api.openai.com/v1' }),
+    });
+    assert.equal(discoveredModels.status, 200);
+    assert.deepEqual((await discoveredModels.json()).models, ['gpt-5.6-terra', 'gpt-4.1-mini']);
+    assert.equal(modelDiscoveryCalls.length, 1);
 
     const emailConfig = await fetch(`${origin}/api/email/config`).then((response) => response.json());
     assert.equal(emailConfig.configured, true);

@@ -503,6 +503,7 @@ function App() {
   const [backgroundText, setBackgroundText] = useState('')
   const [backgroundFiles, setBackgroundFiles] = useState<File[]>([])
   const [configuringAi, setConfiguringAi] = useState(false)
+  const [refreshingModels, setRefreshingModels] = useState(false)
   const [importingProfile, setImportingProfile] = useState(false)
   const [candidateImportStatus, setCandidateImportStatus] = useState<'recognized' | 'empty' | null>(null)
   const cleanupStream = useRef<null | (() => void)>(null)
@@ -797,6 +798,28 @@ function App() {
       setNotice((error as Error).message)
     } finally {
       setConfiguringAi(false)
+    }
+  }
+
+  const refreshAiModels = async () => {
+    setRefreshingModels(true)
+    setNotice(null)
+    try {
+      const result = await api.discoverAiModels({ provider: providerId, apiKey, baseUrl: aiBaseUrl })
+      const currentProvider = providers.find((item) => item.id === providerId)
+      const models = [...new Set([...(currentProvider?.models || []), ...result.models])]
+      setProviders((current) => current.map((item) => item.id === providerId ? { ...item, models } : item))
+      if (!aiModel && models[0]) {
+        setAiModel(models[0])
+        setCustomModelMode(false)
+      } else if (customModelMode && result.models.includes(aiModel)) {
+        setCustomModelMode(false)
+      }
+      setNotice(`已从当前账号读取 ${result.models.length} 个可用模型。`)
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setRefreshingModels(false)
     }
   }
 
@@ -1312,7 +1335,7 @@ function App() {
                 <div className="form-row ai-provider-row">
                   <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
                   <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
-                  <label className="field"><span>模型</span><select value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select></label>
+                  <div className="field model-field"><span id="ai-model-label">模型</span><div className="model-picker"><select aria-labelledby="ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select><button type="button" className="model-refresh-button" title="读取当前账号可用模型" aria-label="读取当前账号可用模型" disabled={refreshingModels || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}</button></div><small>{selectedProvider?.models.length || 0} 个可选模型</small></div>
                 </div>
                 {customModelMode && <label className="field custom-model-field"><span>自定义模型 ID</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="例如 provider/model-name" /></label>}
                 <div className="form-row ai-provider-row">

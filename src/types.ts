@@ -151,6 +151,13 @@ export type AiSession = {
   expiresAt: string
 }
 
+export type AiModelDiscovery = {
+  provider: string
+  baseUrl: string
+  models: string[]
+  fetchedAt: string
+}
+
 export type CandidateProfile = {
   id: string
   display_name: string

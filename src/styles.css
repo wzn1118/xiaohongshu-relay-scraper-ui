@@ -166,6 +166,12 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .ai-provider-row .base-url-field { grid-column: span 2; }
 .base-url-field { margin-top: 10px; }
 .custom-model-field { margin-top: 10px; }
+.model-picker { display: grid; grid-template-columns: minmax(0, 1fr) 36px; gap: 6px; }
+.model-picker select { min-width: 0; }
+.model-refresh-button { width: 36px; min-height: 36px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #aeadA8; border-radius: 4px; background: #fff; color: var(--green); cursor: pointer; }
+.model-refresh-button:hover:not(:disabled) { border-color: var(--green); background: #f2f7f4; }
+.model-refresh-button:disabled { color: #9a9b9d; cursor: not-allowed; opacity: .65; }
+.model-field > small { margin-top: 4px; color: #77797d; font-size: 9px; }
 .setup-action { min-height: 36px; margin-top: 11px; padding: 0 14px; }
 .form-hint { display: block; margin-top: 8px; color: #77797d; font-size: 10px; line-height: 1.5; }
 .upload-zone { min-height: 44px; margin-top: 14px; padding: 8px 10px; display: flex; align-items: center; gap: 9px; border: 1px dashed #a8aaa8; border-radius: 4px; background: #fff; color: #606267; font-size: 10px; cursor: pointer; }

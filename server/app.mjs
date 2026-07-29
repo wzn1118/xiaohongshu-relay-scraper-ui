@@ -157,6 +157,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         return json(res, opened.opened ? 200 : 503, { ...connection, ...opened, profile, url: urlToOpen });
       }
       if (req.method === 'GET' && url.pathname === '/api/ai/providers') return json(res, 200, aiSessions.providers());
+      if (req.method === 'POST' && url.pathname === '/api/ai/models') {
+        return json(res, 200, await aiSessions.discoverModels(await readJsonBody(req, config.maxBodyBytes)));
+      }
       if (req.method === 'POST' && url.pathname === '/api/ai/sessions') {
         return json(res, 201, await aiSessions.create(await readJsonBody(req, config.maxBodyBytes)));
       }
@@ -236,6 +239,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       }
       if (error.code === 'BODY_TOO_LARGE') return json(res, 413, errorBody('BODY_TOO_LARGE', 'Request body is too large.'));
       if (['AI_VALIDATION', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
+      if (error.code === 'AI_MODEL_DISCOVERY_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_IMPORT_FAILED') return json(res, 422, errorBody(error.code, error.message));
       if (error.code === 'MAIL_NOT_CONFIGURED') return json(res, 503, errorBody(error.code, error.message));
