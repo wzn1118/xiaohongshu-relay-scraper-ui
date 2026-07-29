@@ -7,7 +7,7 @@ const PROVIDERS = Object.freeze({
   codex: { label: '内置 Codex Runtime', baseUrl: '', model: 'gpt-5.5', requiresKey: true, wireApi: 'responses', bundled: true },
   deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', requiresKey: true, wireApi: 'chat_completions', bundled: true },
   qwen: { label: 'Qwen', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', requiresKey: true, wireApi: 'chat_completions', bundled: true },
-  custom: { label: '自定义 OpenAI 兼容中转', baseUrl: '', model: '', requiresKey: true, wireApi: 'chat_completions', bundled: true },
+  custom: { label: '自定义 OpenAI 兼容服务', baseUrl: '', model: '', requiresKey: true, wireApi: 'chat_completions', bundled: true },
 });
 
 export class AiSessionStore {

@@ -211,7 +211,7 @@ data/jobs/<JOB_ID>/artifacts/
 ### 依赖
 
 - Windows 首次启动时，项目会自动准备 Node.js 22+、Python 3.11+、项目依赖和 Chrome/Edge；AI 使用项目内置运行时，不要求用户全局安装 Codex CLI
-- 一个可访问的模型中转站地址、模型名和 API Key；在页面的 AI Runtime 区域配置后会保存到本机 `data/ai-config.json`
+- 一个可访问的模型服务 Base URL、模型名和 API Key；在页面的 AI Runtime 区域配置后会保存到本机 `data/ai-config.json`
 
 ### Windows 一键启动
 
@@ -238,9 +238,9 @@ http://127.0.0.1:4317
 3. 执行 `npm ci`、Python 依赖安装和前端构建。
 4. 创建本地 `.env` 并启动页面与 API。
 5. 自动启动原生 CDP 浏览器（已有 Relay 时直接复用）；在页面中完成一次目标网站登录。
-6. 在页面 AI Runtime 中填写中转站 Base URL、协议、模型和 API Key，点击连接后运行采集任务。
+6. 在页面 AI Runtime 中填写模型服务 Base URL、协议、模型和 API Key，点击连接后运行采集任务。
 
-自动准备 Node.js、Python 和 Chrome 需要 Windows App Installer 提供的 `winget`。系统包管理器本身缺失时，先安装 App Installer；采集运行时随项目 ZIP 分发，模型中转配置保存在每台电脑自己的 `data/ai-config.json`。
+自动准备 Node.js、Python 和 Chrome 需要 Windows App Installer 提供的 `winget`。系统包管理器本身缺失时，先安装 App Installer；采集运行时随项目 ZIP 分发，模型服务配置保存在每台电脑自己的 `data/ai-config.json`。
 
 ### 采集节奏
 
@@ -265,7 +265,7 @@ start-windows.cmd -CheckOnly -NoBrowser
 ./start-linux-macos.sh --check-only --no-browser
 ```
 
-输出中的 `ready: true` 表示运行时、项目安装状态和浏览器基础环境满足启动条件；其中 `relayServiceReady: true` 表示浏览器 CDP 已就绪。`npm run preflight` 会继续检查上游采集脚本、模型工具和兼容 Relay 配置。采集任务还需要在本机完成一次浏览器登录，并配置上游脚本和模型中转。详见 [浏览器读取与无 Relay 启动](docs/managed-browser.md)。
+输出中的 `ready: true` 表示运行时、项目安装状态和浏览器基础环境满足启动条件；其中 `relayServiceReady: true` 表示浏览器 CDP 已就绪。`npm run preflight` 会继续检查上游采集脚本、模型工具和兼容 Relay 配置。采集任务还需要在本机完成一次浏览器登录，并配置上游脚本和模型服务。详见 [浏览器读取与无 Relay 启动](docs/managed-browser.md)。
 
 <details>
 <summary><strong>手动安装、配置和验证</strong></summary>
@@ -297,7 +297,7 @@ sh scripts/start.sh
 | `HOST` | `127.0.0.1` | 服务监听地址 |
 | `PORT` | `4317` | 服务端口 |
 | `PYTHON_BIN` | 自动探测 | Python 可执行文件 |
-| `XHS_AI_CONFIG_PATH` | `data/ai-config.json` | 内置 AI 中转配置和本机密钥 |
+| `XHS_AI_CONFIG_PATH` | `data/ai-config.json` | 内置 AI 服务配置和本机密钥 |
 | `XHS_UPSTREAM_RUNNER` | 自动发现 | 上游入口脚本 |
 | `XHS_UPSTREAM_SCRAPER` | 自动发现 | 正文采集模块 |
 | `XHS_SERVER_DATA_DIR` | `data/jobs` | 私有任务数据 |
@@ -346,11 +346,11 @@ npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
 
 个人 Outlook.com 账号则把 `SMTP_HOST` 改为 `smtp-mail.outlook.com`，并把 `SMTP_OAUTH_TENANT` 改为 `consumers`。
 
-#### AI 中转配置
+#### AI 服务配置
 
-项目内置 AI Runtime，不依赖用户电脑上的 Codex CLI。页面支持 `Responses API` 和 `Chat Completions` 两种协议；选择 Codex 时默认使用 Responses API，直接填写中转站提供的 Base URL、模型和 API Key 即可。配置保存于本机 `data/ai-config.json`，API Key 不通过配置查询接口返回，也不会写入任务历史、日志或 GitHub。
+项目内置 AI Runtime，不依赖用户电脑上的 Codex CLI。页面支持 `Responses API` 和 `Chat Completions` 两种协议；选择 Codex 时默认使用 Responses API，直接填写模型服务提供的 Base URL、模型和 API Key 即可。配置保存于本机 `data/ai-config.json`，API Key 不通过配置查询接口返回，也不会写入任务历史、日志或 GitHub。
 
-例如中转站文档给出 `wire_api = "responses"` 时，在页面选择 `内置 Codex Runtime`、填写模型 `gpt-5.5`、对应 Base URL，协议选择 `Responses API`，再粘贴 API Key。原有 `$CODEX_HOME/config.toml` 和外部 CLI 仍可作为兼容回退，但不是新电脑启动条件。
+例如模型服务文档给出 `wire_api = "responses"` 时，在页面选择 `内置 Codex Runtime`、填写模型 `gpt-5.5`、对应 Base URL，协议选择 `Responses API`，再粘贴 API Key。原有 `$CODEX_HOME/config.toml` 和外部 CLI 仍可作为兼容回退，但不是新电脑启动条件。
 
 项目优先使用仓库内置的 `vendor/xiaohongshu-relay-scrape/scripts/` 采集运行时，因此 GitHub 下载包不需要额外安装 Skill。若要切换到本机其他版本，仍可在 `.env` 中填写：
 

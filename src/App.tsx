@@ -577,7 +577,7 @@ function App() {
       const saved = await api.updateRelayConfig(relayConfig)
       setRelayConfig(saved)
       updateRequest('relayPort', saved.port)
-      setNotice('中转站配置已保存')
+      setNotice('Relay 配置已保存')
       await connectRelay(true, saved)
     } catch (error) {
       setNotice((error as Error).message)
@@ -883,7 +883,7 @@ function App() {
           }).then((session) => {
             setAiSession(session)
             updateRequest('aiSessionId', session.id)
-            setNotice('已自动连接本机保存的内置 Codex 中转配置')
+            setNotice('已自动连接本机保存的 Codex Runtime 配置')
           }).catch(() => undefined)
         }
       }
@@ -1191,14 +1191,14 @@ function App() {
             </div>
           </section>
 
-          <section className="panel relay-config-panel" id="relay-config" aria-label="中转站配置">
+          <section className="panel relay-config-panel" id="relay-config" aria-label="Relay 配置">
             <div className="panel-heading compact">
-              <div><span className="step-label">RELAY CONFIGURATION</span><h2>中转站配置</h2></div>
+              <div><span className="step-label">RELAY CONFIGURATION</span><h2>Relay 配置</h2></div>
               <span className={`runtime-badge ${relaySiteReady ? 'passed' : ''}`}>{relaySiteReady ? '登录已就绪' : relayReady ? '服务已启动' : '待配置'}</span>
             </div>
             <div className="relay-config-body">
               <div className="form-row relay-config-fields">
-                <label className="field"><span>中转端口</span><input type="number" min="1024" max="65535" value={relayConfig.port} onChange={(event) => updateRelayConfig('port', Number(event.target.value))} /></label>
+                <label className="field"><span>Relay 端口</span><input type="number" min="1024" max="65535" value={relayConfig.port} onChange={(event) => updateRelayConfig('port', Number(event.target.value))} /></label>
                 <label className="field"><span>浏览器 Profile</span><input value={relayConfig.profile} onChange={(event) => updateRelayConfig('profile', event.target.value)} placeholder="chrome" /></label>
                 <Toggle checked={relayConfig.autoConnect} onChange={(value) => updateRelayConfig('autoConnect', value)} label="开机自动连接" description="启动脚本读取此配置并通过代码连接" />
               </div>
@@ -1296,14 +1296,14 @@ function App() {
                 <div className="setup-title"><KeyRound size={17} /><span><strong>AI Runtime</strong><small>{aiSession ? `${selectedProvider?.label || providerId} · 会话内存` : '选择提供方并连接'}</small></span></div>
                 <div className="form-row ai-provider-row">
                   <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-                  <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴中转站 API Key'} /></label>
+                  <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
                   <label className="field"><span>模型</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="例如 gpt-5.5" /></label>
                 </div>
                 <div className="form-row ai-provider-row">
                   <label className="field base-url-field"><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="https://relay.example/v1" /></label>
                   <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
                 </div>
-                <small className="form-hint">{providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写中转站地址后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
+                <small className="form-hint">{providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写模型服务 Base URL 后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
                 <button type="button" className="secondary-button setup-action" disabled={configuringAi || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}{aiSession ? '重新连接' : '连接 AI'}</button>
               </section>
               <section>
