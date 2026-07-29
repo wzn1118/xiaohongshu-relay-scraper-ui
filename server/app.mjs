@@ -90,6 +90,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         const status = await relayConnector({
           port,
           openClawConfigPath: config.openClawConfigPath,
+          managedBrowserDataDir: config.managedBrowserDataDir,
           profile: body?.profile || configured.profile,
         });
         return json(res, 200, status);
@@ -108,12 +109,18 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         const connection = await relayConnector({
           port: Number(configured.port),
           openClawConfigPath: config.openClawConfigPath,
+          managedBrowserDataDir: config.managedBrowserDataDir,
           profile,
         });
         if (!connection.ready && !(connection.running && connection.cdpReady)) {
           return json(res, 503, { ...connection, opened: false, profile, url: urlToOpen });
         }
-        const opened = await relayLoginOpener({ profile, url: urlToOpen });
+        const opened = await relayLoginOpener({
+          port: Number(configured.port),
+          openClawConfigPath: config.openClawConfigPath,
+          profile,
+          url: urlToOpen,
+        });
         return json(res, opened.opened ? 200 : 503, { ...connection, ...opened, profile, url: urlToOpen });
       }
       if (req.method === 'GET' && url.pathname === '/api/ai/providers') return json(res, 200, aiSessions.providers());

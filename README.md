@@ -1,8 +1,8 @@
 <div align="center">
 
-# 小红书实习岗位 AI 求职助手
+# 小红书实习岗位 AI 求职助手 🚀
 
-<p><strong>把岗位研究、简历匹配和求职信生成，串成一条可复核的投递工作流。</strong></p>
+<p><strong>把岗位研究、简历匹配和求职信生成，串成一条可复核的投递工作流。🔎 → ✍️ → 📮</strong></p>
 
 <p>
   <a href="https://github.com/wzn1118/xiaohongshu-relay-scraper-ui/actions/workflows/ci.yml"><img src="https://github.com/wzn1118/xiaohongshu-relay-scraper-ui/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI" /></a>
@@ -11,11 +11,11 @@
   <img src="https://img.shields.io/badge/Node.js-22%2B-2563eb" alt="Node.js 22+" />
 </p>
 
-<p>小红书实习岗位采集 · 简历智能导入 · Cover Letter 生成 · Agent 质量评审</p>
+<p>小红书实习岗位采集 🔎 · 简历智能导入 🧠 · Cover Letter 生成 ✍️ · Agent 质量评审 🛡️</p>
 
 </div>
 
-> 这是一个面向实习求职者的 **local-first AI job application workbench**：从小红书公开岗位发现开始，自动整理岗位正文、提炼职责与能力要求、读取候选人简历事实，再生成岗位定制的私信、邮件和 Cover Letter。
+> 这是一个面向实习求职者的 **local-first AI job application workbench**：从公开岗位发现开始，自动整理岗位正文、提炼职责与能力要求、读取候选人简历事实，再生成岗位定制的私信、邮件和 Cover Letter。🚀
 
 **一句话理解：** 不再在岗位卡片、正文、简历和邮件之间反复复制粘贴，而是把“找到岗位”推进到“准备好一份可人工确认的投递材料”。
 
@@ -27,24 +27,24 @@
   <a href="#快速开始">快速开始</a>
 </p>
 
-## 产品截图
+## 产品截图 📸
 
-下面是本地实际运行的产品界面，展示岗位任务配置、Agent 阶段、质量覆盖率、任务历史和交付物导出。公开展示图已移除候选人个人资料内容。
+GitHub 展示区放真实运行截图，产品界面本身保持专注：打开工作台就能直接开始配置任务。下面三张图分别展示完整运行态、桌面端深度处理和移动端快速查看。✨
 
 <p align="center">
-  <img src="/completed-run.png" alt="完整采集任务与交付物" width="100%" />
+  <img src="./completed-run.png" alt="完整采集任务与交付物" width="100%" />
 </p>
-<p align="center"><strong>完整运行态：从岗位采集到任务历史与交付文件，一屏看清产品闭环</strong></p>
+<p align="center"><strong>完整运行态：从岗位采集到任务历史与交付文件，一屏看清产品闭环 ✅</strong></p>
 
 <table>
   <tr>
     <td width="65%" valign="top">
-      <p><strong>01 · 桌面端工作台</strong><br /><sub>岗位配置、Agent 进度、质量指标和实时日志</sub></p>
-      <img src="/desktop-workflow.png" alt="桌面端岗位采集与 Agent 工作台" width="100%" />
+      <p><strong>01 · 桌面端工作台 💻</strong><br /><sub>岗位配置、Agent 进度、质量指标和实时日志</sub></p>
+      <img src="./desktop-workflow.png" alt="桌面端岗位采集与 Agent 工作台" width="100%" />
     </td>
     <td width="35%" valign="top">
-      <p><strong>02 · 移动端适配</strong><br /><sub>窄屏下仍可完成配置、运行和结果查看</sub></p>
-      <img src="/mobile-workflow.png" alt="移动端响应式求职工作台" width="100%" />
+      <p><strong>02 · 移动端适配 📱</strong><br /><sub>窄屏下仍可完成配置、运行和结果查看</sub></p>
+      <img src="./mobile-workflow.png" alt="移动端响应式求职工作台" width="100%" />
     </td>
   </tr>
 </table>
@@ -69,7 +69,7 @@
   <tr>
     <td width="50%" valign="top">
       <h3>岗位发现</h3>
-      <p>通过已登录浏览器和 OpenClaw Browser Relay 采集小红书公开岗位信息，保留岗位来源、采集时间和正文状态。</p>
+      <p>通过项目管理的已登录浏览器采集小红书公开岗位信息，保留岗位来源、采集时间和正文状态。</p>
     </td>
     <td width="50%" valign="top">
       <h3>正文补全</h3>
@@ -209,16 +209,14 @@ data/jobs/<JOB_ID>/artifacts/
 
 ### 依赖
 
-- Node.js 22+
-- Python 3.11+
-- Codex CLI 或受支持的 API Key
-- Windows 首次启动时，项目会自动准备 Chrome 和 OpenClaw 托管浏览器 Relay
+- Windows 首次启动时，项目会自动准备 Node.js 22+、Python 3.11+、项目依赖、Chrome/Edge 和 Codex CLI；OpenClaw Relay 不是必需依赖
+- Codex CLI 登录状态或受支持的 API Key；项目会自动写入默认中转配置模板，不覆盖已有 Codex 配置
 
 ### Windows 一键启动
 
 从 GitHub [下载 ZIP](https://github.com/wzn1118/xiaohongshu-relay-scraper-ui/archive/refs/heads/master.zip) 并解压，然后双击根目录的 `start-windows.cmd`。
 
-首次运行会先检查并准备 Windows 运行时、命令行工具、Chrome 和项目自己的托管浏览器 Relay，再安装项目依赖、构建应用、创建 `.env`，成功后打开：
+首次运行会先检查并准备 Windows 运行时、命令行工具、Chrome/Edge 和项目自己的原生 CDP 浏览器，再安装项目依赖、使用仓库内置采集运行时构建应用、创建 `.env` 和本机 Codex 配置，成功后打开：
 
 ```text
 http://127.0.0.1:4317
@@ -226,9 +224,9 @@ http://127.0.0.1:4317
 
 后续再次启动会复用已经运行的健康实例，不会重复启动服务。
 
-如果新电脑没有安装 Relay，也不需要先手动寻找或配置一个外部 Relay。Windows 启动器会通过 OpenClaw 命令行启动独立的 `openclaw` 浏览器 Profile，默认使用本机 CDP 端口 `18800`；如果没有 Chrome，会通过 `winget` 安装。整个过程使用后台进程和 API，不接管当前鼠标。
+如果新电脑没有安装 OpenClaw Relay，也不需要先手动寻找或配置一个外部 Relay。Windows 启动器会自动发现 Chrome/Edge，并通过原生 CDP 启动独立的项目浏览器 Profile，默认使用本机端口 `18800`；如果没有 Chrome，会通过 `winget` 安装。已有可用 Relay 时项目会直接复用。整个过程使用后台进程和 API，不接管当前鼠标。
 
-首次打开页面后，在 Relay 配置区点击“打开登录页”，项目会先确认托管浏览器服务已启动，再用代码打开小红书登录页。登录完成后，该电脑的浏览器 Profile 会保存登录状态；Cookie 只保存在本机，不会随 GitHub 仓库同步到另一台电脑。
+启动器检测到没有目标页签时，会先通过代码打开托管浏览器中的小红书登录页；也可以在 Relay 配置区再次点击“打开登录页”。登录完成后，该电脑的浏览器 Profile 会保存登录状态；Cookie 只保存在本机，不会随 GitHub 仓库同步到另一台电脑。
 
 #### 空机首次配置顺序
 
@@ -238,10 +236,10 @@ http://127.0.0.1:4317
 2. 通过 npm 准备项目使用的命令行工具。
 3. 执行 `npm ci`、Python 依赖安装和前端构建。
 4. 创建本地 `.env` 并启动页面与 API。
-5. 自动启动托管浏览器 Relay；在页面中完成一次目标网站登录。
-6. 配置上游入口脚本、中转站端口/Profile 和模型配置后，再运行采集任务。
+5. 自动启动原生 CDP 浏览器（已有 Relay 时直接复用）；在页面中完成一次目标网站登录。
+6. 完成一次小红书登录和 Codex CLI 登录后，直接运行采集任务。
 
-自动准备 Node.js、Python 和 Chrome 需要 Windows App Installer 提供的 `winget`。系统包管理器本身缺失时，先安装 App Installer；上游采集 Skill 不随项目 ZIP 分发，浏览器登录和模型中转配置也属于每台电脑的一次性本地配置。
+自动准备 Node.js、Python 和 Chrome 需要 Windows App Installer 提供的 `winget`。系统包管理器本身缺失时，先安装 App Installer；采集运行时和中转配置模板已经随项目 ZIP 分发，只有浏览器登录和 Codex 账号鉴权属于每台电脑的一次性本地状态。
 
 ### Linux / macOS
 
@@ -262,7 +260,7 @@ start-windows.cmd -CheckOnly -NoBrowser
 ./start-linux-macos.sh --check-only --no-browser
 ```
 
-输出中的 `ready: true` 表示运行时、项目安装状态和浏览器基础环境满足启动条件；其中 `relayServiceReady: true` 表示托管 Relay 已启动。`npm run preflight` 会继续检查上游采集脚本、模型工具和 Relay 配置。采集任务还需要在本机完成一次浏览器登录，并配置上游脚本和模型中转。
+输出中的 `ready: true` 表示运行时、项目安装状态和浏览器基础环境满足启动条件；其中 `relayServiceReady: true` 表示浏览器 CDP 已就绪。`npm run preflight` 会继续检查上游采集脚本、模型工具和兼容 Relay 配置。采集任务还需要在本机完成一次浏览器登录，并配置上游脚本和模型中转。详见 [浏览器读取与无 Relay 启动](docs/managed-browser.md)。
 
 <details>
 <summary><strong>手动安装、配置和验证</strong></summary>
@@ -294,12 +292,13 @@ sh scripts/start.sh
 | `HOST` | `127.0.0.1` | 服务监听地址 |
 | `PORT` | `4317` | 服务端口 |
 | `PYTHON_BIN` | 自动探测 | Python 可执行文件 |
+| `CODEX_HOME` | 用户目录 `.codex` | Codex 配置和登录状态目录 |
 | `XHS_UPSTREAM_RUNNER` | 自动发现 | 上游入口脚本 |
 | `XHS_UPSTREAM_SCRAPER` | 自动发现 | 正文采集模块 |
 | `XHS_SERVER_DATA_DIR` | `data/jobs` | 私有任务数据 |
 | `XHS_PROFILE_DATA_DIR` | `data/profiles` | 私有背景记忆 |
-| `OPENCLAW_CONFIG_PATH` | 用户目录自动发现 | OpenClaw 本机配置；托管 Relay 由启动器通过命令行启动 |
-| `XHS_RELAY_CONFIG_PATH` | `data/relay-config.json` | Relay 端口、浏览器 Profile 和开机连接开关；新配置默认 `18800` / `openclaw` |
+| `OPENCLAW_CONFIG_PATH` | 用户目录自动发现 | 仅用于发现并兼容已有 OpenClaw Relay，不是新电脑的必需配置 |
+| `XHS_RELAY_CONFIG_PATH` | `data/relay-config.json` | CDP 端口、浏览器 Profile 和开机连接开关；新配置默认 `18800` / `openclaw` |
 | `XHS_AI_TIMEOUT_SECONDS` | `600` | 单次 AI 调用超时秒数 |
 | `SMTP_HOST` / `SMTP_PORT` | 留空 / `587` | 可选邮件服务器；Microsoft 365 使用 `smtp.office365.com:587` |
 | `SMTP_SECURE` / `SMTP_REQUIRE_TLS` | `false` / `true` | 587 端口通过 STARTTLS 加密连接 |
@@ -345,7 +344,7 @@ npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
 
 批处理任务会在启动 Codex CLI 时显式转发这些设置；简历导入使用同一份本机 Codex 配置，不再把推理强度固定为 `low`。API Key 仍由 Codex CLI 自己读取，项目不会写入任务历史或日志。
 
-上游 `xiaohongshu-relay-scrape` 采集 Skill 可位于 `$CODEX_HOME/skills/xiaohongshu-relay-scrape/scripts/`；若安装在其他目录，在 `.env` 中填写：
+项目优先使用仓库内置的 `vendor/xiaohongshu-relay-scrape/scripts/` 采集运行时，因此 GitHub 下载包不需要额外安装 Skill。若要切换到本机其他版本，仍可在 `.env` 中填写：
 
 ```dotenv
 XHS_UPSTREAM_RUNNER=/absolute/path/run_xiaohongshu_relay_scrape.py

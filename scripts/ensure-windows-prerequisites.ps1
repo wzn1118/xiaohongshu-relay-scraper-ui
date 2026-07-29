@@ -7,6 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$projectRoot = Split-Path -Parent $PSScriptRoot
 
 function Refresh-ProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -109,10 +110,13 @@ function Get-ToolStatus {
 }
 
 function Get-ManagedRelayStatus {
-    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Status)
-    if (-not $Status.openclaw) { return $null }
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Status, [switch]$CheckOnly)
+    if (-not $Status.node) { return $null }
     try {
-        $output = @(& $Status.openclaw browser status --browser-profile openclaw --json 2>&1)
+        $browserScript = Join-Path $PSScriptRoot 'start-managed-browser.mjs'
+        $arguments = @($browserScript, '--port', '18800', '--profile', 'openclaw', '--data-dir', (Join-Path $projectRoot 'data\browser'))
+        if ($CheckOnly) { $arguments += '--check-only' }
+        $output = @(& $Status.node @arguments 2>&1)
         if ($LASTEXITCODE -ne 0) { return $null }
         $json = ($output | Out-String).Trim()
         if (-not $json) { return $null }
@@ -153,9 +157,6 @@ if ($InstallRuntime) {
 if ($InstallTools) {
     if (-not $status.codex) { Install-NpmGlobalPackage '@openai/codex' }
     $status = Get-ToolStatus
-    if (-not $status.openclaw) { Install-NpmGlobalPackage 'openclaw' }
-    Refresh-ProcessPath
-    $status = Get-ToolStatus
 }
 
 if ($EnsureBrowserRelay -and -not $status.browser -and -not $CheckOnly) {
@@ -167,14 +168,15 @@ if ($EnsureBrowserRelay -and -not $status.browser) {
     Write-Warning 'A Chromium-based browser is required for the managed browser profile.'
 }
 
-$managedRelay = Get-ManagedRelayStatus -Status $status
+$managedRelay = Get-ManagedRelayStatus -Status $status -CheckOnly:$CheckOnly
 if ($EnsureBrowserRelay -and -not $CheckOnly) {
-    if (-not $status.openclaw) { throw 'The browser relay command is not installed.' }
+    if (-not $status.node) { throw 'Node.js is required to start the managed browser.' }
     if (-not $status.browser) { throw 'A Chromium-based browser is required for the managed browser profile.' }
-    Write-Host 'Starting the managed browser relay through code...'
-    $output = @(& $status.openclaw browser start --browser-profile openclaw --json 2>&1)
+    Write-Host 'Starting the project-managed browser through native CDP...'
+    $browserScript = Join-Path $PSScriptRoot 'start-managed-browser.mjs'
+    $output = @(& $status.node $browserScript --port 18800 --profile openclaw --data-dir (Join-Path $projectRoot 'data\browser') 2>&1)
     if ($LASTEXITCODE -ne 0) {
-        throw "Managed browser relay startup failed (exit code $LASTEXITCODE)."
+        throw "Project-managed browser startup failed (exit code $LASTEXITCODE)."
     }
     $managedRelay = (($output | Out-String).Trim() | ConvertFrom-Json)
 }
@@ -185,9 +187,10 @@ $status.ready =
     [bool]$status.python -and
     $status.nodeMajor -ge 22 -and
     ([Version]$status.pythonVersion -ge [Version]'3.11')
-$status.toolsReady = [bool]$status.codex -and [bool]$status.openclaw
+$status.toolsReady = [bool]$status.codex
 $status.browserReady = [bool]$status.browser
-$status.relayCommandReady = [bool]$status.openclaw
+$status.relayCommandReady = [bool]$status.node
+$status.relayBackend = 'native-cdp'
 $status.relayProfile = 'openclaw'
 $status.relayPort = 18800
 $status.relayServiceReady = [bool]($managedRelay -and $managedRelay.running -and $managedRelay.cdpReady)

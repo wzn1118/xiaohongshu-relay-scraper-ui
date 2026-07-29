@@ -961,7 +961,23 @@ function App() {
         )}
 
         <main>
-          <section className="overview-band" aria-label="运行概览">
+          <section className="product-hero" aria-labelledby="product-hero-title">
+            <div className="product-hero-copy">
+              <span className="marketing-kicker">FROM DISCOVERY TO DELIVERY</span>
+              <h2 id="product-hero-title">别再在碎片信息里找机会，把每次发现都变成更有把握的投递。🚀</h2>
+              <p className="product-hero-lede">继任采集台把“发现岗位 🔎、读懂正文 🧠、匹配经历、写好求职信 ✍️、完成投递 📮”串成一条本地可复核的求职工作流。</p>
+              <div className="product-hero-actions">
+                <button type="button" className="primary-button" onClick={() => document.getElementById('task-config')?.scrollIntoView({ behavior: 'smooth' })}><Play size={16} />马上开始采集 🚀</button>
+              </div>
+              <div className="product-proof-list" aria-label="产品能力">
+                <span><Check size={14} />🧩 多 Agent 分工推进</span>
+                <span><Check size={14} />🛡️ 保留正文与失败原因</span>
+                <span><Check size={14} />📦 JSON / CSV / XLSX / MD 导出</span>
+              </div>
+            </div>
+          </section>
+
+          <section className="overview-band" id="product-overview" aria-label="运行概览">
             <div className="overview-copy">
               <p>多 Agent 工作流</p>
               <strong>{runningCount ? `${runningCount} 个任务正在推进` : '工作台已待命'}</strong>
@@ -1069,7 +1085,7 @@ function App() {
           </section>
 
           <div className="primary-grid">
-            <section className="panel config-panel">
+            <section className="panel config-panel" id="task-config">
               <div className="panel-heading">
                 <div><span className="step-label">01 / CONFIGURE</span><h2>新建采集与投递分析任务</h2></div>
                 <span className="local-badge">本地执行</span>

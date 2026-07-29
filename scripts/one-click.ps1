@@ -2,6 +2,7 @@
 param(
     [switch]$NoBrowser,
     [switch]$CheckOnly,
+    [switch]$SkipBrowserRelayCheck,
     [ValidateRange(0, 65535)]
     [int]$Port = 0
 )
@@ -90,7 +91,19 @@ function Connect-Relay {
         $siteTabs = if ($status.xiaohongshuTabs) { [int]$status.xiaohongshuTabs } else { 0 }
         Write-Host "Relay code startup: ready=$ready siteTabs=$siteTabs port=$port tabs=$tabs attempted=$($status.attempted)"
         if (-not $ready) { Write-Warning "Relay is not ready: $($status.message)" }
-        elseif ($siteTabs -eq 0) { Write-Warning 'Relay service is ready. Complete the one-time website login in the managed browser, then refresh the workbench.' }
+        if ($status.running -and $status.cdpReady -and $siteTabs -eq 0) {
+            try {
+                $loginBody = @{ profile = $relayProfile; url = 'https://www.xiaohongshu.com' } | ConvertTo-Json -Compress
+                $login = Invoke-RestMethod -Method Post -Uri "$Url/api/relay/login" -ContentType 'application/json' -Body $loginBody -TimeoutSec 20
+                if ($login.opened) {
+                    Write-Host 'Login page opened in the managed browser. Complete the one-time login there.'
+                } else {
+                    Write-Warning "Managed browser login page did not open: $($login.message)"
+                }
+            } catch {
+                Write-Warning "Managed browser login page could not be opened: $($_.Exception.Message)"
+            }
+        }
         return $ready
     } catch {
         Write-Warning "Relay code startup did not complete: $($_.Exception.Message)"
@@ -148,16 +161,21 @@ $bootstrapRequired = -not $installationReady
 
 if ($CheckOnly) {
     $relayPreflight = $null
-    $relayPreflightExit = 2
-    try {
-        $relayOutput = @(& (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -CheckOnly -EnsureBrowserRelay 2>$null)
-        $relayPreflightExit = $LASTEXITCODE
-        if ($relayOutput) {
-            $relayPreflight = (($relayOutput | Out-String).Trim() | ConvertFrom-Json)
-        }
-    } catch { $relayPreflight = $null }
+    $relayPreflightExit = 0
+    $relayCheckPassed = $true
+    if (-not $SkipBrowserRelayCheck) {
+        $relayPreflightExit = 2
+        try {
+            $relayOutput = @(& (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -CheckOnly -EnsureBrowserRelay 2>$null)
+            $relayPreflightExit = $LASTEXITCODE
+            if ($relayOutput) {
+                $relayPreflight = (($relayOutput | Out-String).Trim() | ConvertFrom-Json)
+            }
+        } catch { $relayPreflight = $null }
+        $relayCheckPassed = $relayPreflightExit -eq 0 -and $relayPreflight -and $relayPreflight.browserReady -eq $true -and $relayPreflight.relayCommandReady -eq $true
+    }
     [ordered]@{
-        ready = $prerequisitesReady -and $relayPreflightExit -eq 0 -and $relayPreflight -and $relayPreflight.browserReady -eq $true -and $relayPreflight.relayCommandReady -eq $true
+        ready = $prerequisitesReady -and $relayCheckPassed
         bootstrapRequired = $bootstrapRequired
         nodeMajor = $nodeMajor
         pythonVersion = $pythonVersion.ToString()
@@ -169,9 +187,10 @@ if ($CheckOnly) {
         relayProfile = if ($relayPreflight) { $relayPreflight.relayProfile } else { 'openclaw' }
         relayPort = if ($relayPreflight) { $relayPreflight.relayPort } else { 18800 }
         relayServiceReady = if ($relayPreflight) { $relayPreflight.relayServiceReady } else { $false }
+        relayCheckSkipped = [bool]$SkipBrowserRelayCheck
         url = $url
     } | ConvertTo-Json
-    if (-not $prerequisitesReady -or $relayPreflightExit -ne 0 -or -not $relayPreflight -or -not $relayPreflight.browserReady -or -not $relayPreflight.relayCommandReady) { exit 2 }
+    if (-not $prerequisitesReady -or -not $relayCheckPassed) { exit 2 }
     exit 0
 }
 
@@ -184,6 +203,9 @@ if ($bootstrapRequired) {
     Write-Host 'First run detected. Installing dependencies and building the application...'
     & (Join-Path $PSScriptRoot 'bootstrap.ps1') -SkipTests
 }
+
+& (Join-Path $PSScriptRoot 'ensure-codex-config.ps1') | Out-Host
+if ($LASTEXITCODE -ne 0) { throw 'Codex configuration could not be prepared.' }
 
 if (-not (Test-Path -LiteralPath '.env')) {
     Copy-Item -LiteralPath '.env.example' -Destination '.env'

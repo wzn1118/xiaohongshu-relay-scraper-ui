@@ -60,7 +60,7 @@ export function validateRunRequest(value) {
   return Object.freeze({
     keyword,
     browserProfile,
-    relayPort: integerField(value.relayPort, 'relayPort', 18792, 1, 65535),
+    relayPort: integerField(value.relayPort, 'relayPort', 18800, 1, 65535),
     // The upstream scraper uses 0 to mean every unique card found before the
     // search result stream stabilizes.
     limit: integerField(value.limit, 'limit', 0, 0, 1000),

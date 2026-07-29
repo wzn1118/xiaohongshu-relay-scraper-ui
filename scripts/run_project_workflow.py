@@ -23,7 +23,7 @@ def resolve_upstream_runner(explicit: str = "") -> Path:
     candidates = [
         Path(explicit) if explicit else None,
         Path(os.environ["XHS_UPSTREAM_RUNNER"]) if os.environ.get("XHS_UPSTREAM_RUNNER") else None,
-        PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/run_xiaohongshu_relay_scrape.py",
+        PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scripts/run_xiaohongshu_relay_scrape.py",
         Path(os.environ["CODEX_HOME"]) / "skills/xiaohongshu-relay-scrape/scripts/run_xiaohongshu_relay_scrape.py"
         if os.environ.get("CODEX_HOME")
         else None,
@@ -41,7 +41,7 @@ def resolve_upstream_scraper(upstream_runner: Path) -> Path:
     candidates = [
         Path(os.environ["XHS_UPSTREAM_SCRAPER"]) if os.environ.get("XHS_UPSTREAM_SCRAPER") else None,
         upstream_runner.parent / "scrape_xiaohongshu_search.py",
-        PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scrape_xiaohongshu_search.py",
+        PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scripts/scrape_xiaohongshu_search.py",
         Path(os.environ["CODEX_HOME"]) / "skills/xiaohongshu-relay-scrape/scripts/scrape_xiaohongshu_search.py"
         if os.environ.get("CODEX_HOME")
         else None,
@@ -250,7 +250,7 @@ def main(arguments: list[str] | None = None) -> int:
         raise ValueError("--output-dir is required for project workflow enrichment")
     output_dir = Path(output_dir_value).resolve()
     candidate_profile = Path(os.environ.get("XHS_PROFILE_PATH") or resolve_project_path(wrapper.candidate_profile)).resolve()
-    relay_port = int(option_value(unlimited_arguments, "--relay-port") or 18792)
+    relay_port = int(option_value(unlimited_arguments, "--relay-port") or 18800)
     goto_timeout_ms = int(option_value(unlimited_arguments, "--goto-timeout-ms") or 15000)
     body_summary = complete_bodies(
         output_dir,

@@ -4,20 +4,16 @@ import { readFile } from 'node:fs/promises';
 export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, fetchImpl = fetch }) {
   const checkedAt = new Date().toISOString();
   try {
-    const gatewayConfig = JSON.parse(await readFile(openClawConfigPath, 'utf8'));
-    const gatewayToken = gatewayConfig?.gateway?.auth?.token;
-    if (typeof gatewayToken !== 'string' || !gatewayToken) throw new Error('Gateway token is missing.');
-    const relayToken = crypto
-      .createHmac('sha256', gatewayToken)
-      .update(`openclaw-extension-relay-v1:${port}`)
-      .digest('hex');
+    const relayToken = await resolveRelayToken({ port, openClawConfigPath });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetchImpl(`http://127.0.0.1:${port}/json/list`, {
-        headers: { 'x-openclaw-relay-token': relayToken },
+      const request = (headers) => fetchImpl(`http://127.0.0.1:${port}/json/list`, {
+        ...(Object.keys(headers).length ? { headers } : {}),
         signal: controller.signal,
       });
+      let response = await request(relayToken ? { 'x-openclaw-relay-token': relayToken } : {});
+      if (!response.ok && relayToken) response = await request({});
       if (!response.ok) throw new Error(`Relay responded with HTTP ${response.status}.`);
       const tabs = await response.json();
       if (!Array.isArray(tabs)) throw new Error('Relay returned an invalid tab list.');
@@ -50,6 +46,21 @@ export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, f
       message,
       error: message,
     };
+  }
+}
+
+async function resolveRelayToken({ port, openClawConfigPath }) {
+  if (!openClawConfigPath) return '';
+  try {
+    const gatewayConfig = JSON.parse(await readFile(openClawConfigPath, 'utf8'));
+    const gatewayToken = gatewayConfig?.gateway?.auth?.token;
+    if (typeof gatewayToken !== 'string' || !gatewayToken) return '';
+    return crypto
+      .createHmac('sha256', gatewayToken)
+      .update(`openclaw-extension-relay-v1:${port}`)
+      .digest('hex');
+  } catch {
+    return '';
   }
 }
 

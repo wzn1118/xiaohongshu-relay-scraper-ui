@@ -7,12 +7,12 @@ const root = path.resolve(import.meta.dirname, '..');
 const codexHome = process.env.CODEX_HOME || '';
 const runnerCandidates = [
   process.env.XHS_UPSTREAM_RUNNER,
-  path.join(root, 'vendor', 'xiaohongshu-relay-scrape', 'run_xiaohongshu_relay_scrape.py'),
+  path.join(root, 'vendor', 'xiaohongshu-relay-scrape', 'scripts', 'run_xiaohongshu_relay_scrape.py'),
   codexHome && path.join(codexHome, 'skills', 'xiaohongshu-relay-scrape', 'scripts', 'run_xiaohongshu_relay_scrape.py'),
 ].filter(Boolean);
 const scraperCandidates = [
   process.env.XHS_UPSTREAM_SCRAPER,
-  path.join(root, 'vendor', 'xiaohongshu-relay-scrape', 'scrape_xiaohongshu_search.py'),
+  path.join(root, 'vendor', 'xiaohongshu-relay-scrape', 'scripts', 'scrape_xiaohongshu_search.py'),
   codexHome && path.join(codexHome, 'skills', 'xiaohongshu-relay-scrape', 'scripts', 'scrape_xiaohongshu_search.py'),
 ].filter(Boolean);
 const python = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');

@@ -15,30 +15,25 @@ function relayStatus({ ok, tabs = 0 }) {
   };
 }
 
-test('starts the relay through the browser service without UI automation', async () => {
+test('starts the project-managed browser through native CDP without UI automation', async () => {
   const calls = [];
   const statuses = [relayStatus({ ok: false }), relayStatus({ ok: true, tabs: 2 })];
   const result = await connectRelay({
     port: 18792,
     openClawConfigPath: 'unused',
+    managedBrowserDataDir: 'data/browser',
     timeoutMs: 1000,
-    openClawCommand: 'openclaw.cmd',
     probeRelayImpl: async () => statuses.shift(),
-    spawnImpl: (command, args, options) => {
-      calls.push({ command, args, options });
-      const child = new EventEmitter();
-      queueMicrotask(() => child.emit('close', 0));
-      return child;
+    browserEnsurer: (options) => {
+      calls.push(options);
+      return { running: true, cdpReady: true };
     },
   });
 
   assert.equal(result.ready, true);
   assert.equal(result.attempted, true);
-  assert.deepEqual(calls, [{
-    command: 'openclaw.cmd',
-    args: ['browser', 'start', '--browser-profile', 'openclaw', '--json'],
-    options: { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
-  }]);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].profileDir, /data[\\/]browser[\\/]openclaw$/);
 });
 
 test('does not start another process when the relay is already attached', async () => {
@@ -47,7 +42,7 @@ test('does not start another process when the relay is already attached', async 
     port: 18792,
     openClawConfigPath: 'unused',
     probeRelayImpl: async () => relayStatus({ ok: true, tabs: 1 }),
-    spawnImpl: () => {
+    browserEnsurer: () => {
       starts += 1;
       throw new Error('unexpected start');
     },
@@ -58,22 +53,66 @@ test('does not start another process when the relay is already attached', async 
   assert.equal(starts, 0);
 });
 
-test('opens the login page through the managed browser command', async () => {
+test('opens the login page through the managed browser CDP endpoint', async () => {
   const calls = [];
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.listeners = new Map();
+    }
+
+    addEventListener(event, handler) {
+      this.listeners.set(event, handler);
+      if (event === 'open') queueMicrotask(() => handler({}));
+    }
+
+    send(value) {
+      calls.push(JSON.parse(value));
+      queueMicrotask(() => this.listeners.get('message')?.({
+        data: JSON.stringify({ id: 1, result: { targetId: 'target-1' } }),
+      }));
+    }
+
+    close() {}
+  }
+
   const result = await openRelayLogin({
     profile: 'openclaw',
     url: 'https://www.xiaohongshu.com',
-    openClawCommand: 'openclaw.cmd',
-    spawnImpl: (command, args, options) => {
-      calls.push({ command, args, options });
-      const child = new EventEmitter();
-      queueMicrotask(() => child.emit('close', 0));
-      return child;
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1:18800/devtools/browser/test' }),
+    }),
+    webSocketImpl: FakeWebSocket,
+  });
+
+  assert.equal(result.opened, true);
+  assert.deepEqual(calls[0], {
+    id: 1,
+    method: 'Target.createTarget',
+    params: { url: 'https://www.xiaohongshu.com' },
+  });
+});
+
+test('supports EventEmitter-style WebSocket clients', async () => {
+  const result = await openRelayLogin({
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ webSocketDebuggerUrl: 'ws://127.0.0.1:18800/devtools/browser/test' }),
+    }),
+    webSocketImpl: class extends EventEmitter {
+      constructor() {
+        super();
+        queueMicrotask(() => this.emit('open'));
+      }
+
+      send() {
+        queueMicrotask(() => this.emit('message', JSON.stringify({ id: 1, result: { targetId: 'target-2' } })));
+      }
+
+      close() {}
     },
   });
 
   assert.equal(result.opened, true);
-  assert.deepEqual(calls[0].args, [
-    'browser', 'open', '--browser-profile', 'openclaw', 'https://www.xiaohongshu.com',
-  ]);
 });

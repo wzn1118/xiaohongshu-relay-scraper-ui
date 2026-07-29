@@ -1,27 +1,28 @@
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { probeRelay } from './relay.mjs';
+import { ensureNativeBrowser, resolveManagedBrowserProfileDir } from './native-browser.mjs';
 
 let activeConnection = null;
 
 export async function connectRelay({
   port,
   openClawConfigPath,
+  managedBrowserDataDir,
   profile = 'openclaw',
   timeoutMs = 25000,
   probeRelayImpl = probeRelay,
-  spawnImpl = spawn,
-  openClawCommand = resolveOpenClawCommand(),
+  browserEnsurer = ensureNativeBrowser,
 }) {
   if (activeConnection) return activeConnection;
   activeConnection = performConnection({
     port,
     openClawConfigPath,
+    managedBrowserDataDir,
     profile,
     timeoutMs,
     probeRelayImpl,
-    spawnImpl,
-    openClawCommand,
+    browserEnsurer,
   });
   try {
     return await activeConnection;
@@ -31,73 +32,56 @@ export async function connectRelay({
 }
 
 export function openRelayLogin({
+  port = 18800,
+  openClawConfigPath,
   profile = 'openclaw',
   url = 'https://www.xiaohongshu.com',
   timeoutMs = 15000,
-  spawnImpl = spawn,
-  openClawCommand = resolveOpenClawCommand(),
+  fetchImpl = fetch,
+  webSocketImpl = WebSocket,
 }) {
-  return new Promise((resolve) => {
-    let child;
-    let settled = false;
-    let timer;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-
-    try {
-      child = spawnImpl(
-        openClawCommand,
-        ['browser', 'open', '--browser-profile', profile, url],
-        { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
-      );
-      timer = setTimeout(() => {
-        child.kill?.();
-        finish({ opened: false, timedOut: true, message: 'Login page open timed out.' });
-      }, timeoutMs);
-      child.once('error', (error) => finish({ opened: false, timedOut: false, message: `Login page open failed: ${error.message}` }));
-      child.once('close', (code) => finish({
-        opened: code === 0,
-        timedOut: false,
-        exitCode: code,
-        message: code === 0 ? 'Login page opened in the managed browser.' : `Login page open exited with code ${code}.`,
-      }));
-    } catch (error) {
-      finish({ opened: false, timedOut: false, message: `Login page open failed: ${error.message}` });
-    }
-  });
+  return createManagedTarget({ port, openClawConfigPath, profile, url, timeoutMs, fetchImpl, webSocketImpl });
 }
 
 async function performConnection({
   port,
   openClawConfigPath,
+  managedBrowserDataDir,
   profile,
   timeoutMs,
   probeRelayImpl,
-  spawnImpl,
-  openClawCommand,
+  browserEnsurer,
 }) {
   const before = await probeRelayImpl({ port, openClawConfigPath });
   if (isAttached(before)) {
     return { ...before, ready: true, attempted: false, message: 'Relay is already connected.' };
   }
+  if (before.running && before.cdpReady) {
+    return {
+      ...before,
+      ready: false,
+      attempted: false,
+      message: 'Browser CDP is running; waiting for an attached browser tab.',
+    };
+  }
 
-  const started = await startBrowserService({
-    command: openClawCommand,
-    profile,
+  const started = await browserEnsurer({
+    port,
+    profileDir: resolveManagedBrowserProfileDir(
+      managedBrowserDataDir || path.resolve(process.cwd(), 'data', 'browser'),
+      profile,
+    ),
     timeoutMs,
-    spawnImpl,
+    url: 'about:blank',
+    profile,
   });
-  if (!started.started) {
+  if (!started.running) {
     return {
       ...before,
       ready: false,
       attempted: true,
-      startExitCode: started.code,
-      startTimedOut: started.timedOut,
+      startExitCode: null,
+      startTimedOut: false,
       message: started.message,
     };
   }
@@ -113,7 +97,7 @@ async function performConnection({
     ...after,
     ready,
     attempted: true,
-    startExitCode: started.code,
+    startExitCode: null,
     startTimedOut: false,
     message: ready
       ? 'Relay connected through the browser service.'
@@ -138,49 +122,95 @@ async function waitForRelay({ port, openClawConfigPath, timeoutMs, probeRelayImp
   return status;
 }
 
-function startBrowserService({ command, profile, timeoutMs, spawnImpl }) {
-  return new Promise((resolve) => {
-    let child;
+async function createManagedTarget({ port, openClawConfigPath, url, timeoutMs, fetchImpl, webSocketImpl }) {
+  try {
+    const relayToken = await resolveRelayToken({ port, openClawConfigPath });
+    const headers = relayToken ? { 'x-openclaw-relay-token': relayToken } : {};
+    const requestVersion = (requestHeaders) => fetchImpl(`http://127.0.0.1:${port}/json/version`, {
+      ...(Object.keys(requestHeaders).length ? { headers: requestHeaders } : {}),
+    });
+    let response = await requestVersion(headers);
+    const authenticated = response.ok && Boolean(relayToken);
+    if (!response.ok && relayToken) response = await requestVersion({});
+    if (!response.ok) throw new Error(`Browser CDP version endpoint responded with HTTP ${response.status}.`);
+    const version = await response.json();
+    const rawWebSocketUrl = String(version?.webSocketDebuggerUrl || '').trim();
+    if (!rawWebSocketUrl) throw new Error('Browser CDP version endpoint has no WebSocket URL.');
+    const webSocketUrl = appendRelayToken(rawWebSocketUrl, authenticated ? relayToken : '');
+    const result = await sendCdpCommand({
+      webSocketImpl,
+      webSocketUrl,
+      method: 'Target.createTarget',
+      params: { url },
+      timeoutMs,
+    });
+    if (!result?.targetId) throw new Error('Browser CDP did not return a target id.');
+    return { opened: true, timedOut: false, targetId: result.targetId, message: 'Login page opened in the managed browser.' };
+  } catch (error) {
+    return {
+      opened: false,
+      timedOut: error?.name === 'AbortError' || /timed out/i.test(String(error?.message || '')),
+      message: `Managed browser page open failed: ${error?.message || error}`,
+    };
+  }
+}
+
+function sendCdpCommand({ webSocketImpl, webSocketUrl, method, params, timeoutMs }) {
+  return new Promise((resolve, reject) => {
     let settled = false;
     let timer;
-    const finish = (result) => {
+    let socket;
+    const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(result);
+      try { socket?.close?.(); } catch {}
+      if (error) reject(error); else resolve(value);
     };
-
     try {
-      child = spawnImpl(
-        command,
-        ['browser', 'start', '--browser-profile', profile, '--json'],
-        { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
-      );
-      timer = setTimeout(() => {
-        child.kill?.();
-        finish({ started: false, code: null, timedOut: true, message: 'Relay service start timed out.' });
-      }, timeoutMs);
-      child.once('error', (error) => finish({
-        started: false,
-        code: null,
-        timedOut: false,
-        message: `Relay service start failed: ${error.message}`,
-      }));
-      child.once('close', (code) => finish({
-        started: code === 0,
-        code,
-        timedOut: false,
-        message: code === 0 ? '' : `Relay service exited with code ${code}.`,
-      }));
-    } catch (error) {
-      finish({
-        started: false,
-        code: null,
-        timedOut: false,
-        message: `Relay service start failed: ${error.message}`,
+      socket = new webSocketImpl(webSocketUrl);
+      const listen = (event, handler) => {
+        if (typeof socket.addEventListener === 'function') socket.addEventListener(event, handler);
+        else socket.on?.(event, handler);
+      };
+      listen('open', () => socket.send(JSON.stringify({ id: 1, method, params })));
+      listen('message', (event) => {
+        const raw = typeof event === 'string' ? event : event?.data;
+        const text = typeof raw === 'string' ? raw : raw ? Buffer.from(raw).toString('utf8') : '';
+        let payload;
+        try { payload = JSON.parse(text); } catch { return; }
+        if (payload?.id !== 1) return;
+        if (payload.error) finish(new Error(payload.error.message || 'Browser CDP command failed.'));
+        else finish(null, payload.result || {});
       });
+      listen('error', (event) => finish(new Error(event?.message || 'Browser CDP WebSocket failed.')));
+      timer = setTimeout(() => finish(new Error('Browser CDP command timed out.')), Math.max(1000, timeoutMs));
+    } catch (error) {
+      finish(error);
     }
   });
+}
+
+async function resolveRelayToken({ port, openClawConfigPath }) {
+  if (!openClawConfigPath) return '';
+  try {
+    const gatewayConfig = JSON.parse(await readFile(openClawConfigPath, 'utf8'));
+    const gatewayToken = gatewayConfig?.gateway?.auth?.token;
+    if (typeof gatewayToken !== 'string' || !gatewayToken) return '';
+    const { createHmac } = await import('node:crypto');
+    return createHmac('sha256', gatewayToken)
+      .update(`openclaw-extension-relay-v1:${port}`)
+      .digest('hex');
+  } catch {
+    return '';
+  }
+}
+
+function appendRelayToken(webSocketUrl, relayToken) {
+  if (!relayToken) return webSocketUrl;
+  const parsed = new URL(webSocketUrl);
+  parsed.searchParams.set('token', relayToken);
+  return parsed.toString();
 }
 
 function delay(milliseconds) {

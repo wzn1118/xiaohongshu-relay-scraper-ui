@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def default_upstream_scraper() -> Path:
     candidates = [
         Path(os.environ["XHS_UPSTREAM_SCRAPER"]) if os.environ.get("XHS_UPSTREAM_SCRAPER") else None,
-        PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scrape_xiaohongshu_search.py",
+        PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scripts/scrape_xiaohongshu_search.py",
         Path(os.environ["CODEX_HOME"]) / "skills/xiaohongshu-relay-scrape/scripts/scrape_xiaohongshu_search.py"
         if os.environ.get("CODEX_HOME")
         else None,
@@ -29,7 +29,7 @@ def default_upstream_scraper() -> Path:
     for candidate in candidates:
         if candidate and candidate.is_file():
             return candidate.resolve()
-    return PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scrape_xiaohongshu_search.py"
+    return PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scripts/scrape_xiaohongshu_search.py"
 
 
 DEFAULT_UPSTREAM_SCRAPER = default_upstream_scraper()
