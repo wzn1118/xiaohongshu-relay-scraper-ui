@@ -22,11 +22,13 @@ class AIProviderError(RuntimeError):
 
 
 class AIProvider:
-    def __init__(self, provider: str = "", api_key: str = "", base_url: str = "", model: str = "", timeout: int | None = None):
+    def __init__(self, provider: str = "", api_key: str = "", base_url: str = "", model: str = "", wire_api: str = "", timeout: int | None = None):
         self.provider = (provider or os.environ.get("XHS_AI_PROVIDER") or "codex").strip().lower()
         self.api_key = api_key or os.environ.get("XHS_AI_API_KEY", "")
         self.base_url = (base_url or os.environ.get("XHS_AI_BASE_URL", "")).rstrip("/")
         self.model = model or os.environ.get("XHS_AI_MODEL", "")
+        configured_wire_api = wire_api or os.environ.get("XHS_AI_WIRE_API", "")
+        self.wire_api = (configured_wire_api or ("responses" if self.provider == "codex" else "chat_completions")).strip().lower().replace("-", "_")
         configured_timeout = timeout if timeout is not None else os.environ.get("XHS_AI_TIMEOUT_SECONDS", "600")
         try:
             self.timeout = max(30, int(configured_timeout))
@@ -38,13 +40,17 @@ class AIProvider:
             "\nReturn exactly one JSON object matching this JSON Schema; do not add Markdown:\n"
             + json.dumps(schema, ensure_ascii=False)
         )
-        if self.provider == "codex":
+        if self.provider == "codex" and not (self.api_key and self.base_url and self.model):
             return self._codex(system + schema_instruction, user, schema)
-        return self._openai_compatible(system + schema_instruction, user)
+        return self._openai_compatible(system + schema_instruction, user, self.wire_api)
 
-    def _openai_compatible(self, system: str, user: str) -> dict[str, Any]:
+    def _openai_compatible(self, system: str, user: str, wire_api: str = "chat_completions") -> dict[str, Any]:
         if not self.api_key or not self.base_url or not self.model:
             raise AIProviderError("AI provider configuration is incomplete")
+        if wire_api == "responses":
+            return self._responses(system, user)
+        if wire_api != "chat_completions":
+            raise AIProviderError("Unsupported AI wire API")
         payload = {
             "model": self.model,
             "temperature": 0.2,
@@ -75,6 +81,43 @@ class AIProvider:
             return _parse_json_object(str(content))
         except (KeyError, IndexError, TypeError) as error:
             raise AIProviderError("AI provider response did not contain a message") from error
+
+    def _responses(self, system: str, user: str) -> dict[str, Any]:
+        payload = {
+            "model": self.model,
+            "instructions": system,
+            "input": user,
+            "temperature": 0.2,
+            "text": {"format": {"type": "json_object"}},
+        }
+        request = urllib.request.Request(
+            f"{self.base_url}/responses",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:500]
+            raise AIProviderError(f"AI provider returned HTTP {error.code}: {detail}") from error
+        except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as error:
+            raise AIProviderError(f"AI provider request failed: {error}") from error
+        content = result.get("output_text") if isinstance(result, dict) else None
+        if not isinstance(content, str):
+            parts: list[str] = []
+            for item in (result.get("output", []) if isinstance(result, dict) else []):
+                for block in (item.get("content", []) if isinstance(item, dict) else []):
+                    if not isinstance(block, dict):
+                        continue
+                    text = block.get("text") or block.get("output_text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            content = "".join(parts)
+        if not content:
+            raise AIProviderError("AI provider Responses API response did not contain output text")
+        return _parse_json_object(content)
 
     def _codex(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
         executable = (

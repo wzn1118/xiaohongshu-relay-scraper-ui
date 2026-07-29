@@ -73,6 +73,7 @@ export class ProfileStore {
       XHS_AI_API_KEY: aiSession.apiKey,
       XHS_AI_BASE_URL: aiSession.baseUrl,
       XHS_AI_MODEL: aiSession.model,
+      XHS_AI_WIRE_API: aiSession.wireApi || 'responses',
     });
     return this.get(id);
   }

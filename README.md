@@ -210,14 +210,14 @@ data/jobs/<JOB_ID>/artifacts/
 
 ### 依赖
 
-- Windows 首次启动时，项目会自动准备 Node.js 22+、Python 3.11+、项目依赖、Chrome/Edge 和 Codex CLI；OpenClaw Relay 不是必需依赖
-- Codex CLI 登录状态或受支持的 API Key；项目会自动写入默认中转配置模板，不覆盖已有 Codex 配置
+- Windows 首次启动时，项目会自动准备 Node.js 22+、Python 3.11+、项目依赖和 Chrome/Edge；AI 使用项目内置运行时，不要求用户全局安装 Codex CLI
+- 一个可访问的模型中转站地址、模型名和 API Key；在页面的 AI Runtime 区域配置后会保存到本机 `data/ai-config.json`
 
 ### Windows 一键启动
 
 从 GitHub [下载 ZIP](https://github.com/wzn1118/xiaohongshu-relay-scraper-ui/archive/refs/heads/master.zip) 并解压，然后双击根目录的 `start-windows.cmd`。
 
-首次运行会先检查并准备 Windows 运行时、命令行工具、Chrome/Edge 和项目自己的原生 CDP 浏览器，再安装项目依赖、使用仓库内置采集运行时构建应用、创建 `.env` 和本机 Codex 配置，成功后打开：
+首次运行会先检查并准备 Windows 运行时、Chrome/Edge 和项目自己的原生 CDP 浏览器，再安装项目依赖、使用仓库内置采集和 AI 运行时构建应用、创建 `.env`，成功后打开：
 
 ```text
 http://127.0.0.1:4317
@@ -238,9 +238,9 @@ http://127.0.0.1:4317
 3. 执行 `npm ci`、Python 依赖安装和前端构建。
 4. 创建本地 `.env` 并启动页面与 API。
 5. 自动启动原生 CDP 浏览器（已有 Relay 时直接复用）；在页面中完成一次目标网站登录。
-6. 完成一次小红书登录和 Codex CLI 登录后，直接运行采集任务。
+6. 在页面 AI Runtime 中填写中转站 Base URL、协议、模型和 API Key，点击连接后运行采集任务。
 
-自动准备 Node.js、Python 和 Chrome 需要 Windows App Installer 提供的 `winget`。系统包管理器本身缺失时，先安装 App Installer；采集运行时和中转配置模板已经随项目 ZIP 分发，只有浏览器登录和 Codex 账号鉴权属于每台电脑的一次性本地状态。
+自动准备 Node.js、Python 和 Chrome 需要 Windows App Installer 提供的 `winget`。系统包管理器本身缺失时，先安装 App Installer；采集运行时随项目 ZIP 分发，模型中转配置保存在每台电脑自己的 `data/ai-config.json`。
 
 ### 采集节奏
 
@@ -297,7 +297,7 @@ sh scripts/start.sh
 | `HOST` | `127.0.0.1` | 服务监听地址 |
 | `PORT` | `4317` | 服务端口 |
 | `PYTHON_BIN` | 自动探测 | Python 可执行文件 |
-| `CODEX_HOME` | 用户目录 `.codex` | Codex 配置和登录状态目录 |
+| `XHS_AI_CONFIG_PATH` | `data/ai-config.json` | 内置 AI 中转配置和本机密钥 |
 | `XHS_UPSTREAM_RUNNER` | 自动发现 | 上游入口脚本 |
 | `XHS_UPSTREAM_SCRAPER` | 自动发现 | 正文采集模块 |
 | `XHS_SERVER_DATA_DIR` | `data/jobs` | 私有任务数据 |
@@ -346,11 +346,11 @@ npm run configure:outlook -- --client-id YOUR_ENTRA_APP_CLIENT_ID
 
 个人 Outlook.com 账号则把 `SMTP_HOST` 改为 `smtp-mail.outlook.com`，并把 `SMTP_OAUTH_TENANT` 改为 `consumers`。
 
-#### Codex 中转配置
+#### AI 中转配置
 
-选择 Codex 作为任务 AI 时，项目会读取 `$CODEX_HOME/config.toml` 中的模型提供方配置。把中转站提供的配置放入该文件即可，项目会沿用其中的模型、`review_model`、`base_url`、`wire_api`、鉴权要求、`model_reasoning_effort`、`network_access`、响应存储设置和 `features.goals`；批处理采集、岗位分析、文案生成和简历导入使用同一份配置。不需要把中转地址或凭据写进仓库的 `.env`。
+项目内置 AI Runtime，不依赖用户电脑上的 Codex CLI。页面支持 `Responses API` 和 `Chat Completions` 两种协议；选择 Codex 时默认使用 Responses API，直接填写中转站提供的 Base URL、模型和 API Key 即可。配置保存于本机 `data/ai-config.json`，API Key 不通过配置查询接口返回，也不会写入任务历史、日志或 GitHub。
 
-批处理任务会在启动 Codex CLI 时显式转发这些设置；简历导入使用同一份本机 Codex 配置，不再把推理强度固定为 `low`。API Key 仍由 Codex CLI 自己读取，项目不会写入任务历史或日志。
+例如中转站文档给出 `wire_api = "responses"` 时，在页面选择 `内置 Codex Runtime`、填写模型 `gpt-5.5`、对应 Base URL，协议选择 `Responses API`，再粘贴 API Key。原有 `$CODEX_HOME/config.toml` 和外部 CLI 仍可作为兼容回退，但不是新电脑启动条件。
 
 项目优先使用仓库内置的 `vendor/xiaohongshu-relay-scrape/scripts/` 采集运行时，因此 GitHub 下载包不需要额外安装 Skill。若要切换到本机其他版本，仍可在 `.env` 中填写：
 

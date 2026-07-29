@@ -116,7 +116,7 @@ if ($Port -gt 0) { $env:PORT = [string]$Port }
 $url = Get-AppUrl
 
 if (-not $CheckOnly) {
-    Write-Host 'Preparing Windows runtime and command-line tools...'
+    Write-Host 'Preparing Windows runtime and bundled AI/browser tools...'
     & (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -InstallRuntime -InstallTools -EnsureBrowserRelay
     if ($LASTEXITCODE -ne 0) { throw 'Windows prerequisites are not ready.' }
     Refresh-ProcessPath
@@ -204,8 +204,7 @@ if ($bootstrapRequired) {
     & (Join-Path $PSScriptRoot 'bootstrap.ps1') -SkipTests
 }
 
-& (Join-Path $PSScriptRoot 'ensure-codex-config.ps1') | Out-Host
-if ($LASTEXITCODE -ne 0) { throw 'Codex configuration could not be prepared.' }
+Write-Host 'The built-in AI runtime is ready. Configure the model relay in the app.'
 
 if (-not (Test-Path -LiteralPath '.env')) {
     Copy-Item -LiteralPath '.env.example' -Destination '.env'

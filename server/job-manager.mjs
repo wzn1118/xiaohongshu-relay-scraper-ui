@@ -72,7 +72,7 @@ export class JobManager {
     const id = `${timestampId()}-${crypto.randomBytes(4).toString('hex')}`;
     const ai = params.aiSessionId
       ? this.aiSessions.resolve(params.aiSessionId)
-      : { provider: 'codex', apiKey: '', baseUrl: '', model: '' };
+      : { provider: 'codex', apiKey: '', baseUrl: '', model: '', wireApi: 'responses' };
     const profilePath = params.profileId
       ? await this.profileStore.resolvePath(params.profileId)
       : this.legacyProfilePath;
@@ -166,6 +166,7 @@ export class JobManager {
           XHS_AI_API_KEY: runtime.ai?.apiKey || '',
           XHS_AI_BASE_URL: runtime.ai?.baseUrl || '',
           XHS_AI_MODEL: runtime.ai?.model || '',
+          XHS_AI_WIRE_API: runtime.ai?.wireApi || 'responses',
           XHS_PROFILE_PATH: runtime.profilePath || this.legacyProfilePath,
         },
         windowsHide: true,

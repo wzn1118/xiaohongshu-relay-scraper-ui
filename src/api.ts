@@ -16,7 +16,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<Health>('/api/health'),
   aiProviders: () => request<AiProviderOption[]>('/api/ai/providers'),
-  createAiSession: (payload: { provider: string; apiKey: string; model: string; baseUrl: string }) =>
+  createAiSession: (payload: { provider: string; apiKey: string; model: string; baseUrl: string; wireApi: 'responses' | 'chat_completions' }) =>
     request<AiSession>('/api/ai/sessions', { method: 'POST', body: JSON.stringify(payload) }),
   profiles: () => request<CandidateProfile[]>('/api/profiles'),
   importProfile: (payload: { aiSessionId: string; backgroundText: string; files: Array<{ name: string; base64: string }> }) =>
@@ -25,6 +25,7 @@ export const api = {
   updateRelayConfig: (payload: RelayConfig) => request<RelayConfig>('/api/relay/config', { method: 'PUT', body: JSON.stringify(payload) }),
   smtpConfig: () => request<SmtpConfig>('/api/email/config'),
   updateSmtpConfig: (payload: SmtpConfigUpdate) => request<SmtpConfig>('/api/email/config', { method: 'PUT', body: JSON.stringify(payload) }),
+  clearSmtpConfig: () => request<SmtpConfig>('/api/email/config', { method: 'DELETE' }),
   testSmtp: () => request<SmtpTestResult>('/api/email/test', { method: 'POST' }),
   relayStatus: (port: number) => request<RelayStatus>(`/api/relay/status?port=${port}`),
   connectRelay: (port: number, profile: string) => request<RelayStatus & { ready?: boolean; attempted?: boolean }>(`/api/relay/connect`, {

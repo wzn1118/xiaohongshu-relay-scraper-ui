@@ -32,9 +32,6 @@ if (-not (Test-Path -LiteralPath '.env')) {
     Copy-Item -LiteralPath '.env.example' -Destination '.env'
 }
 
-& (Join-Path $PSScriptRoot 'ensure-codex-config.ps1')
-if ($LASTEXITCODE -ne 0) { throw 'Codex configuration could not be prepared.' }
-
-Write-Host 'Bootstrap completed. The bundled scraper runtime and Codex model configuration are ready.'
-Write-Host 'The first run still needs Codex authentication and one-time Xiaohongshu login.'
+Write-Host 'Bootstrap completed. The bundled scraper and AI runtimes are ready.'
+Write-Host 'The first run still needs model relay configuration and one-time Xiaohongshu login.'
 Write-Host 'Start with: start-windows.cmd'

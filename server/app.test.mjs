@@ -64,6 +64,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     provider: 'custom', host: 'smtp.example.com', port: 465, secure: true, requireTls: false,
     auth: 'login', user: 'sender@example.com', from: 'sender@example.com', hasPassword: true,
   };
+  let smtpDeliveryStatus = { configured: true, from: 's***@example.com', authMode: 'login' };
   const sentMessages = [];
   const relaySetupCalls = [];
   const server = http.createServer(createApp({
@@ -99,8 +100,15 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       message: 'Login page opened.',
     }),
     mailSender: {
-      status: () => ({ configured: true, from: 's***@example.com' }),
-      configure: () => ({ configured: true, from: 's***@example.com' }),
+      status: () => ({ ...smtpDeliveryStatus }),
+      configure: (value) => {
+        smtpDeliveryStatus = {
+          configured: Boolean(value.host && value.from),
+          from: value.from ? 's***@example.com' : '',
+          authMode: value.auth || 'login',
+        };
+        return { ...smtpDeliveryStatus };
+      },
       verify: async () => ({ configured: true, from: 's***@example.com', authMode: 'login' }),
       send: async (message) => {
         sentMessages.push(message);
@@ -117,6 +125,14 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       update: async (value) => {
         smtpSettings = { ...smtpSettings, ...value, hasPassword: true };
         delete smtpSettings.password;
+        return { ...smtpSettings };
+      },
+      clear: async () => {
+        smtpSettings = {
+          provider: 'custom', host: '', port: 465, secure: true, requireTls: false,
+          auth: 'login', user: '', from: '', hasPassword: false,
+          oauth: { tenant: 'organizations', clientId: '', scope: '', hasClientSecret: false, hasRefreshToken: false },
+        };
         return { ...smtpSettings };
       },
     },
@@ -147,6 +163,13 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     const testedEmail = await fetch(`${origin}/api/email/test`, { method: 'POST' });
     assert.equal(testedEmail.status, 200);
     assert.equal((await testedEmail.json()).ok, true);
+
+    const clearedEmail = await fetch(`${origin}/api/email/config`, { method: 'DELETE' });
+    assert.equal(clearedEmail.status, 200);
+    const clearedEmailBody = await clearedEmail.json();
+    assert.equal(clearedEmailBody.configured, false);
+    assert.equal(clearedEmailBody.from, '');
+    assert.equal(clearedEmailBody.hasPassword, false);
 
     const jobs = await fetch(`${origin}/api/jobs`).then((response) => response.json());
     assert.deepEqual(jobs, []);

@@ -23,6 +23,7 @@ const checks = {
   build: fileCheck(path.join(root, 'dist', 'index.html')),
   upstreamRunner: firstFile(runnerCandidates),
   upstreamScraper: firstFile(scraperCandidates),
+  builtInAiRuntime: { ok: true, value: 'Python AIProvider with Responses/Chat Completions support' },
   codexCli: commandVersion(process.env.CODEX_CLI_BIN || 'codex', ['--version']),
   openClawConfig: fileCheck(
     process.env.OPENCLAW_CONFIG_PATH

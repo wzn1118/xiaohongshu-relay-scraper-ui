@@ -104,6 +104,57 @@ test('SMTP configuration preserves an existing password when the UI leaves it bl
   }
 });
 
+test('OAuth2 configuration preserves hidden secrets while allowing frontend edits', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-smtp-oauth-'));
+  try {
+    const store = new SmtpConfigStore({ filePath: path.join(fixture, 'smtp-config.json') });
+    await store.initialize();
+    const saved = await store.update({
+      provider: 'outlook', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true,
+      auth: 'oauth2', user: 'candidate@outlook.com', from: 'candidate@outlook.com',
+      oauth: {
+        tenant: 'organizations', clientId: 'client-id', clientSecret: 'client-secret',
+        refreshToken: 'refresh-token', scope: 'https://outlook.office.com/SMTP.Send offline_access',
+      },
+    });
+    assert.equal(saved.oauth.hasClientSecret, true);
+    assert.equal(saved.oauth.hasRefreshToken, true);
+    assert.equal('clientSecret' in saved.oauth, false);
+    assert.equal('refreshToken' in saved.oauth, false);
+
+    await store.update({
+      from: 'updated@outlook.com', user: 'updated@outlook.com',
+      oauth: { tenant: 'consumers', clientId: 'updated-client-id', clientSecret: '', refreshToken: '' },
+    });
+    const privateConfig = store.getForMailer();
+    assert.equal(privateConfig.oauth.tenant, 'consumers');
+    assert.equal(privateConfig.oauth.clientSecret, 'client-secret');
+    assert.equal(privateConfig.oauth.refreshToken, 'refresh-token');
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('SMTP configuration can be cleared completely from the frontend', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-smtp-clear-'));
+  const filePath = path.join(fixture, 'smtp-config.json');
+  try {
+    const store = new SmtpConfigStore({ filePath });
+    await store.initialize();
+    await store.update({
+      provider: '163', host: 'smtp.163.com', port: 465, secure: true, requireTls: false,
+      auth: 'login', user: 'candidate@163.com', from: 'candidate@163.com', password: 'secret',
+    });
+    const cleared = await store.clear();
+    assert.equal(cleared.from, '');
+    assert.equal(cleared.hasPassword, false);
+    assert.equal(cleared.oauth.hasRefreshToken, false);
+    assert.doesNotMatch(await readFile(filePath, 'utf8'), /candidate@163\.com|secret/);
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
 test('SMTP configuration validates provider settings', async () => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-smtp-invalid-'));
   try {

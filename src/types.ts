@@ -66,17 +66,28 @@ export type RelayConfig = {
 
 export type SmtpProvider = '163' | 'qq' | 'gmail' | 'outlook' | 'custom'
 
+export type SmtpAuthMode = 'login' | 'oauth2' | 'none'
+
+export type SmtpOAuthConfig = {
+  tenant: string
+  clientId: string
+  scope: string
+  hasClientSecret: boolean
+  hasRefreshToken: boolean
+}
+
 export type SmtpConfig = {
   provider: SmtpProvider
   host: string
   port: number
   secure: boolean
   requireTls: boolean
-  auth: 'login' | 'oauth2' | 'none'
-  authMode?: 'login' | 'oauth2' | 'none'
+  auth: SmtpAuthMode
+  authMode?: SmtpAuthMode
   user: string
   from: string
   hasPassword: boolean
+  oauth: SmtpOAuthConfig
   configured: boolean
   verified: boolean
   maskedFrom: string
@@ -88,13 +99,19 @@ export type SmtpConfigUpdate = Partial<Pick<SmtpConfig, 'provider' | 'host' | 'p
   password?: string
   clearPassword?: boolean
   autoConfigure?: boolean
+  oauth?: Partial<Pick<SmtpOAuthConfig, 'tenant' | 'clientId' | 'scope'>> & {
+    clientSecret?: string
+    refreshToken?: string
+    clearClientSecret?: boolean
+    clearRefreshToken?: boolean
+  }
 }
 
 export type SmtpTestResult = {
   ok: boolean
   configured: boolean
   from: string
-  authMode: 'login' | 'oauth2' | 'none'
+  authMode: SmtpAuthMode
   lastVerifiedAt: string
 }
 
@@ -117,6 +134,10 @@ export type AiProviderOption = {
   baseUrl: string
   model: string
   requiresKey: boolean
+  wireApi: 'responses' | 'chat_completions'
+  bundled?: boolean
+  configured?: boolean
+  hasApiKey?: boolean
 }
 
 export type AiSession = {
@@ -124,6 +145,7 @@ export type AiSession = {
   provider: string
   model: string
   baseUrl: string
+  wireApi: 'responses' | 'chat_completions'
   configured: boolean
   expiresAt: string
 }

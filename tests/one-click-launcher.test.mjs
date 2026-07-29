@@ -25,7 +25,8 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   assert.match(bootstrap, /ensure-windows-prerequisites\.ps1/);
   assert.match(prerequisites, /OpenJS\.NodeJS\.LTS/);
   assert.match(prerequisites, /Python\.Python\.3\.13/);
-  assert.match(prerequisites, /@openai\/codex/);
+  assert.match(prerequisites, /bundled AI runtime/);
+  assert.match(prerequisites, /builtInAiReady/);
   assert.match(prerequisites, /(?:openclaw|start-managed-browser\.mjs)/);
   assert.match(prerequisites, /(?:Google\.Chrome|start-managed-browser\.mjs)/);
   assert.match(prerequisites, /(?:browser start --browser-profile openclaw|start-managed-browser\.mjs)/);
@@ -33,8 +34,8 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   assert.match(bootstrap, /-EnsureBrowserRelay/);
   assert.match(oneClick, /relayServiceReady/);
   assert.match(oneClick, /api\/relay\/login/);
-  assert.match(oneClick, /ensure-codex-config\.ps1/);
-  assert.match(bootstrap, /ensure-codex-config\.ps1/);
+  assert.doesNotMatch(oneClick, /ensure-codex-config\.ps1/);
+  assert.doesNotMatch(bootstrap, /ensure-codex-config\.ps1/);
   assert.match(codexConfig, /codex-config\.example\.toml/);
   assert.match(bundledRuntime, /DEFAULT_RELAY_PORT = 18800/);
   assert.match(bundledRuntime, /DEFAULT_BROWSER_PROFILE = "openclaw"/);

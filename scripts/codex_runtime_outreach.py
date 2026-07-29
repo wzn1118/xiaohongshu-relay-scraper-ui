@@ -12,8 +12,10 @@ from typing import Any, Callable
 
 try:
     from .codex_config import current_codex_runtime_args
+    from .ai_provider_runtime import AIProvider
 except ImportError:
     from codex_config import current_codex_runtime_args
+    from ai_provider_runtime import AIProvider
 
 
 PROMPT_VERSION = "xhs-outreach-v3"
@@ -253,7 +255,21 @@ class CodexRuntimeOutreachAgent:
         self.output_dir = output_dir.resolve()
         self.candidate_profile = candidate_profile or {}
         self.candidate_name = _text(self.candidate_profile.get("name")) or candidate_name
-        self.cli_bin = resolve_codex_cli(cli_bin)
+        self.builtin_provider: AIProvider | None = None
+        try:
+            self.cli_bin = resolve_codex_cli(cli_bin)
+        except FileNotFoundError:
+            if not (os.environ.get("XHS_AI_API_KEY") and os.environ.get("XHS_AI_BASE_URL") and os.environ.get("XHS_AI_MODEL")):
+                raise
+            self.cli_bin = "bundled-ai-runtime"
+            self.builtin_provider = AIProvider(
+                provider=os.environ.get("XHS_AI_PROVIDER", "codex"),
+                api_key=os.environ.get("XHS_AI_API_KEY", ""),
+                base_url=os.environ.get("XHS_AI_BASE_URL", ""),
+                model=os.environ.get("XHS_AI_MODEL", ""),
+                wire_api=os.environ.get("XHS_AI_WIRE_API", ""),
+                timeout=timeout_seconds,
+            )
         self.batch_size = max(1, min(int(batch_size), 20))
         self.timeout_seconds = max(30, min(int(timeout_seconds), 1800))
         self.run_command = run_command
@@ -282,6 +298,16 @@ class CodexRuntimeOutreachAgent:
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     def _run_batch(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if self.builtin_provider:
+            payload = self.builtin_provider.generate_json(
+                "You are a structured outreach writing agent. Return only the requested JSON object.",
+                _prompt(items, self.candidate_name, self.candidate_profile),
+                _output_schema(),
+            )
+            results = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(results, list):
+                raise ValueError("Bundled AI runtime response does not contain an items array")
+            return results
         with tempfile.TemporaryDirectory(prefix="xhs-codex-runtime-") as temporary:
             root = Path(temporary)
             schema_path = root / "schema.json"
@@ -328,8 +354,7 @@ class CodexRuntimeOutreachAgent:
             raise ValueError("Codex CLI response does not contain an items array")
         return results
 
-    @staticmethod
-    def _validate_output(item: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    def _validate_output(self, item: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict) or _text(item.get("note_id")) != source["note_id"]:
             raise ValueError("Codex CLI returned a mismatched note_id")
         allowed_evidence = {entry["id"] for entry in source["candidate_evidence"] if entry["id"]}
@@ -350,7 +375,7 @@ class CodexRuntimeOutreachAgent:
             ],
             "recommended_resume": "",
             "resume_reason": "",
-            "generation_mode": "codex_cli_runtime",
+            "generation_mode": "codex_builtin_runtime" if self.builtin_provider else "codex_cli_runtime",
             "runtime_status": "generated",
             "status": "ready",
         }

@@ -69,6 +69,14 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         deliveryMailer.configure(smtpConfig.getForMailer());
         return json(res, 200, publicSmtpConfig(smtpConfig, deliveryMailer));
       }
+      if (req.method === 'DELETE' && url.pathname === '/api/email/config') {
+        if (!smtpConfig?.clear || !smtpConfig?.getForMailer) {
+          return json(res, 503, errorBody('SMTP_CONFIG_UNAVAILABLE', 'SMTP configuration storage is unavailable.'));
+        }
+        await smtpConfig.clear();
+        deliveryMailer.configure(smtpConfig.getForMailer());
+        return json(res, 200, publicSmtpConfig(smtpConfig, deliveryMailer));
+      }
       if (req.method === 'POST' && url.pathname === '/api/email/test') {
         const status = await deliveryMailer.verify();
         const saved = await smtpConfig?.markVerified?.();
@@ -150,7 +158,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       }
       if (req.method === 'GET' && url.pathname === '/api/ai/providers') return json(res, 200, aiSessions.providers());
       if (req.method === 'POST' && url.pathname === '/api/ai/sessions') {
-        return json(res, 201, aiSessions.create(await readJsonBody(req, config.maxBodyBytes)));
+        return json(res, 201, await aiSessions.create(await readJsonBody(req, config.maxBodyBytes)));
       }
       if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'ai' && parts[2] === 'sessions' && parts[3]) {
         return json(res, aiSessions.delete(parts[3]) ? 200 : 404, { deleted: true });

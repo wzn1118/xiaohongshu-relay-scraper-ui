@@ -8,7 +8,7 @@ import { RelayConfigStore } from './relay-config-store.mjs';
 import { SmtpConfigStore } from './smtp-config-store.mjs';
 import { createMailSender } from './mail-sender.mjs';
 
-const aiSessions = new AiSessionStore();
+const aiSessions = new AiSessionStore({ filePath: config.aiConfigPath });
 const profileStore = new ProfileStore({
   root: config.profileDir,
   pythonBin: config.pythonBin,
@@ -17,6 +17,7 @@ const profileStore = new ProfileStore({
 const relayConfig = new RelayConfigStore({ filePath: config.relayConfigPath });
 const smtpConfig = new SmtpConfigStore({ filePath: config.smtpConfigPath, defaults: config.smtp });
 await profileStore.initialize();
+await aiSessions.initialize();
 await relayConfig.initialize();
 await smtpConfig.initialize();
 const mailSender = createMailSender(smtpConfig.getForMailer());

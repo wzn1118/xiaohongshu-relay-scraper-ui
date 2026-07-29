@@ -97,6 +97,9 @@ def load_upstream(path: Path):
     resolved = path.resolve()
     if not resolved.is_file():
         raise FileNotFoundError(f"Upstream scraper was not found: {resolved}")
+    module_dir = str(resolved.parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
     spec = importlib.util.spec_from_file_location("xiaohongshu_parallel_upstream", resolved)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load upstream scraper: {resolved}")

@@ -167,8 +167,7 @@ if ($InstallRuntime) {
 }
 
 if ($InstallTools) {
-    if (-not $status.codex) { Install-NpmGlobalPackage '@openai/codex' }
-    $status = Get-ToolStatus
+    Write-Host 'Using the bundled AI runtime; external Codex CLI is optional.'
 }
 
 if ($EnsureBrowserRelay -and -not $status.browser -and -not $CheckOnly) {
@@ -200,7 +199,8 @@ $status.ready =
     [bool]$status.python -and
     $status.nodeMajor -ge 22 -and
     ([Version]$status.pythonVersion -ge [Version]'3.11')
-$status.toolsReady = [bool]$status.codex
+$status.builtInAiReady = $true
+$status.toolsReady = $status.builtInAiReady
 $status.browserReady = [bool]$status.browser
 $status.relayCommandReady = [bool]$status.node
 $status.relayBackend = 'native-cdp'

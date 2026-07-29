@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +12,36 @@ from scripts.ai_provider_runtime import AIProvider, AIProviderError
 
 
 class AiProviderRuntimeTests(unittest.TestCase):
+    def test_codex_uses_bundled_responses_runtime_when_relay_is_configured(self) -> None:
+        provider = AIProvider(
+            provider="codex",
+            api_key="test-key",
+            base_url="https://relay.example/v1",
+            model="gpt-5.5",
+            wire_api="responses",
+            timeout=30,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"output_text":"{\\"items\\": []}"}'
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", return_value=Response()) as open_url, patch(
+            "scripts.ai_provider_runtime.shutil.which", side_effect=AssertionError("CLI should not be used")
+        ):
+            self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {"items": []})
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "https://relay.example/v1/responses")
+        self.assertEqual(json.loads(request.data)["model"], "gpt-5.5")
+        self.assertEqual(json.loads(request.data)["text"]["format"]["type"], "json_object")
+
     def test_native_codex_binary_is_preferred_on_windows(self) -> None:
         provider = AIProvider(provider="codex", timeout=30)
         lookups: list[str] = []

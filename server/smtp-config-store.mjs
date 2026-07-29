@@ -66,6 +66,7 @@ export class SmtpConfigStore {
 
   async update(input = {}) {
     const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+    const oauth = mergeOAuth(this.value.oauth, source.oauth);
     const autoConfigure = source.autoConfigure === true;
     const automatic = autoConfigure ? detectSmtpSettings(source.from || source.user) : null;
     if (autoConfigure && !automatic) {
@@ -83,13 +84,19 @@ export class SmtpConfigStore {
       pass: source.clearPassword ? '' : Object.hasOwn(source, 'password') && source.password !== ''
         ? String(source.password)
         : this.value.pass,
-      oauth: { ...this.value.oauth, ...(source.oauth || {}) },
+      oauth,
       lastVerifiedAt: '',
     };
     delete next.password;
     delete next.clearPassword;
     delete next.autoConfigure;
     this.value = normalizeSmtpConfig(next);
+    await this.persist();
+    return this.getPublic();
+  }
+
+  async clear() {
+    this.value = normalizeSmtpConfig({}, { allowEmpty: true });
     await this.persist();
     return this.getPublic();
   }
@@ -160,6 +167,27 @@ function normalizeOAuth(value = {}) {
     refreshToken: String(value.refreshToken || ''),
     scope: String(value.scope || 'https://outlook.office.com/SMTP.Send offline_access openid profile email').trim(),
   };
+}
+
+function mergeOAuth(current, input) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const next = {
+    ...current,
+    ...source,
+    clientSecret: source.clearClientSecret
+      ? ''
+      : Object.hasOwn(source, 'clientSecret') && source.clientSecret !== ''
+        ? String(source.clientSecret)
+        : current.clientSecret,
+    refreshToken: source.clearRefreshToken
+      ? ''
+      : Object.hasOwn(source, 'refreshToken') && source.refreshToken !== ''
+        ? String(source.refreshToken)
+        : current.refreshToken,
+  };
+  delete next.clearClientSecret;
+  delete next.clearRefreshToken;
+  return next;
 }
 
 function validation(message) {

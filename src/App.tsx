@@ -60,6 +60,7 @@ import type {
   CandidateApplicationProfile,
   ApplicationRoute,
   OutreachDraft,
+  SmtpAuthMode,
   SmtpConfig,
   SmtpProvider,
 } from './types'
@@ -171,6 +172,13 @@ const defaultSmtpConfig: SmtpConfig = {
   user: '',
   from: '',
   hasPassword: false,
+  oauth: {
+    tenant: 'organizations',
+    clientId: '',
+    scope: 'https://outlook.office.com/SMTP.Send offline_access openid profile email',
+    hasClientSecret: false,
+    hasRefreshToken: false,
+  },
   configured: false,
   verified: false,
   maskedFrom: '',
@@ -421,6 +429,8 @@ function App() {
   const [relayConfigSaving, setRelayConfigSaving] = useState(false)
   const [smtpConfig, setSmtpConfig] = useState<SmtpConfig>(defaultSmtpConfig)
   const [smtpPassword, setSmtpPassword] = useState('')
+  const [smtpOAuthClientSecret, setSmtpOAuthClientSecret] = useState('')
+  const [smtpOAuthRefreshToken, setSmtpOAuthRefreshToken] = useState('')
   const [smtpManualMode, setSmtpManualMode] = useState(false)
   const [smtpSaving, setSmtpSaving] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
@@ -447,6 +457,7 @@ function App() {
   const [apiKey, setApiKey] = useState('')
   const [aiModel, setAiModel] = useState('')
   const [aiBaseUrl, setAiBaseUrl] = useState('')
+  const [aiWireApi, setAiWireApi] = useState<'responses' | 'chat_completions'>('responses')
   const [aiSession, setAiSession] = useState<AiSession | null>(null)
   const [profiles, setProfiles] = useState<CandidateProfile[]>([])
   const [backgroundText, setBackgroundText] = useState('')
@@ -462,11 +473,16 @@ function App() {
   const detectedSmtpProvider = detectedSmtpPreset
     ? smtpProviderOptions.find((item) => item.id === detectedSmtpPreset.provider)
     : null
-  const smtpCanSave = Boolean(
-    smtpConfig.from.trim()
-    && (smtpPassword || smtpConfig.hasPassword)
-    && (smtpManualMode || detectedSmtpPreset),
-  )
+  const smtpHasLoginCredential = Boolean(smtpPassword || smtpConfig.hasPassword)
+  const smtpHasRefreshToken = Boolean(smtpOAuthRefreshToken || smtpConfig.oauth.hasRefreshToken)
+  const smtpManualAuthReady = smtpConfig.auth === 'none'
+    || (smtpConfig.auth === 'login' && Boolean((smtpConfig.user || smtpConfig.from).trim()) && smtpHasLoginCredential)
+    || (smtpConfig.auth === 'oauth2' && Boolean((smtpConfig.user || smtpConfig.from).trim()) && smtpConfig.oauth.clientId.trim() && smtpHasRefreshToken)
+  const smtpCanSave = Boolean(smtpConfig.from.trim() && (
+    smtpManualMode
+      ? smtpConfig.host.trim() && smtpConfig.port > 0 && smtpManualAuthReady
+      : detectedSmtpPreset && smtpHasLoginCredential
+  ))
 
   const updateRequest = <K extends keyof JobRequest>(key: K, value: JobRequest[K]) => {
     setRequest((current) => ({ ...current, [key]: value }))
@@ -546,12 +562,12 @@ function App() {
     const preset = smtpPresetForEmail(value)
     setSmtpConfig((current) => {
       const emailChanged = value.trim().toLowerCase() !== current.from.trim().toLowerCase()
+      const userTracksFrom = !current.user || current.user.trim().toLowerCase() === current.from.trim().toLowerCase()
       return {
         ...current,
-        ...(preset || {}),
-        auth: 'login',
-        authMode: 'login',
-        user: value,
+        ...(!smtpManualMode && preset ? preset : {}),
+        ...(!smtpManualMode ? { auth: 'login' as const, authMode: 'login' as const } : {}),
+        user: userTracksFrom ? value : current.user,
         from: value,
         hasPassword: emailChanged ? false : current.hasPassword,
         configured: false,
@@ -582,6 +598,19 @@ function App() {
     setSmtpConfig((current) => ({ ...current, [key]: value }))
   }
 
+  const selectSmtpAuth = (auth: SmtpAuthMode) => {
+    setSmtpConfig((current) => ({ ...current, auth, authMode: auth, configured: false, verified: false }))
+  }
+
+  const updateSmtpOAuth = <K extends 'tenant' | 'clientId' | 'scope'>(key: K, value: SmtpConfig['oauth'][K]) => {
+    setSmtpConfig((current) => ({
+      ...current,
+      oauth: { ...current.oauth, [key]: value },
+      configured: false,
+      verified: false,
+    }))
+  }
+
   const saveSmtpConfig = async (testConnection = false) => {
     setSmtpSaving(true)
     setNotice(null)
@@ -596,6 +625,15 @@ function App() {
         user: smtpConfig.user || smtpConfig.from,
         from: smtpConfig.from,
         password: smtpPassword,
+        ...(smtpConfig.auth === 'oauth2' ? {
+          oauth: {
+            tenant: smtpConfig.oauth.tenant,
+            clientId: smtpConfig.oauth.clientId,
+            clientSecret: smtpOAuthClientSecret,
+            refreshToken: smtpOAuthRefreshToken,
+            scope: smtpConfig.oauth.scope,
+          },
+        } : {}),
       } : {
         from: smtpConfig.from,
         password: smtpPassword,
@@ -603,6 +641,8 @@ function App() {
       })
       setSmtpConfig(saved)
       setSmtpPassword('')
+      setSmtpOAuthClientSecret('')
+      setSmtpOAuthRefreshToken('')
       setHealth((current) => current ? {
         ...current,
         emailDelivery: { configured: saved.configured, from: saved.maskedFrom, authMode: saved.authMode },
@@ -614,6 +654,28 @@ function App() {
       } else {
         setNotice('发件邮箱已保存并立即生效，无需重启服务。')
       }
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setSmtpSaving(false)
+    }
+  }
+
+  const clearSmtpConfig = async () => {
+    if (!window.confirm('清除当前设备保存的发件邮箱、密码和 OAuth2 凭据？')) return
+    setSmtpSaving(true)
+    setNotice(null)
+    try {
+      const cleared = await api.clearSmtpConfig()
+      setSmtpConfig(cleared)
+      setSmtpPassword('')
+      setSmtpOAuthClientSecret('')
+      setSmtpOAuthRefreshToken('')
+      setHealth((current) => current ? {
+        ...current,
+        emailDelivery: { configured: false, from: '', authMode: cleared.authMode },
+      } : current)
+      setNotice('当前设备保存的发件邮箱配置已清除。')
     } catch (error) {
       setNotice((error as Error).message)
     } finally {
@@ -656,6 +718,7 @@ function App() {
     if (selected) {
       setAiModel(selected.model)
       setAiBaseUrl(selected.baseUrl)
+      setAiWireApi(selected.wireApi)
     }
     setAiSession(null)
     updateRequest('aiSessionId', null)
@@ -665,7 +728,7 @@ function App() {
     setConfiguringAi(true)
     setNotice(null)
     try {
-      const session = await api.createAiSession({ provider: providerId, apiKey, model: aiModel, baseUrl: aiBaseUrl })
+      const session = await api.createAiSession({ provider: providerId, apiKey, model: aiModel, baseUrl: aiBaseUrl, wireApi: aiWireApi })
       setAiSession(session)
       updateRequest('aiSessionId', session.id)
       setApiKey('')
@@ -763,7 +826,22 @@ function App() {
       setProviders(options)
       setProfiles(saved)
       const codex = options.find((item) => item.id === 'codex') || options[0]
-      if (codex) selectProvider(codex.id, options)
+      if (codex) {
+        selectProvider(codex.id, options)
+        if (codex.configured && codex.hasApiKey) {
+          void api.createAiSession({
+            provider: codex.id,
+            apiKey: '',
+            model: codex.model,
+            baseUrl: codex.baseUrl,
+            wireApi: codex.wireApi,
+          }).then((session) => {
+            setAiSession(session)
+            updateRequest('aiSessionId', session.id)
+            setNotice('已自动连接本机保存的内置 Codex 中转配置')
+          }).catch(() => undefined)
+        }
+      }
       if (saved[0]) updateRequest('profileId', saved[0].id)
     }).catch((error) => setNotice((error as Error).message))
   }, [])
@@ -1099,7 +1177,7 @@ function App() {
               <div className="smtp-simple-layout">
                 <div className="form-row smtp-primary-fields">
                   <label className="field"><span>发件邮箱</span><input type="email" autoComplete="email" value={smtpConfig.from} onChange={(event) => updateSmtpEmail(event.target.value)} placeholder="name@163.com" /></label>
-                  <label className="field"><span>{detectedSmtpPreset?.provider === '163' || detectedSmtpPreset?.provider === 'qq' ? '客户端授权密码' : '密码 / 应用专用密码'}</span><input type="password" autoComplete="current-password" value={smtpPassword} onChange={(event) => setSmtpPassword(event.target.value)} placeholder={smtpConfig.hasPassword ? '已保存，留空保持不变' : '仅保存在当前设备'} /></label>
+                  {(!smtpManualMode || smtpConfig.auth === 'login') && <label className="field"><span>{detectedSmtpPreset?.provider === '163' || detectedSmtpPreset?.provider === 'qq' ? '客户端授权密码' : '密码 / 应用专用密码'}</span><input type="password" autoComplete="current-password" value={smtpPassword} onChange={(event) => setSmtpPassword(event.target.value)} placeholder={smtpConfig.hasPassword ? '已保存，留空保持不变' : '仅保存在当前设备'} /></label>}
                 </div>
                 <div className={`smtp-auto-status ${detectedSmtpPreset ? 'detected' : ''}`}>
                   <Mail size={17} />
@@ -1114,15 +1192,26 @@ function App() {
               </button>
               {smtpManualMode && <div className="smtp-advanced-fields">
                 <label className="field"><span>邮箱服务商</span><select value={smtpConfig.provider} onChange={(event) => selectSmtpProvider(event.target.value as SmtpProvider)}>{smtpProviderOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-                <label className="field"><span>SMTP 用户名</span><input autoComplete="username" value={smtpConfig.user} onChange={(event) => updateSmtpConfig('user', event.target.value)} placeholder="通常与发件邮箱相同" /></label>
+                <label className="field"><span>认证方式</span><select value={smtpConfig.auth} onChange={(event) => selectSmtpAuth(event.target.value as SmtpAuthMode)}><option value="login">用户名 + 密码</option><option value="oauth2">Outlook OAuth2</option><option value="none">无需认证</option></select></label>
                 <label className="field"><span>SMTP 主机</span><input value={smtpConfig.host} onChange={(event) => updateSmtpConfig('host', event.target.value)} placeholder="smtp.example.com" /></label>
                 <label className="field"><span>端口</span><input type="number" min="1" max="65535" value={smtpConfig.port} onChange={(event) => updateSmtpConfig('port', Number(event.target.value))} /></label>
-                <Toggle checked={smtpConfig.secure} onChange={(value) => updateSmtpConfig('secure', value)} label="SSL/TLS" description="通常使用 465 端口" />
-                <Toggle checked={smtpConfig.requireTls} onChange={(value) => updateSmtpConfig('requireTls', value)} label="STARTTLS" description="通常使用 587 端口" />
+                {smtpConfig.auth !== 'none' && <label className="field"><span>SMTP 用户名</span><input autoComplete="username" value={smtpConfig.user} onChange={(event) => updateSmtpConfig('user', event.target.value)} placeholder="通常与发件邮箱相同" /></label>}
+                <div className="smtp-security-options">
+                  <Toggle checked={smtpConfig.secure} onChange={(value) => updateSmtpConfig('secure', value)} label="SSL/TLS" description="通常使用 465 端口" />
+                  <Toggle checked={smtpConfig.requireTls} onChange={(value) => updateSmtpConfig('requireTls', value)} label="STARTTLS" description="通常使用 587 端口" />
+                </div>
+                {smtpConfig.auth === 'oauth2' && <div className="smtp-oauth-fields">
+                  <label className="field"><span>Tenant</span><input value={smtpConfig.oauth.tenant} onChange={(event) => updateSmtpOAuth('tenant', event.target.value)} placeholder="organizations" /></label>
+                  <label className="field"><span>Client ID</span><input value={smtpConfig.oauth.clientId} onChange={(event) => updateSmtpOAuth('clientId', event.target.value)} placeholder="Microsoft Entra 应用 ID" /></label>
+                  <label className="field"><span>Client Secret（可选）</span><input type="password" autoComplete="off" value={smtpOAuthClientSecret} onChange={(event) => setSmtpOAuthClientSecret(event.target.value)} placeholder={smtpConfig.oauth.hasClientSecret ? '已保存，留空保持不变' : '公共客户端可留空'} /></label>
+                  <label className="field"><span>Refresh Token</span><input type="password" autoComplete="off" value={smtpOAuthRefreshToken} onChange={(event) => setSmtpOAuthRefreshToken(event.target.value)} placeholder={smtpConfig.oauth.hasRefreshToken ? '已保存，留空保持不变' : '粘贴 OAuth2 Refresh Token'} /></label>
+                  <label className="field smtp-oauth-scope"><span>Scope</span><input value={smtpConfig.oauth.scope} onChange={(event) => updateSmtpOAuth('scope', event.target.value)} /></label>
+                </div>}
               </div>}
               <div className="smtp-config-footer">
                 <div className="smtp-guidance"><ShieldCheck size={16} /><span><strong>{smtpManualMode ? '高级参数仅保存在当前设备' : '邮箱凭据仅保存在当前设备'}</strong><small>{smtpManualMode ? smtpProviderOptions.find((item) => item.id === smtpConfig.provider)?.guidance : detectedSmtpProvider?.guidance || '输入完整邮箱后即可自动配置；企业邮箱请使用高级设置。'}</small></span></div>
                 <div className="smtp-config-actions">
+                  <button type="button" className="secondary-button smtp-clear-action" disabled={smtpSaving || (!smtpConfig.from && !smtpConfig.configured && !smtpConfig.hasPassword && !smtpConfig.oauth.hasRefreshToken)} onClick={() => void clearSmtpConfig()}><RotateCcw size={16} />清除配置</button>
                   <button type="button" className="secondary-button" disabled={smtpSaving || !smtpCanSave} onClick={() => void saveSmtpConfig(false)}><Save size={16} />{smtpManualMode ? '保存配置' : '自动配置'}</button>
                   <button type="button" className="primary-button smtp-test-action" disabled={smtpSaving || !smtpCanSave} onClick={() => void saveSmtpConfig(true)}>{smtpSaving ? <LoaderCircle className="spin" size={16} /> : <Wifi size={16} />}{smtpManualMode ? '保存并测试' : '配置并测试'}</button>
                 </div>
@@ -1140,11 +1229,15 @@ function App() {
                 <div className="setup-title"><KeyRound size={17} /><span><strong>AI Runtime</strong><small>{aiSession ? `${selectedProvider?.label || providerId} · 会话内存` : '选择提供方并连接'}</small></span></div>
                 <div className="form-row ai-provider-row">
                   <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-                  {providerId !== 'codex' && <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="仅保存在服务进程内" /></label>}
-                  {providerId !== 'codex' && <label className="field"><span>模型</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} /></label>}
+                  <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴中转站 API Key'} /></label>
+                  <label className="field"><span>模型</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="例如 gpt-5.5" /></label>
                 </div>
-                {providerId !== 'codex' && <label className="field base-url-field"><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} /></label>}
-                <button type="button" className="secondary-button setup-action" disabled={configuringAi || (selectedProvider?.requiresKey && !apiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}{aiSession ? '重新连接' : '连接 AI'}</button>
+                <div className="form-row ai-provider-row">
+                  <label className="field base-url-field"><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => setAiBaseUrl(event.target.value)} placeholder="https://relay.example/v1" /></label>
+                  <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
+                </div>
+                <small className="form-hint">{providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写中转站地址后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
+                <button type="button" className="secondary-button setup-action" disabled={configuringAi || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}{aiSession ? '重新连接' : '连接 AI'}</button>
               </section>
               <section>
                 <div className="setup-title"><Upload size={17} /><span><strong>背景资料</strong><small>{activeProfile ? `${activeProfile.display_name || '个人档案'} · ${activeProfile.sourceFiles?.length || 0} 个来源` : 'PDF / DOCX / TXT / MD / JSON / CSV / RTF'}</small></span></div>
