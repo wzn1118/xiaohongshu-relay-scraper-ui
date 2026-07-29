@@ -200,6 +200,7 @@ data/jobs/<JOB_ID>/artifacts/
 ## 产品边界与隐私
 
 - 系统不会自动投递；只有用户点击“发送邮件”后，才会通过本机配置的 SMTP 把当前编辑稿发送到该岗位正文中提取出的邮箱。私信仍由用户复制文案并打开原帖发送。
+- 每位用户在工作台中填写自己的发件邮箱和客户端授权码；系统按邮箱域名自动配置 SMTP，凭据仅写入本机 Git 忽略文件，不内置任何项目维护者账号。
 - 上传文件、背景记忆、任务数据和个人证据默认写入本地 Git 忽略目录。
 - API Key 只保存在服务进程内存中，默认 8 小时过期，不写入任务历史、日志、导出文件或 Git。
 - 文案只能使用简历和背景记忆中明确存在的事实，不能把不确定信息写成确定经历。
@@ -303,6 +304,7 @@ sh scripts/start.sh
 | `XHS_PROFILE_DATA_DIR` | `data/profiles` | 私有背景记忆 |
 | `OPENCLAW_CONFIG_PATH` | 用户目录自动发现 | 仅用于发现并兼容已有 OpenClaw Relay，不是新电脑的必需配置 |
 | `XHS_RELAY_CONFIG_PATH` | `data/relay-config.json` | CDP 端口、浏览器 Profile 和开机连接开关；新配置默认 `18800` / `openclaw` |
+| `XHS_SMTP_CONFIG_PATH` | `data/smtp-config.json` | 每位用户自己的 SMTP 本地配置；密码不会通过配置查询 API 返回 |
 | `XHS_AI_TIMEOUT_SECONDS` | `600` | 单次 AI 调用超时秒数 |
 | `SMTP_HOST` / `SMTP_PORT` | 留空 / `587` | 可选邮件服务器；Microsoft 365 使用 `smtp.office365.com:587` |
 | `SMTP_SECURE` / `SMTP_REQUIRE_TLS` | `false` / `true` | 587 端口通过 STARTTLS 加密连接 |
@@ -314,6 +316,8 @@ sh scripts/start.sh
 | `SMTP_OAUTH_CLIENT_SECRET` | 留空 | 机密客户端可选；公共客户端留空 |
 | `SMTP_OAUTH_REFRESH_TOKEN` | 留空 | 获得 `SMTP.Send` 和 `offline_access` 授权后的 Refresh Token |
 | `SMTP_OAUTH_SCOPE` | Outlook SMTP scope | SMTP 发送、离线续期和账号识别权限 |
+
+工作台默认只要求填写发件邮箱和密码 / 客户端授权码，并自动识别网易 163/126/yeah、QQ/foxmail、Gmail、Outlook/Hotmail/Live 的 SMTP 参数。企业邮箱或自定义域名可展开“高级设置”手动填写主机、端口和 TLS 参数。网易、QQ 等服务商通常要求使用客户端授权码，而不是网页登录密码。
 
 邮件发送只在三个条件同时成立时启用：AI 文案通过不低于 90 分的质量门禁、岗位正文提取到有效邮箱、本机 SMTP 配置完整。草稿和发送结果写入任务目录的 `delivery-state.json`，不会改写原始 AI 分析文件。
 
