@@ -7,6 +7,9 @@ const ALLOWED_KEYS = new Set([
   'stableRounds',
   'gotoTimeoutMs',
   'noteDelaySeconds',
+  'speedMode',
+  'randomDelayMinSeconds',
+  'randomDelayMaxSeconds',
   'mode',
   'skipPostprocess',
   'noAutoAttach',
@@ -53,21 +56,35 @@ export function validateRunRequest(value) {
 
   const mode = value.mode ?? 'fresh';
   if (mode !== 'fresh' && mode !== 'resume') throw fieldError('mode', 'must_be_fresh_or_resume');
+  integerField(value.limit, 'limit', 0, 0, 1000);
   const resumeFromJobId = optionalStringField(value.resumeFromJobId, 'resumeFromJobId', 64);
   if (resumeFromJobId && !JOB_ID.test(resumeFromJobId)) throw fieldError('resumeFromJobId', 'invalid_job_id');
   if (resumeFromJobId && mode !== 'resume') throw fieldError('resumeFromJobId', 'requires_resume_mode');
+
+  const speedMode = value.speedMode ?? 'random';
+  if (speedMode !== 'steady' && speedMode !== 'random') throw fieldError('speedMode', 'must_be_steady_or_random');
+  const noteDelaySeconds = numberField(value.noteDelaySeconds, 'noteDelaySeconds', 1.2, 0, 60);
+  const randomDelayMinSeconds = numberField(value.randomDelayMinSeconds, 'randomDelayMinSeconds', 0.8, 0, 60);
+  const randomDelayMaxSeconds = numberField(value.randomDelayMaxSeconds, 'randomDelayMaxSeconds', 2.4, 0, 60);
+  if (randomDelayMinSeconds > randomDelayMaxSeconds) {
+    throw fieldError('randomDelayMaxSeconds', 'must_be_greater_than_or_equal_to_randomDelayMinSeconds');
+  }
 
   return Object.freeze({
     keyword,
     browserProfile,
     relayPort: integerField(value.relayPort, 'relayPort', 18800, 1, 65535),
-    // The upstream scraper uses 0 to mean every unique card found before the
-    // search result stream stabilizes.
-    limit: integerField(value.limit, 'limit', 0, 0, 1000),
+    // Every production run must collect the body for every discovered card.
+    // Keep the field for request compatibility, but normalize any submitted
+    // cap to the only supported collection mode.
+    limit: 0,
     maxScrolls: integerField(value.maxScrolls, 'maxScrolls', 40, 1, 100),
     stableRounds: integerField(value.stableRounds, 'stableRounds', 4, 1, 20),
     gotoTimeoutMs: integerField(value.gotoTimeoutMs, 'gotoTimeoutMs', 15000, 3000, 120000),
-    noteDelaySeconds: numberField(value.noteDelaySeconds, 'noteDelaySeconds', 0.2, 0, 10),
+    noteDelaySeconds,
+    speedMode,
+    randomDelayMinSeconds,
+    randomDelayMaxSeconds,
     mode,
     skipPostprocess: booleanField(value.skipPostprocess, 'skipPostprocess', false),
     noAutoAttach: booleanField(value.noAutoAttach, 'noAutoAttach', true),
@@ -127,6 +144,9 @@ export function buildRunnerArgs(params, outputDir) {
     '--stable-rounds', String(params.stableRounds),
     '--goto-timeout-ms', String(params.gotoTimeoutMs),
     '--note-delay-seconds', String(params.noteDelaySeconds),
+    '--speed-mode', params.speedMode,
+    '--random-delay-min-seconds', String(params.randomDelayMinSeconds),
+    '--random-delay-max-seconds', String(params.randomDelayMaxSeconds),
     params.mode === 'resume' ? '--resume' : '--fresh',
     '--security-verification-timeout-seconds', String(params.securityVerificationTimeoutSeconds),
     '--codex-batch-size', String(params.codexBatchSize),

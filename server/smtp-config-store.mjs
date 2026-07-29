@@ -9,6 +9,20 @@ export const SMTP_PROVIDER_PRESETS = Object.freeze({
   custom: Object.freeze({ host: '', port: 465, secure: true, requireTls: false }),
 });
 
+const SMTP_EMAIL_DOMAIN_PRESETS = Object.freeze({
+  '163.com': Object.freeze({ provider: '163', ...SMTP_PROVIDER_PRESETS['163'] }),
+  '126.com': Object.freeze({ provider: '163', host: 'smtp.126.com', port: 465, secure: true, requireTls: false }),
+  'yeah.net': Object.freeze({ provider: '163', host: 'smtp.yeah.net', port: 465, secure: true, requireTls: false }),
+  'qq.com': Object.freeze({ provider: 'qq', ...SMTP_PROVIDER_PRESETS.qq }),
+  'foxmail.com': Object.freeze({ provider: 'qq', ...SMTP_PROVIDER_PRESETS.qq }),
+  'gmail.com': Object.freeze({ provider: 'gmail', ...SMTP_PROVIDER_PRESETS.gmail }),
+  'googlemail.com': Object.freeze({ provider: 'gmail', ...SMTP_PROVIDER_PRESETS.gmail }),
+  'outlook.com': Object.freeze({ provider: 'outlook', ...SMTP_PROVIDER_PRESETS.outlook }),
+  'hotmail.com': Object.freeze({ provider: 'outlook', ...SMTP_PROVIDER_PRESETS.outlook }),
+  'live.com': Object.freeze({ provider: 'outlook', ...SMTP_PROVIDER_PRESETS.outlook }),
+  'msn.com': Object.freeze({ provider: 'outlook', ...SMTP_PROVIDER_PRESETS.outlook }),
+});
+
 const PROVIDERS = new Set(Object.keys(SMTP_PROVIDER_PRESETS));
 const AUTH_MODES = new Set(['login', 'oauth2', 'none']);
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
@@ -52,9 +66,20 @@ export class SmtpConfigStore {
 
   async update(input = {}) {
     const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+    const autoConfigure = source.autoConfigure === true;
+    const automatic = autoConfigure ? detectSmtpSettings(source.from || source.user) : null;
+    if (autoConfigure && !automatic) {
+      throw validation('暂不支持自动识别这个邮箱，请展开高级设置并填写服务商提供的 SMTP 参数。');
+    }
     const next = {
       ...this.value,
       ...source,
+      ...(automatic ? {
+        ...automatic,
+        auth: 'login',
+        user: String(source.from || source.user || '').trim(),
+        from: String(source.from || source.user || '').trim(),
+      } : {}),
       pass: source.clearPassword ? '' : Object.hasOwn(source, 'password') && source.password !== ''
         ? String(source.password)
         : this.value.pass,
@@ -63,6 +88,7 @@ export class SmtpConfigStore {
     };
     delete next.password;
     delete next.clearPassword;
+    delete next.autoConfigure;
     this.value = normalizeSmtpConfig(next);
     await this.persist();
     return this.getPublic();
@@ -106,6 +132,14 @@ export function normalizeSmtpConfig(value = {}, { allowEmpty = false } = {}) {
   if (auth === 'oauth2' && !(user && oauth.clientId && oauth.refreshToken)) throw validation('Outlook OAuth2 配置不完整。');
   if (pass.length > 2048) throw validation('SMTP 密码长度无效。');
   return { provider, host, port, secure, requireTls, auth, user, pass, from, oauth, lastVerifiedAt };
+}
+
+export function detectSmtpSettings(email) {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!EMAIL.test(normalized)) return null;
+  const domain = normalized.slice(normalized.lastIndexOf('@') + 1);
+  const preset = SMTP_EMAIL_DOMAIN_PRESETS[domain];
+  return preset ? { ...preset } : null;
 }
 
 function providerForHost(host) {

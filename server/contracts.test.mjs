@@ -11,6 +11,9 @@ test('validateRunRequest applies bounded production defaults', () => {
   assert.equal(result.maxScrolls, 40);
   assert.equal(result.stableRounds, 4);
   assert.equal(result.relayPort, 18800);
+  assert.equal(result.speedMode, 'random');
+  assert.equal(result.randomDelayMinSeconds, 0.8);
+  assert.equal(result.randomDelayMaxSeconds, 2.4);
   assert.equal(result.noAutoAttach, true);
   assert.equal(result.mode, 'fresh');
   assert.equal(result.securityVerificationTimeoutSeconds, 600);
@@ -27,9 +30,22 @@ test('validateRunRequest rejects unknown and malformed parameters', () => {
   assert.throws(() => validateRunRequest({ keyword: 'bad\nvalue' }), ValidationError);
 });
 
-test('validateRunRequest accepts uncapped and high-volume collection', () => {
+test('validateRunRequest always normalizes collection to full-body mode', () => {
   assert.equal(validateRunRequest({ limit: 0 }).limit, 0);
-  assert.equal(validateRunRequest({ limit: 1000 }).limit, 1000);
+  assert.equal(validateRunRequest({ limit: 1000 }).limit, 0);
+});
+
+test('validateRunRequest validates collection pacing ranges', () => {
+  const result = validateRunRequest({
+    speedMode: 'steady',
+    noteDelaySeconds: 3,
+    randomDelayMinSeconds: 1,
+    randomDelayMaxSeconds: 5,
+  });
+  assert.equal(result.speedMode, 'steady');
+  assert.equal(result.noteDelaySeconds, 3);
+  assert.throws(() => validateRunRequest({ speedMode: 'burst' }), ValidationError);
+  assert.throws(() => validateRunRequest({ randomDelayMinSeconds: 5, randomDelayMaxSeconds: 1 }), ValidationError);
 });
 
 test('validateRunRequest accepts only valid resume source ids in resume mode', () => {
@@ -67,6 +83,9 @@ test('buildRunnerArgs only emits the normalized whitelist', () => {
   assert.ok(args.includes('--no-auto-attach'));
   assert.ok(args.includes('--codex-runtime'));
   assert.equal(args[args.indexOf('--security-verification-timeout-seconds') + 1], '600');
+  assert.equal(args[args.indexOf('--speed-mode') + 1], 'random');
+  assert.equal(args[args.indexOf('--random-delay-min-seconds') + 1], '0.8');
+  assert.equal(args[args.indexOf('--random-delay-max-seconds') + 1], '2.4');
   assert.equal(args.some((arg) => /[;&|]/.test(arg)), false);
 });
 

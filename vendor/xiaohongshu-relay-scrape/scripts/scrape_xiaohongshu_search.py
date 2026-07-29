@@ -15,6 +15,15 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import Browser, BrowserContext, Error, Page, TimeoutError, sync_playwright
 
+from collection_pacing import (
+    DEFAULT_NOTE_DELAY_SECONDS,
+    DEFAULT_RANDOM_DELAY_MAX_SECONDS,
+    DEFAULT_RANDOM_DELAY_MIN_SECONDS,
+    DEFAULT_SPEED_MODE,
+    next_collection_delay,
+    validate_collection_pacing,
+)
+
 
 SEARCH_URL = (
     "https://www.xiaohongshu.com/search_result/"
@@ -456,7 +465,16 @@ def extract_cards(page: Page) -> list[dict[str, Any]]:
     return page.evaluate(js)
 
 
-def collect_note_links(page: Page, *, max_scrolls: int, stable_rounds: int) -> list[dict[str, Any]]:
+def collect_note_links(
+    page: Page,
+    *,
+    max_scrolls: int,
+    stable_rounds: int,
+    speed_mode: str,
+    note_delay_seconds: float,
+    random_delay_min_seconds: float,
+    random_delay_max_seconds: float,
+) -> list[dict[str, Any]]:
     all_cards: dict[str, dict[str, Any]] = {}
     unchanged_rounds = 0
 
@@ -490,7 +508,12 @@ def collect_note_links(page: Page, *, max_scrolls: int, stable_rounds: int) -> l
         if not scrolled:
             continue
         try:
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(round(1000 * next_collection_delay(
+                speed_mode,
+                note_delay_seconds,
+                random_delay_min_seconds,
+                random_delay_max_seconds,
+            )))
         except Error as exc:
             if is_navigation_context_error(exc):
                 log("search page navigated after scroll; waiting and retrying this scroll step")
@@ -821,14 +844,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stable-rounds", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0, help="Optional max note count to scrape. 0 means no cap.")
     parser.add_argument("--goto-timeout-ms", type=int, default=45000)
-    parser.add_argument("--note-delay-seconds", type=float, default=0.8)
+    parser.add_argument("--note-delay-seconds", type=float, default=DEFAULT_NOTE_DELAY_SECONDS)
+    parser.add_argument("--speed-mode", choices=("steady", "random"), default=DEFAULT_SPEED_MODE)
+    parser.add_argument("--random-delay-min-seconds", type=float, default=DEFAULT_RANDOM_DELAY_MIN_SECONDS)
+    parser.add_argument("--random-delay-max-seconds", type=float, default=DEFAULT_RANDOM_DELAY_MAX_SECONDS)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--use-card-cache", action="store_true")
     parser.add_argument(
         "--output-dir",
         default=str(pathlib.Path.cwd() / "output" / "xiaohongshu-relay-scrape"),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        validate_collection_pacing(
+            args.speed_mode,
+            args.note_delay_seconds,
+            args.random_delay_min_seconds,
+            args.random_delay_max_seconds,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def load_existing_records(path: pathlib.Path) -> list[NoteRecord]:
@@ -875,6 +911,10 @@ def main() -> int:
                 search_page,
                 max_scrolls=args.max_scrolls,
                 stable_rounds=args.stable_rounds,
+                speed_mode=args.speed_mode,
+                note_delay_seconds=args.note_delay_seconds,
+                random_delay_min_seconds=args.random_delay_min_seconds,
+                random_delay_max_seconds=args.random_delay_max_seconds,
             )
             latest_cards_json.write_text(
                 json.dumps(cards, ensure_ascii=False, indent=2),
@@ -926,7 +966,12 @@ def main() -> int:
                 write_csv(records, latest_csv)
             if target_total_records is not None and len(records) >= target_total_records:
                 break
-            time.sleep(args.note_delay_seconds)
+            time.sleep(next_collection_delay(
+                args.speed_mode,
+                args.note_delay_seconds,
+                args.random_delay_min_seconds,
+                args.random_delay_max_seconds,
+            ))
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_path = output_dir / f"xiaohongshu_notes_{timestamp}.json"

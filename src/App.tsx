@@ -30,6 +30,7 @@ import {
   Search,
   Settings2,
   ShieldCheck,
+  Shuffle,
   SquareTerminal,
   Table2,
   Target,
@@ -107,7 +108,10 @@ const defaultRequest: JobRequest = {
   maxScrolls: 60,
   stableRounds: 8,
   gotoTimeoutMs: 30000,
-  noteDelaySeconds: 0.3,
+  noteDelaySeconds: 1.2,
+  speedMode: 'random',
+  randomDelayMinSeconds: 0.8,
+  randomDelayMaxSeconds: 2.4,
   mode: 'resume',
   skipPostprocess: false,
   noAutoAttach: true,
@@ -130,12 +134,31 @@ const defaultRelayConfig: RelayConfig = {
 }
 
 const smtpProviderOptions: Array<{ id: SmtpProvider; label: string; host: string; port: number; secure: boolean; requireTls: boolean; guidance: string }> = [
-  { id: '163', label: '网易 163 邮箱', host: 'smtp.163.com', port: 465, secure: true, requireTls: false, guidance: '先在网易邮箱网页版开启 SMTP 服务，再填写客户端授权密码；不是网页登录密码。' },
+  { id: '163', label: '网易邮箱', host: 'smtp.163.com', port: 465, secure: true, requireTls: false, guidance: '支持 163、126 和 yeah 邮箱。请填写客户端授权密码，不是网页登录密码。' },
   { id: 'qq', label: 'QQ 邮箱', host: 'smtp.qq.com', port: 465, secure: true, requireTls: false, guidance: '先在邮箱设置中开启 SMTP 服务，并使用客户端授权码。' },
   { id: 'gmail', label: 'Gmail', host: 'smtp.gmail.com', port: 465, secure: true, requireTls: false, guidance: '账号开启两步验证后，请使用应用专用密码。' },
   { id: 'outlook', label: 'Outlook / Microsoft 365', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true, guidance: '组织账号可能关闭 SMTP AUTH；如已加载 OAuth2 配置，可直接测试当前连接。' },
   { id: 'custom', label: '其他 SMTP', host: '', port: 465, secure: true, requireTls: false, guidance: '按邮箱服务商文档填写 SMTP 主机、端口和加密方式。' },
 ]
+
+const smtpDomainPresets: Record<string, Pick<SmtpConfig, 'provider' | 'host' | 'port' | 'secure' | 'requireTls'>> = {
+  '163.com': { provider: '163', host: 'smtp.163.com', port: 465, secure: true, requireTls: false },
+  '126.com': { provider: '163', host: 'smtp.126.com', port: 465, secure: true, requireTls: false },
+  'yeah.net': { provider: '163', host: 'smtp.yeah.net', port: 465, secure: true, requireTls: false },
+  'qq.com': { provider: 'qq', host: 'smtp.qq.com', port: 465, secure: true, requireTls: false },
+  'foxmail.com': { provider: 'qq', host: 'smtp.qq.com', port: 465, secure: true, requireTls: false },
+  'gmail.com': { provider: 'gmail', host: 'smtp.gmail.com', port: 465, secure: true, requireTls: false },
+  'googlemail.com': { provider: 'gmail', host: 'smtp.gmail.com', port: 465, secure: true, requireTls: false },
+  'outlook.com': { provider: 'outlook', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true },
+  'hotmail.com': { provider: 'outlook', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true },
+  'live.com': { provider: 'outlook', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true },
+  'msn.com': { provider: 'outlook', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true },
+}
+
+function smtpPresetForEmail(email: string) {
+  const domain = email.trim().toLowerCase().split('@')[1] || ''
+  return smtpDomainPresets[domain] || null
+}
 
 const defaultSmtpConfig: SmtpConfig = {
   provider: '163',
@@ -398,6 +421,7 @@ function App() {
   const [relayConfigSaving, setRelayConfigSaving] = useState(false)
   const [smtpConfig, setSmtpConfig] = useState<SmtpConfig>(defaultSmtpConfig)
   const [smtpPassword, setSmtpPassword] = useState('')
+  const [smtpManualMode, setSmtpManualMode] = useState(false)
   const [smtpSaving, setSmtpSaving] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
   const [activeJob, setActiveJob] = useState<Job | null>(null)
@@ -434,6 +458,15 @@ function App() {
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
+  const detectedSmtpPreset = smtpPresetForEmail(smtpConfig.from)
+  const detectedSmtpProvider = detectedSmtpPreset
+    ? smtpProviderOptions.find((item) => item.id === detectedSmtpPreset.provider)
+    : null
+  const smtpCanSave = Boolean(
+    smtpConfig.from.trim()
+    && (smtpPassword || smtpConfig.hasPassword)
+    && (smtpManualMode || detectedSmtpPreset),
+  )
 
   const updateRequest = <K extends keyof JobRequest>(key: K, value: JobRequest[K]) => {
     setRequest((current) => ({ ...current, [key]: value }))
@@ -509,6 +542,24 @@ function App() {
     }
   }
 
+  const updateSmtpEmail = (value: string) => {
+    const preset = smtpPresetForEmail(value)
+    setSmtpConfig((current) => {
+      const emailChanged = value.trim().toLowerCase() !== current.from.trim().toLowerCase()
+      return {
+        ...current,
+        ...(preset || {}),
+        auth: 'login',
+        authMode: 'login',
+        user: value,
+        from: value,
+        hasPassword: emailChanged ? false : current.hasPassword,
+        configured: false,
+        verified: false,
+      }
+    })
+  }
+
   const selectSmtpProvider = (provider: SmtpProvider) => {
     const preset = smtpProviderOptions.find((item) => item.id === provider) || smtpProviderOptions.at(-1)!
     setSmtpConfig((current) => ({
@@ -520,6 +571,7 @@ function App() {
       requireTls: preset.requireTls,
       auth: 'login',
       authMode: 'login',
+      hasPassword: false,
       configured: false,
       verified: false,
     }))
@@ -534,16 +586,20 @@ function App() {
     setSmtpSaving(true)
     setNotice(null)
     try {
-      const saved = await api.updateSmtpConfig({
+      const saved = await api.updateSmtpConfig(smtpManualMode ? {
         provider: smtpConfig.provider,
         host: smtpConfig.host,
         port: smtpConfig.port,
         secure: smtpConfig.secure,
         requireTls: smtpConfig.requireTls,
         auth: smtpConfig.auth,
-        user: smtpConfig.user,
+        user: smtpConfig.user || smtpConfig.from,
         from: smtpConfig.from,
         password: smtpPassword,
+      } : {
+        from: smtpConfig.from,
+        password: smtpPassword,
+        autoConfigure: true,
       })
       setSmtpConfig(saved)
       setSmtpPassword('')
@@ -788,27 +844,12 @@ function App() {
     }
   }
 
-  const resumeBodyCollection = () => {
-    if (!activeJob || submitting) return
-    const sourceConfig = activeJob.config || {}
-    const payload: JobRequest = {
-      ...request,
-      ...sourceConfig,
-      keyword: activeJob.keyword || request.keyword,
-      mode: 'resume',
-      resumeFromJobId: activeJob.id,
-      limit: 0,
-      skipPostprocess: false,
-      checkOnly: false,
-      aiSessionId: request.aiSessionId,
-      profileId: request.profileId,
-      candidateProfile: request.candidateProfile,
-    }
-    void runJob(payload)
-  }
-
   const submit = (event: FormEvent) => {
     event.preventDefault()
+    if (request.speedMode === 'random' && request.randomDelayMinSeconds > request.randomDelayMaxSeconds) {
+      setNotice('随机节奏的最短间隔需要小于或等于最长间隔')
+      return
+    }
     const requiredFields: Array<[keyof CandidateApplicationProfile, string]> = [
       ['name', '姓名'],
       ['school', '学校'],
@@ -882,16 +923,6 @@ function App() {
   const selectedDeliveryRoutes = selectedResult ? deliveryRoutes(selectedResult) : []
   const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email')
   const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message')
-  const bodyGap = Boolean(
-    (coverage?.discovered !== undefined && coverage.bodySucceeded !== undefined && coverage.bodySucceeded < coverage.discovered)
-    || results?.items.some((item) => !item.body),
-  )
-  const bodyRepairBlocked = !activeJob
-    || submitting
-    || activeJob.status === 'running'
-    || activeJob.status === 'queued'
-  const canResumeBodyCollection = bodyGap && !bodyRepairBlocked
-
   const replaceResult = (next: ApplicationResult) => {
     setSelectedResult(next)
     setResults((current) => current ? { ...current, items: current.items.map((item) => item.note_id === next.note_id ? next : item) } : current)
@@ -1065,23 +1096,35 @@ function App() {
               <span className={`runtime-badge ${smtpConfig.verified ? 'passed' : ''}`}>{smtpConfig.verified ? '连接已验证' : smtpConfig.configured ? '配置已保存' : '等待配置'}</span>
             </div>
             <div className="email-config-body">
-              <div className="form-row smtp-primary-fields">
-                <label className="field"><span>邮箱服务商</span><select value={smtpConfig.provider} onChange={(event) => selectSmtpProvider(event.target.value as SmtpProvider)}>{smtpProviderOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-                <label className="field"><span>发件邮箱</span><input type="email" autoComplete="email" value={smtpConfig.from} onChange={(event) => { const value = event.target.value; setSmtpConfig((current) => ({ ...current, from: value, user: current.user || value })) }} placeholder="name@example.com" /></label>
-                <label className="field"><span>SMTP 用户名</span><input autoComplete="username" value={smtpConfig.user} onChange={(event) => updateSmtpConfig('user', event.target.value)} placeholder="通常与发件邮箱相同" /></label>
-                <label className="field"><span>{smtpConfig.provider === '163' || smtpConfig.provider === 'qq' ? '客户端授权密码' : 'SMTP 密码 / 授权码'}</span><input type="password" autoComplete="new-password" value={smtpPassword} onChange={(event) => setSmtpPassword(event.target.value)} placeholder={smtpConfig.hasPassword ? '已保存，留空保持不变' : '仅保存到本机'} /></label>
+              <div className="smtp-simple-layout">
+                <div className="form-row smtp-primary-fields">
+                  <label className="field"><span>发件邮箱</span><input type="email" autoComplete="email" value={smtpConfig.from} onChange={(event) => updateSmtpEmail(event.target.value)} placeholder="name@163.com" /></label>
+                  <label className="field"><span>{detectedSmtpPreset?.provider === '163' || detectedSmtpPreset?.provider === 'qq' ? '客户端授权密码' : '密码 / 应用专用密码'}</span><input type="password" autoComplete="current-password" value={smtpPassword} onChange={(event) => setSmtpPassword(event.target.value)} placeholder={smtpConfig.hasPassword ? '已保存，留空保持不变' : '仅保存在当前设备'} /></label>
+                </div>
+                <div className={`smtp-auto-status ${detectedSmtpPreset ? 'detected' : ''}`}>
+                  <Mail size={17} />
+                  <span>
+                    <strong>{detectedSmtpProvider ? `已识别：${detectedSmtpProvider.label}` : '输入邮箱后自动识别 SMTP'}</strong>
+                    <small>{detectedSmtpPreset ? `${detectedSmtpPreset.host} · ${detectedSmtpPreset.port} · ${detectedSmtpPreset.secure ? 'SSL/TLS' : 'STARTTLS'}` : '支持网易、QQ、Gmail、Outlook 等常用邮箱'}</small>
+                  </span>
+                </div>
               </div>
-              <div className="smtp-advanced-fields">
+              <button type="button" className="smtp-advanced-toggle" aria-expanded={smtpManualMode} onClick={() => setSmtpManualMode((current) => !current)}>
+                <Settings2 size={15} /><span>{smtpManualMode ? '收起高级设置' : '企业邮箱 / 高级设置'}</span><ChevronDown className={smtpManualMode ? 'expanded' : ''} size={15} />
+              </button>
+              {smtpManualMode && <div className="smtp-advanced-fields">
+                <label className="field"><span>邮箱服务商</span><select value={smtpConfig.provider} onChange={(event) => selectSmtpProvider(event.target.value as SmtpProvider)}>{smtpProviderOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+                <label className="field"><span>SMTP 用户名</span><input autoComplete="username" value={smtpConfig.user} onChange={(event) => updateSmtpConfig('user', event.target.value)} placeholder="通常与发件邮箱相同" /></label>
                 <label className="field"><span>SMTP 主机</span><input value={smtpConfig.host} onChange={(event) => updateSmtpConfig('host', event.target.value)} placeholder="smtp.example.com" /></label>
                 <label className="field"><span>端口</span><input type="number" min="1" max="65535" value={smtpConfig.port} onChange={(event) => updateSmtpConfig('port', Number(event.target.value))} /></label>
                 <Toggle checked={smtpConfig.secure} onChange={(value) => updateSmtpConfig('secure', value)} label="SSL/TLS" description="通常使用 465 端口" />
                 <Toggle checked={smtpConfig.requireTls} onChange={(value) => updateSmtpConfig('requireTls', value)} label="STARTTLS" description="通常使用 587 端口" />
-              </div>
+              </div>}
               <div className="smtp-config-footer">
-                <div className="smtp-guidance"><ShieldCheck size={16} /><span><strong>仅保存在当前设备</strong><small>{smtpProviderOptions.find((item) => item.id === smtpConfig.provider)?.guidance}</small></span></div>
+                <div className="smtp-guidance"><ShieldCheck size={16} /><span><strong>{smtpManualMode ? '高级参数仅保存在当前设备' : '邮箱凭据仅保存在当前设备'}</strong><small>{smtpManualMode ? smtpProviderOptions.find((item) => item.id === smtpConfig.provider)?.guidance : detectedSmtpProvider?.guidance || '输入完整邮箱后即可自动配置；企业邮箱请使用高级设置。'}</small></span></div>
                 <div className="smtp-config-actions">
-                  <button type="button" className="secondary-button" disabled={smtpSaving} onClick={() => void saveSmtpConfig(false)}><Save size={16} />保存配置</button>
-                  <button type="button" className="primary-button smtp-test-action" disabled={smtpSaving} onClick={() => void saveSmtpConfig(true)}>{smtpSaving ? <LoaderCircle className="spin" size={16} /> : <Wifi size={16} />}保存并测试</button>
+                  <button type="button" className="secondary-button" disabled={smtpSaving || !smtpCanSave} onClick={() => void saveSmtpConfig(false)}><Save size={16} />{smtpManualMode ? '保存配置' : '自动配置'}</button>
+                  <button type="button" className="primary-button smtp-test-action" disabled={smtpSaving || !smtpCanSave} onClick={() => void saveSmtpConfig(true)}>{smtpSaving ? <LoaderCircle className="spin" size={16} /> : <Wifi size={16} />}{smtpManualMode ? '保存并测试' : '配置并测试'}</button>
                 </div>
               </div>
             </div>
@@ -1166,6 +1209,25 @@ function App() {
                   </div>
                 </div>
 
+                <div className="field mode-field pacing-mode-field">
+                  <span>采集节奏</span>
+                  <div className="segmented">
+                    <button type="button" className={request.speedMode === 'steady' ? 'selected' : ''} onClick={() => updateRequest('speedMode', 'steady')}><Gauge size={15} />匀速</button>
+                    <button type="button" className={request.speedMode === 'random' ? 'selected' : ''} onClick={() => updateRequest('speedMode', 'random')}><Shuffle size={15} />随机节奏</button>
+                  </div>
+                  <small className="field-help">随机节奏会在设定范围内变化滚动和正文间隔，降低突发请求与固定节奏风险。</small>
+                </div>
+                <div className="pacing-grid">
+                  {request.speedMode === 'random' ? (
+                    <>
+                      <label className="field"><span>最短间隔 s</span><input type="number" min="0" max="60" step="0.1" value={request.randomDelayMinSeconds} onChange={(event) => updateRequest('randomDelayMinSeconds', Number(event.target.value))} /></label>
+                      <label className="field"><span>最长间隔 s</span><input type="number" min="0" max="60" step="0.1" value={request.randomDelayMaxSeconds} onChange={(event) => updateRequest('randomDelayMaxSeconds', Number(event.target.value))} /></label>
+                    </>
+                  ) : (
+                    <label className="field"><span>固定间隔 s</span><input type="number" min="0" max="60" step="0.1" value={request.noteDelaySeconds} onChange={(event) => updateRequest('noteDelaySeconds', Number(event.target.value))} /></label>
+                  )}
+                </div>
+
                 <button className="advanced-trigger" type="button" onClick={() => setAdvanced((value) => !value)} aria-expanded={advanced}>
                   <Settings2 size={16} />高级参数<ChevronDown size={16} className={advanced ? 'rotated' : ''} />
                 </button>
@@ -1174,7 +1236,6 @@ function App() {
                     <label className="field"><span>最大滚动</span><input type="number" min="1" max="100" value={request.maxScrolls} onChange={(event) => updateRequest('maxScrolls', Number(event.target.value))} /></label>
                     <label className="field"><span>稳定轮次</span><input type="number" min="1" max="20" value={request.stableRounds} onChange={(event) => updateRequest('stableRounds', Number(event.target.value))} /></label>
                     <label className="field"><span>页面超时 ms</span><input type="number" min="1000" max="120000" step="1000" value={request.gotoTimeoutMs} onChange={(event) => updateRequest('gotoTimeoutMs', Number(event.target.value))} /></label>
-                    <label className="field"><span>笔记间隔 s</span><input type="number" min="0" max="10" step="0.1" value={request.noteDelaySeconds} onChange={(event) => updateRequest('noteDelaySeconds', Number(event.target.value))} /></label>
                     <label className="field"><span>安全验证等待 s</span><input type="number" min="60" max="3600" step="60" value={request.securityVerificationTimeoutSeconds} onChange={(event) => updateRequest('securityVerificationTimeoutSeconds', Number(event.target.value))} /></label>
                     <label className="field"><span>Codex 单批数量</span><input type="number" min="1" max="20" value={request.codexBatchSize} onChange={(event) => updateRequest('codexBatchSize', Number(event.target.value))} /></label>
                     <Toggle checked={request.useCodexRuntime} onChange={(value) => updateRequest('useCodexRuntime', value)} label="AI 文案与评分" description="逐链接写作、评分并自动重写" />
@@ -1263,15 +1324,6 @@ function App() {
             <div className="panel-heading compact">
               <div><span className="step-label">PER-LINK APPLICATION INTELLIGENCE</span><h2>逐链接岗位与投递文案</h2></div>
               <div className="result-heading-meta">
-                {bodyGap && <button
-                  className="icon-text-button body-repair-button"
-                  disabled={!canResumeBodyCollection}
-                  onClick={resumeBodyCollection}
-                  title={bodyRepairBlocked ? '当前任务仍在运行，或补采任务正在创建' : '从当前任务的检查点继续采集缺失正文'}
-                >
-                  {submitting ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
-                  {submitting ? '创建补采任务' : '补采缺失正文'}
-                </button>}
                 <span className={`runtime-badge ${codexRuntime?.status === 'completed' ? 'passed' : ''}`}>AI 质量流 · {String(codexRuntime?.status || '等待结果')}</span>
                 <span className="count-badge">{results?.total ?? 0}</span>
               </div>

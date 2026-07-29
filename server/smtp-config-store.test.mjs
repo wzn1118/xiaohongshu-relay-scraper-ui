@@ -3,7 +3,55 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { SmtpConfigStore } from './smtp-config-store.mjs';
+import { detectSmtpSettings, SmtpConfigStore } from './smtp-config-store.mjs';
+
+test('SMTP settings are detected from common mailbox domains', () => {
+  assert.deepEqual(detectSmtpSettings('candidate@163.com'), {
+    provider: '163', host: 'smtp.163.com', port: 465, secure: true, requireTls: false,
+  });
+  assert.equal(detectSmtpSettings('candidate@126.com').host, 'smtp.126.com');
+  assert.equal(detectSmtpSettings('candidate@foxmail.com').provider, 'qq');
+  assert.equal(detectSmtpSettings('candidate@gmail.com').host, 'smtp.gmail.com');
+  assert.equal(detectSmtpSettings('candidate@outlook.com').port, 587);
+  assert.equal(detectSmtpSettings('candidate@company.example'), null);
+});
+
+test('automatic SMTP configuration only needs an email and password', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-smtp-auto-'));
+  try {
+    const store = new SmtpConfigStore({ filePath: path.join(fixture, 'smtp-config.json') });
+    await store.initialize();
+    const saved = await store.update({
+      autoConfigure: true,
+      from: 'candidate@163.com',
+      password: 'client-authorization-code',
+    });
+
+    assert.equal(saved.provider, '163');
+    assert.equal(saved.host, 'smtp.163.com');
+    assert.equal(saved.user, 'candidate@163.com');
+    assert.equal(saved.from, 'candidate@163.com');
+    assert.equal(saved.hasPassword, true);
+    assert.equal(store.getForMailer().auth, 'login');
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('automatic SMTP configuration rejects unknown mailbox domains', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-smtp-auto-unknown-'));
+  try {
+    const store = new SmtpConfigStore({ filePath: path.join(fixture, 'smtp-config.json') });
+    await store.initialize();
+    await assert.rejects(() => store.update({
+      autoConfigure: true,
+      from: 'candidate@company.example',
+      password: 'secret',
+    }), { code: 'SMTP_CONFIG_VALIDATION' });
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
 
 test('SMTP configuration persists locally without exposing its password', async () => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-smtp-config-'));

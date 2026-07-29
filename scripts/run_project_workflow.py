@@ -12,7 +12,6 @@ from typing import Any
 
 from application_intelligence_agents import run_pipeline, write_pipeline_artifacts
 from ai_application_workflow import enrich_payload
-from parallel_body_completion import complete_bodies
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +67,12 @@ def rewrite_unlimited_args(arguments: list[str]) -> list[str]:
     return rewritten + ["--limit", "0"]
 
 
+def rewrite_limit(arguments: list[str], limit: int) -> list[str]:
+    """Keep the historical argument helper available to integrations and tests."""
+    rewritten = rewrite_unlimited_args(arguments)
+    return rewritten[:-2] + ["--limit", str(limit)]
+
+
 def option_value(arguments: list[str], name: str) -> str:
     for index, argument in enumerate(arguments):
         if argument == name and index + 1 < len(arguments):
@@ -81,9 +86,6 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--candidate-profile", default=str(DEFAULT_CANDIDATE_PROFILE))
     parser.add_argument("--upstream-runner", default="")
-    parser.add_argument("--allow-incomplete-bodies", action="store_true")
-    parser.add_argument("--parallel-workers", type=int, default=1)
-    parser.add_argument("--parallel-attempts", type=int, default=3)
     parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
     parser.add_argument("--codex-runtime", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--codex-cli-bin", default="")
@@ -92,11 +94,6 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser.add_argument("--cover-letter-threshold", type=int, default=90)
     parser.add_argument("--cover-letter-max-attempts", type=int, default=4)
     return parser.parse_known_args(arguments)
-
-
-def rewrite_limit(arguments: list[str], limit: int) -> list[str]:
-    rewritten = rewrite_unlimited_args(arguments)
-    return rewritten[:-2] + ["--limit", str(limit)]
 
 
 def add_flag_once(arguments: list[str], flag: str) -> list[str]:
@@ -237,9 +234,9 @@ def main(arguments: list[str] | None = None) -> int:
     wrapper, upstream_arguments = parse_wrapper_args(raw_arguments)
     unlimited_arguments = rewrite_unlimited_args(upstream_arguments)
     upstream = resolve_upstream_runner(wrapper.upstream_runner)
-    print("[coverage-agent] forcing --limit 0 so every discovered card is extracted", flush=True)
-    bootstrap_arguments = add_flag_once(rewrite_limit(unlimited_arguments, 1), "--skip-postprocess")
-    completed = subprocess.run([sys.executable, str(upstream), *bootstrap_arguments], check=False)
+    print("[coverage-agent] running one full-body collection pass with --limit 0", flush=True)
+    scrape_arguments = add_flag_once(unlimited_arguments, "--skip-postprocess")
+    completed = subprocess.run([sys.executable, str(upstream), *scrape_arguments], check=False)
     if completed.returncode != 0:
         return completed.returncode
     if "--check-only" in unlimited_arguments or "--help" in unlimited_arguments or "-h" in unlimited_arguments:
@@ -250,22 +247,6 @@ def main(arguments: list[str] | None = None) -> int:
         raise ValueError("--output-dir is required for project workflow enrichment")
     output_dir = Path(output_dir_value).resolve()
     candidate_profile = Path(os.environ.get("XHS_PROFILE_PATH") or resolve_project_path(wrapper.candidate_profile)).resolve()
-    relay_port = int(option_value(unlimited_arguments, "--relay-port") or 18800)
-    goto_timeout_ms = int(option_value(unlimited_arguments, "--goto-timeout-ms") or 15000)
-    body_summary = complete_bodies(
-        output_dir,
-        relay_port=relay_port,
-        workers=wrapper.parallel_workers,
-        attempts=wrapper.parallel_attempts,
-        goto_timeout_ms=goto_timeout_ms,
-        security_verification_timeout_seconds=wrapper.security_verification_timeout_seconds,
-        upstream_scraper=resolve_upstream_scraper(upstream),
-    )
-    if not body_summary["passed"]:
-        print(
-            f"[coverage-agent] body completion still has {body_summary['missingBodies']} missing records",
-            flush=True,
-        )
     if "--skip-postprocess" not in unlimited_arguments:
         postprocess = upstream.parent / "build_structured_excel.py"
         completed = subprocess.run(
@@ -281,7 +262,7 @@ def main(arguments: list[str] | None = None) -> int:
         )
         if completed.returncode != 0:
             return completed.returncode
-    emit_stage(1, "full-body-coverage", "partial" if body_summary.get("transitionedToAnalysis") else "completed")
+    emit_stage(1, "full-body-coverage")
     result = run_pipeline(
         output_dir,
         candidate_profile,
@@ -319,14 +300,12 @@ def main(arguments: list[str] | None = None) -> int:
     )
     for issue in gate["issues"]:
         print(f"[quality-gate] {issue['message']}", flush=True)
-    summary = build_workflow_summary(result.payload, body_summary)
+    summary = build_workflow_summary(result.payload)
     atomic_json(output_dir / "workflow-summary.json", summary)
     result.passed = bool(gate["passed"])
     emit_stage(8, "quality-gate-and-artifacts", "passed" if result.passed else "failed")
     write_project_manifest(output_dir, summary)
-    partial_allowed = wrapper.allow_incomplete_bodies or body_summary.get("transitionedToAnalysis")
-    quality_passed = bool(gate.get("cover_letter_quality_passed"))
-    return 0 if result.passed or (partial_allowed and quality_passed) else 3
+    return 0 if result.passed else 3
 
 
 if __name__ == "__main__":

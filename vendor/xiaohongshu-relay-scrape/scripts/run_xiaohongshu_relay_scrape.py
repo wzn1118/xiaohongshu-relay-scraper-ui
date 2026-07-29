@@ -17,6 +17,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
+from collection_pacing import (
+    DEFAULT_NOTE_DELAY_SECONDS,
+    DEFAULT_RANDOM_DELAY_MAX_SECONDS,
+    DEFAULT_RANDOM_DELAY_MIN_SECONDS,
+    DEFAULT_SPEED_MODE,
+    validate_collection_pacing,
+)
+
 
 DEFAULT_KEYWORD = "运营 实习 继任"
 DEFAULT_SOURCE = "web_note_detail_r10"
@@ -1375,7 +1383,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stable-rounds", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--goto-timeout-ms", type=int, default=15000)
-    parser.add_argument("--note-delay-seconds", type=float, default=0.2)
+    parser.add_argument("--note-delay-seconds", type=float, default=DEFAULT_NOTE_DELAY_SECONDS)
+    parser.add_argument("--speed-mode", choices=("steady", "random"), default=DEFAULT_SPEED_MODE)
+    parser.add_argument("--random-delay-min-seconds", type=float, default=DEFAULT_RANDOM_DELAY_MIN_SECONDS)
+    parser.add_argument("--random-delay-max-seconds", type=float, default=DEFAULT_RANDOM_DELAY_MAX_SECONDS)
     parser.add_argument("--resume", action="store_true", help="Force resume mode.")
     parser.add_argument("--fresh", action="store_true", help="Ignore existing checkpoints and start a fresh scrape.")
     parser.add_argument("--skip-postprocess", action="store_true")
@@ -1384,7 +1395,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--send-to-codex", action="store_true", help="Ask Codex to generate a brief analysis and keep it visible in the local desktop session.")
     parser.add_argument("--send-to-feishu", action="store_true", help="Generate a Codex analysis DOCX and send it to Feishu via the local OpenClaw bot.")
     parser.add_argument("--feishu-target", default=DEFAULT_FEISHU_TARGET, help="Feishu target open_id/chat target for analysis delivery.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        validate_collection_pacing(
+            args.speed_mode,
+            args.note_delay_seconds,
+            args.random_delay_min_seconds,
+            args.random_delay_max_seconds,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def main() -> int:
@@ -1437,6 +1458,12 @@ def main() -> int:
         str(args.goto_timeout_ms),
         "--note-delay-seconds",
         str(args.note_delay_seconds),
+        "--speed-mode",
+        args.speed_mode,
+        "--random-delay-min-seconds",
+        str(args.random_delay_min_seconds),
+        "--random-delay-max-seconds",
+        str(args.random_delay_max_seconds),
     ]
     if resume_mode:
         scrape_command.append("--resume")

@@ -83,9 +83,11 @@ export type SmtpConfig = {
   lastVerifiedAt?: string
 }
 
-export type SmtpConfigUpdate = Pick<SmtpConfig, 'provider' | 'host' | 'port' | 'secure' | 'requireTls' | 'auth' | 'user' | 'from'> & {
+export type SmtpConfigUpdate = Partial<Pick<SmtpConfig, 'provider' | 'host' | 'port' | 'secure' | 'requireTls' | 'auth' | 'user'>> & {
+  from: string
   password?: string
   clearPassword?: boolean
+  autoConfigure?: boolean
 }
 
 export type SmtpTestResult = {
@@ -147,6 +149,8 @@ export type CandidateApplicationProfile = {
   internshipDuration: string
 }
 
+export type CollectionSpeedMode = 'steady' | 'random'
+
 export type JobRequest = {
   keyword: string
   browserProfile: string
@@ -156,6 +160,9 @@ export type JobRequest = {
   stableRounds: number
   gotoTimeoutMs: number
   noteDelaySeconds: number
+  speedMode: CollectionSpeedMode
+  randomDelayMinSeconds: number
+  randomDelayMaxSeconds: number
   mode: 'fresh' | 'resume'
   resumeFromJobId?: string | null
   skipPostprocess: boolean

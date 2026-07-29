@@ -101,8 +101,19 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .relay-install-button:hover { background: var(--red-deep); border-color: var(--red-deep); }
 .email-config-panel { margin-top: 14px; }
 .email-config-body { padding: 16px 18px; }
-.smtp-primary-fields { grid-template-columns: .9fr 1.2fr 1.2fr 1.2fr; align-items: end; }
-.smtp-advanced-fields { margin-top: 12px; display: grid; grid-template-columns: 1.35fr .5fr 1fr 1fr; gap: 10px; align-items: end; }
+.smtp-simple-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, .48fr); gap: 14px; align-items: end; }
+.smtp-primary-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+.smtp-auto-status { min-height: 52px; padding: 9px 11px; display: flex; align-items: center; gap: 9px; border-left: 3px solid #a8aaa8; background: #f4f3ee; color: #77797d; }
+.smtp-auto-status.detected { border-left-color: var(--green); color: var(--green); }
+.smtp-auto-status > svg { flex: 0 0 auto; }
+.smtp-auto-status span { min-width: 0; display: flex; flex-direction: column; }
+.smtp-auto-status strong { color: var(--ink); font-size: 10px; }
+.smtp-auto-status small { margin-top: 3px; font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
+.smtp-advanced-toggle { min-height: 30px; margin-top: 10px; padding: 0; display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; color: #606267; font-size: 10px; box-shadow: none; }
+.smtp-advanced-toggle:hover { color: var(--ink); background: transparent; }
+.smtp-advanced-toggle svg:last-child { transition: transform 160ms ease; }
+.smtp-advanced-toggle svg:last-child.expanded { transform: rotate(180deg); }
+.smtp-advanced-fields { margin-top: 8px; padding-top: 12px; display: grid; grid-template-columns: .8fr 1fr 1.15fr .45fr .8fr .8fr; gap: 10px; align-items: end; border-top: 1px dashed #cfcdc6; }
 .smtp-config-footer { margin-top: 14px; padding-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid var(--line); }
 .smtp-guidance { min-width: 0; display: flex; align-items: flex-start; gap: 9px; color: var(--green); }
 .smtp-guidance > svg { flex: 0 0 auto; margin-top: 1px; }
@@ -166,6 +177,8 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .field-help { color: #77797d; font-size: 10px; line-height: 1.55; overflow-wrap: anywhere; }
 .field input:disabled { color: #77797d; background: #ecebe7; }
 .mode-field { margin-top: 15px; }
+.pacing-mode-field { margin-top: 14px; }
+.pacing-grid { margin-top: 10px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .segmented { margin-top: 7px; padding: 3px; display: grid; grid-template-columns: 1fr 1fr; gap: 3px; border: 1px solid #c8c7c1; border-radius: 5px; background: #e5e4df; }
 .segmented button { min-height: 34px; display: flex; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 3px; background: transparent; color: #67696e; font-size: 11px; font-weight: 700; }
 .segmented button.selected { color: var(--ink); background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.13); }
@@ -273,12 +286,9 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .coverage-note.warning { border-left-color: #b37a18; background: #f6edd8; color: #6d571f; }
 .coverage-note.warning svg { color: #9a6812; }
 
-.results-panel { margin-top: 14px; }
-.result-heading-meta { display: flex; align-items: center; gap: 8px; }
-.body-repair-button { color: var(--red-deep); border-color: #d8a4ac; background: #fff7f8; }
-.body-repair-button:hover { border-color: var(--red-deep); background: #fbe9ec; }
-.body-repair-button:disabled { color: #8c8e92; border-color: #c8c7c1; background: #eeede9; }
-.runtime-badge { padding: 4px 7px; border: 1px solid #c8c7c1; border-radius: 3px; color: #686a6e; background: #eeede9; font-size: 9px; font-weight: 800; white-space: nowrap; }
+  .results-panel { margin-top: 14px; }
+  .result-heading-meta { display: flex; align-items: center; gap: 8px; }
+  .runtime-badge { padding: 4px 7px; border: 1px solid #c8c7c1; border-radius: 3px; color: #686a6e; background: #eeede9; font-size: 9px; font-weight: 800; white-space: nowrap; }
 .runtime-badge.passed { color: var(--green); border-color: #91bdad; background: #e4f2ed; }
 .results-workspace { display: grid; grid-template-columns: minmax(260px, .7fr) minmax(0, 2.3fr); min-height: 520px; }
 .result-index { min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: #ecebe7; }
@@ -426,6 +436,7 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .ai-setup-grid { grid-template-columns: 1fr; }
   .ai-setup-grid > section + section { border-left: 0; border-top: 1px solid var(--line); }
   .candidate-profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .smtp-simple-layout { grid-template-columns: 1fr; }
   .smtp-primary-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .smtp-advanced-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .secondary-grid { min-width: 0; }
@@ -464,7 +475,7 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .metric strong { font-size: 21px; }
   .metric small { display: none; }
   .primary-grid { margin-top: 11px; gap: 11px; }
-  .form-row.three, .advanced-grid { grid-template-columns: 1fr 1fr; }
+  .form-row.three, .advanced-grid, .pacing-grid { grid-template-columns: 1fr 1fr; }
   .ai-provider-row { grid-template-columns: 1fr; }
   .relay-config-fields { grid-template-columns: 1fr 1fr; }
   .relay-config-fields .toggle-row { grid-column: 1 / -1; }
@@ -484,6 +495,7 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .form-actions { grid-template-columns: 1fr; }
   .panel-heading { min-height: 60px; padding: 12px 13px; }
   .config-panel form { padding: 13px; }
+  .pacing-grid { grid-template-columns: 1fr; }
   .readiness-items { grid-template-columns: 1fr; }
   .secondary-grid { margin-top: 11px; gap: 11px; }
   .history-panel { overflow: hidden; }
