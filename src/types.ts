@@ -52,6 +52,9 @@ export type RelayStatus = {
   attempted?: boolean
   helperTimedOut?: boolean
   helperExitCode?: number | null
+  xiaohongshuTabs?: number
+  setupRequired?: boolean
+  setupStep?: 'install' | 'start' | 'login' | 'ready'
   message?: string
 }
 

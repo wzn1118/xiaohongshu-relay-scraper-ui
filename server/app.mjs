@@ -5,14 +5,14 @@ import { readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
 import { ValidationError, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
-import { connectRelay } from './lib/relay-connect.mjs';
+import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
 const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, mailSender, relayConnector = connectRelay }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, mailSender, relayConnector = connectRelay, relayLoginOpener = openRelayLogin }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
@@ -70,6 +70,28 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           profile: body?.profile || configured.profile,
         });
         return json(res, 200, status);
+      }
+      if (req.method === 'POST' && url.pathname === '/api/relay/login') {
+        const configured = getRelayConfig();
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        const profile = String(body?.profile || configured.profile || 'openclaw').trim();
+        const urlToOpen = String(body?.url || 'https://www.xiaohongshu.com').trim();
+        if (!/^[\p{L}\p{N}_.-]+$/u.test(profile)) {
+          return json(res, 400, errorBody('INVALID_PROFILE', 'Invalid browser profile.'));
+        }
+        if (!/^https:\/\/www\.xiaohongshu\.com(?:\/|$)/i.test(urlToOpen)) {
+          return json(res, 400, errorBody('INVALID_LOGIN_URL', 'Login URL must be on the target website.'));
+        }
+        const connection = await relayConnector({
+          port: Number(configured.port),
+          openClawConfigPath: config.openClawConfigPath,
+          profile,
+        });
+        if (!connection.ready && !(connection.running && connection.cdpReady)) {
+          return json(res, 503, { ...connection, opened: false, profile, url: urlToOpen });
+        }
+        const opened = await relayLoginOpener({ profile, url: urlToOpen });
+        return json(res, opened.opened ? 200 : 503, { ...connection, ...opened, profile, url: urlToOpen });
       }
       if (req.method === 'GET' && url.pathname === '/api/ai/providers') return json(res, 200, aiSessions.providers());
       if (req.method === 'POST' && url.pathname === '/api/ai/sessions') {

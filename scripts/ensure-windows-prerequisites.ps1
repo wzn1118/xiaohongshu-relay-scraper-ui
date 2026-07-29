@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [switch]$InstallRuntime,
-    [switch]$InstallTools
+    [switch]$InstallTools,
+    [switch]$CheckOnly,
+    [switch]$EnsureBrowserRelay
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +27,28 @@ function Find-CommandPath {
     if ($command.Path) { return [string]$command.Path }
     if ($command.Source) { return [string]$command.Source }
     return [string]$command.Definition
+}
+
+function Find-BrowserPath {
+    $candidates = @(
+        $env:XHS_BROWSER_PATH,
+        (Join-Path ${env:ProgramFiles} 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path ${env:ProgramFiles} 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\Application\msedge.exe')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+    if ($candidates) { return [string]$candidates }
+    return $null
+}
+
+function Find-OpenClawPath {
+    foreach ($name in @('openclaw.cmd', 'openclaw.exe', 'openclaw')) {
+        $path = Find-CommandPath $name
+        if ($path) { return $path }
+    }
+    return $null
 }
 
 function Get-WingetPath {
@@ -54,7 +78,8 @@ function Get-ToolStatus {
     $pythonName = if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { 'python' }
     $pythonPath = Find-CommandPath $pythonName
     $codexPath = Find-CommandPath 'codex'
-    $openclawPath = Find-CommandPath 'openclaw'
+    $openclawPath = Find-OpenClawPath
+    $browserPath = Find-BrowserPath
 
     $nodeMajor = 0
     if ($nodePath) {
@@ -79,6 +104,21 @@ function Get-ToolStatus {
         pythonVersion = $pythonVersion.ToString()
         codex = if ($codexPath) { $codexPath } else { '' }
         openclaw = if ($openclawPath) { $openclawPath } else { '' }
+        browser = if ($browserPath) { $browserPath } else { '' }
+    }
+}
+
+function Get-ManagedRelayStatus {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Status)
+    if (-not $Status.openclaw) { return $null }
+    try {
+        $output = @(& $Status.openclaw browser status --browser-profile openclaw --json 2>&1)
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $json = ($output | Out-String).Trim()
+        if (-not $json) { return $null }
+        return ($json | ConvertFrom-Json)
+    } catch {
+        return $null
     }
 }
 
@@ -118,6 +158,27 @@ if ($InstallTools) {
     $status = Get-ToolStatus
 }
 
+if ($EnsureBrowserRelay -and -not $status.browser -and -not $CheckOnly) {
+    Install-WingetPackage 'Google.Chrome'
+    $status = Get-ToolStatus
+}
+
+if ($EnsureBrowserRelay -and -not $status.browser) {
+    Write-Warning 'A Chromium-based browser is required for the managed browser profile.'
+}
+
+$managedRelay = Get-ManagedRelayStatus -Status $status
+if ($EnsureBrowserRelay -and -not $CheckOnly) {
+    if (-not $status.openclaw) { throw 'The browser relay command is not installed.' }
+    if (-not $status.browser) { throw 'A Chromium-based browser is required for the managed browser profile.' }
+    Write-Host 'Starting the managed browser relay through code...'
+    $output = @(& $status.openclaw browser start --browser-profile openclaw --json 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Managed browser relay startup failed (exit code $LASTEXITCODE)."
+    }
+    $managedRelay = (($output | Out-String).Trim() | ConvertFrom-Json)
+}
+
 $status.ready =
     [bool]$status.node -and
     [bool]$status.npm -and
@@ -125,8 +186,14 @@ $status.ready =
     $status.nodeMajor -ge 22 -and
     ([Version]$status.pythonVersion -ge [Version]'3.11')
 $status.toolsReady = [bool]$status.codex -and [bool]$status.openclaw
+$status.browserReady = [bool]$status.browser
+$status.relayCommandReady = [bool]$status.openclaw
+$status.relayProfile = 'openclaw'
+$status.relayPort = 18800
+$status.relayServiceReady = [bool]($managedRelay -and $managedRelay.running -and $managedRelay.cdpReady)
 $status | ConvertTo-Json -Depth 4
 
 if (-not $status.ready) { exit 2 }
 if ($InstallTools -and -not $status.toolsReady) { exit 2 }
+if ($EnsureBrowserRelay -and (-not $status.browserReady -or -not $status.relayCommandReady -or (-not $CheckOnly -and -not $status.relayServiceReady))) { exit 2 }
 exit 0

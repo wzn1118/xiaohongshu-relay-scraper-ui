@@ -2,6 +2,12 @@ import path from 'node:path';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 
 export const DEFAULT_RELAY_CONFIG = Object.freeze({
+  port: 18800,
+  profile: 'openclaw',
+  autoConnect: true,
+});
+
+const LEGACY_DEFAULT_RELAY_CONFIG = Object.freeze({
   port: 18792,
   profile: 'chrome',
   autoConnect: true,
@@ -18,7 +24,10 @@ export class RelayConfigStore {
     await mkdir(path.dirname(this.filePath), { recursive: true });
     try {
       const saved = JSON.parse(await readFile(this.filePath, 'utf8'));
-      this.value = normalizeRelayConfig({ ...this.defaults, ...saved });
+      this.value = isLegacyDefault(saved)
+        ? normalizeRelayConfig(this.defaults)
+        : normalizeRelayConfig({ ...this.defaults, ...saved });
+      if (isLegacyDefault(saved)) await this.persist();
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
       await this.persist();
@@ -41,6 +50,12 @@ export class RelayConfigStore {
     await writeFile(temporary, `${JSON.stringify(this.value, null, 2)}\n`, 'utf8');
     await rename(temporary, this.filePath);
   }
+}
+
+function isLegacyDefault(value) {
+  return value?.port === LEGACY_DEFAULT_RELAY_CONFIG.port
+    && value?.profile === LEGACY_DEFAULT_RELAY_CONFIG.profile
+    && value?.autoConnect === LEGACY_DEFAULT_RELAY_CONFIG.autoConnect;
 }
 
 export function normalizeRelayConfig(value = {}) {

@@ -83,6 +83,12 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       tabCount: 1,
       message: 'Relay 已智能连接。',
     }),
+    relayLoginOpener: async ({ profile, url }) => ({
+      opened: true,
+      profile,
+      url,
+      message: 'Login page opened.',
+    }),
     mailSender: {
       status: () => ({ configured: true, from: 's***@example.com' }),
       send: async (message) => {
@@ -133,6 +139,25 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     });
     assert.equal(connected.status, 200);
     assert.equal((await connected.json()).ready, true);
+
+    const loginPage = await fetch(`${origin}/api/relay/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(loginPage.status, 200);
+    const loginPayload = await loginPage.json();
+    assert.equal(loginPayload.opened, true);
+    assert.equal(loginPayload.profile, 'work-profile');
+    assert.equal(loginPayload.url, 'https://www.xiaohongshu.com');
+
+    const invalidProfile = await fetch(`${origin}/api/relay/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ profile: 'work profile' }),
+    });
+    assert.equal(invalidProfile.status, 400);
+    assert.equal((await invalidProfile.json()).error.code, 'INVALID_PROFILE');
 
     const created = await fetch(`${origin}/api/jobs`, {
       method: 'POST',

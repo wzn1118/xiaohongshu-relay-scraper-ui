@@ -100,7 +100,7 @@ function importedCandidateProfileValues(imported?: Partial<CandidateApplicationP
 const defaultRequest: JobRequest = {
   keyword: '实习继任',
   browserProfile: 'openclaw',
-  relayPort: 18792,
+  relayPort: 18800,
   limit: 0,
   maxScrolls: 60,
   stableRounds: 8,
@@ -122,8 +122,8 @@ const defaultRequest: JobRequest = {
 }
 
 const defaultRelayConfig: RelayConfig = {
-  port: 18792,
-  profile: 'chrome',
+  port: 18800,
+  profile: 'openclaw',
   autoConnect: true,
 }
 
@@ -462,6 +462,16 @@ function App() {
     }
   }
 
+  const openRelayLogin = async () => {
+    try {
+      const result = await api.openRelayLogin(relayConfig.profile)
+      setNotice(result.message || '已在独立浏览器中打开登录页，登录完成后点击右上角刷新。')
+      window.setTimeout(() => void refreshRelay(), 1500)
+    } catch (error) {
+      setNotice((error as Error).message)
+    }
+  }
+
   const refreshRelay = useCallback(async () => {
     try {
       const status = await api.relayStatus(request.relayPort)
@@ -705,6 +715,7 @@ function App() {
   }
 
   const relayReady = Boolean(relay?.running && relay?.cdpReady && (Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)) > 0)
+  const relaySiteReady = relayReady && Number(relay?.xiaohongshuTabs || 0) > 0
   const progress = activeJob?.progress ?? (activeJob ? progressByStatus[activeJob.status] : 0)
   const runningCount = jobs.filter((job) => job.status === 'running' || job.status === 'queued').length
   const completedCount = jobs.filter((job) => job.status === 'completed').length
@@ -845,7 +856,7 @@ function App() {
           <div className="topbar-status">
             <div className={`relay-indicator ${relayReady ? 'ready' : relayConnecting ? 'connecting' : 'offline'}`}>
               {relayReady ? <Wifi size={17} /> : relayConnecting ? <LoaderCircle className="spin" size={17} /> : <WifiOff size={17} />}
-              <span><strong>{relayReady ? 'Relay 已连接' : relayConnecting ? 'Relay 连接中' : 'Relay 待连接'}</strong><small>CDP {request.relayPort} · {tabCount} 个标签页</small></span>
+              <span><strong>{relaySiteReady ? 'Relay 已连接' : relayReady ? 'Relay 已启动，待登录' : relayConnecting ? 'Relay 连接中' : 'Relay 待配置'}</strong><small>CDP {request.relayPort} · {tabCount} 个标签页</small></span>
             </div>
             <button className="icon-button" onClick={() => void connectRelay(true)} disabled={relayConnecting} title="通过代码启动 Relay"><RefreshCw className={relayConnecting ? 'spin' : ''} size={17} /></button>
             <time title="北京时间（Asia/Shanghai）">{formatTime(clock.toISOString())}</time>
@@ -878,7 +889,7 @@ function App() {
           <section className="panel relay-config-panel" id="relay-config" aria-label="中转站配置">
             <div className="panel-heading compact">
               <div><span className="step-label">RELAY CONFIGURATION</span><h2>中转站配置</h2></div>
-              <span className={`runtime-badge ${relayReady ? 'passed' : ''}`}>{relayReady ? '已连接' : '待连接'}</span>
+              <span className={`runtime-badge ${relaySiteReady ? 'passed' : ''}`}>{relaySiteReady ? '登录已就绪' : relayReady ? '服务已启动' : '待配置'}</span>
             </div>
             <div className="relay-config-body">
               <div className="form-row relay-config-fields">
@@ -888,7 +899,10 @@ function App() {
               </div>
               <div className="relay-config-footer">
                 <span className="field-help">端口和 Profile 会同时用于状态探测、连接按钮和新任务。</span>
-                <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
+                <div className="relay-config-actions">
+                  <button type="button" className="secondary-button" disabled={relayConnecting} onClick={() => void openRelayLogin()}><ExternalLink size={16} />打开登录页</button>
+                  <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
+                </div>
               </div>
             </div>
           </section>

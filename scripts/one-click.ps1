@@ -80,14 +80,17 @@ function Connect-Relay {
             Write-Host "Relay auto-connect is disabled by configuration"
             return $true
         }
-        $relayPort = if ($config.port) { [int]$config.port } else { 18792 }
-        $relayProfile = if ($config.profile) { [string]$config.profile } else { "chrome" }
+        $relayPort = if ($config.port) { [int]$config.port } else { 18800 }
+        $relayProfile = if ($config.profile) { [string]$config.profile } else { "openclaw" }
         $body = @{ port = $relayPort; profile = $relayProfile } | ConvertTo-Json -Compress
         $status = Invoke-RestMethod -Method Post -Uri "$Url/api/relay/connect" -ContentType "application/json" -Body $body -TimeoutSec 35
         $port = if ($status.port) { $status.port } else { $relayPort }
         $tabs = if ($status.tabs) { $status.tabs } else { 0 }
         $ready = $status.ready -or ($status.running -and $status.cdpReady -and $tabs -gt 0)
-        Write-Host "Relay code startup: ready=$ready port=$port tabs=$tabs attempted=$($status.attempted)"
+        $siteTabs = if ($status.xiaohongshuTabs) { [int]$status.xiaohongshuTabs } else { 0 }
+        Write-Host "Relay code startup: ready=$ready siteTabs=$siteTabs port=$port tabs=$tabs attempted=$($status.attempted)"
+        if (-not $ready) { Write-Warning "Relay is not ready: $($status.message)" }
+        elseif ($siteTabs -eq 0) { Write-Warning 'Relay service is ready. Complete the one-time website login in the managed browser, then refresh the workbench.' }
         return $ready
     } catch {
         Write-Warning "Relay code startup did not complete: $($_.Exception.Message)"
@@ -99,18 +102,18 @@ Import-DotEnv (Join-Path $root '.env')
 if ($Port -gt 0) { $env:PORT = [string]$Port }
 $url = Get-AppUrl
 
-if (Test-AppHealth $url) {
+if (-not $CheckOnly) {
+    Write-Host 'Preparing Windows runtime and command-line tools...'
+    & (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -InstallRuntime -InstallTools -EnsureBrowserRelay
+    if ($LASTEXITCODE -ne 0) { throw 'Windows prerequisites are not ready.' }
+    Refresh-ProcessPath
+}
+
+if (Test-AppHealth $url -and -not $CheckOnly) {
     Write-Host "Application is already running at $url"
     if (-not $CheckOnly) { Connect-Relay $url | Out-Null }
     if (-not $CheckOnly) { Open-App $url }
     exit 0
-}
-
-if (-not $CheckOnly) {
-    Write-Host 'Preparing Windows runtime and command-line tools...'
-    & (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -InstallRuntime -InstallTools
-    if ($LASTEXITCODE -ne 0) { throw 'Windows prerequisites are not ready.' }
-    Refresh-ProcessPath
 }
 
 $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
@@ -144,17 +147,31 @@ $installationReady =
 $bootstrapRequired = -not $installationReady
 
 if ($CheckOnly) {
+    $relayPreflight = $null
+    $relayPreflightExit = 2
+    try {
+        $relayOutput = @(& (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -CheckOnly -EnsureBrowserRelay 2>$null)
+        $relayPreflightExit = $LASTEXITCODE
+        if ($relayOutput) {
+            $relayPreflight = (($relayOutput | Out-String).Trim() | ConvertFrom-Json)
+        }
+    } catch { $relayPreflight = $null }
     [ordered]@{
-        ready = $prerequisitesReady
+        ready = $prerequisitesReady -and $relayPreflightExit -eq 0 -and $relayPreflight -and $relayPreflight.browserReady -eq $true -and $relayPreflight.relayCommandReady -eq $true
         bootstrapRequired = $bootstrapRequired
         nodeMajor = $nodeMajor
         pythonVersion = $pythonVersion.ToString()
         node = if ($nodeCommand) { $nodeCommand.Source } else { '' }
         npm = if ($npmCommand) { $npmCommand.Source } else { '' }
         python = if ($pythonCommand) { $pythonCommand.Source } else { '' }
+        browser = if ($relayPreflight) { $relayPreflight.browser } else { '' }
+        relayCommandReady = if ($relayPreflight) { $relayPreflight.relayCommandReady } else { $false }
+        relayProfile = if ($relayPreflight) { $relayPreflight.relayProfile } else { 'openclaw' }
+        relayPort = if ($relayPreflight) { $relayPreflight.relayPort } else { 18800 }
+        relayServiceReady = if ($relayPreflight) { $relayPreflight.relayServiceReady } else { $false }
         url = $url
     } | ConvertTo-Json
-    if (-not $prerequisitesReady) { exit 2 }
+    if (-not $prerequisitesReady -or $relayPreflightExit -ne 0 -or -not $relayPreflight -or -not $relayPreflight.browserReady -or -not $relayPreflight.relayCommandReady) { exit 2 }
     exit 0
 }
 

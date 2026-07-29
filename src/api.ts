@@ -28,6 +28,10 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ port, profile }),
   }),
+  openRelayLogin: (profile: string) => request<{ opened: boolean; message?: string; profile?: string; url?: string }>('/api/relay/login', {
+    method: 'POST',
+    body: JSON.stringify({ profile, url: 'https://www.xiaohongshu.com' }),
+  }),
   jobs: () => request<Job[]>('/api/jobs'),
   job: (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`),
   createJob: (payload: JobRequest) =>

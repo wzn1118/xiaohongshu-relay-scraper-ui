@@ -7,7 +7,7 @@ let activeConnection = null;
 export async function connectRelay({
   port,
   openClawConfigPath,
-  profile = 'chrome',
+  profile = 'openclaw',
   timeoutMs = 25000,
   probeRelayImpl = probeRelay,
   spawnImpl = spawn,
@@ -28,6 +28,47 @@ export async function connectRelay({
   } finally {
     activeConnection = null;
   }
+}
+
+export function openRelayLogin({
+  profile = 'openclaw',
+  url = 'https://www.xiaohongshu.com',
+  timeoutMs = 15000,
+  spawnImpl = spawn,
+  openClawCommand = resolveOpenClawCommand(),
+}) {
+  return new Promise((resolve) => {
+    let child;
+    let settled = false;
+    let timer;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    try {
+      child = spawnImpl(
+        openClawCommand,
+        ['browser', 'open', '--browser-profile', profile, url],
+        { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      timer = setTimeout(() => {
+        child.kill?.();
+        finish({ opened: false, timedOut: true, message: 'Login page open timed out.' });
+      }, timeoutMs);
+      child.once('error', (error) => finish({ opened: false, timedOut: false, message: `Login page open failed: ${error.message}` }));
+      child.once('close', (code) => finish({
+        opened: code === 0,
+        timedOut: false,
+        exitCode: code,
+        message: code === 0 ? 'Login page opened in the managed browser.' : `Login page open exited with code ${code}.`,
+      }));
+    } catch (error) {
+      finish({ opened: false, timedOut: false, message: `Login page open failed: ${error.message}` });
+    }
+  });
 }
 
 async function performConnection({

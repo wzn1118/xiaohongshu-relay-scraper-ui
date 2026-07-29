@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { connectRelay } from './lib/relay-connect.mjs';
+import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
 
 function relayStatus({ ok, tabs = 0 }) {
   return {
@@ -36,7 +36,7 @@ test('starts the relay through the browser service without UI automation', async
   assert.equal(result.attempted, true);
   assert.deepEqual(calls, [{
     command: 'openclaw.cmd',
-    args: ['browser', 'start', '--browser-profile', 'chrome', '--json'],
+    args: ['browser', 'start', '--browser-profile', 'openclaw', '--json'],
     options: { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
   }]);
 });
@@ -56,4 +56,24 @@ test('does not start another process when the relay is already attached', async 
   assert.equal(result.ready, true);
   assert.equal(result.attempted, false);
   assert.equal(starts, 0);
+});
+
+test('opens the login page through the managed browser command', async () => {
+  const calls = [];
+  const result = await openRelayLogin({
+    profile: 'openclaw',
+    url: 'https://www.xiaohongshu.com',
+    openClawCommand: 'openclaw.cmd',
+    spawnImpl: (command, args, options) => {
+      calls.push({ command, args, options });
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('close', 0));
+      return child;
+    },
+  });
+
+  assert.equal(result.opened, true);
+  assert.deepEqual(calls[0].args, [
+    'browser', 'open', '--browser-profile', 'openclaw', 'https://www.xiaohongshu.com',
+  ]);
 });

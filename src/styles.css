@@ -83,7 +83,8 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .relay-config-body { padding: 16px 18px; }
 .relay-config-fields { grid-template-columns: .75fr 1fr 1.5fr; align-items: end; }
 .relay-config-footer { margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
-.relay-config-footer .setup-action { margin-top: 0; flex: 0 0 auto; }
+.relay-config-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.relay-config-actions .setup-action { margin-top: 0; }
 .ai-setup-grid { display: grid; grid-template-columns: 1fr 1fr; }
 .ai-setup-grid > section { min-width: 0; padding: 16px 18px; }
 .ai-setup-grid > section + section { border-left: 1px solid var(--line); }
@@ -428,7 +429,8 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .relay-config-fields { grid-template-columns: 1fr 1fr; }
   .relay-config-fields .toggle-row { grid-column: 1 / -1; }
   .relay-config-footer { align-items: stretch; flex-direction: column; }
-  .relay-config-footer .setup-action { width: 100%; }
+  .relay-config-actions { width: 100%; flex-direction: column; }
+  .relay-config-actions button { width: 100%; }
   .candidate-profile-grid { grid-template-columns: 1fr; }
   .profile-actions, .evaluation-panel { grid-template-columns: 1fr; }
   .form-row.three .field:first-child { grid-column: 1 / -1; }

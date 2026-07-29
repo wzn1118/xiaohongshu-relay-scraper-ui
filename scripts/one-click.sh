@@ -65,8 +65,8 @@ if config.get("autoConnect") is False:
     print("Relay auto-connect is disabled by configuration")
     raise SystemExit(0)
 payload = json.dumps({
-    "port": config.get("port", 18792),
-    "profile": config.get("profile", "chrome"),
+    "port": config.get("port", 18800),
+    "profile": config.get("profile", "openclaw"),
 }).encode()
 request = Request(
     f"{origin}/api/relay/connect",
@@ -78,7 +78,10 @@ with urlopen(request, timeout=35) as response:
     status = json.load(response)
 tabs = status.get("tabs", 0)
 ready = status.get("ready") is True or (status.get("running") and status.get("cdpReady") and tabs > 0)
-print(f"Relay code startup: ready={ready} port={status.get('port')} tabs={tabs}")
+site_tabs = status.get("xiaohongshuTabs", 0)
+print(f"Relay code startup: ready={ready} siteTabs={site_tabs} port={status.get('port')} tabs={tabs}")
+if ready and site_tabs == 0:
+    print("Relay service is ready. Complete the one-time website login in the managed browser, then refresh the workbench.")
 raise SystemExit(0 if ready else 1)
 PY
 }

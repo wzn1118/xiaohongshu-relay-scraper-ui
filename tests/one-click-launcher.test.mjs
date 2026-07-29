@@ -24,6 +24,11 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   assert.match(prerequisites, /Python\.Python\.3\.13/);
   assert.match(prerequisites, /@openai\/codex/);
   assert.match(prerequisites, /openclaw/);
+  assert.match(prerequisites, /Google\.Chrome/);
+  assert.match(prerequisites, /browser start --browser-profile openclaw/);
+  assert.match(oneClick, /-EnsureBrowserRelay/);
+  assert.match(bootstrap, /-EnsureBrowserRelay/);
+  assert.match(oneClick, /relayServiceReady/);
 });
 
 test('one-click check mode verifies the current platform prerequisites without starting a server', () => {
