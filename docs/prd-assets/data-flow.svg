@@ -1,0 +1,139 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="920" viewBox="0 0 1600 920" role="img" aria-labelledby="title desc">
+  <title id="title">数据流与交付物关系图</title>
+  <desc id="desc">展示配置、岗位来源、候选人资料如何进入任务，经过八阶段处理后生成岗位结果、投递文案、覆盖报告和交付产物。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#667085"/>
+    </marker>
+    <marker id="arrow-dark" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#344054"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f8fa; }
+      .title { font: 700 30px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #101828; }
+      .subtitle { font: 400 16px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #667085; }
+      .lane { fill: #ffffff; stroke: #d0d5dd; stroke-width: 2; }
+      .lane-source { fill: #f9fafb; stroke: #d0d5dd; stroke-width: 2; }
+      .lane-process { fill: #eef4ff; stroke: #b2ccfa; stroke-width: 2; }
+      .lane-output { fill: #f9f5ff; stroke: #d6bbfb; stroke-width: 2; }
+      .lane-title { font: 700 18px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #344054; }
+      .lane-note { font: 400 13px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #667085; }
+      .box { fill: #ffffff; stroke: #98a2b3; stroke-width: 2; }
+      .box-main { fill: #ffffff; stroke: #84adf7; stroke-width: 2; }
+      .box-output { fill: #ffffff; stroke: #b692e6; stroke-width: 2; }
+      .box-title { font: 700 16px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #101828; }
+      .box-text { font: 400 13px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #475467; }
+      .edge { fill: none; stroke: #667085; stroke-width: 2.3; marker-end: url(#arrow); }
+      .edge-main { fill: none; stroke: #344054; stroke-width: 2.7; marker-end: url(#arrow-dark); }
+      .edge-dashed { fill: none; stroke: #98a2b3; stroke-width: 2; stroke-dasharray: 8 7; marker-end: url(#arrow); }
+      .label { font: 600 12px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #667085; }
+      .number { font: 700 13px ui-monospace, Consolas, monospace; fill: #344054; }
+      .divider { stroke: #eaecf0; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="920"/>
+  <text class="title" x="48" y="55">数据流与交付物关系图</text>
+  <text class="subtitle" x="48" y="84">所有结果都从可追溯来源进入任务，并在交付前经过事实、质量和任务归属校验</text>
+
+  <rect class="lane-source" x="40" y="112" width="330" height="730" rx="14"/>
+  <text class="lane-title" x="66" y="148">输入与来源</text>
+  <text class="lane-note" x="66" y="172">用户配置和外部公开信息</text>
+  <rect class="box" x="66" y="204" width="278" height="88" rx="8"/>
+  <text class="box-title" x="86" y="233">运行配置</text>
+  <text class="box-text" x="86" y="256">关键词、排序、时间、数量、节奏</text>
+  <text class="box-text" x="86" y="277">Relay、AI、Profile、SMTP</text>
+  <rect class="box" x="66" y="330" width="278" height="88" rx="8"/>
+  <text class="box-title" x="86" y="359">岗位来源</text>
+  <text class="box-text" x="86" y="382">公开卡片、正文、发布时间</text>
+  <text class="box-text" x="86" y="403">来源链接、投递入口和访问状态</text>
+  <rect class="box" x="66" y="456" width="278" height="88" rx="8"/>
+  <text class="box-title" x="86" y="485">候选人资料</text>
+  <text class="box-text" x="86" y="508">简历、背景材料、补充文本</text>
+  <text class="box-text" x="86" y="529">解析后的 evidence id 和来源</text>
+  <rect class="box" x="66" y="582" width="278" height="88" rx="8"/>
+  <text class="box-title" x="86" y="611">用户动作</text>
+  <text class="box-text" x="86" y="634">编辑草稿、确认复制、发送邮件</text>
+  <text class="box-text" x="86" y="655">续跑、重试、取消和下载</text>
+  <text class="lane-note" x="66" y="738">来源字段缺失时显示“待核验”</text>
+  <text class="lane-note" x="66" y="760">不由模型补写未知事实</text>
+
+  <rect class="lane-process" x="402" y="112" width="700" height="730" rx="14"/>
+  <text class="lane-title" x="428" y="148">任务处理与证据边界</text>
+  <text class="lane-note" x="428" y="172">Node API 创建任务，Python Runner 按检查点顺序处理</text>
+  <rect class="box-main" x="450" y="204" width="600" height="66" rx="8"/>
+  <text class="box-title" x="474" y="231">Job Request / Preflight</text>
+  <text class="box-text" x="474" y="253">校验参数、连接状态、目标标签页、资料和邮箱配置</text>
+  <path class="edge-main" d="M750 270 L750 302"/>
+
+  <rect class="box-main" x="450" y="302" width="278" height="82" rx="8"/>
+  <text class="number" x="472" y="328">01-02</text>
+  <text class="box-title" x="472" y="352">发现与时间归一化</text>
+  <text class="box-text" x="472" y="374">coverage / body / publish time</text>
+  <rect class="box-main" x="772" y="302" width="278" height="82" rx="8"/>
+  <text class="number" x="794" y="328">03-05</text>
+  <text class="box-title" x="794" y="352">资料与岗位结构化</text>
+  <text class="box-text" x="794" y="374">profile / application / capability</text>
+
+  <path class="edge" d="M589 384 L589 416"/>
+  <path class="edge" d="M911 384 L911 416"/>
+  <rect class="box-main" x="450" y="416" width="600" height="66" rx="8"/>
+  <text class="box-title" x="474" y="443">Evidence-bound Result</text>
+  <text class="box-text" x="474" y="465">岗位字段、正文状态、来源证据、缺失原因和投递路线</text>
+  <path class="edge-main" d="M750 482 L750 514"/>
+  <rect class="box-main" x="450" y="514" width="278" height="82" rx="8"/>
+  <text class="number" x="472" y="540">06-07</text>
+  <text class="box-title" x="472" y="564">文案生成与独立评分</text>
+  <text class="box-text" x="472" y="586">私信 / 邮件 / Cover Letter</text>
+  <rect class="box-main" x="772" y="514" width="278" height="82" rx="8"/>
+  <text class="number" x="794" y="540">08</text>
+  <text class="box-title" x="794" y="564">质量门禁</text>
+  <text class="box-text" x="794" y="586">阈值、证据、长度、产物完整性</text>
+  <path class="edge-main" d="M589 596 L589 628"/>
+  <path class="edge-main" d="M911 596 L911 628"/>
+  <rect class="box-main" x="450" y="628" width="600" height="82" rx="8"/>
+  <text class="box-title" x="474" y="655">Delivery Gate</text>
+  <text class="box-text" x="474" y="678">服务端重新校验 Job ID、note ID、收件地址、SMTP、评分和当前草稿版本</text>
+  <text class="box-text" x="474" y="699">邮件只在全部条件通过后可发送；私信只提供复制和打开原帖</text>
+
+  <rect class="lane-output" x="1134" y="112" width="426" height="730" rx="14"/>
+  <text class="lane-title" x="1160" y="148">结果与交付</text>
+  <text class="lane-note" x="1160" y="172">按 Job ID 隔离，文件通过 manifest 复核</text>
+  <rect class="box-output" x="1160" y="204" width="374" height="88" rx="8"/>
+  <text class="box-title" x="1180" y="233">岗位结果</text>
+  <text class="box-text" x="1180" y="256">标题、来源、正文、职责、要求、能力</text>
+  <text class="box-text" x="1180" y="277">证据、投递路线、覆盖状态、缺失原因</text>
+  <rect class="box-output" x="1160" y="330" width="374" height="88" rx="8"/>
+  <text class="box-title" x="1180" y="359">投递文案</text>
+  <text class="box-text" x="1180" y="382">私信、邮件主题/正文、Cover Letter</text>
+  <text class="box-text" x="1180" y="403">草稿版本、评分、重写次数和门禁状态</text>
+  <rect class="box-output" x="1160" y="456" width="374" height="88" rx="8"/>
+  <text class="box-title" x="1180" y="485">任务报告</text>
+  <text class="box-text" x="1180" y="508">workflow、coverage、日志、阶段状态</text>
+  <text class="box-text" x="1180" y="529">发现数、正文尝试数、正文成功数</text>
+  <rect class="box-output" x="1160" y="582" width="374" height="88" rx="8"/>
+  <text class="box-title" x="1180" y="611">可下载产物</text>
+  <text class="box-text" x="1180" y="634">JSON、CSV、XLSX、Markdown、manifest</text>
+  <text class="box-text" x="1180" y="655">大小、修改时间和 SHA-256</text>
+  <rect class="box-output" x="1160" y="708" width="374" height="74" rx="8"/>
+  <text class="box-title" x="1180" y="737">外部动作记录</text>
+  <text class="box-text" x="1180" y="760">复制、打开原帖、邮件成功/失败和错误码</text>
+
+  <path class="edge" d="M344 248 C390 248 400 237 450 237"/>
+  <text class="label" x="365" y="226">配置</text>
+  <path class="edge" d="M344 374 C390 374 410 344 450 344"/>
+  <text class="label" x="365" y="360">来源</text>
+  <path class="edge" d="M344 500 C390 500 410 450 450 450"/>
+  <text class="label" x="362" y="476">事实</text>
+  <path class="edge-dashed" d="M344 626 C390 626 410 670 450 670"/>
+  <text class="label" x="360" y="652">确认 / 控制</text>
+
+  <path class="edge" d="M1050 344 C1090 344 1110 248 1160 248"/>
+  <path class="edge" d="M1050 450 C1090 450 1110 374 1160 374"/>
+  <path class="edge" d="M1050 670 C1090 670 1110 500 1160 500"/>
+  <path class="edge-main" d="M1050 670 C1100 670 1110 620 1160 620"/>
+  <path class="edge-dashed" d="M1050 670 C1110 670 1110 745 1160 745"/>
+  <text class="label" x="1062" y="326">结构化结果</text>
+  <text class="label" x="1066" y="430">草稿与评分</text>
+  <text class="label" x="1066" y="604">报告与产物</text>
+</svg>

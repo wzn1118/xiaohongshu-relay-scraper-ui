@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">八阶段 Agent 编排与检查点</title>
+  <desc id="desc">展示八阶段 Agent 的输入、处理顺序、检查点、正文受限分支和质量重写回路。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#667085"/></marker>
+    <style>
+      .bg{fill:#f7f8fa}.title{font:700 30px "Microsoft YaHei","PingFang SC",sans-serif;fill:#101828}.subtitle{font:400 16px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}.panel{fill:#fff;stroke:#d0d5dd;stroke-width:2}.agent{fill:#eef4ff;stroke:#84adf7;stroke-width:2}.agent2{fill:#fff;stroke:#98a2b3;stroke-width:2}.checkpoint{fill:#f5f3ff;stroke:#b692f6;stroke-width:2}.warn{fill:#fff6ed;stroke:#f2b36f;stroke-width:2}.head{font:700 17px "Microsoft YaHei","PingFang SC",sans-serif;fill:#101828}.num{font:700 13px ui-monospace,Consolas,monospace;fill:#475467}.sub{font:400 13px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}.label{font:600 13px "Microsoft YaHei","PingFang SC",sans-serif;fill:#475467}.edge{fill:none;stroke:#667085;stroke-width:2.2;marker-end:url(#arrow)}.dash{fill:none;stroke:#98a2b3;stroke-width:2;stroke-dasharray:8 7;marker-end:url(#arrow)}.caption{font:400 14px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}
+    </style>
+  </defs>
+  <rect class="bg" width="1600" height="1000"/>
+  <text class="title" x="48" y="55">八阶段 Agent 编排与检查点</text>
+  <text class="subtitle" x="48" y="84">每个阶段都有输入、输出和可恢复边界，质量问题回到生成与评审环节处理</text>
+  <rect class="panel" x="40" y="112" width="1520" height="830" rx="14"/>
+
+  <rect class="agent" x="90" y="190" width="320" height="110" rx="10"/><text class="num" x="112" y="220">01 coverage-agent</text><text class="head" x="112" y="248">发现与正文补全</text><text class="sub" x="112" y="274">输入：搜索卡片、Relay 标签页</text><text class="sub" x="112" y="293">输出：正文状态、覆盖报告</text>
+  <rect class="agent" x="450" y="190" width="320" height="110" rx="10"/><text class="num" x="472" y="220">02 time-agent</text><text class="head" x="472" y="248">时间归一化</text><text class="sub" x="472" y="274">输入：发布时间、采集时刻</text><text class="sub" x="472" y="293">输出：可比较的标准时间</text>
+  <rect class="agent" x="810" y="190" width="320" height="110" rx="10"/><text class="num" x="832" y="220">03 profile-memory-agent</text><text class="head" x="832" y="248">候选人事实提取</text><text class="sub" x="832" y="274">输入：简历、背景文件、补充资料</text><text class="sub" x="832" y="293">输出：evidence id 与事实库</text>
+  <rect class="agent" x="1170" y="190" width="320" height="110" rx="10"/><text class="num" x="1192" y="220">04 application-info-agent</text><text class="head" x="1192" y="248">岗位与投递方式</text><text class="sub" x="1192" y="274">输入：正文、来源和时间</text><text class="sub" x="1192" y="293">输出：职责、要求、邮箱、链接</text>
+  <path class="edge" d="M410 245 L450 245"/><path class="edge" d="M770 245 L810 245"/><path class="edge" d="M1130 245 L1170 245"/>
+
+  <rect class="checkpoint" x="90" y="355" width="1400" height="62" rx="10"/><text class="head" x="120" y="393">检查点 A · 正文覆盖与岗位事实</text><text class="caption" x="505" y="393">保存发现数、正文尝试数、正文成功数、失败原因和可续跑位置</text>
+  <path class="edge" d="M1330 300 L1330 355"/>
+
+  <rect class="agent2" x="90" y="500" width="320" height="110" rx="10"/><text class="num" x="112" y="530">05 capability-agent</text><text class="head" x="112" y="558">能力模型与匹配</text><text class="sub" x="112" y="584">输入：职责、要求、候选人事实</text><text class="sub" x="112" y="603">输出：能力优先级与匹配依据</text>
+  <rect class="agent2" x="450" y="500" width="320" height="110" rx="10"/><text class="num" x="472" y="530">06 ai-writer-agent</text><text class="head" x="472" y="558">三类文案生成</text><text class="sub" x="472" y="584">输入：岗位事实、evidence id</text><text class="sub" x="472" y="603">输出：私信、邮件、Cover Letter</text>
+  <rect class="agent2" x="810" y="500" width="320" height="110" rx="10"/><text class="num" x="832" y="530">07 employer-review-agent</text><text class="head" x="832" y="558">独立评分与重写</text><text class="sub" x="832" y="584">输入：草稿、岗位要求、事实边界</text><text class="sub" x="832" y="603">输出：分数、问题、重写结果</text>
+  <rect class="agent2" x="1170" y="500" width="320" height="110" rx="10"/><text class="num" x="1192" y="530">08 quality-gate-agent</text><text class="head" x="1192" y="558">质量门禁与交付</text><text class="sub" x="1192" y="584">输入：覆盖、质量、产物清单</text><text class="sub" x="1192" y="603">输出：完成状态、manifest、报告</text>
+  <path class="edge" d="M790 417 C790 455 250 455 250 500"/><path class="edge" d="M410 555 L450 555"/><path class="edge" d="M770 555 L810 555"/><path class="edge" d="M1130 555 L1170 555"/>
+
+  <rect class="warn" x="90" y="690" width="440" height="112" rx="10"/><text class="head" x="120" y="728">正文访问受限</text><text class="sub" x="120" y="756">10 分钟安全验证未解除时停止新增访问</text><text class="sub" x="120" y="780">保存检查点，已有完整正文继续进入后续阶段</text>
+  <path class="dash" d="M250 300 C40 370 40 640 250 690"/><text class="label" x="72" y="505">保存检查点</text>
+  <path class="dash" d="M310 690 C310 650 310 630 310 610"/><text class="label" x="328" y="655">补齐连接后续跑</text>
+  <rect class="warn" x="580" y="690" width="440" height="112" rx="10"/><text class="head" x="610" y="728">评分低于 90 分</text><text class="sub" x="610" y="756">记录问题，不开放邮件发送</text><text class="sub" x="610" y="780">回到文案生成或交由用户编辑</text>
+  <path class="dash" d="M970 610 C970 650 820 670 800 690"/><path class="dash" d="M580 746 C520 746 480 650 610 610"/><text class="label" x="430" y="675">重写回路</text>
+  <rect class="checkpoint" x="1070" y="690" width="420" height="112" rx="10"/><text class="head" x="1100" y="728">检查点 B · 交付前快照</text><text class="sub" x="1100" y="756">保存文案版本、评分、门禁结果</text><text class="sub" x="1100" y="780">生成报告、导出文件和 SHA-256 manifest</text>
+  <path class="edge" d="M1330 610 L1330 690"/>
+  <text class="caption" x="90" y="875">编排原则：阶段输出写入 Job 快照；前端展示事件，不根据局部进度自行推断任务完成。</text>
+</svg>

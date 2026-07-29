@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">任务状态机与状态语义</title>
+  <desc id="desc">展示 queued、running、completed、failed、cancelled、interrupted 六个任务状态及其转换条件，并说明部分分析是结果标签而不是状态。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#667085"/>
+    </marker>
+    <marker id="arrow-dark" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#344054"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f8fa; }
+      .title { font: 700 30px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #101828; }
+      .subtitle { font: 400 16px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #667085; }
+      .panel { fill: #ffffff; stroke: #d0d5dd; stroke-width: 2; }
+      .state { fill: #ffffff; stroke: #98a2b3; stroke-width: 2; }
+      .state-active { fill: #eef4ff; stroke: #84adf7; stroke-width: 2; }
+      .state-error { fill: #fff6ed; stroke: #f2b36f; stroke-width: 2; }
+      .state-end { fill: #f2f4f7; stroke: #98a2b3; stroke-width: 2; }
+      .state-title { font: 700 20px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #101828; }
+      .state-sub { font: 400 14px ui-monospace, Consolas, monospace; fill: #667085; }
+      .label { font: 600 14px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #475467; }
+      .note { font: 400 14px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #667085; }
+      .edge { fill: none; stroke: #667085; stroke-width: 2.2; marker-end: url(#arrow); }
+      .edge-main { fill: none; stroke: #344054; stroke-width: 2.7; marker-end: url(#arrow-dark); }
+      .edge-retry { fill: none; stroke: #98a2b3; stroke-width: 2; stroke-dasharray: 8 7; marker-end: url(#arrow); }
+      .divider { stroke: #eaecf0; stroke-width: 1; }
+      .pill { fill: #f2f4f7; stroke: #d0d5dd; stroke-width: 1; }
+      .pill-text { font: 600 13px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #475467; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="900"/>
+  <text class="title" x="48" y="55">任务状态机与状态语义</text>
+  <text class="subtitle" x="48" y="84">任务状态表示执行生命周期；覆盖质量、正文受限和部分分析属于结果标签</text>
+  <rect class="panel" x="40" y="112" width="1520" height="730" rx="14"/>
+
+  <circle cx="800" cy="154" r="12" fill="#667085"/>
+  <path class="edge-main" d="M800 166 L800 202"/>
+  <rect class="state" x="710" y="202" width="180" height="78" rx="10"/>
+  <text class="state-title" x="773" y="235">queued</text>
+  <text class="state-sub" x="768" y="258">已创建 / 等待启动</text>
+
+  <path class="edge-main" d="M800 280 L800 356"/>
+  <text class="label" x="830" y="323">启动前检查通过，Runner 已启动</text>
+  <rect class="state-active" x="710" y="356" width="180" height="78" rx="10"/>
+  <text class="state-title" x="768" y="389">running</text>
+  <text class="state-sub" x="747" y="412">执行中 / 持续写入快照</text>
+
+  <path class="edge" d="M710 240 C500 240 290 350 320 600"/>
+  <text class="label" x="150" y="300">启动失败</text>
+
+  <path class="edge" d="M890 395 C1030 395 1070 395 1150 395"/>
+  <text class="label" x="942" y="374">Runner 正常结束并写入产物</text>
+  <rect class="state-end" x="1150" y="356" width="180" height="78" rx="10"/>
+  <text class="state-title" x="1190" y="389">completed</text>
+  <text class="state-sub" x="1182" y="412">任务执行结束</text>
+
+  <path class="edge" d="M710 430 C570 500 470 550 430 600"/>
+  <text class="label" x="430" y="536">任务级错误或检查点不可用</text>
+  <rect class="state-error" x="210" y="600" width="220" height="78" rx="10"/>
+  <text class="state-title" x="285" y="633">failed</text>
+  <text class="state-sub" x="267" y="656">失败，可重试</text>
+
+  <path class="edge" d="M800 434 L800 620"/>
+  <text class="label" x="825" y="540">用户终止</text>
+  <rect class="state-end" x="710" y="620" width="180" height="78" rx="10"/>
+  <text class="state-title" x="752" y="653">cancelled</text>
+  <text class="state-sub" x="756" y="676">用户主动取消</text>
+
+  <path class="edge" d="M890 430 C1010 520 1100 560 1200 620"/>
+  <text class="label" x="1000" y="536">进程重启、Relay 中断或清理未确认</text>
+  <rect class="state-error" x="1110" y="620" width="210" height="78" rx="10"/>
+  <text class="state-title" x="1172" y="653">interrupted</text>
+  <text class="state-sub" x="1157" y="676">中断，可续跑</text>
+
+  <path class="edge-retry" d="M430 600 C520 540 600 470 710 430"/>
+  <text class="label" x="430" y="588">重试 / 从检查点恢复</text>
+  <path class="edge-retry" d="M1110 620 C1020 560 980 490 890 430"/>
+  <text class="label" x="990" y="590">续跑 / 重新启动</text>
+
+  <circle cx="320" cy="750" r="12" fill="#667085"/>
+  <path class="edge" d="M320 678 L320 738"/>
+  <text class="label" x="350" y="748">失败、取消和中断均保留已有结果；恢复动作必须重新经过检查</text>
+
+  <rect class="panel" x="72" y="764" width="1440" height="54" rx="8"/>
+  <rect class="pill" x="96" y="779" width="118" height="26" rx="13"/>
+  <text class="pill-text" x="116" y="797">结果标签</text>
+  <text class="note" x="236" y="798">“部分分析”表示正文受限或部分阶段完成，不新增任务状态；覆盖报告必须记录发现数、正文尝试数和正文成功数。</text>
+</svg>
