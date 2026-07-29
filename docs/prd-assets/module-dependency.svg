@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="950" viewBox="0 0 1600 950" role="img" aria-labelledby="title desc">
+  <title id="title">模块依赖与数据责任</title>
+  <desc id="desc">展示 UI 模块、Node 服务、Python Agent、数据目录和外部依赖之间的调用关系与责任边界。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#667085"/></marker>
+    <style>
+      .bg{fill:#f7f8fa}.title{font:700 30px "Microsoft YaHei","PingFang SC",sans-serif;fill:#101828}.subtitle{font:400 16px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}.panel{fill:#fff;stroke:#d0d5dd;stroke-width:2}.lane-ui{fill:#f8fbff;stroke:#b2ddff;stroke-width:2}.lane-svc{fill:#f5faff;stroke:#84adf7;stroke-width:2}.lane-run{fill:#fbfaff;stroke:#b692f6;stroke-width:2}.lane-data{fill:#fffdf8;stroke:#f2b36f;stroke-width:2}.box{fill:#fff;stroke:#98a2b3;stroke-width:2}.head{font:700 18px "Microsoft YaHei","PingFang SC",sans-serif;fill:#101828}.sub{font:400 13px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}.lanehead{font:700 18px "Microsoft YaHei","PingFang SC",sans-serif;fill:#344054}.label{font:600 13px "Microsoft YaHei","PingFang SC",sans-serif;fill:#475467}.edge{fill:none;stroke:#667085;stroke-width:2.2;marker-end:url(#arrow)}.dash{fill:none;stroke:#98a2b3;stroke-width:2;stroke-dasharray:7 7;marker-end:url(#arrow)}.caption{font:400 14px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}
+    </style>
+  </defs>
+  <rect class="bg" width="1600" height="950"/>
+  <text class="title" x="48" y="55">模块依赖与数据责任</text>
+  <text class="subtitle" x="48" y="84">功能模块通过 API、事件和任务目录连接；执行责任不跨层漂移</text>
+  <rect class="panel" x="40" y="112" width="1520" height="780" rx="14"/>
+
+  <rect class="lane-ui" x="70" y="155" width="300" height="665" rx="12"/><text class="lanehead" x="95" y="195">交互层 · UI 模块</text>
+  <rect class="box" x="95" y="225" width="250" height="80" rx="8"/><text class="head" x="115" y="257">UI-05—UI-13</text><text class="sub" x="115" y="282">Relay、AI、资料、候选人配置</text>
+  <rect class="box" x="95" y="335" width="250" height="80" rx="8"/><text class="head" x="115" y="367">UI-14—UI-22</text><text class="sub" x="115" y="392">任务配置、Agent、日志、覆盖</text>
+  <rect class="box" x="95" y="445" width="250" height="80" rx="8"/><text class="head" x="115" y="477">UI-23—UI-31</text><text class="sub" x="115" y="502">结果事实、文案、评分、发送</text>
+  <rect class="box" x="95" y="555" width="250" height="80" rx="8"/><text class="head" x="115" y="587">UI-32—UI-34</text><text class="sub" x="115" y="612">历史、产物、通知、响应式布局</text>
+  <text class="caption" x="95" y="690">只提交动作和展示快照</text><text class="caption" x="95" y="716">不直接执行 Runner 或外部发送</text>
+
+  <rect class="lane-svc" x="430" y="155" width="330" height="665" rx="12"/><text class="lanehead" x="455" y="195">应用服务层 · Node API</text>
+  <rect class="box" x="455" y="225" width="280" height="80" rx="8"/><text class="head" x="475" y="257">SVC-01—SVC-05</text><text class="sub" x="475" y="282">健康、Relay、AI、Profile</text>
+  <rect class="box" x="455" y="335" width="280" height="80" rx="8"/><text class="head" x="475" y="367">SVC-07—SVC-10</text><text class="sub" x="475" y="392">Job、Runner、SSE、Agent 编排</text>
+  <rect class="box" x="455" y="445" width="280" height="80" rx="8"/><text class="head" x="475" y="477">SVC-11—SVC-12</text><text class="sub" x="475" y="502">结果变更、邮件发送门禁</text>
+  <rect class="box" x="455" y="555" width="280" height="80" rx="8"/><text class="head" x="475" y="587">SVC-13—SVC-14</text><text class="sub" x="475" y="612">Artifact、manifest、进程安全</text>
+  <text class="caption" x="455" y="690">校验请求、拥有状态</text><text class="caption" x="455" y="716">隔离任务和外部动作</text>
+
+  <rect class="lane-run" x="820" y="155" width="330" height="665" rx="12"/><text class="lanehead" x="845" y="195">工作流层 · Python</text>
+  <rect class="box" x="845" y="225" width="280" height="80" rx="8"/><text class="head" x="865" y="257">01—04</text><text class="sub" x="865" y="282">发现、时间、资料、岗位结构化</text>
+  <rect class="box" x="845" y="335" width="280" height="80" rx="8"/><text class="head" x="865" y="367">05—07</text><text class="sub" x="865" y="392">能力、写作、独立评分重写</text>
+  <rect class="box" x="845" y="445" width="280" height="80" rx="8"/><text class="head" x="865" y="477">08 quality-gate</text><text class="sub" x="865" y="502">覆盖、质量、产物完整性</text>
+  <rect class="box" x="845" y="555" width="280" height="80" rx="8"/><text class="head" x="865" y="587">Checkpoint</text><text class="sub" x="865" y="612">快照、恢复位置、失败原因</text>
+  <text class="caption" x="845" y="690">只使用可验证事实</text><text class="caption" x="845" y="716">输出结构化结果和事件</text>
+
+  <rect class="lane-data" x="1210" y="155" width="300" height="665" rx="12"/><text class="lanehead" x="1235" y="195">数据与外部依赖</text>
+  <rect class="box" x="1235" y="225" width="250" height="80" rx="8"/><text class="head" x="1255" y="257">Profile Store</text><text class="sub" x="1255" y="282">候选人资料、evidence id</text>
+  <rect class="box" x="1235" y="335" width="250" height="80" rx="8"/><text class="head" x="1255" y="367">Job Store</text><text class="sub" x="1255" y="392">状态、结果、事件、检查点</text>
+  <rect class="box" x="1235" y="445" width="250" height="80" rx="8"/><text class="head" x="1255" y="477">Artifact Store</text><text class="sub" x="1255" y="502">导出文件、manifest、哈希</text>
+  <rect class="box" x="1235" y="555" width="250" height="80" rx="8"/><text class="head" x="1255" y="587">Relay / AI / SMTP</text><text class="sub" x="1255" y="612">外部连接和发送能力</text>
+  <text class="caption" x="1235" y="690">按 Job ID 隔离读取</text><text class="caption" x="1235" y="716">外部异常转为可见状态</text>
+
+  <path class="edge" d="M370 265 L430 265"/><path class="edge" d="M370 375 L430 375"/><path class="edge" d="M370 485 L430 485"/><path class="edge" d="M370 595 L430 595"/>
+  <path class="edge" d="M760 265 L820 265"/><path class="edge" d="M760 375 L820 375"/><path class="edge" d="M760 485 L820 485"/><path class="edge" d="M760 595 L820 595"/>
+  <path class="edge" d="M1150 265 L1210 265"/><path class="edge" d="M1150 375 L1210 375"/><path class="edge" d="M1150 485 L1210 485"/><path class="dash" d="M1150 595 L1210 595"/>
+  <text class="label" x="380" y="245">HTTP / JSON / SSE</text><text class="label" x="770" y="245">受控 Runner</text><text class="label" x="1160" y="245">持久化 / 外部调用</text>
+  <text class="caption" x="70" y="862">依赖原则：UI 依赖 API，API 拥有 Job，Runner 产出事实和产物，数据层保留可复盘证据。</text>
+</svg>

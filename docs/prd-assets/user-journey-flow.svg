@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">用户主流程与决策节点</title>
+  <desc id="desc">从准备、连接、检查、采集到结果复核和人工交付的产品流程图，并展示失败、部分分析和完成分支。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#667085"/></marker>
+    <style>
+      .bg{fill:#f7f8fa}.title{font:700 30px "Microsoft YaHei","PingFang SC",sans-serif;fill:#101828}.subtitle{font:400 16px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}.panel{fill:#fff;stroke:#d0d5dd;stroke-width:2}.node{fill:#fff;stroke:#98a2b3;stroke-width:2}.node-main{fill:#eef4ff;stroke:#84adf7;stroke-width:2}.node-success{fill:#f2f4f7;stroke:#98a2b3;stroke-width:2}.node-error{fill:#fff6ed;stroke:#f2b36f;stroke-width:2}.node-partial{fill:#f5f3ff;stroke:#b692f6;stroke-width:2}.head{font:700 19px "Microsoft YaHei","PingFang SC",sans-serif;fill:#101828}.sub{font:400 14px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}.label{font:600 14px "Microsoft YaHei","PingFang SC",sans-serif;fill:#475467}.edge{fill:none;stroke:#667085;stroke-width:2.4;marker-end:url(#arrow)}.dash{fill:none;stroke:#98a2b3;stroke-width:2;stroke-dasharray:8 7;marker-end:url(#arrow)}.caption{font:400 14px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}
+    </style>
+  </defs>
+  <rect class="bg" width="1600" height="900"/>
+  <text class="title" x="48" y="55">用户主流程与决策节点</text>
+  <text class="subtitle" x="48" y="84">用户始终知道当前阶段、下一步动作和失败后的恢复路径</text>
+  <rect class="panel" x="40" y="112" width="1520" height="730" rx="14"/>
+
+  <rect class="node" x="82" y="220" width="190" height="86" rx="10"/><text class="head" x="144" y="255">准备</text><text class="sub" x="105" y="280">AI、资料、候选人信息</text>
+  <rect class="node" x="332" y="220" width="190" height="86" rx="10"/><text class="head" x="390" y="255">连接</text><text class="sub" x="353" y="280">Relay、CDP、目标标签页</text>
+  <rect class="node-main" x="582" y="220" width="190" height="86" rx="10"/><text class="head" x="638" y="255">启动前检查</text><text class="sub" x="633" y="280">preflight 通过</text>
+  <rect class="node-main" x="832" y="220" width="190" height="86" rx="10"/><text class="head" x="895" y="255">运行任务</text><text class="sub" x="873" y="280">queued → running</text>
+  <rect class="node" x="1082" y="220" width="190" height="86" rx="10"/><text class="head" x="1137" y="255">结果复核</text><text class="sub" x="1101" y="280">正文、事实、文案</text>
+  <rect class="node-success" x="1332" y="220" width="190" height="86" rx="10"/><text class="head" x="1382" y="255">人工交付</text><text class="sub" x="1350" y="280">复制、打开、邮件</text>
+
+  <path class="edge" d="M272 263 L332 263"/><path class="edge" d="M522 263 L582 263"/><path class="edge" d="M772 263 L832 263"/><path class="edge" d="M1022 263 L1082 263"/><path class="edge" d="M1272 263 L1332 263"/>
+  <text class="label" x="302" y="204" text-anchor="middle">保存配置</text><text class="label" x="552" y="204" text-anchor="middle">连接成功</text><text class="label" x="802" y="204" text-anchor="middle">创建 Job</text><text class="label" x="1052" y="204" text-anchor="middle">产出结果</text><text class="label" x="1302" y="204" text-anchor="middle">用户确认</text>
+
+  <text class="label" x="90" y="430">运行期间的结果分支</text>
+  <path class="edge" d="M927 306 C927 360 610 360 610 480"/>
+  <path class="edge" d="M927 306 L927 480"/>
+  <path class="edge" d="M927 306 C927 360 1245 360 1245 480"/>
+  <rect class="node-error" x="470" y="480" width="280" height="100" rx="10"/><text class="head" x="570" y="520">失败 / 中断</text><text class="sub" x="515" y="548">保留日志和检查点</text><text class="sub" x="530" y="568">检查环境后重试或续跑</text>
+  <rect class="node-partial" x="787" y="480" width="280" height="100" rx="10"/><text class="head" x="882" y="520">部分分析</text><text class="sub" x="832" y="548">已有正文继续处理</text><text class="sub" x="829" y="568">覆盖报告记录缺口</text>
+  <rect class="node-success" x="1105" y="480" width="280" height="100" rx="10"/><text class="head" x="1202" y="520">已完成</text><text class="sub" x="1150" y="548">覆盖、质量、产物满足</text><text class="sub" x="1160" y="568">进入结果与交付准备</text>
+  <path class="dash" d="M610 580 C610 650 927 650 927 580"/><text class="label" x="670" y="640">从检查点恢复</text>
+  <path class="edge" d="M1245 580 L1245 680"/>
+  <rect class="panel" x="850" y="680" width="670" height="112" rx="10"/><text class="head" x="890" y="720">交付门禁</text><text class="caption" x="890" y="748">私信：复制并打开原帖；邮件需要通过正文邮箱、SMTP、评分和</text><text class="caption" x="890" y="770">当前草稿版本检查。</text>
+  <text class="caption" x="82" y="790">产品口径：Relay 在线只代表连接条件满足，Runner 启动只代表进入执行阶段，业务完成必须经过结果与交付条件检查。</text>
+</svg>

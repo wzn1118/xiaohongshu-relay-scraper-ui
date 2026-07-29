@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">结果质量门禁与交付决策</title>
+  <desc id="desc">展示正文、事实、文案评分、邮件配置和用户确认如何共同决定复制、打开原帖、发送邮件或返回处理。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#667085"/></marker>
+    <style>
+      .bg{fill:#f7f8fa}.title{font:700 30px "Microsoft YaHei","PingFang SC",sans-serif;fill:#101828}.subtitle{font:400 16px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}.panel{fill:#fff;stroke:#d0d5dd;stroke-width:2}.input{fill:#fff;stroke:#98a2b3;stroke-width:2}.gate{fill:#eef4ff;stroke:#84adf7;stroke-width:2}.success{fill:#f2f4f7;stroke:#98a2b3;stroke-width:2}.warn{fill:#fff6ed;stroke:#f2b36f;stroke-width:2}.partial{fill:#f5f3ff;stroke:#b692f6;stroke-width:2}.head{font:700 18px "Microsoft YaHei","PingFang SC",sans-serif;fill:#101828}.sub{font:400 13px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}.label{font:600 13px "Microsoft YaHei","PingFang SC",sans-serif;fill:#475467}.edge{fill:none;stroke:#667085;stroke-width:2.3;marker-end:url(#arrow)}.dash{fill:none;stroke:#98a2b3;stroke-width:2;stroke-dasharray:8 7;marker-end:url(#arrow)}.caption{font:400 14px "Microsoft YaHei","PingFang SC",sans-serif;fill:#667085}
+    </style>
+  </defs>
+  <rect class="bg" width="1600" height="900"/>
+  <text class="title" x="48" y="55">结果质量门禁与交付决策</text>
+  <text class="subtitle" x="48" y="84">完成、复制、打开原帖和发送邮件使用不同条件，不用一个按钮状态覆盖所有业务结果</text>
+  <rect class="panel" x="40" y="112" width="1520" height="730" rx="14"/>
+
+  <rect class="input" x="90" y="205" width="260" height="92" rx="10"/><text class="head" x="125" y="242">岗位正文</text><text class="sub" x="125" y="270">正文状态、来源链接、邮箱</text>
+  <rect class="input" x="90" y="345" width="260" height="92" rx="10"/><text class="head" x="125" y="382">候选人事实</text><text class="sub" x="125" y="410">资料来源、evidence id</text>
+  <rect class="input" x="90" y="485" width="260" height="92" rx="10"/><text class="head" x="125" y="522">当前文案</text><text class="sub" x="125" y="550">保存版本、用户编辑内容</text>
+  <path class="edge" d="M350 251 C430 251 430 320 520 320"/><path class="edge" d="M350 391 L520 391"/><path class="edge" d="M350 531 C430 531 430 462 520 462"/>
+  <text class="label" x="383" y="235">事实校验</text><text class="label" x="385" y="376">证据边界</text><text class="label" x="383" y="518">版本校验</text>
+
+  <rect class="gate" x="520" y="270" width="300" height="100" rx="10"/><text class="head" x="570" y="308">门禁 1 · 内容完整性</text><text class="sub" x="555" y="337">正文或卡片状态明确</text><text class="sub" x="555" y="357">岗位字段和投递路线可解释</text>
+  <rect class="gate" x="520" y="420" width="300" height="100" rx="10"/><text class="head" x="570" y="458">门禁 2 · 文案质量</text><text class="sub" x="555" y="487">事实引用有效，评分达到 90</text><text class="sub" x="555" y="507">低分进入编辑或重写</text>
+  <path class="edge" d="M670 370 L670 420"/>
+  <path class="dash" d="M520 470 C430 470 420 600 350 600"/><text class="label" x="390" y="620">待核验 / 重写</text>
+
+  <rect class="success" x="990" y="190" width="430" height="86" rx="10"/><text class="head" x="1030" y="228">私信交付</text><text class="sub" x="1030" y="256">允许复制当前文案并打开原帖，系统不直接提交站内内容</text>
+  <rect class="success" x="990" y="335" width="430" height="86" rx="10"/><text class="head" x="1030" y="373">岗位结果完成</text><text class="sub" x="1030" y="401">记录来源、事实、文案、评分和任务产物</text>
+  <rect class="warn" x="990" y="480" width="430" height="86" rx="10"/><text class="head" x="1030" y="518">邮件保持关闭</text><text class="sub" x="1030" y="546">正文邮箱、SMTP、质量分或当前版本任一项未通过</text>
+  <rect class="partial" x="990" y="625" width="430" height="86" rx="10"/><text class="head" x="1030" y="663">部分分析交付</text><text class="sub" x="1030" y="691">保留已完成结果和缺口原因，不标记为完整正文成功</text>
+
+  <path class="edge" d="M820 320 C900 320 900 233 990 233"/><text class="label" x="836" y="270">用户确认</text>
+  <path class="edge" d="M820 370 C900 370 900 378 990 378"/><text class="label" x="840" y="360">覆盖与产物</text>
+  <path class="edge" d="M820 470 C900 470 900 523 990 523"/><text class="label" x="840" y="492">邮件条件未满足</text>
+  <path class="edge" d="M820 520 C900 520 900 668 990 668"/><text class="label" x="838" y="600">正文访问受限</text>
+  <rect class="panel" x="90" y="690" width="730" height="92" rx="10"/><text class="head" x="125" y="728">服务端重新校验</text><text class="caption" x="125" y="756">前端按钮只提供提示；发送接口重新验证 Job ID、note ID、邮箱来源、SMTP 状态、评分和草稿版本。</text>
+</svg>

@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100" role="img" aria-labelledby="title desc">
+  <title id="title">继任采集与投递工作台产品架构图</title>
+  <desc id="desc">展示用户与外部依赖、React 工作台、本地 Node API、Python 工作流、八阶段 Agent、数据存储和交付产物之间的关系。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#667085"/>
+    </marker>
+    <marker id="arrow-dark" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#344054"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f8fa; }
+      .title { font: 700 30px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #101828; }
+      .subtitle { font: 400 16px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #667085; }
+      .layer { fill: #ffffff; stroke: #d0d5dd; stroke-width: 2; }
+      .layer-label { font: 700 18px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #344054; }
+      .layer-note { font: 400 13px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #667085; }
+      .box { fill: #ffffff; stroke: #98a2b3; stroke-width: 2; }
+      .box-main { fill: #eef4ff; stroke: #84adf7; stroke-width: 2; }
+      .box-workflow { fill: #f2f4f7; stroke: #98a2b3; stroke-width: 2; }
+      .box-data { fill: #f9f5ff; stroke: #b692e6; stroke-width: 2; }
+      .box-title { font: 700 17px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #101828; }
+      .box-text { font: 400 13px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #475467; }
+      .edge { fill: none; stroke: #667085; stroke-width: 2; marker-end: url(#arrow); }
+      .edge-dark { fill: none; stroke: #344054; stroke-width: 2.5; marker-end: url(#arrow-dark); }
+      .edge-dashed { fill: none; stroke: #98a2b3; stroke-width: 2; stroke-dasharray: 8 7; marker-end: url(#arrow); }
+      .edge-label { font: 600 12px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #667085; }
+      .badge { fill: #eef2f6; stroke: #d0d5dd; stroke-width: 1; }
+      .badge-text { font: 600 12px "Microsoft YaHei", "PingFang SC", sans-serif; fill: #475467; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1100"/>
+  <text class="title" x="48" y="55">产品架构图 · 继任采集与投递工作台</text>
+  <text class="subtitle" x="48" y="84">从用户操作到本地服务、任务编排、证据处理和交付产物的完整边界</text>
+
+  <rect class="layer" x="40" y="112" width="1520" height="148" rx="12"/>
+  <text class="layer-label" x="66" y="143">用户与外部依赖</text>
+  <text class="layer-note" x="66" y="166">外部系统只通过明确的连接边界参与任务；凭据不进入任务参数和产物</text>
+  <rect class="box" x="66" y="184" width="230" height="56" rx="8"/>
+  <text class="box-title" x="86" y="208">用户 / 求职者</text>
+  <text class="box-text" x="86" y="228">配置、复核、确认外发</text>
+  <rect class="box" x="350" y="184" width="250" height="56" rx="8"/>
+  <text class="box-title" x="370" y="208">浏览器 Relay + CDP</text>
+  <text class="box-text" x="370" y="228">登录态、目标标签页、公开页面</text>
+  <rect class="box" x="654" y="184" width="220" height="56" rx="8"/>
+  <text class="box-title" x="674" y="208">AI Provider</text>
+  <text class="box-text" x="674" y="228">结构化、写作、评分和重写</text>
+  <rect class="box" x="928" y="184" width="220" height="56" rx="8"/>
+  <text class="box-title" x="948" y="208">SMTP / 邮件服务</text>
+  <text class="box-text" x="948" y="228">服务端门禁后的邮件发送</text>
+  <rect class="box" x="1202" y="184" width="300" height="56" rx="8"/>
+  <text class="box-title" x="1222" y="208">本地资料与配置文件</text>
+  <text class="box-text" x="1222" y="228">候选人材料、环境配置、模型设置</text>
+
+  <rect class="layer" x="40" y="286" width="1520" height="156" rx="12"/>
+  <text class="layer-label" x="66" y="317">交互层 · React Web 工作台</text>
+  <text class="layer-note" x="66" y="340">负责状态呈现、表单输入和人工确认，不直接执行采集或邮件发送</text>
+  <rect class="box-main" x="66" y="358" width="315" height="60" rx="8"/>
+  <text class="box-title" x="86" y="383">配置与启动前检查</text>
+  <text class="box-text" x="86" y="404">AI / 资料 / Relay / SMTP / 目标页</text>
+  <rect class="box-main" x="405" y="358" width="315" height="60" rx="8"/>
+  <text class="box-title" x="425" y="383">任务控制台</text>
+  <text class="box-text" x="425" y="404">进度、Agent、日志、覆盖和状态</text>
+  <rect class="box-main" x="744" y="358" width="350" height="60" rx="8"/>
+  <text class="box-title" x="764" y="383">结果与投递准备</text>
+  <text class="box-text" x="764" y="404">岗位事实、证据、三类文案、质量门禁</text>
+  <rect class="box-main" x="1118" y="358" width="384" height="60" rx="8"/>
+  <text class="box-title" x="1138" y="383">历史与交付物</text>
+  <text class="box-text" x="1138" y="404">续跑、重试、下载、manifest、诊断摘要</text>
+
+  <rect class="layer" x="40" y="468" width="1520" height="156" rx="12"/>
+  <text class="layer-label" x="66" y="499">应用服务层 · 本地 Node API</text>
+  <text class="layer-note" x="66" y="522">统一校验请求、持久化任务、推送事件，并把执行权交给受控的 Runner</text>
+  <rect class="box" x="66" y="540" width="315" height="60" rx="8"/>
+  <text class="box-title" x="86" y="565">配置与健康服务</text>
+  <text class="box-text" x="86" y="586">Profile、AI、Relay、SMTP、preflight</text>
+  <rect class="box" x="405" y="540" width="315" height="60" rx="8"/>
+  <text class="box-title" x="425" y="565">Job Manager</text>
+  <text class="box-text" x="425" y="586">单活动任务、状态、取消、续跑、重试</text>
+  <rect class="box" x="744" y="540" width="350" height="60" rx="8"/>
+  <text class="box-title" x="764" y="565">结果与发送门禁</text>
+  <text class="box-text" x="764" y="586">草稿版本、证据校验、邮箱和评分校验</text>
+  <rect class="box" x="1118" y="540" width="384" height="60" rx="8"/>
+  <text class="box-title" x="1138" y="565">SSE / Artifact 服务</text>
+  <text class="box-text" x="1138" y="586">snapshot、log、done、下载和哈希</text>
+
+  <rect class="layer" x="40" y="650" width="1520" height="156" rx="12"/>
+  <text class="layer-label" x="66" y="681">工作流层 · Python Runner 与八阶段 Agent</text>
+  <text class="layer-note" x="66" y="704">每个阶段有独立输入、输出和检查点；写作只能引用已有 evidence id</text>
+  <rect class="box-workflow" x="66" y="722" width="350" height="60" rx="8"/>
+  <text class="box-title" x="86" y="747">发现与正文</text>
+  <text class="box-text" x="86" y="768">coverage · body collection · checkpoint</text>
+  <rect class="box-workflow" x="440" y="722" width="350" height="60" rx="8"/>
+  <text class="box-title" x="460" y="747">时间与岗位结构化</text>
+  <text class="box-text" x="460" y="768">time · application info · capability</text>
+  <rect class="box-workflow" x="814" y="722" width="315" height="60" rx="8"/>
+  <text class="box-title" x="834" y="747">文案与评分</text>
+  <text class="box-text" x="834" y="768">writer · employer review · rewrite</text>
+  <rect class="box-workflow" x="1153" y="722" width="349" height="60" rx="8"/>
+  <text class="box-title" x="1173" y="747">质量与交付准备</text>
+  <text class="box-text" x="1173" y="768">quality gate · workflow summary · manifest</text>
+
+  <rect class="layer" x="40" y="832" width="1520" height="196" rx="12"/>
+  <text class="layer-label" x="66" y="863">数据与交付层 · 本地隔离目录</text>
+  <text class="layer-note" x="66" y="886">Profile、Job、Result、Artifact 按任务边界隔离；可下载文件必须通过 manifest 校验</text>
+  <rect class="box-data" x="66" y="906" width="300" height="88" rx="8"/>
+  <text class="box-title" x="86" y="932">Profile Store</text>
+  <text class="box-text" x="86" y="954">背景材料、候选人资料</text>
+  <text class="box-text" x="86" y="974">evidence id、来源和解析状态</text>
+  <rect class="box-data" x="402" y="906" width="300" height="88" rx="8"/>
+  <text class="box-title" x="422" y="932">Job Store</text>
+  <text class="box-text" x="422" y="954">任务配置、状态、事件、检查点</text>
+  <text class="box-text" x="422" y="974">岗位结果、草稿和发送状态</text>
+  <rect class="box-data" x="738" y="906" width="300" height="88" rx="8"/>
+  <text class="box-title" x="758" y="932">Artifact Store</text>
+  <text class="box-text" x="758" y="954">JSON / CSV / XLSX / Markdown</text>
+  <text class="box-text" x="758" y="974">coverage、workflow、manifest</text>
+  <rect class="box-data" x="1074" y="906" width="428" height="88" rx="8"/>
+  <text class="box-title" x="1094" y="932">外部交付边界</text>
+  <text class="box-text" x="1094" y="954">复制私信、打开原帖、服务端校验后的邮件</text>
+  <text class="box-text" x="1094" y="974">任何外发动作均保留当前草稿版本和结果</text>
+
+  <path class="edge-dark" d="M800 442 L800 468"/>
+  <text class="edge-label" x="820" y="461">HTTP / JSON</text>
+  <path class="edge-dark" d="M800 624 L800 650"/>
+  <text class="edge-label" x="820" y="643">受控子进程</text>
+  <path class="edge-dark" d="M800 806 L800 832"/>
+  <text class="edge-label" x="820" y="825">结果 / 事件 / 产物</text>
+  <path class="edge" d="M720 600 C720 530 480 300 475 240"/>
+  <text class="edge-label" x="515" y="325">CDP / 标签页</text>
+  <path class="edge" d="M900 722 C900 610 780 310 764 240"/>
+  <text class="edge-label" x="920" y="430">JSON Schema</text>
+  <path class="edge" d="M1094 570 C1230 540 1270 320 1038 240"/>
+  <text class="edge-label" x="1180" y="390">SMTP</text>
+  <path class="edge-dashed" d="M1260 358 C1260 320 1350 270 1350 240"/>
+  <text class="edge-label" x="1280" y="300">上传 / 配置</text>
+  <path class="edge-dashed" d="M1118 390 C1090 450 1070 530 1030 540"/>
+  <text class="edge-label" x="1050" y="468">SSE / HTTP</text>
+  <path class="edge-dashed" d="M570 600 C570 700 520 840 552 906"/>
+  <text class="edge-label" x="495" y="770">持久化</text>
+  <path class="edge-dashed" d="M975 782 C975 840 885 870 888 906"/>
+  <text class="edge-label" x="930" y="855">生成文件</text>
+
+  <rect class="badge" x="1262" y="50" width="118" height="28" rx="14"/>
+  <text class="badge-text" x="1281" y="69">本机优先</text>
+  <rect class="badge" x="1394" y="50" width="138" height="28" rx="14"/>
+  <text class="badge-text" x="1411" y="69">人工确认在环</text>
+</svg>
