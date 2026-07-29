@@ -85,6 +85,19 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .relay-config-footer { margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .relay-config-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .relay-config-actions .setup-action { margin-top: 0; }
+.email-config-panel { margin-top: 14px; }
+.email-config-body { padding: 16px 18px; }
+.smtp-primary-fields { grid-template-columns: .9fr 1.2fr 1.2fr 1.2fr; align-items: end; }
+.smtp-advanced-fields { margin-top: 12px; display: grid; grid-template-columns: 1.35fr .5fr 1fr 1fr; gap: 10px; align-items: end; }
+.smtp-config-footer { margin-top: 14px; padding-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid var(--line); }
+.smtp-guidance { min-width: 0; display: flex; align-items: flex-start; gap: 9px; color: var(--green); }
+.smtp-guidance > svg { flex: 0 0 auto; margin-top: 1px; }
+.smtp-guidance span { min-width: 0; display: flex; flex-direction: column; }
+.smtp-guidance strong { color: var(--ink); font-size: 10px; }
+.smtp-guidance small { margin-top: 3px; color: #77797d; font-size: 9px; line-height: 1.5; }
+.smtp-config-actions { flex: 0 0 auto; display: flex; gap: 8px; }
+.smtp-config-actions button { min-height: 38px; padding: 0 14px; }
+.smtp-test-action { border-color: var(--red-deep); background: var(--red); }
 .ai-setup-grid { display: grid; grid-template-columns: 1fr 1fr; }
 .ai-setup-grid > section { min-width: 0; padding: 16px 18px; }
 .ai-setup-grid > section + section { border-left: 1px solid var(--line); }
@@ -394,6 +407,8 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .ai-setup-grid { grid-template-columns: 1fr; }
   .ai-setup-grid > section + section { border-left: 0; border-top: 1px solid var(--line); }
   .candidate-profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .smtp-primary-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .smtp-advanced-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .secondary-grid { min-width: 0; }
   .coverage-grid { grid-template-columns: repeat(3, minmax(90px, 1fr)); }
   .results-workspace { grid-template-columns: 230px minmax(0, 1fr); }
@@ -428,6 +443,10 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .ai-provider-row { grid-template-columns: 1fr; }
   .relay-config-fields { grid-template-columns: 1fr 1fr; }
   .relay-config-fields .toggle-row { grid-column: 1 / -1; }
+  .smtp-primary-fields, .smtp-advanced-fields { grid-template-columns: 1fr; }
+  .smtp-config-footer { align-items: stretch; flex-direction: column; }
+  .smtp-config-actions { width: 100%; }
+  .smtp-config-actions button { flex: 1 1 0; min-width: 0; }
   .relay-config-footer { align-items: stretch; flex-direction: column; }
   .relay-config-actions { width: 100%; flex-direction: column; }
   .relay-config-actions button { width: 100%; }

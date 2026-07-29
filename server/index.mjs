@@ -5,6 +5,7 @@ import { JobManager } from './job-manager.mjs';
 import { AiSessionStore } from './ai-session-store.mjs';
 import { ProfileStore } from './profile-store.mjs';
 import { RelayConfigStore } from './relay-config-store.mjs';
+import { SmtpConfigStore } from './smtp-config-store.mjs';
 import { createMailSender } from './mail-sender.mjs';
 
 const aiSessions = new AiSessionStore();
@@ -14,13 +15,15 @@ const profileStore = new ProfileStore({
   scriptPath: config.profileScriptPath,
 });
 const relayConfig = new RelayConfigStore({ filePath: config.relayConfigPath });
-const mailSender = createMailSender(config.smtp);
+const smtpConfig = new SmtpConfigStore({ filePath: config.smtpConfigPath, defaults: config.smtp });
 await profileStore.initialize();
 await relayConfig.initialize();
+await smtpConfig.initialize();
+const mailSender = createMailSender(smtpConfig.getForMailer());
 const manager = new JobManager({ ...config, aiSessions, profileStore });
 await manager.initialize();
 
-const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, mailSender }));
+const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender }));
 server.listen(config.port, config.host, () => {
   console.log(`Xiaohongshu relay scraper API listening at http://${config.host}:${config.port}`);
 });

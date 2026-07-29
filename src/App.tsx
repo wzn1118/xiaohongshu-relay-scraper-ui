@@ -59,6 +59,8 @@ import type {
   CandidateApplicationProfile,
   ApplicationRoute,
   OutreachDraft,
+  SmtpConfig,
+  SmtpProvider,
 } from './types'
 
 const CANDIDATE_PROFILE_STORAGE_KEY = 'xhs-candidate-application-profile'
@@ -125,6 +127,30 @@ const defaultRelayConfig: RelayConfig = {
   port: 18800,
   profile: 'openclaw',
   autoConnect: true,
+}
+
+const smtpProviderOptions: Array<{ id: SmtpProvider; label: string; host: string; port: number; secure: boolean; requireTls: boolean; guidance: string }> = [
+  { id: '163', label: '网易 163 邮箱', host: 'smtp.163.com', port: 465, secure: true, requireTls: false, guidance: '先在网易邮箱网页版开启 SMTP 服务，再填写客户端授权密码；不是网页登录密码。' },
+  { id: 'qq', label: 'QQ 邮箱', host: 'smtp.qq.com', port: 465, secure: true, requireTls: false, guidance: '先在邮箱设置中开启 SMTP 服务，并使用客户端授权码。' },
+  { id: 'gmail', label: 'Gmail', host: 'smtp.gmail.com', port: 465, secure: true, requireTls: false, guidance: '账号开启两步验证后，请使用应用专用密码。' },
+  { id: 'outlook', label: 'Outlook / Microsoft 365', host: 'smtp.office365.com', port: 587, secure: false, requireTls: true, guidance: '组织账号可能关闭 SMTP AUTH；如已加载 OAuth2 配置，可直接测试当前连接。' },
+  { id: 'custom', label: '其他 SMTP', host: '', port: 465, secure: true, requireTls: false, guidance: '按邮箱服务商文档填写 SMTP 主机、端口和加密方式。' },
+]
+
+const defaultSmtpConfig: SmtpConfig = {
+  provider: '163',
+  host: 'smtp.163.com',
+  port: 465,
+  secure: true,
+  requireTls: false,
+  auth: 'login',
+  authMode: 'login',
+  user: '',
+  from: '',
+  hasPassword: false,
+  configured: false,
+  verified: false,
+  maskedFrom: '',
 }
 
 const statusText: Record<JobStatus, string> = {
@@ -370,6 +396,9 @@ function App() {
   const [relay, setRelay] = useState<RelayStatus | null>(null)
   const [relayConfig, setRelayConfig] = useState<RelayConfig>(defaultRelayConfig)
   const [relayConfigSaving, setRelayConfigSaving] = useState(false)
+  const [smtpConfig, setSmtpConfig] = useState<SmtpConfig>(defaultSmtpConfig)
+  const [smtpPassword, setSmtpPassword] = useState('')
+  const [smtpSaving, setSmtpSaving] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
   const [activeJob, setActiveJob] = useState<Job | null>(null)
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
@@ -459,6 +488,62 @@ function App() {
       setNotice((error as Error).message)
     } finally {
       setRelayConfigSaving(false)
+    }
+  }
+
+  const selectSmtpProvider = (provider: SmtpProvider) => {
+    const preset = smtpProviderOptions.find((item) => item.id === provider) || smtpProviderOptions.at(-1)!
+    setSmtpConfig((current) => ({
+      ...current,
+      provider,
+      host: preset.host,
+      port: preset.port,
+      secure: preset.secure,
+      requireTls: preset.requireTls,
+      auth: 'login',
+      authMode: 'login',
+      configured: false,
+      verified: false,
+    }))
+    setSmtpPassword('')
+  }
+
+  const updateSmtpConfig = <K extends keyof SmtpConfig>(key: K, value: SmtpConfig[K]) => {
+    setSmtpConfig((current) => ({ ...current, [key]: value }))
+  }
+
+  const saveSmtpConfig = async (testConnection = false) => {
+    setSmtpSaving(true)
+    setNotice(null)
+    try {
+      const saved = await api.updateSmtpConfig({
+        provider: smtpConfig.provider,
+        host: smtpConfig.host,
+        port: smtpConfig.port,
+        secure: smtpConfig.secure,
+        requireTls: smtpConfig.requireTls,
+        auth: smtpConfig.auth,
+        user: smtpConfig.user,
+        from: smtpConfig.from,
+        password: smtpPassword,
+      })
+      setSmtpConfig(saved)
+      setSmtpPassword('')
+      setHealth((current) => current ? {
+        ...current,
+        emailDelivery: { configured: saved.configured, from: saved.maskedFrom, authMode: saved.authMode },
+      } : current)
+      if (testConnection) {
+        const result = await api.testSmtp()
+        setSmtpConfig((current) => ({ ...current, verified: true, lastVerifiedAt: result.lastVerifiedAt }))
+        setNotice(`SMTP 连接成功 · 发件人 ${result.from}`)
+      } else {
+        setNotice('发件邮箱已保存并立即生效，无需重启服务。')
+      }
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setSmtpSaving(false)
     }
   }
 
@@ -564,9 +649,9 @@ function App() {
   useEffect(() => {
     let mounted = true
     const boot = async () => {
-      const results = await Promise.allSettled([api.health(), api.jobs(), api.relayConfig()])
+      const results = await Promise.allSettled([api.health(), api.jobs(), api.relayConfig(), api.smtpConfig()])
       if (!mounted) return
-      const [healthResult, jobsResult, relayConfigResult] = results
+      const [healthResult, jobsResult, relayConfigResult, smtpConfigResult] = results
       if (healthResult.status === 'fulfilled') setHealth(healthResult.value)
       if (jobsResult.status === 'fulfilled') {
         setJobs(Array.isArray(jobsResult.value) ? jobsResult.value : [])
@@ -576,6 +661,10 @@ function App() {
       if (relayConfigResult.status === 'fulfilled') {
         setRelayConfig(relayConfigResult.value)
         setRequest((current) => ({ ...current, relayPort: relayConfigResult.value.port }))
+      }
+      if (smtpConfigResult.status === 'fulfilled') {
+        const saved = smtpConfigResult.value
+        setSmtpConfig(saved.host || saved.from || saved.user ? saved : defaultSmtpConfig)
       }
       try {
         setRelay(await api.relayStatus(configuredPort))
@@ -843,7 +932,7 @@ function App() {
           <button className="nav-button" title="任务历史" onClick={() => document.getElementById('history')?.scrollIntoView({ behavior: 'smooth' })}><Clock3 size={20} /><span>历史</span></button>
           <button className="nav-button" title="导出文件" onClick={() => document.getElementById('artifacts')?.scrollIntoView({ behavior: 'smooth' })}><Table2 size={20} /><span>产物</span></button>
         </nav>
-        <button className="nav-button rail-settings" title="工作台设置" onClick={() => document.getElementById('relay-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={20} /><span>设置</span></button>
+        <button className="nav-button rail-settings" title="发件邮箱设置" onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={20} /><span>设置</span></button>
       </aside>
 
       <div className="workspace">
@@ -902,6 +991,34 @@ function App() {
                 <div className="relay-config-actions">
                   <button type="button" className="secondary-button" disabled={relayConnecting} onClick={() => void openRelayLogin()}><ExternalLink size={16} />打开登录页</button>
                   <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section className="panel email-config-panel" id="email-config" aria-label="发件邮箱配置">
+            <div className="panel-heading compact">
+              <div><span className="step-label">DELIVERY EMAIL</span><h2>发件邮箱</h2></div>
+              <span className={`runtime-badge ${smtpConfig.verified ? 'passed' : ''}`}>{smtpConfig.verified ? '连接已验证' : smtpConfig.configured ? '配置已保存' : '等待配置'}</span>
+            </div>
+            <div className="email-config-body">
+              <div className="form-row smtp-primary-fields">
+                <label className="field"><span>邮箱服务商</span><select value={smtpConfig.provider} onChange={(event) => selectSmtpProvider(event.target.value as SmtpProvider)}>{smtpProviderOptions.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+                <label className="field"><span>发件邮箱</span><input type="email" autoComplete="email" value={smtpConfig.from} onChange={(event) => { const value = event.target.value; setSmtpConfig((current) => ({ ...current, from: value, user: current.user || value })) }} placeholder="name@example.com" /></label>
+                <label className="field"><span>SMTP 用户名</span><input autoComplete="username" value={smtpConfig.user} onChange={(event) => updateSmtpConfig('user', event.target.value)} placeholder="通常与发件邮箱相同" /></label>
+                <label className="field"><span>{smtpConfig.provider === '163' || smtpConfig.provider === 'qq' ? '客户端授权密码' : 'SMTP 密码 / 授权码'}</span><input type="password" autoComplete="new-password" value={smtpPassword} onChange={(event) => setSmtpPassword(event.target.value)} placeholder={smtpConfig.hasPassword ? '已保存，留空保持不变' : '仅保存到本机'} /></label>
+              </div>
+              <div className="smtp-advanced-fields">
+                <label className="field"><span>SMTP 主机</span><input value={smtpConfig.host} onChange={(event) => updateSmtpConfig('host', event.target.value)} placeholder="smtp.example.com" /></label>
+                <label className="field"><span>端口</span><input type="number" min="1" max="65535" value={smtpConfig.port} onChange={(event) => updateSmtpConfig('port', Number(event.target.value))} /></label>
+                <Toggle checked={smtpConfig.secure} onChange={(value) => updateSmtpConfig('secure', value)} label="SSL/TLS" description="通常使用 465 端口" />
+                <Toggle checked={smtpConfig.requireTls} onChange={(value) => updateSmtpConfig('requireTls', value)} label="STARTTLS" description="通常使用 587 端口" />
+              </div>
+              <div className="smtp-config-footer">
+                <div className="smtp-guidance"><ShieldCheck size={16} /><span><strong>仅保存在当前设备</strong><small>{smtpProviderOptions.find((item) => item.id === smtpConfig.provider)?.guidance}</small></span></div>
+                <div className="smtp-config-actions">
+                  <button type="button" className="secondary-button" disabled={smtpSaving} onClick={() => void saveSmtpConfig(false)}><Save size={16} />保存配置</button>
+                  <button type="button" className="primary-button smtp-test-action" disabled={smtpSaving} onClick={() => void saveSmtpConfig(true)}>{smtpSaving ? <LoaderCircle className="spin" size={16} /> : <Wifi size={16} />}保存并测试</button>
                 </div>
               </div>
             </div>
@@ -1139,10 +1256,11 @@ function App() {
                     <div className="delivery-console">
                       <div className="delivery-target">
                         <span className={selectedEmailRoute ? 'available' : ''}><Mail size={17} /></span>
-                        <div><small>邮件收件人</small><strong>{selectedEmailRoute?.target || '岗位正文未提取到邮箱'}</strong><p>{health?.emailDelivery?.configured ? `${health.emailDelivery.authMode === 'oauth2' ? 'Outlook OAuth2' : 'SMTP'} 已就绪 · 发件人 ${health.emailDelivery.from}` : health?.emailDelivery?.authMode === 'oauth2' ? 'Outlook OAuth2 尚未授权，完成本机 .env 配置后重启服务' : 'SMTP 尚未配置，填写 .env 后重启服务即可启用'}</p></div>
+                        <div><small>邮件收件人</small><strong>{selectedEmailRoute?.target || '岗位正文未提取到邮箱'}</strong><p>{health?.emailDelivery?.configured ? `${health.emailDelivery.authMode === 'oauth2' ? 'Outlook OAuth2' : 'SMTP'} 已就绪 · 发件人 ${health.emailDelivery.from}` : '发件邮箱尚未配置，可在当前页面保存并测试后立即启用'}</p></div>
                       </div>
                       <div className="delivery-actions">
                         <button className="send-email-action" disabled={!selectedResult.cover_letter_evaluation?.passed || !selectedEmailRoute || !health?.emailDelivery?.configured || emailSending} onClick={() => void sendEmail()} title={!selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : '立即发送当前邮件正文'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}{emailSending ? '发送中' : '发送邮件'}</button>
+                        <button onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={16} />发件邮箱</button>
                         <button disabled={!selectedResult.cover_letter_evaluation?.passed || !selectedMessageRoute} onClick={() => void prepareMessage()}><MessageSquare size={16} />复制私信</button>
                         {selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer"><ExternalLink size={16} />打开岗位</a>}
                       </div>

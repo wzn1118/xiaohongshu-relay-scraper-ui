@@ -23,10 +23,12 @@ export const config = Object.freeze({
   staticDir: path.resolve(process.env.XHS_STATIC_DIR || path.join(serverDir, '..', 'dist')),
   dataDir,
   relayConfigPath: path.resolve(process.env.XHS_RELAY_CONFIG_PATH || path.join(dataDir, '..', 'relay-config.json')),
+  smtpConfigPath: path.resolve(process.env.XHS_SMTP_CONFIG_PATH || path.join(dataDir, '..', 'smtp-config.json')),
   profileDir: path.resolve(process.env.XHS_PROFILE_DATA_DIR || path.join(serverDir, '..', 'data', 'profiles')),
   profileScriptPath: path.resolve(serverDir, '..', 'scripts', 'profile_memory.py'),
   legacyProfilePath: path.resolve(serverDir, '..', 'profiles', 'candidate_profile.json'),
   smtp: Object.freeze({
+    provider: String(process.env.SMTP_PROVIDER || '').trim(),
     host: String(process.env.SMTP_HOST || '').trim(),
     port: smtpPort,
     secure: readBoolean(process.env.SMTP_SECURE, smtpPort === 465),

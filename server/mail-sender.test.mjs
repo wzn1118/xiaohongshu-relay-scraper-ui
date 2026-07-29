@@ -137,3 +137,25 @@ test('mail sender treats a fully rejected recipient as a delivery failure', asyn
     (error) => error.code === 'MAIL_SEND_FAILED' && /rejected recipient/.test(error.message),
   );
 });
+
+test('mail sender can hot-swap accounts and verify the active transport', async () => {
+  const transports = [];
+  const sender = createMailSender({}, (options) => {
+    transports.push(options);
+    return {
+      async verify() {},
+      close() {},
+      async sendMail(value) {
+        return { messageId: 'mail-2', accepted: [value.to], rejected: [] };
+      },
+    };
+  });
+
+  sender.configure({
+    host: 'smtp.example.com', port: 465, secure: true, requireTls: false,
+    auth: 'login', user: 'new@example.com', pass: 'new-secret', from: 'new@example.com',
+  });
+  assert.deepEqual(await sender.verify(), { configured: true, from: 'n***@example.com', authMode: 'login' });
+  assert.equal(transports.length, 1);
+  assert.equal(transports[0].auth.pass, 'new-secret');
+});

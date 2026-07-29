@@ -60,6 +60,10 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     runnerAvailable: true,
   };
   let relaySettings = { port: 18792, profile: 'chrome', autoConnect: true };
+  let smtpSettings = {
+    provider: 'custom', host: 'smtp.example.com', port: 465, secure: true, requireTls: false,
+    auth: 'login', user: 'sender@example.com', from: 'sender@example.com', hasPassword: true,
+  };
   const sentMessages = [];
   const server = http.createServer(createApp({
     manager,
@@ -91,9 +95,24 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     }),
     mailSender: {
       status: () => ({ configured: true, from: 's***@example.com' }),
+      configure: () => ({ configured: true, from: 's***@example.com' }),
+      verify: async () => ({ configured: true, from: 's***@example.com', authMode: 'login' }),
       send: async (message) => {
         sentMessages.push(message);
         return { messageId: 'mail-1', accepted: [message.to], rejected: [] };
+      },
+    },
+    smtpConfig: {
+      getPublic: () => ({ ...smtpSettings }),
+      getForMailer: () => ({ ...smtpSettings, pass: 'stored-secret' }),
+      markVerified: async () => {
+        smtpSettings = { ...smtpSettings, lastVerifiedAt: new Date().toISOString() };
+        return { ...smtpSettings };
+      },
+      update: async (value) => {
+        smtpSettings = { ...smtpSettings, ...value, hasPassword: true };
+        delete smtpSettings.password;
+        return { ...smtpSettings };
       },
     },
   }));
@@ -106,6 +125,23 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(health.ok, true);
     assert.equal(health.service, 'xiaohongshu-relay-scraper');
     assert.equal(health.emailDelivery.configured, true);
+
+    const emailConfig = await fetch(`${origin}/api/email/config`).then((response) => response.json());
+    assert.equal(emailConfig.configured, true);
+    assert.equal(emailConfig.hasPassword, true);
+    assert.equal('password' in emailConfig, false);
+    const updatedEmailConfig = await fetch(`${origin}/api/email/config`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...emailConfig, user: 'updated@example.com', from: 'updated@example.com', password: 'replacement' }),
+    });
+    assert.equal(updatedEmailConfig.status, 200);
+    const updatedEmailBody = await updatedEmailConfig.json();
+    assert.equal(updatedEmailBody.user, 'updated@example.com');
+    assert.equal('password' in updatedEmailBody, false);
+    const testedEmail = await fetch(`${origin}/api/email/test`, { method: 'POST' });
+    assert.equal(testedEmail.status, 200);
+    assert.equal((await testedEmail.json()).ok, true);
 
     const jobs = await fetch(`${origin}/api/jobs`).then((response) => response.json());
     assert.deepEqual(jobs, []);

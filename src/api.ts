@@ -1,4 +1,4 @@
-import type { AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, OutreachDraft, RelayConfig, RelayStatus } from './types'
+import type { AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, OutreachDraft, RelayConfig, RelayStatus, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -23,6 +23,9 @@ export const api = {
     request<CandidateProfile>('/api/profiles/import', { method: 'POST', body: JSON.stringify(payload) }),
   relayConfig: () => request<RelayConfig>('/api/relay/config'),
   updateRelayConfig: (payload: RelayConfig) => request<RelayConfig>('/api/relay/config', { method: 'PUT', body: JSON.stringify(payload) }),
+  smtpConfig: () => request<SmtpConfig>('/api/email/config'),
+  updateSmtpConfig: (payload: SmtpConfigUpdate) => request<SmtpConfig>('/api/email/config', { method: 'PUT', body: JSON.stringify(payload) }),
+  testSmtp: () => request<SmtpTestResult>('/api/email/test', { method: 'POST' }),
   relayStatus: (port: number) => request<RelayStatus>(`/api/relay/status?port=${port}`),
   connectRelay: (port: number, profile: string) => request<RelayStatus & { ready?: boolean; attempted?: boolean }>(`/api/relay/connect`, {
     method: 'POST',

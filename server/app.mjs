@@ -12,10 +12,16 @@ const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
 const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, mailSender, relayConnector = connectRelay, relayLoginOpener = openRelayLogin }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, relayConnector = connectRelay, relayLoginOpener = openRelayLogin }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
+    configure: () => ({ configured: false, from: '' }),
+    verify: async () => {
+      const error = new Error('请先配置 SMTP 邮件发送。');
+      error.code = 'MAIL_NOT_CONFIGURED';
+      throw error;
+    },
     send: async () => {
       const error = new Error('请先配置 SMTP 邮件发送。');
       error.code = 'MAIL_NOT_CONFIGURED';
@@ -49,6 +55,23 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (!relayConfig?.update) return json(res, 503, errorBody('RELAY_CONFIG_UNAVAILABLE', 'Relay configuration storage is unavailable.'));
         const body = await readJsonBody(req, config.maxBodyBytes);
         return json(res, 200, await relayConfig.update(body));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/email/config') {
+        return json(res, 200, publicSmtpConfig(smtpConfig, deliveryMailer));
+      }
+      if (req.method === 'PUT' && url.pathname === '/api/email/config') {
+        if (!smtpConfig?.update || !smtpConfig?.getForMailer) {
+          return json(res, 503, errorBody('SMTP_CONFIG_UNAVAILABLE', 'SMTP configuration storage is unavailable.'));
+        }
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        await smtpConfig.update(body);
+        deliveryMailer.configure(smtpConfig.getForMailer());
+        return json(res, 200, publicSmtpConfig(smtpConfig, deliveryMailer));
+      }
+      if (req.method === 'POST' && url.pathname === '/api/email/test') {
+        const status = await deliveryMailer.verify();
+        const saved = await smtpConfig?.markVerified?.();
+        return json(res, 200, { ok: true, ...status, lastVerifiedAt: saved?.lastVerifiedAt || new Date().toISOString() });
       }
       if (req.method === 'GET' && url.pathname === '/api/relay/status') {
         const configured = getRelayConfig();
@@ -172,10 +195,11 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         return json(res, 400, errorBody(error.code, error.message));
       }
       if (error.code === 'BODY_TOO_LARGE') return json(res, 413, errorBody('BODY_TOO_LARGE', 'Request body is too large.'));
-      if (['AI_VALIDATION', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
+      if (['AI_VALIDATION', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_IMPORT_FAILED') return json(res, 422, errorBody(error.code, error.message));
       if (error.code === 'MAIL_NOT_CONFIGURED') return json(res, 503, errorBody(error.code, error.message));
+      if (error.code === 'MAIL_CONNECTION_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'MAIL_SEND_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error instanceof SyntaxError) return json(res, 400, errorBody('INVALID_JSON', 'Request body must contain valid JSON.'));
       if (error.code === 'ENOENT' || /artifact/i.test(error.message) || /Path escapes/.test(error.message)) {
@@ -352,6 +376,22 @@ async function writeDeliveryState(outputDir, state) {
   await rename(temporary, target);
 }
 
+function publicSmtpConfig(smtpConfig, mailer) {
+  const saved = smtpConfig?.getPublic?.() || {
+    provider: 'custom',
+    host: '',
+    port: 465,
+    secure: true,
+    requireTls: false,
+    auth: 'login',
+    user: '',
+    from: '',
+    hasPassword: false,
+  };
+  const status = mailer.status();
+  return { ...saved, configured: status.configured, verified: Boolean(saved.lastVerifiedAt), maskedFrom: status.from, authMode: status.authMode };
+}
+
 function boundedInteger(raw, fallback, min, max) {
   if (raw === null || raw === '') return fallback;
   const value = Number(raw);
@@ -408,7 +448,7 @@ function setSecurityHeaders(res) {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Access-Control-Allow-Origin', 'http://127.0.0.1:5173');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
 }
 
 function json(res, status, body) {

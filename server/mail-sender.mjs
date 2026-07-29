@@ -9,45 +9,63 @@ export class MailDeliveryError extends Error {
 }
 
 export function createMailSender(smtp = {}, createTransport = nodemailer.createTransport, fetchImpl = fetch) {
-  const host = String(smtp.host || '').trim();
-  const from = String(smtp.from || '').trim();
-  const user = String(smtp.user || '').trim();
-  const pass = String(smtp.pass || '');
-  const oauth = smtp.oauth || {};
-  const authMode = resolveAuthMode(smtp.auth, { user, pass, oauth });
-  const configured = Boolean(host && from && isAuthConfigured(authMode, { user, pass, oauth }));
-  const tokenProvider = authMode === 'oauth2' ? createMicrosoftTokenProvider(oauth, fetchImpl) : null;
+  let current = normalizeRuntimeConfig(smtp);
+  let tokenProvider = current.authMode === 'oauth2' ? createMicrosoftTokenProvider(current.oauth, fetchImpl) : null;
   let transport = null;
   let transportAccessToken = '';
+
+  const resetTransport = () => {
+    transport?.close?.();
+    transport = null;
+    transportAccessToken = '';
+  };
+
+  const ensureTransport = async () => {
+    const accessToken = tokenProvider ? await tokenProvider.getAccessToken() : '';
+    if (!transport || (accessToken && accessToken !== transportAccessToken)) {
+      resetTransport();
+      transport = createTransport({
+        host: current.host,
+        port: current.port,
+        secure: current.secure,
+        requireTLS: current.requireTls,
+        ...buildAuth(current.authMode, { user: current.user, pass: current.pass, accessToken }),
+      });
+      transportAccessToken = accessToken;
+    }
+    return transport;
+  };
 
   return {
     status() {
       return {
-        configured,
-        from: configured ? maskEmail(from) : '',
-        authMode,
+        configured: current.configured,
+        from: current.configured ? maskEmail(current.from) : '',
+        authMode: current.authMode,
       };
     },
-    async send({ to, subject, text, replyTo }) {
-      if (!configured) {
-        throw new MailDeliveryError('MAIL_NOT_CONFIGURED', authMode === 'oauth2'
-          ? '请先在 .env 中完成 Outlook OAuth2 账号授权配置。'
-          : '请先在 .env 中配置 SMTP_HOST、SMTP_FROM 及账号信息。');
-      }
+    configure(next = {}) {
+      resetTransport();
+      current = normalizeRuntimeConfig(next);
+      tokenProvider = current.authMode === 'oauth2' ? createMicrosoftTokenProvider(current.oauth, fetchImpl) : null;
+      return this.status();
+    },
+    async verify() {
+      assertConfigured(current);
       try {
-        const accessToken = tokenProvider ? await tokenProvider.getAccessToken() : '';
-        if (!transport || (accessToken && accessToken !== transportAccessToken)) {
-          transport?.close?.();
-          transport = createTransport({
-            host,
-            port: Number(smtp.port || 587),
-            secure: Boolean(smtp.secure),
-            requireTLS: Boolean(smtp.requireTls),
-            ...buildAuth(authMode, { user, pass, accessToken }),
-          });
-          transportAccessToken = accessToken;
-        }
-        const result = await transport.sendMail({ from, to, subject, text, ...(replyTo ? { replyTo } : {}) });
+        const activeTransport = await ensureTransport();
+        if (typeof activeTransport.verify === 'function') await activeTransport.verify();
+        return this.status();
+      } catch (error) {
+        resetTransport();
+        throw new MailDeliveryError('MAIL_CONNECTION_FAILED', `SMTP 连接测试失败：${String(error?.message || error)}`);
+      }
+    },
+    async send({ to, subject, text, replyTo }) {
+      assertConfigured(current);
+      try {
+        const activeTransport = await ensureTransport();
+        const result = await activeTransport.sendMail({ from: current.from, to, subject, text, ...(replyTo ? { replyTo } : {}) });
         const accepted = Array.isArray(result.accepted) ? result.accepted.map(String) : [];
         const rejected = Array.isArray(result.rejected) ? result.rejected.map(String) : [];
         if (!accepted.length && rejected.length) {
@@ -125,6 +143,34 @@ function createMicrosoftTokenProvider(oauth, fetchImpl) {
       return cachedToken;
     },
   };
+}
+
+function normalizeRuntimeConfig(smtp = {}) {
+  const host = String(smtp.host || '').trim();
+  const from = String(smtp.from || '').trim();
+  const user = String(smtp.user || '').trim();
+  const pass = String(smtp.pass || '');
+  const oauth = smtp.oauth || {};
+  const authMode = resolveAuthMode(smtp.auth, { user, pass, oauth });
+  return {
+    host,
+    from,
+    user,
+    pass,
+    oauth,
+    authMode,
+    port: Number(smtp.port || 587),
+    secure: Boolean(smtp.secure),
+    requireTls: Boolean(smtp.requireTls),
+    configured: Boolean(host && from && isAuthConfigured(authMode, { user, pass, oauth })),
+  };
+}
+
+function assertConfigured(current) {
+  if (current.configured) return;
+  throw new MailDeliveryError('MAIL_NOT_CONFIGURED', current.authMode === 'oauth2'
+    ? 'Outlook OAuth2 尚未完成授权。'
+    : '请先在工作台中配置发件邮箱和客户端授权密码。');
 }
 
 function maskEmail(value) {

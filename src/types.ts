@@ -64,6 +64,38 @@ export type RelayConfig = {
   autoConnect: boolean
 }
 
+export type SmtpProvider = '163' | 'qq' | 'gmail' | 'outlook' | 'custom'
+
+export type SmtpConfig = {
+  provider: SmtpProvider
+  host: string
+  port: number
+  secure: boolean
+  requireTls: boolean
+  auth: 'login' | 'oauth2' | 'none'
+  authMode?: 'login' | 'oauth2' | 'none'
+  user: string
+  from: string
+  hasPassword: boolean
+  configured: boolean
+  verified: boolean
+  maskedFrom: string
+  lastVerifiedAt?: string
+}
+
+export type SmtpConfigUpdate = Pick<SmtpConfig, 'provider' | 'host' | 'port' | 'secure' | 'requireTls' | 'auth' | 'user' | 'from'> & {
+  password?: string
+  clearPassword?: boolean
+}
+
+export type SmtpTestResult = {
+  ok: boolean
+  configured: boolean
+  from: string
+  authMode: 'login' | 'oauth2' | 'none'
+  lastVerifiedAt: string
+}
+
 export type Health = {
   ok: boolean
   service?: string
