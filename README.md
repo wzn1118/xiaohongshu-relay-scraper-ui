@@ -208,6 +208,8 @@ data/jobs/<JOB_ID>/artifacts/
 
 ## 快速开始
 
+第一次使用建议直接阅读[傻瓜式教程](docs/BEGINNER_GUIDE.md)，它按照“启动、登录、连接 AI、导入简历、采集、查看和下载”的实际点击顺序编写。
+
 ### 依赖
 
 - Windows 首次启动时，项目会自动准备 Node.js 22+、Python 3.11+、项目依赖和 Chrome/Edge；AI 使用项目内置运行时，不要求用户全局安装 Codex CLI
