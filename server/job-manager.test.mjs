@@ -626,3 +626,63 @@ test('JobManager shutdown interrupts active work and waits for its process tree'
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
+test('JobManager keeps every persisted task when new history is added', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-unlimited-history-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  await writeFile(fakeRunner, '', 'utf8');
+  const history = [];
+  for (let index = 0; index < 12; index += 1) {
+    const id = `history-${String(index).padStart(2, '0')}`;
+    const outputDir = path.join(dataDir, id, 'artifacts');
+    await mkdir(outputDir, { recursive: true });
+    history.push({
+      id,
+      status: 'failed',
+      createdAt: new Date(Date.UTC(2026, 6, 1, 0, index)).toISOString(),
+      finishedAt: new Date(Date.UTC(2026, 6, 1, 0, index, 30)).toISOString(),
+      outputDir,
+      logPath: path.join(dataDir, id, 'run.log'),
+      pid: null,
+      params: { keyword: `history ${index}` },
+    });
+  }
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify(history), 'utf8');
+
+  const child = new EventEmitter();
+  child.pid = 78903;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    maxHistory: 10,
+    spawnImpl: () => child,
+    terminateImpl: async (target) => target.kill('SIGTERM'),
+  });
+
+  try {
+    await manager.initialize();
+    assert.equal(manager.list().length, 12);
+    const started = await manager.start(validateRunRequest({ checkOnly: true }));
+    assert.equal(manager.list().length, 13);
+    const persisted = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
+    assert.equal(persisted.length, 13);
+
+    const ended = new Promise((resolve) => {
+      const unsubscribe = manager.subscribe(started.id, (event) => {
+        if (event.type === 'end') {
+          unsubscribe();
+          resolve();
+        }
+      });
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    child.emit('close', 0, null);
+    await ended;
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});

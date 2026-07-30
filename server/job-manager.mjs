@@ -14,7 +14,6 @@ export class JobManager {
     dataDir,
     pythonBin,
     runnerPath,
-    maxHistory = 1000,
     spawnImpl = spawn,
     terminateImpl = terminateChildTree,
     recoverImpl = terminatePersistedJobProcesses,
@@ -27,7 +26,6 @@ export class JobManager {
     this.historyPath = path.join(dataDir, 'jobs.json');
     this.pythonBin = pythonBin;
     this.runnerPath = runnerPath;
-    this.maxHistory = maxHistory;
     this.spawnImpl = spawnImpl;
     this.terminateImpl = terminateImpl;
     this.recoverImpl = recoverImpl;
@@ -194,7 +192,6 @@ export class JobManager {
       workflowSummary: null,
     };
     this.jobs.unshift(job);
-    this.jobs = this.jobs.slice(0, this.maxHistory);
     this.active = job;
     this.runtimeContexts.set(id, { ai, profilePath: runtimeProfilePath });
     await this.persist();

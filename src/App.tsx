@@ -828,6 +828,7 @@ function GeneralResultsWorkspace({
 }
 
 type GeneralResultModule = 'insights' | 'audience'
+type HistoryScope = 'all' | AnalysisMode
 
 function audienceStatusLabel(status: AudienceResultsResponse['summary']['status']) {
   return status === 'complete' ? '全量完成' : status === 'partial' ? '部分完成' : status === 'failed' ? '采集失败' : '等待采集'
@@ -1055,6 +1056,7 @@ function App() {
   const [smtpSaving, setSmtpSaving] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
   const [activeJob, setActiveJob] = useState<Job | null>(null)
+  const [historyScope, setHistoryScope] = useState<HistoryScope>('all')
   const [historyPage, setHistoryPage] = useState(1)
   const [historyPageSize, setHistoryPageSize] = useState(50)
   const activeJobIdCache = useRef<Record<AnalysisMode, string | null>>({ job: null, general: null })
@@ -2485,6 +2487,16 @@ function App() {
     if (job.status === 'running' || job.status === 'queued') connectJob(job)
   }
 
+  const openHistoryJob = (job: Job) => {
+    const targetMode = jobAnalysisMode(job)
+    if (targetMode !== workspaceMode) {
+      activeJobIdCache.current[targetMode] = job.id
+      switchWorkspace(targetMode)
+      return
+    }
+    selectJob(job)
+  }
+
   const tabCount = Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)
   const xiaohongshuTabCount = Number(relay?.xiaohongshuTabs || 0)
   const relayConfigValid = Number.isInteger(relayConfig.port) && relayConfig.port >= 1024 && relayConfig.port <= 65535 && Boolean(relayConfig.profile.trim())
@@ -2529,17 +2541,25 @@ function App() {
     () => jobs.filter((job) => jobAnalysisMode(job) === workspaceMode),
     [jobs, workspaceMode],
   )
-  const effectiveHistoryPageSize = historyPageSize === 0 ? Math.max(workspaceJobs.length, 1) : historyPageSize
-  const historyPageCount = Math.max(1, Math.ceil(workspaceJobs.length / effectiveHistoryPageSize))
+  const historyModeCounts = useMemo(() => jobs.reduce(
+    (counts, job) => ({ ...counts, [jobAnalysisMode(job)]: counts[jobAnalysisMode(job)] + 1 }),
+    { job: 0, general: 0 } as Record<AnalysisMode, number>,
+  ), [jobs])
+  const historyJobs = useMemo(
+    () => historyScope === 'all' ? jobs : jobs.filter((job) => jobAnalysisMode(job) === historyScope),
+    [historyScope, jobs],
+  )
+  const effectiveHistoryPageSize = historyPageSize === 0 ? Math.max(historyJobs.length, 1) : historyPageSize
+  const historyPageCount = Math.max(1, Math.ceil(historyJobs.length / effectiveHistoryPageSize))
   const currentHistoryPage = Math.min(historyPage, historyPageCount)
   const historyStart = (currentHistoryPage - 1) * effectiveHistoryPageSize
-  const visibleWorkspaceJobs = workspaceJobs.slice(historyStart, historyStart + effectiveHistoryPageSize)
+  const visibleHistoryJobs = historyJobs.slice(historyStart, historyStart + effectiveHistoryPageSize)
   useEffect(() => {
     setHistoryPage((current) => Math.min(current, historyPageCount))
   }, [historyPageCount])
   useEffect(() => {
     setHistoryPage(1)
-  }, [workspaceMode, historyPageSize])
+  }, [historyScope, historyPageSize])
   const progress = activeJob?.progress ?? (activeJob ? progressByStatus[activeJob.status] : 0)
   const progressCurrent = Number(activeJob?.progressCurrent || 0)
   const progressTotal = Number(activeJob?.progressTotal || 0)
@@ -3477,32 +3497,38 @@ function App() {
           <div className="secondary-grid">
             <section className="panel history-panel" id="history">
               <div className="panel-heading compact">
-                <div><span className="step-label">RUN HISTORY</span><h2>任务记录 <small>{workspaceJobs.length}</small></h2></div>
+                <div><span className="step-label">RUN HISTORY</span><h2>全部历史任务 <small>{historyJobs.length}</small></h2></div>
                 <div className="history-heading-actions">
-                  <span>当前模式 {workspaceJobs.length} 条 · 全部 {jobs.length} 条</span>
+                  <span>已保存 {jobs.length} 条任务</span>
                   <button className="icon-text-button" onClick={loadJobs}><RefreshCw size={15} />刷新</button>
                 </div>
+              </div>
+              <div className="history-scope-control" aria-label="历史任务类型筛选">
+                <button type="button" className={historyScope === 'all' ? 'active' : ''} aria-pressed={historyScope === 'all'} onClick={() => setHistoryScope('all')}>全部 <strong>{jobs.length}</strong></button>
+                <button type="button" className={historyScope === 'job' ? 'active' : ''} aria-pressed={historyScope === 'job'} onClick={() => setHistoryScope('job')}>岗位投递 <strong>{historyModeCounts.job}</strong></button>
+                <button type="button" className={historyScope === 'general' ? 'active' : ''} aria-pressed={historyScope === 'general'} onClick={() => setHistoryScope('general')}>内容采集 <strong>{historyModeCounts.general}</strong></button>
               </div>
               <div className="table-wrap">
                 <table>
                   <thead><tr><th>状态</th><th>关键词</th><th>创建时间（北京时间）</th><th>范围</th><th>产物</th><th>操作</th></tr></thead>
                   <tbody>
-                    {visibleWorkspaceJobs.length ? visibleWorkspaceJobs.map((job) => {
+                    {visibleHistoryJobs.length ? visibleHistoryJobs.map((job) => {
                       const retryFailedJob = job.status === 'failed'
-                      return <tr key={job.id} className={activeJob?.id === job.id ? 'selected-row' : ''} onClick={() => selectJob(job)}>
-                        <td><StatusPill status={job.status} /></td><td><strong>{job.keyword}</strong><small>{workspaceMode === 'general' ? '内容采集' : '岗位投递'} · #{job.id.slice(0, 8)}</small></td><td>{formatTime(job.createdAt)}</td><td>{job.config?.limit === 0 ? '全量 · 不限时间' : `历史限定 ${job.config?.limit ?? '-'} 篇`} · {job.config?.searchSort === 'comprehensive' ? '综合' : '最新'}</td><td>{job.artifactCount ?? job.artifacts?.length ?? 0}</td><td>{job.resumeAvailable ? <button className="row-resume" title={retryFailedJob ? '从检查点重试' : '从检查点续跑'} onClick={(event) => { event.stopPropagation(); void resumeJob(job) }} disabled={submitting}><RotateCcw size={14} />{retryFailedJob ? '重试' : '续跑'}</button> : <button className="row-open" title="查看任务"><ChevronDown size={15} /></button>}</td>
+                      return <tr key={job.id} className={activeJob?.id === job.id ? 'selected-row' : ''} onClick={() => openHistoryJob(job)}>
+                        <td><StatusPill status={job.status} /></td><td><strong>{job.keyword || '未命名任务'}</strong><small>{jobAnalysisMode(job) === 'general' ? '内容采集' : '岗位投递'} · #{job.id.slice(0, 8)}</small></td><td>{formatTime(job.createdAt)}</td><td>{job.config?.limit === 0 ? '全量 · 不限时间' : `历史限定 ${job.config?.limit ?? '-'} 篇`} · {job.config?.searchSort === 'comprehensive' ? '综合' : '最新'}</td><td>{job.artifactCount ?? job.artifacts?.length ?? 0}</td><td>{job.resumeAvailable ? <button className="row-resume" title={retryFailedJob ? '从检查点重试' : '从检查点续跑'} onClick={(event) => { event.stopPropagation(); void resumeJob(job) }} disabled={submitting}><RotateCcw size={14} />{retryFailedJob ? '重试' : '续跑'}</button> : <button className="row-open" title="查看任务"><ChevronDown size={15} /></button>}</td>
                       </tr>
-                    }) : <tr className="empty-row"><td colSpan={6}>{loading ? '正在读取任务记录...' : workspaceMode === 'general' ? '还没有内容采集任务' : '还没有岗位投递任务'}</td></tr>}
+                    }) : <tr className="empty-row"><td colSpan={6}>{loading ? '正在读取任务记录...' : historyScope === 'all' ? '还没有历史任务' : historyScope === 'general' ? '还没有内容采集任务' : '还没有岗位投递任务'}</td></tr>}
                   </tbody>
                 </table>
               </div>
-              {workspaceJobs.length > 0 && <div className="history-pagination">
-                <span>显示 {historyStart + 1}-{Math.min(historyStart + effectiveHistoryPageSize, workspaceJobs.length)} / {workspaceJobs.length}</span>
+              {historyJobs.length > 0 && <div className="history-pagination">
+                <span>显示 {historyStart + 1}-{Math.min(historyStart + effectiveHistoryPageSize, historyJobs.length)} / {historyJobs.length}</span>
                 <div className="history-page-controls">
                   <label>每页
                     <select value={historyPageSize} onChange={(event) => setHistoryPageSize(Number(event.target.value))} aria-label="每页显示任务数">
                       <option value={20}>20</option>
                       <option value={50}>50</option>
+                      <option value={100}>100</option>
                       <option value={0}>全部</option>
                     </select>
                   </label>

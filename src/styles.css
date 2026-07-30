@@ -807,6 +807,11 @@ main { padding: 20px 24px 38px; max-width: 1740px; margin: 0 auto; }
 .icon-text-button { min-height: 31px; padding: 0 9px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 4px; background: #fff; color: #5c5e62; font-size: 10px; font-weight: 800; }
 .history-heading-actions { display: flex; align-items: center; gap: 10px; }
 .history-heading-actions > span { color: #77797d; font-size: 9px; white-space: nowrap; }
+.history-scope-control { min-height: 48px; padding: 8px 12px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid var(--line); background: #f4f3ef; }
+.history-scope-control button { min-height: 31px; padding: 0 10px; display: inline-flex; align-items: center; gap: 7px; border: 1px solid #c8c7c1; border-radius: 4px; background: #fff; color: #65676b; font-size: 9px; font-weight: 800; }
+.history-scope-control button strong { min-width: 20px; padding: 2px 5px; border-radius: 3px; background: #ecebe7; color: #55575b; font-size: 8px; font-variant-numeric: tabular-nums; }
+.history-scope-control button.active { border-color: #4b8875; background: #e5f1ed; color: #075f4b; box-shadow: inset 3px 0 0 var(--green); }
+.history-scope-control button.active strong { background: #fff; color: #075f4b; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 10px; }
 th { height: 34px; padding: 0 12px; color: #77797d; background: #ecebe7; border-bottom: 1px solid var(--line); text-align: left; font-size: 9px; }
@@ -1093,6 +1098,8 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .secondary-grid { margin-top: 11px; gap: 11px; }
   .history-panel { overflow: hidden; }
   .history-heading-actions > span { display: none; }
+  .history-scope-control { overflow-x: auto; }
+  .history-scope-control button { flex: 0 0 auto; }
   .history-pagination { align-items: flex-start; flex-direction: column; }
   .history-page-controls { width: 100%; justify-content: space-between; }
   table { min-width: 650px; }

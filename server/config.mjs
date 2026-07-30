@@ -53,7 +53,6 @@ export const config = Object.freeze({
   openClawConfigPath:
     process.env.OPENCLAW_CONFIG_PATH ||
     path.join(process.env.USERPROFILE || process.env.HOME || '', '.openclaw', 'openclaw.json'),
-  maxHistory: readInt(process.env.XHS_MAX_HISTORY, 1000, 10, 5000),
   maxBodyBytes: readInt(process.env.XHS_MAX_BODY_BYTES, 32 * 1024 * 1024, 1024, 64 * 1024 * 1024),
 });
 
