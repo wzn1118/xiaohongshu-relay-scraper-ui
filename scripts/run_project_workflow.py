@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from application_intelligence_agents import run_pipeline, write_pipeline_artifacts
-from ai_application_workflow import enrich_payload
+from artifact_io import atomic_write_json
+from ai_application_workflow import (
+    enrich_general_payload,
+    enrich_payload,
+    record_needs_completion,
+    record_needs_content_completion,
+)
 from parallel_body_completion import complete_bodies
 
 
@@ -59,19 +65,19 @@ def rewrite_unlimited_args(arguments: list[str]) -> list[str]:
         if skip_next:
             skip_next = False
             continue
-        if argument == "--limit":
+        if argument in {"--limit", "--max-age-days"}:
             skip_next = True
             continue
-        if argument.startswith("--limit="):
+        if argument.startswith("--limit=") or argument.startswith("--max-age-days="):
             continue
         rewritten.append(argument)
-    return rewritten + ["--limit", "0"]
+    return rewritten + ["--limit", "0", "--max-age-days", "0"]
 
 
 def rewrite_limit(arguments: list[str], limit: int) -> list[str]:
     """Keep the historical argument helper available to integrations and tests."""
     rewritten = rewrite_unlimited_args(arguments)
-    return rewritten[:-2] + ["--limit", str(limit)]
+    return rewritten[:-4] + ["--limit", str(limit), "--max-age-days", "0"]
 
 
 def option_value(arguments: list[str], name: str) -> str:
@@ -85,8 +91,16 @@ def option_value(arguments: list[str], name: str) -> str:
 
 def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--analysis-mode", choices=("job", "general"), default="job")
+    parser.add_argument(
+        "--content-preset",
+        choices=("auto", "experience", "people", "trend", "product", "place", "custom"),
+        default="auto",
+    )
+    parser.add_argument("--content-goal", default="")
     parser.add_argument("--candidate-profile", default=str(DEFAULT_CANDIDATE_PROFILE))
     parser.add_argument("--analyze-checkpoint", action="store_true")
+    parser.add_argument("--complete-missing-only", action="store_true")
     parser.add_argument("--upstream-runner", default="")
     parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
     parser.add_argument("--codex-runtime", action=argparse.BooleanOptionalAction, default=True)
@@ -118,9 +132,145 @@ def utc_now() -> str:
 
 
 def atomic_json(path: Path, payload: Any) -> None:
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(path, payload)
+
+
+def can_complete_from_checkpoint(output_dir: Path, complete_missing_only: bool) -> bool:
+    return complete_missing_only and all(
+        (output_dir / filename).is_file()
+        for filename in ("xiaohongshu_cards_latest.json", "xiaohongshu_notes_latest.json")
+    )
+
+
+def checkpoint_body_summary(output_dir: Path, *, stop_reason: str) -> dict[str, Any]:
+    def load_list(filename: str) -> list[dict[str, Any]]:
+        try:
+            payload = json.loads((output_dir / filename).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+    cards = load_list("xiaohongshu_cards_latest.json")
+    notes = load_list("xiaohongshu_notes_latest.json")
+    completed = sum(
+        1
+        for note in notes
+        if str(note.get("access_status") or "") == "detail_ok" and str(note.get("body") or "").strip()
+    )
+    return {
+        "transitionedToAnalysis": True,
+        "stopReason": stop_reason,
+        "cardsDiscovered": len(cards),
+        "bodyAttempted": 0,
+        "bodySucceeded": completed,
+        "missingBodies": max(0, len(cards) - completed),
+        "checkpointFallback": True,
+    }
+
+
+def collect_body_checkpoint(
+    output_dir: Path,
+    *,
+    scrape_failed: bool,
+    checkpoint_fallback: bool,
+    relay_port: int,
+    goto_timeout_ms: int,
+    security_verification_timeout_seconds: int,
+    upstream_scraper: Path,
+) -> dict[str, Any]:
+    if scrape_failed and not checkpoint_fallback:
+        return checkpoint_body_summary(output_dir, stop_reason="relay_connection_failed")
+    return complete_bodies(
+        output_dir,
+        relay_port=relay_port,
+        workers=2,
+        attempts=3,
+        goto_timeout_ms=goto_timeout_ms,
+        security_verification_timeout_seconds=security_verification_timeout_seconds,
+        upstream_scraper=upstream_scraper,
+    )
+
+
+def load_application_checkpoint(output_dir: Path) -> dict[str, Any] | None:
+    for filename in ("application_intelligence.checkpoint.json", "application_intelligence.json"):
+        path = output_dir / filename
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("records"), list):
+            return payload
+    return None
+
+
+def reuse_completed_records(
+    payload: dict[str, Any],
+    previous: dict[str, Any] | None,
+    analysis_mode: str = "job",
+) -> int:
+    if not previous:
+        return 0
+    previous_by_id = {
+        str(record.get("note_id") or ""): record
+        for record in previous.get("records", [])
+        if isinstance(record, dict) and str(record.get("note_id") or "")
+    }
+    reused = 0
+    records = payload.get("records", [])
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        prior = previous_by_id.get(str(record.get("note_id") or ""))
+        if not prior:
+            continue
+        prior_analysis = prior.get("media", {}).get("analysis", {})
+        current_media = record.setdefault("media", {})
+        current_analysis = current_media.get("analysis", {})
+        if (
+            isinstance(prior_analysis, dict)
+            and prior_analysis.get("status") == "analyzed"
+            and str(prior_analysis.get("visible_text") or "").strip()
+            and not str(current_analysis.get("visible_text") or "").strip()
+        ):
+            current_media["analysis"] = prior_analysis.copy()
+        needs_completion = record_needs_content_completion if analysis_mode == "general" else record_needs_completion
+        if needs_completion(prior):
+            continue
+        if str(record.get("body") or "").strip() and not str(prior.get("body") or "").strip():
+            continue
+        records[index] = prior
+        reused += 1
+    return reused
+
+
+def completion_target_ids(
+    payload: dict[str, Any],
+    previous: dict[str, Any] | None,
+    analysis_mode: str = "job",
+) -> set[str]:
+    needs_completion = record_needs_content_completion if analysis_mode == "general" else record_needs_completion
+    previous_records = {
+        str(record.get("note_id") or ""): record
+        for record in (previous or {}).get("records", [])
+        if isinstance(record, dict) and str(record.get("note_id") or "")
+    }
+    targets = {
+        note_id
+        for note_id, record in previous_records.items()
+        if needs_completion(record)
+    }
+    for record in payload.get("records", []):
+        if not isinstance(record, dict):
+            continue
+        note_id = str(record.get("note_id") or "")
+        if not note_id:
+            continue
+        prior = previous_records.get(note_id)
+        if prior is None or (needs_completion(record) and needs_completion(prior)):
+            targets.add(note_id)
+    return targets
 
 
 def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -153,6 +303,7 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         )
     )
     runtime = payload.get("codex_runtime", {})
+    task_mode = "general" if payload.get("analysis_mode") == "general" else "job"
     partial_analysis = bool(
         body_summary.get("transitionedToAnalysis")
         or int(body_summary.get("missingBodies") or 0) > 0
@@ -165,9 +316,15 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         collection_stop_reason == "security_verification_timeout"
         or security_verification.get("status") == "timed_out"
     )
+    rate_limit = body_summary.get("rateLimit")
+    if not isinstance(rate_limit, dict):
+        rate_limit = {}
+    rate_limited = collection_stop_reason == "rate_limited" or rate_limit.get("status") == "stopped"
     analysis_mode = (
         "security_timeout_partial"
         if security_timeout
+        else "rate_limited_partial"
+        if rate_limited
         else "partial_collection"
         if partial_analysis
         else "full_collection"
@@ -175,11 +332,11 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
     agent_stages = [
         {"index": 1, "total": 8, "id": "coverage-agent", "label": "full-body-coverage", "status": "partial" if partial_analysis else "completed"},
         {"index": 2, "total": 8, "id": "time-agent", "label": "time-normalization", "status": "completed"},
-        {"index": 3, "total": 8, "id": "profile-memory-agent", "label": "background-memory", "status": "completed"},
-        {"index": 4, "total": 8, "id": "application-info-agent", "label": "responsibilities-requirements-and-routes", "status": "completed"},
-        {"index": 5, "total": 8, "id": "capability-agent", "label": "job-capabilities", "status": "completed"},
-        {"index": 6, "total": 8, "id": "ai-writer-agent", "label": "per-link-outreach", "status": runtime.get("status", "disabled")},
-        {"index": 7, "total": 8, "id": "employer-review-agent", "label": "score-and-rewrite", "status": runtime.get("status", "disabled")},
+        {"index": 3, "total": 8, "id": "keyword-blueprint-agent" if task_mode == "general" else "profile-memory-agent", "label": "keyword-blueprint" if task_mode == "general" else "background-memory", "status": "completed"},
+        {"index": 4, "total": 8, "id": "image-content-agent" if task_mode == "general" else "application-info-agent", "label": "image-and-content" if task_mode == "general" else "responsibilities-requirements-and-routes", "status": "completed"},
+        {"index": 5, "total": 8, "id": "dynamic-module-agent" if task_mode == "general" else "capability-agent", "label": "dynamic-modules" if task_mode == "general" else "job-capabilities", "status": "completed"},
+        {"index": 6, "total": 8, "id": "content-analysis-agent" if task_mode == "general" else "ai-writer-agent", "label": "ai-content-analysis" if task_mode == "general" else "per-link-outreach", "status": runtime.get("status", "disabled")},
+        {"index": 7, "total": 8, "id": "content-quality-agent" if task_mode == "general" else "employer-review-agent", "label": "content-quality-check" if task_mode == "general" else "score-and-rewrite", "status": runtime.get("status", "disabled")},
         {
             "index": 8,
             "total": 8,
@@ -193,8 +350,10 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         "runner": "xiaohongshu-project-workflow",
         "status": "completed_partial" if partial_analysis else "succeeded" if gate["passed"] else "failed",
         "analysisMode": analysis_mode,
+        "taskMode": task_mode,
         "collectionStopReason": collection_stop_reason,
         "securityVerification": security_verification,
+        "rateLimit": rate_limit,
         "generatedAt": utc_now(),
         "cardsDiscovered": gate["discovered_count"],
         "notesCollected": gate["record_count"],
@@ -273,6 +432,10 @@ def materialize_checkpoint(
     candidate_profile: Path,
     *,
     stop_reason: str,
+    analysis_mode: str = "job",
+    keyword: str = "",
+    content_preset: str = "auto",
+    content_goal: str = "",
     body_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     print("[checkpoint-analysis] parsing every discovered job card", flush=True)
@@ -280,6 +443,14 @@ def materialize_checkpoint(
     if not notes_checkpoint.exists():
         atomic_json(notes_checkpoint, [])
     result = run_pipeline(output_dir, candidate_profile, use_codex_runtime=False)
+    result.payload["analysis_mode"] = analysis_mode
+    result.payload["keyword"] = keyword
+    if analysis_mode == "general":
+        result.payload["content_research"] = {
+            "preset": content_preset,
+            "goal": content_goal,
+        }
+    write_pipeline_artifacts(output_dir, result.payload)
     summary = build_workflow_summary(
         result.payload,
         body_summary or {
@@ -309,7 +480,15 @@ def main(arguments: list[str] | None = None) -> int:
         if not output_dir_value:
             raise ValueError("--output-dir is required for checkpoint analysis")
         output_dir = Path(output_dir_value).resolve()
-        materialize_checkpoint(output_dir, candidate_profile, stop_reason="terminal_checkpoint")
+        materialize_checkpoint(
+            output_dir,
+            candidate_profile,
+            stop_reason="terminal_checkpoint",
+            analysis_mode=wrapper.analysis_mode,
+            keyword=option_value(upstream_arguments, "--keyword"),
+            content_preset=wrapper.content_preset,
+            content_goal=wrapper.content_goal,
+        )
         return 0
 
     upstream = resolve_upstream_runner(wrapper.upstream_runner)
@@ -322,49 +501,70 @@ def main(arguments: list[str] | None = None) -> int:
         str(wrapper.security_verification_timeout_seconds),
     )
     completed = subprocess.run([sys.executable, str(upstream), *scrape_arguments], check=False)
-    if completed.returncode != 0:
-        if output_dir_value and "--check-only" not in unlimited_arguments:
-            output_dir = Path(output_dir_value).resolve()
-            if (output_dir / "xiaohongshu_cards_latest.json").is_file():
-                try:
-                    restriction_path = output_dir / "security-restriction.json"
-                    restriction = (
-                        json.loads(restriction_path.read_text(encoding="utf-8"))
-                        if restriction_path.is_file()
-                        else {}
-                    )
-                    security_timeout = restriction.get("status") == "timed_out"
-                    stop_reason = "security_verification_timeout" if security_timeout else "scrape_runner_failed"
-                    materialize_checkpoint(
-                        output_dir,
-                        candidate_profile,
-                        stop_reason=stop_reason,
-                        body_summary={
-                            "transitionedToAnalysis": True,
-                            "stopReason": stop_reason,
-                            "newAccessStopped": security_timeout,
-                            "securityVerification": restriction,
-                        },
-                    )
-                except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
-                    print(f"[checkpoint-analysis] failed: {error}", file=sys.stderr, flush=True)
-        return completed.returncode
+    scrape_failed = completed.returncode != 0
+    checkpoint_fallback = False
+    if scrape_failed:
+        checkpoint_fallback = bool(
+            output_dir_value
+            and can_complete_from_checkpoint(Path(output_dir_value).resolve(), wrapper.complete_missing_only)
+        )
+        if checkpoint_fallback:
+            print(
+                "SCRAPE_UNAVAILABLE continuing=checkpoint-completion "
+                f"exit_code={completed.returncode}",
+                flush=True,
+            )
+        else:
+            if output_dir_value and "--check-only" not in unlimited_arguments:
+                output_dir = Path(output_dir_value).resolve()
+                if (output_dir / "xiaohongshu_cards_latest.json").is_file():
+                    try:
+                        restriction_path = output_dir / "security-restriction.json"
+                        restriction = (
+                            json.loads(restriction_path.read_text(encoding="utf-8"))
+                            if restriction_path.is_file()
+                            else {}
+                        )
+                        security_timeout = restriction.get("status") == "timed_out"
+                        stop_reason = "security_verification_timeout" if security_timeout else "scrape_runner_failed"
+                        materialize_checkpoint(
+                            output_dir,
+                            candidate_profile,
+                            stop_reason=stop_reason,
+                            analysis_mode=wrapper.analysis_mode,
+                            keyword=option_value(unlimited_arguments, "--keyword"),
+                            content_preset=wrapper.content_preset,
+                            content_goal=wrapper.content_goal,
+                            body_summary={
+                                "transitionedToAnalysis": True,
+                                "stopReason": stop_reason,
+                                "newAccessStopped": security_timeout,
+                                "securityVerification": restriction,
+                            },
+                        )
+                    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+                        print(f"[checkpoint-analysis] failed: {error}", file=sys.stderr, flush=True)
+            return completed.returncode
     if "--check-only" in unlimited_arguments or "--help" in unlimited_arguments or "-h" in unlimited_arguments:
         return 0
 
     if not output_dir_value:
         raise ValueError("--output-dir is required for project workflow enrichment")
     output_dir = Path(output_dir_value).resolve()
-    body_summary = complete_bodies(
+    previous_application = load_application_checkpoint(output_dir) if wrapper.complete_missing_only else None
+    # A failed card-discovery pass can still leave a complete card checkpoint.
+    # Retry missing bodies from that checkpoint instead of materializing every
+    # uncollected card as a permanent fallback record.
+    body_summary = collect_body_checkpoint(
         output_dir,
+        scrape_failed=scrape_failed,
+        checkpoint_fallback=checkpoint_fallback,
         relay_port=int(option_value(unlimited_arguments, "--relay-port") or 18800),
-        workers=1,
-        attempts=3,
         goto_timeout_ms=int(option_value(unlimited_arguments, "--goto-timeout-ms") or 15000),
         security_verification_timeout_seconds=wrapper.security_verification_timeout_seconds,
         upstream_scraper=resolve_upstream_scraper(upstream),
     )
-    if "--skip-postprocess" not in unlimited_arguments:
+    if not scrape_failed and "--skip-postprocess" not in unlimited_arguments:
         postprocess = upstream.parent / "build_structured_excel.py"
         completed = subprocess.run(
             [
@@ -388,34 +588,66 @@ def main(arguments: list[str] | None = None) -> int:
         codex_batch_size=wrapper.codex_batch_size,
         codex_timeout_seconds=wrapper.codex_timeout_seconds,
     )
+    keyword = option_value(unlimited_arguments, "--keyword")
+    result.payload["analysis_mode"] = wrapper.analysis_mode
+    result.payload["keyword"] = keyword
+    if wrapper.analysis_mode == "general":
+        result.payload["content_research"] = {
+            "preset": wrapper.content_preset,
+            "goal": wrapper.content_goal,
+        }
+    write_pipeline_artifacts(output_dir, result.payload)
+    target_note_ids: set[str] | None = None
+    if wrapper.complete_missing_only:
+        reused = reuse_completed_records(result.payload, previous_application, wrapper.analysis_mode)
+        target_note_ids = completion_target_ids(result.payload, previous_application, wrapper.analysis_mode)
+        print(f"COMPLETE_MISSING targets={len(target_note_ids)} reused={reused}", flush=True)
     emit_stage(2, "time-normalization")
-    emit_stage(3, "background-memory")
+    emit_stage(3, "keyword-blueprint" if wrapper.analysis_mode == "general" else "background-memory")
     if wrapper.codex_runtime:
-        profile = json.loads(candidate_profile.read_text(encoding="utf-8"))
-
         def checkpoint_ai_progress(completed: int, total: int, status: str, _record: dict[str, Any]) -> None:
-            if completed % 10 == 0 or completed == total or status != "skipped":
+            if completed % 5 == 0 or completed == total or status != "skipped":
                 print(f"AI_RECORD {completed}/{total} {status}", flush=True)
-            if completed % 10 == 0 or completed == total:
+            if completed % 5 == 0 or completed == total:
                 atomic_json(output_dir / "application_intelligence.checkpoint.json", result.payload)
 
-        report = enrich_payload(
-            result.payload,
-            profile,
-            threshold=wrapper.cover_letter_threshold,
-            max_attempts=wrapper.cover_letter_max_attempts,
-            progress_callback=checkpoint_ai_progress,
-        )
+        if wrapper.analysis_mode == "general":
+            report = enrich_general_payload(
+                result.payload,
+                keyword,
+                only_incomplete=wrapper.complete_missing_only,
+                progress_callback=checkpoint_ai_progress,
+                content_preset=wrapper.content_preset,
+                content_goal=wrapper.content_goal,
+            )
+        else:
+            profile = json.loads(candidate_profile.read_text(encoding="utf-8"))
+            report = enrich_payload(
+                result.payload,
+                profile,
+                threshold=wrapper.cover_letter_threshold,
+                max_attempts=wrapper.cover_letter_max_attempts,
+                only_incomplete=wrapper.complete_missing_only,
+                target_note_ids=target_note_ids,
+                progress_callback=checkpoint_ai_progress,
+            )
         write_pipeline_artifacts(output_dir, result.payload)
         print(
-            f"[employer-review-agent] processed={report.processed} skipped={report.skipped} "
+            f"[{'content-analysis-agent' if wrapper.analysis_mode == 'general' else 'employer-review-agent'}] "
+            f"processed={report.processed} skipped={report.skipped} "
             f"passed={report.passed} failed={report.failed} attempts={report.attempts}",
             flush=True,
         )
-    emit_stage(4, "application-info")
-    emit_stage(5, "job-capabilities")
-    emit_stage(6, "ai-outreach", result.payload["codex_runtime"]["status"])
-    emit_stage(7, "employer-score-and-rewrite", "passed" if result.payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
+    if wrapper.analysis_mode == "general":
+        emit_stage(4, "image-and-content")
+        emit_stage(5, "dynamic-modules")
+        emit_stage(6, "ai-content-analysis", result.payload["codex_runtime"]["status"])
+        emit_stage(7, "content-quality-check", "passed" if result.payload["quality_gate"].get("passed") else "failed")
+    else:
+        emit_stage(4, "application-info")
+        emit_stage(5, "job-capabilities")
+        emit_stage(6, "ai-outreach", result.payload["codex_runtime"]["status"])
+        emit_stage(7, "employer-score-and-rewrite", "passed" if result.payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
     gate = result.payload["quality_gate"]
     print(
         "[quality-gate] "

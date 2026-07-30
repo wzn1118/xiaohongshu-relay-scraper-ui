@@ -165,7 +165,7 @@ def normalize_publish_time(raw: str, collected_at: datetime, source_field: str =
                 value=target_date.isoformat(),
                 precision="day",
                 method="relative_named_date_only",
-                is_estimated=False,
+                is_estimated=True,
             )
         return result
 
@@ -179,7 +179,7 @@ def normalize_publish_time(raw: str, collected_at: datetime, source_field: str =
                 value=target_date.isoformat(),
                 precision="day",
                 method="relative_days_date_only",
-                is_estimated=False,
+                is_estimated=True,
             )
             return result
         delta = {
@@ -255,6 +255,8 @@ class ApplicationInfoAgent:
     PHONE_RE = re.compile(r"(?:电话|手机|联系)\s*[:：]?\s*(1[3-9]\d{9})(?!\d)")
     URL_RE = re.compile(r"https?://[^\s|，。；;]+", re.I)
     REQUIREMENT_CUES = (
+        "任职要求",
+        "岗位要求",
         "要求",
         "适合",
         "希望",
@@ -289,6 +291,37 @@ class ApplicationInfoAgent:
         "撰写",
         "对接",
     )
+    REQUIREMENT_WEIGHTS = {
+        "任职要求": 4,
+        "岗位要求": 4,
+        "要求": 2,
+        "需要": 2,
+        "优先": 2,
+        "熟练": 2,
+        "擅长": 2,
+        "每周": 2,
+        "到岗": 2,
+        "经验": 2,
+        "专业": 2,
+        "学历": 2,
+        "能力": 2,
+    }
+    RESPONSIBILITY_WEIGHTS = {
+        "岗位职责": 4,
+        "工作职责": 4,
+        "工作内容": 4,
+        "职责": 2,
+        "负责": 2,
+        "协助": 2,
+        "参与": 2,
+        "支持": 2,
+        "跟进": 2,
+        "维护": 2,
+        "策划": 2,
+        "分析": 2,
+        "撰写": 2,
+        "对接": 2,
+    }
 
     def run(self, note: dict[str, Any]) -> dict[str, Any]:
         contacts: list[dict[str, Any]] = []
@@ -332,24 +365,56 @@ class ApplicationInfoAgent:
                 if body:
                     source_field = fallback_field
                     break
+        classified: set[str] = set()
+        boundary_cues = tuple(dict.fromkeys(self.REQUIREMENT_CUES + self.RESPONSIBILITY_CUES))
+        boundary_pattern = re.compile(rf"[，,]\s*(?=(?:{'|'.join(map(re.escape, boundary_cues))}))", re.I)
         for match in re.finditer(r"[^。！？；;\n]+[。！？；;]?", body):
-            sentence = match.group(0).strip()
-            lowered = sentence.lower()
-            if len(sentence) < 4:
-                continue
-            item = {
-                "text": sentence,
-                "source_field": source_field,
-                "evidence": sentence,
-                "offset_start": match.start(),
-                "offset_end": match.end(),
-            }
-            is_requirement = any(cue in lowered for cue in self.REQUIREMENT_CUES)
-            is_responsibility = any(cue in lowered for cue in self.RESPONSIBILITY_CUES)
-            if is_requirement:
-                requirements.append(item)
-            if is_responsibility:
-                responsibilities.append(item)
+            raw_sentence = match.group(0)
+            starts = [0, *(boundary.end() for boundary in boundary_pattern.finditer(raw_sentence))]
+            ends = [*starts[1:], len(raw_sentence)]
+            for local_start, local_end in zip(starts, ends):
+                raw_clause = raw_sentence[local_start:local_end]
+                leading = len(raw_clause) - len(raw_clause.lstrip())
+                sentence = raw_clause.strip()
+                lowered = sentence.lower()
+                if len(sentence) < 4:
+                    continue
+                normalized = re.sub(r"[\W_]+", "", lowered)
+                if not normalized or normalized in classified:
+                    continue
+                requirement_hits = [cue for cue in self.REQUIREMENT_CUES if cue in lowered]
+                responsibility_hits = [cue for cue in self.RESPONSIBILITY_CUES if cue in lowered]
+                requirement_score = sum(self.REQUIREMENT_WEIGHTS.get(cue, 1) for cue in requirement_hits)
+                responsibility_score = sum(self.RESPONSIBILITY_WEIGHTS.get(cue, 1) for cue in responsibility_hits)
+                if max(requirement_score, responsibility_score) < 2:
+                    continue
+                if requirement_score == responsibility_score:
+                    if any(cue in lowered for cue in ("任职要求", "岗位要求")):
+                        category = "requirement"
+                    elif any(cue in lowered for cue in ("岗位职责", "工作职责", "工作内容")):
+                        category = "responsibility"
+                    else:
+                        continue
+                else:
+                    category = "requirement" if requirement_score > responsibility_score else "responsibility"
+                winner = max(requirement_score, responsibility_score)
+                loser = min(requirement_score, responsibility_score)
+                confidence = round(min(0.98, 0.55 + winner * 0.07 - loser * 0.03), 2)
+                offset_start = match.start() + local_start + leading
+                item = {
+                    "text": sentence,
+                    "source_field": source_field,
+                    "evidence": sentence,
+                    "offset_start": offset_start,
+                    "offset_end": offset_start + len(sentence),
+                    "classification_confidence": confidence,
+                    "classification_basis": requirement_hits if category == "requirement" else responsibility_hits,
+                }
+                classified.add(normalized)
+                if category == "requirement":
+                    requirements.append(item)
+                else:
+                    responsibilities.append(item)
 
         return {
             "contacts": contacts,
@@ -446,7 +511,7 @@ def load_candidate_evidence(profile: dict[str, Any]) -> list[dict[str, str]]:
                 continue
             result.append(
                 {
-                    "id": f"{section}-{len(result) + 1}",
+                    "id": _text(item.get("id")) if isinstance(item, dict) and _text(item.get("id")) else f"{section}-{len(result) + 1}",
                     "category": section,
                     "label": label,
                     "detail": detail,
@@ -484,16 +549,78 @@ MATCH_TERMS = (
     "活动",
     "文案",
 )
+GENERIC_MATCH_TERMS = {"项目", "活动", "运营"}
+TOKEN_STOPWORDS = {
+    "and",
+    "for",
+    "from",
+    "intern",
+    "internship",
+    "role",
+    "work",
+    "working",
+}
+ROLE_MATCH_EXPANSIONS = (
+    (re.compile(r"(?:商业分析|业务分析|经营分析|咨询)", re.I), "数据分析 市场调研 用户需求 竞品分析 研究报告 指标"),
+    (re.compile(r"(?:市场研究|市场分析)", re.I), "市场调研 用户需求 竞品分析 数据分析 研究报告"),
+    (re.compile(r"(?:品牌|公关)", re.I), "品牌 市场 舆情监测 分析 报告"),
+    (re.compile(r"(?:内容运营|社媒运营)", re.I), "内容运营 社群运营 用户反馈 数据分析"),
+)
+NON_NARRATIVE_EVIDENCE_CATEGORIES = {"skills", "education"}
+OUTREACH_FORMAT_VERSION = "fixed-cn-application-v1"
+
+
+def _expand_role_target(target: str) -> str:
+    expansions = [terms for pattern, terms in ROLE_MATCH_EXPANSIONS if pattern.search(target)]
+    return " ".join([target, *expansions])
+
+
+def _is_writable_evidence(item: dict[str, Any]) -> bool:
+    category = _text(item.get("category")).lower()
+    detail = _text(item.get("detail"))
+    if category in NON_NARRATIVE_EVIDENCE_CATEGORIES or len(detail) < 20:
+        return False
+    return bool(
+        re.search(
+            r"(?:负责|搭建|分析|整理|优化|推进|开展|撰写|输出|设计|协同|完成|支持|支撑|运营|监测|调研|抓取|策划|对接|访谈|梳理|促成)",
+            detail,
+        )
+    )
+
+
+def _match_metrics(target: str, evidence: dict[str, str]) -> dict[str, Any]:
+    target_lower = target.lower()
+    evidence_lower = f"{evidence['label']} {evidence['detail']}".lower()
+    matched_terms = [term for term in MATCH_TERMS if term in target_lower and term in evidence_lower]
+    specific_terms = [term for term in matched_terms if term not in GENERIC_MATCH_TERMS]
+    generic_terms = [term for term in matched_terms if term in GENERIC_MATCH_TERMS]
+    target_tokens = {
+        token
+        for token in re.findall(r"[a-z][a-z0-9+#.-]{1,}", target_lower, re.I)
+        if token not in TOKEN_STOPWORDS
+    }
+    evidence_tokens = {
+        token
+        for token in re.findall(r"[a-z][a-z0-9+#.-]{1,}", evidence_lower, re.I)
+        if token not in TOKEN_STOPWORDS
+    }
+    token_overlap = sorted(target_tokens & evidence_tokens)
+    accepted = bool(specific_terms or len(token_overlap) >= 2)
+    score = len(specific_terms) * 5 + min(len(generic_terms), 2) + min(len(token_overlap), 4) * 2
+    confidence = 0.0 if not accepted else round(
+        min(0.98, 0.58 + min(len(specific_terms), 3) * 0.1 + min(len(token_overlap), 3) * 0.05),
+        2,
+    )
+    return {
+        "accepted": accepted,
+        "score": score,
+        "confidence": confidence,
+        "matched_terms": list(dict.fromkeys([*specific_terms, *generic_terms, *token_overlap])),
+    }
 
 
 def _match_score(target: str, evidence: dict[str, str]) -> int:
-    target_lower = target.lower()
-    evidence_lower = f"{evidence['label']} {evidence['detail']}".lower()
-    score = sum(3 for term in MATCH_TERMS if term in target_lower and term in evidence_lower)
-    target_words = set(re.findall(r"[a-z][a-z0-9+#.-]{1,}|[\u4e00-\u9fff]{2,4}", target_lower, re.I))
-    evidence_words = set(re.findall(r"[a-z][a-z0-9+#.-]{1,}|[\u4e00-\u9fff]{2,4}", evidence_lower, re.I))
-    score += min(len(target_words & evidence_words), 8)
-    return score
+    return int(_match_metrics(target, evidence)["score"])
 
 
 class FitEvidenceAgent:
@@ -502,29 +629,33 @@ class FitEvidenceAgent:
         self.evidence = load_candidate_evidence(profile)
 
     def run(self, note: dict[str, Any], requirements: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        target = " ".join(
-            [_text(note.get("title")), _text(note.get("body"))]
+        job_card = note.get("job_card") if isinstance(note.get("job_card"), dict) else {}
+        target = _expand_role_target(" ".join(
+            [_text(note.get("title")), _text(job_card.get("role_name")), _text(note.get("body"))]
             + [_text(item.get("text")) for item in requirements]
-        )
+        ))
         ranked = sorted(
-            ((max(_match_score(target, item), 0), item) for item in self.evidence),
-            key=lambda pair: (-pair[0], pair[1]["id"]),
-        )
-        positive = [dict(item, match_score=score) for score, item in ranked if score > 0]
-        if positive:
-            return [dict(item, match_basis="keyword_match") for item in positive[:3]]
-
-        # A zero-score note still needs a truthful draft. Prefer a general skills
-        # item and label it explicitly instead of presenting it as a role match.
-        general = next(
-            (
-                item
-                for item in self.evidence
-                if item.get("category") == "skills" or "skill" in item.get("id", "").lower()
+            ((_match_metrics(target, item), item) for item in self.evidence),
+            key=lambda pair: (
+                not _is_writable_evidence(pair[1]),
+                -pair[0]["score"],
+                -pair[0]["confidence"],
+                pair[1]["id"],
             ),
-            self.evidence[0] if self.evidence else None,
         )
-        return [dict(general, match_score=0, match_basis="general_background")] if general else []
+        accepted = [
+            dict(
+                item,
+                match_score=metrics["score"],
+                match_confidence=metrics["confidence"],
+                matched_terms=metrics["matched_terms"],
+                match_basis="validated_term_match",
+            )
+            for metrics, item in ranked
+            if metrics["accepted"]
+        ]
+        narrative = [item for item in accepted if _is_writable_evidence(item)]
+        return (narrative or accepted)[:3]
 
 
 class OutreachWriterAgent:
@@ -557,31 +688,213 @@ class OutreachWriterAgent:
             sentences.append(f"我预计可连续实习{duration}。")
         return sentences
 
+    @staticmethod
+    def _evidence_sentence(item: dict[str, Any], target: str = "") -> str:
+        detail = re.sub(
+            r"^(?:多份|三份)?简历(?:共同)?(?:确认|显示|记载)的?[：:]?\s*",
+            "",
+            _text(item.get("detail")),
+        ).strip()
+        clauses = [clause.strip(" -，。；") for clause in re.split(r"[；\n]+", detail) if clause.strip(" -，。；")]
+        clauses = [
+            clause
+            for clause in clauses
+            if not re.fullmatch(r"(?:exp|proj)-[A-Za-z0-9-]+", clause, re.I)
+            and not re.fullmatch(r"\d{4}年\d{1,2}月[–—-]\d{4}年\d{1,2}月", clause)
+            and not re.fullmatch(r"https?://\S+", clause, re.I)
+        ]
+        concepts = (
+            "数据", "分析", "监测", "抓取", "清洗", "看板", "指标", "用户", "市场", "竞品",
+            "内容", "社群", "增长", "转化", "活动", "调研", "运营", "协作", "项目", "报告",
+            "kol", "玩家", "反馈", "twitter", "工具",
+        )
+        target_lower = target.lower()
+
+        def relevance(clause: str, context: str = target_lower) -> int:
+            lowered = clause.lower()
+            score = sum(6 for term in MATCH_TERMS if term in context and term in lowered)
+            score += sum(2 for term in concepts if term in context and term in lowered)
+            if "数据分析" in context:
+                score += 12 if "数据" in lowered else 0
+                score += 8 if "分析" in lowered else 0
+                score += 4 if re.search(r"监测|抓取|清洗|看板|指标|转化", lowered) else 0
+            context_tokens = set(re.findall(r"[a-z][a-z0-9+#.-]{1,}", context, re.I))
+            clause_tokens = set(re.findall(r"[a-z][a-z0-9+#.-]{1,}", lowered, re.I))
+            return score + min(len(context_tokens & clause_tokens), 5)
+
+        action_candidates = [
+            clause for clause in clauses
+            if 8 <= len(clause) <= 110
+            and re.search(r"(?:负责|搭建|分析|整理|优化|推进|开展|撰写|输出|设计|协同|完成|支持|支撑|运营|监测|调研|抓取)", clause)
+        ]
+        action = max(action_candidates, key=lambda clause: relevance(clause), default="")
+        result_candidates = [
+            clause for clause in clauses
+            if clause != action and 6 <= len(clause) <= 90
+            and re.search(r"\d|(?:提升|增长|缩短|降低|减少|达到|促成|沉淀|避免)", clause)
+        ]
+        result_context = f"{target_lower} {action.lower()}"
+        result = max(result_candidates, key=lambda clause: relevance(clause, result_context), default="")
+        common_length = 0
+        for left, right in zip(action, result):
+            if left != right:
+                break
+            common_length += 1
+        if result and common_length >= 4:
+            result = result[common_length:].lstrip("，、； ")
+        summary = "；".join(filter(None, (action, result)))
+        return summary.rstrip("，。；")
+
+    @staticmethod
+    def _evidence_lead(item: dict[str, Any]) -> str:
+        label = _text(item.get("label")) or "相关实践"
+        if label.lower() in {"skills", "education", "experience", "experiences", "projects", "evidence"}:
+            label = "相关项目"
+        if label.endswith("实习生"):
+            label = label[:-1]
+        if any(marker in label for marker in ("实习", "项目", "经历", "工作")):
+            return f"在{label}期间，我"
+        return f"在{label}相关实践中，我"
+
+    @staticmethod
+    def _work_method(focus: str) -> str:
+        if any(term in focus for term in ("分析", "调研", "研究", "咨询", "结论输出")):
+            return "我会先确认业务问题和判断口径，再整理关键事实、核验结论，并把结果转成可执行的交付物"
+        if "内容运营" in focus or "文案" in focus:
+            return "我会先明确目标受众和内容目标，再结合反馈与表现数据调整选题、表达和发布节奏"
+        if "用户运营" in focus or "社群" in focus:
+            return "我会先梳理用户分层和关键需求，再通过反馈与行为表现验证运营动作并持续复盘"
+        if "增长" in focus:
+            return "我会先拆解转化路径和关键指标，再用用户反馈与结果数据判断优先级并推进验证"
+        return "我会先对齐目标和交付标准，再用事实验证判断，并将结论转化为可执行、可复盘的动作"
+
+    @staticmethod
+    def _role_focus(title: str, application_info: dict[str, Any], fit_evidence: list[dict[str, Any]]) -> str:
+        role_source = " ".join([
+            title,
+            *[
+                _text(item.get("text"))
+                for field in ("responsibilities", "requirements")
+                for item in application_info.get(field, [])
+                if isinstance(item, dict)
+            ],
+        ]).lower()
+        evidence_source = " ".join(
+            f"{_text(item.get('label'))} {_text(item.get('detail'))}"
+            for item in fit_evidence
+            if isinstance(item, dict)
+        ).lower()
+        matched = [term for term in MATCH_TERMS if term in role_source and term in evidence_source]
+        specific = [term for term in matched if term not in {"活动", "市场", "运营", "文案", "项目"}]
+        if specific:
+            return "、".join(dict.fromkeys(specific[:2]))
+        if re.search(r"商业分析|业务分析|经营分析|咨询", role_source):
+            return "信息分析与结论输出"
+        if re.search(r"市场研究|市场分析|调研", role_source):
+            return "市场研究与判断"
+        generic = [term for term in matched if term not in {"项目", "活动"}]
+        if generic:
+            return "、".join(dict.fromkeys(generic[:2]))
+        return "信息整理与任务交付"
+
     def run(
         self,
         note: dict[str, Any],
         application_info: dict[str, Any],
         fit_evidence: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        title = _text(note.get("title")) or "实习岗位"
-        author = _text(note.get("author")) or _text(note.get("card_author"))
-        author = re.sub(r"\s+(?:昨天|前天|\d+天前|\d{1,2}:\d{2}).*$", "", author).strip()
-        salutation = f"{author}您好" if author else "您好"
-        greeting = f"{salutation}，我希望就「{title}」进一步沟通。"
-        evidence_ids = [item["id"] for item in fit_evidence]
-        if not fit_evidence:
-            profile_text = "".join(self._profile_sentences())
+        job_card = note.get("job_card") if isinstance(note.get("job_card"), dict) else {}
+        title = _text(job_card.get("role_name")) or _text(note.get("title")) or "实习岗位"
+        salutation = "您好"
+        name = "" if self.name == "候选人" else self.name
+        focus = self._role_focus(title, application_info, fit_evidence)
+        availability = self.application_profile.get("availabilityDays", "")
+        duration = self.application_profile.get("internshipDuration", "")
+        availability_text = f"每周可实习{availability}天" if availability else ""
+        writable_evidence = [item for item in fit_evidence if _is_writable_evidence(item)]
+        scored_evidence = [
+            item for item in writable_evidence
+            if isinstance(item.get("match_score"), (int, float))
+        ]
+        if scored_evidence:
+            top_score = max(int(item["match_score"]) for item in scored_evidence)
+            score_floor = max(5, (top_score * 2 + 2) // 3)
+            writable_evidence = [
+                item for item in scored_evidence
+                if int(item["match_score"]) >= score_floor
+            ]
+        writing_evidence = writable_evidence[:2]
+        evidence_ids = [item["id"] for item in writing_evidence]
+        identity = "".join(
+            part for part in (
+                self.application_profile.get("school", ""),
+                self.application_profile.get("major", ""),
+                self.application_profile.get("degreeYear", ""),
+            ) if part
+        )
+        identity_text = f"，目前就读于{identity}" if identity else ""
+        availability_parts = [
+            availability_text,
+            f"可连续实习{duration}" if duration else "",
+        ]
+        availability_sentence = "、".join(part for part in availability_parts if part)
+        role_target = " ".join([
+            title,
+            *[
+                _text(item.get("text"))
+                for field in ("responsibilities", "requirements")
+                for item in application_info.get(field, [])
+                if isinstance(item, dict)
+            ],
+        ])
+        subject = "｜".join(filter(None, (f"应聘{title}", name, f"每周可实习{availability}天" if availability else "")))
+        if writing_evidence:
+            evidence_preview = self._evidence_sentence(writing_evidence[0], role_target)
+            if len(evidence_preview) > 58:
+                evidence_preview = evidence_preview[:58].rstrip("，。；")
+            greeting = (
+                f"{salutation}，我是{name or '应聘者'}{identity_text}，想应聘「{title}」。"
+                f"我曾{evidence_preview or '参与相关项目实践'}，这段经历与岗位所需的{focus}直接相关。"
+                f"{availability_sentence + '。' if availability_sentence else ''}请问岗位目前是否仍在招聘？"
+            )
+        else:
+            greeting = (
+                f"{salutation}，我是{name or '应聘者'}{identity_text}，想应聘「{title}」。"
+                f"{availability_sentence + '，到岗安排稳定。' if availability_sentence else ''}"
+                "请问岗位目前是否仍在招聘？期待进一步沟通，谢谢。"
+            )
+        if not writing_evidence:
             email_body = (
-                f"{salutation}：\n\n"
-                f"我希望申请「{title}」。{profile_text}"
-                "我愿意进一步介绍与岗位相关的学习、项目和实践经历，并配合沟通到岗安排。\n\n"
-                f"谢谢！\n{self.name}"
+                "尊敬的招聘负责人：\n"
+                f"您好！我是{name or '应聘者'}{identity_text}，了解到贵公司的「{title}」岗位后，希望申请该职位。\n\n"
+                "我希望进一步了解岗位负责的业务方向、核心任务与交付要求，并据此补充最相关的项目案例。\n\n"
+                f"{availability_sentence + '。' if availability_sentence else ''}希望在实际工作中持续提升业务理解和分析能力。\n\n"
+                "简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n"
+                "此致\n敬礼！\n"
+                f"{name}"
+            )
+            contact_lines = [
+                f"姓名：{name}" if name else "",
+                f"电话/微信：{self.application_profile.get('phoneWeChat', '')}" if self.application_profile.get("phoneWeChat") else "",
+                f"邮箱：{self.application_profile.get('email', '')}" if self.application_profile.get("email") else "",
+            ]
+            cover_letter = (
+                f"主题：{subject}\n"
+                "尊敬的招聘负责人：\n"
+                f"您好！我是{name or '应聘者'}{identity_text}，了解到贵公司的「{title}」岗位后，希望申请该职位。\n\n"
+                "我希望进一步了解该岗位负责的业务方向、核心分析任务和交付标准，"
+                "并结合最相关的项目案例说明我的判断方法、实际行动与交付结果。\n\n"
+                f"{availability_sentence + '。' if availability_sentence else ''}"
+                "希望在实际工作中持续提升业务理解和分析能力。\n\n"
+                "简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n"
+                "此致\n敬礼！\n"
+                + "\n".join(line for line in contact_lines if line)
             )
             return {
-                "greeting": f"{greeting}我愿意进一步说明相关经历和到岗安排，期待您的回复。",
-                "email_subject": f"应聘「{title}」-{self.name}",
+                "greeting": greeting,
+                "email_subject": subject,
                 "email_body": email_body,
-                "cover_letter": email_body,
+                "cover_letter": cover_letter,
                 "used_evidence_ids": [],
                 "requirement_matches": [],
                 "recommended_resume": "",
@@ -589,34 +902,61 @@ class OutreachWriterAgent:
                 "generation_mode": "deterministic_fallback",
                 "runtime_status": "fallback_missing_candidate_evidence",
                 "status": "needs_review",
+                "format_version": OUTREACH_FORMAT_VERSION,
             }
 
         evidence_lines = []
-        for item in fit_evidence:
-            detail = re.sub(r"^(?:多份|三份)?简历(?:共同)?(?:确认|显示|记载)的?", "", _text(item.get("detail"))).strip()
-            evidence_lines.append(f"我在{item['label']}中{detail}")
+        for item in writing_evidence:
+            summary = self._evidence_sentence(item, role_target)
+            if summary:
+                evidence_lines.append(f"{self._evidence_lead(item)}{summary}。")
         requirements = application_info.get("requirements", [])
-        source_links = [item["source"] for item in fit_evidence if _text(item.get("source")).lower().startswith(("https://", "http://"))]
-        source_block = ""
-        if source_links:
-            source_block = "\n可核验项目：\n" + "\n".join(f"- {url}" for url in dict.fromkeys(source_links)) + "\n"
+        evidence_block = "".join(evidence_lines)
+        work_method = self._work_method(focus)
         email_body = (
-            f"{salutation}：\n\n"
-            + "".join(self._profile_sentences())
-            + "\n"
-            + "\n".join(evidence_lines)
-            + "\n\n"
-            + f"我期待把这些工作方法用于实际任务，并就团队当前目标进一步沟通。{source_block}\n"
-            + f"谢谢！\n{self.name}"
+            "尊敬的招聘负责人：\n"
+            f"您好！我是{name or '应聘者'}{identity_text}，了解到贵公司的「{title}」岗位后，希望申请该职位。\n\n"
+            f"{evidence_block}这些经历使我能够围绕{focus}梳理事实、形成判断并推进交付。\n\n"
+            f"{availability_sentence + '。' if availability_sentence else ''}希望将这些能力应用于实际业务，并持续提升业务理解和分析能力。\n\n"
+            "简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n"
+            "此致\n敬礼！\n"
+            f"{name}"
+        )
+        identity = "".join(
+            part for part in (
+                self.application_profile.get("school", ""),
+                self.application_profile.get("major", ""),
+                self.application_profile.get("degreeYear", ""),
+            ) if part
+        )
+        introduction = f"我是{name}" if name else "我希望申请该岗位"
+        if identity:
+            introduction += f"，目前就读于{identity}"
+        availability_sentence = "，".join(filter(None, (availability_text, f"预计可连续实习{duration}" if duration else "")))
+        contact_lines = [
+            f"姓名：{name}" if name else "",
+            f"电话/微信：{self.application_profile.get('phoneWeChat', '')}" if self.application_profile.get("phoneWeChat") else "",
+            f"邮箱：{self.application_profile.get('email', '')}" if self.application_profile.get("email") else "",
+        ]
+        cover_letter = (
+            f"主题：{subject}\n"
+            "尊敬的招聘负责人：\n"
+            f"您好！{introduction}，了解到贵公司的「{title}」岗位后，希望申请该职位。\n\n"
+            f"{evidence_block}这些工作要求我从具体目标出发筛选信息、核对关键事实，并把分析结果整理成团队可以继续使用的交付物。"
+            "我也会根据反馈及时修正判断，确保结论能够服务于后续决策和执行。\n\n"
+            f"{availability_sentence + '。' if availability_sentence else ''}希望将这些能力应用于贵公司的实际业务。若有机会加入，{work_method}，从明确、可验收的任务开始稳定交付。\n\n"
+            "简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n"
+            "此致\n敬礼！\n"
+            + "\n".join(line for line in contact_lines if line)
         )
         return {
             "greeting": greeting,
-            "email_subject": f"应聘「{title}」-{self.name}",
+            "email_subject": subject,
             "email_body": email_body,
-            "cover_letter": email_body,
+            "cover_letter": cover_letter,
             "used_evidence_ids": evidence_ids,
             "requirement_matches": [
-                f"{_text(item.get('text'))}：对应证据 {fit_evidence[0]['id']}"
+                f"{_text(item.get('text'))}：对应证据 {writing_evidence[0]['id']}"
                 for item in requirements[:2]
             ],
             "recommended_resume": "",
@@ -624,6 +964,7 @@ class OutreachWriterAgent:
             "generation_mode": "deterministic",
             "runtime_status": "not_requested",
             "status": "ready",
+            "format_version": OUTREACH_FORMAT_VERSION,
         }
 
 
@@ -703,7 +1044,6 @@ class ApplicationIntelligencePipeline:
                 seen_card_keys.add(key)
             unique_cards.append(card)
         merged: list[tuple[dict[str, Any], bool]] = []
-        used_keys: set[str] = set()
         for card in unique_cards:
             key = _record_key(card)
             note = note_by_key.get(key)
@@ -713,10 +1053,11 @@ class ApplicationIntelligencePipeline:
                 merged.append((dict(card), False))
             else:
                 merged.append(({**card, **note}, True))
-                used_keys.add(_record_key(note))
-        for note in notes:
-            if _record_key(note) not in used_keys:
-                merged.append((note, True))
+        # When cards are present they are the authoritative checkpoint boundary.
+        # Resume directories can briefly contain notes copied from an older card
+        # set, so appending unmatched notes would create duplicate/stale job cards.
+        if not cards:
+            merged.extend((note, True) for note in notes)
 
         results: list[dict[str, Any]] = []
         unparsed_times = 0
@@ -901,7 +1242,7 @@ class ApplicationIntelligencePipeline:
             "generated_at": self.now.isoformat(timespec="seconds"),
             "timezone": "Asia/Shanghai",
             "discovered_count": discovered_count,
-            "record_count": len(notes),
+            "record_count": covered_discovered if cards else len(results),
             "covered_discovered_count": covered_discovered,
             "body_count": sum(1 for item in results if item["quality"]["body_present"]),
             "job_cards_generated": job_cards_generated,
@@ -991,19 +1332,13 @@ def run_pipeline(
 def write_pipeline_artifacts(output_dir: Path, payload: dict[str, Any]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "application_intelligence.json"
-    temp_json = json_path.with_suffix(".json.tmp")
-    temp_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_json.replace(json_path)
+    atomic_write_json(json_path, payload)
 
     summary = payload["quality_gate"]
     summary_path = output_dir / "application_intelligence_summary.json"
-    temp_summary = summary_path.with_suffix(".json.tmp")
-    temp_summary.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_summary.replace(summary_path)
+    atomic_write_json(summary_path, summary)
     coverage_path = output_dir / "coverage_report.json"
-    temp_coverage = coverage_path.with_suffix(".json.tmp")
-    temp_coverage.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_coverage.replace(coverage_path)
+    atomic_write_json(coverage_path, summary)
 
     csv_path = output_dir / "application_intelligence.csv"
     with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -1017,10 +1352,13 @@ def write_pipeline_artifacts(output_dir: Path, payload: dict[str, Any]) -> None:
                 "publish_time_raw",
                 "publish_time_normalized",
                 "publish_time_precision",
+                "publish_time_is_estimated",
                 "contact_values",
                 "application_routes",
                 "responsibilities",
                 "requirements",
+                "fit_evidence_ids",
+                "fit_match_confidence",
                 "greeting",
                 "email_subject",
                 "email_body",
@@ -1046,10 +1384,13 @@ def write_pipeline_artifacts(output_dir: Path, payload: dict[str, Any]) -> None:
                     "publish_time_raw": record["publish_time"]["raw"],
                     "publish_time_normalized": record["publish_time"]["value"],
                     "publish_time_precision": record["publish_time"]["precision"],
+                    "publish_time_is_estimated": record["publish_time"]["is_estimated"],
                     "contact_values": " | ".join(f"{item['type']}:{item['value']}" for item in contacts),
                     "application_routes": " | ".join(item["type"] for item in routes),
                     "responsibilities": " | ".join(item["text"] for item in responsibilities),
                     "requirements": " | ".join(item["text"] for item in requirements),
+                    "fit_evidence_ids": " | ".join(item["id"] for item in record["fit_evidence"]),
+                    "fit_match_confidence": " | ".join(str(item.get("match_confidence", "")) for item in record["fit_evidence"]),
                     "greeting": record["outreach"]["greeting"],
                     "email_subject": record["outreach"]["email_subject"],
                     "email_body": record["outreach"]["email_body"],
@@ -1142,11 +1483,11 @@ def _write_xlsx(path: Path, payload: dict[str, Any]) -> None:
     contacts = workbook.create_sheet("Contacts")
     contacts.append(["note_id", "type", "value", "source_field", "evidence", "offset_start", "offset_end"])
     requirements = workbook.create_sheet("Requirements")
-    requirements.append(["note_id", "requirement", "source_field", "evidence", "offset_start", "offset_end"])
+    requirements.append(["note_id", "requirement", "source_field", "evidence", "offset_start", "offset_end", "classification_confidence", "classification_basis"])
     responsibilities = workbook.create_sheet("Responsibilities")
-    responsibilities.append(["note_id", "responsibility", "source_field", "evidence", "offset_start", "offset_end"])
+    responsibilities.append(["note_id", "responsibility", "source_field", "evidence", "offset_start", "offset_end", "classification_confidence", "classification_basis"])
     evidence = workbook.create_sheet("Fit Evidence")
-    evidence.append(["note_id", "evidence_id", "category", "label", "detail", "source", "match_score"])
+    evidence.append(["note_id", "evidence_id", "category", "label", "detail", "source", "match_score", "match_confidence", "matched_terms", "match_basis"])
     for record in payload["records"]:
         for item in record["application_info"]["contacts"] + record["application_info"]["application_routes"]:
             contacts.append(
@@ -1169,6 +1510,8 @@ def _write_xlsx(path: Path, payload: dict[str, Any]) -> None:
                     item["evidence"],
                     item.get("offset_start", -1),
                     item.get("offset_end", -1),
+                    item.get("classification_confidence", 0),
+                    " | ".join(item.get("classification_basis", [])),
                 ]]
             )
         for item in record["application_info"]["responsibilities"]:
@@ -1180,6 +1523,8 @@ def _write_xlsx(path: Path, payload: dict[str, Any]) -> None:
                     item["evidence"],
                     item.get("offset_start", -1),
                     item.get("offset_end", -1),
+                    item.get("classification_confidence", 0),
+                    " | ".join(item.get("classification_basis", [])),
                 ]]
             )
         for item in record["fit_evidence"]:
@@ -1192,6 +1537,9 @@ def _write_xlsx(path: Path, payload: dict[str, Any]) -> None:
                     item["detail"],
                     item["source"],
                     item["match_score"],
+                    item.get("match_confidence", 0),
+                    " | ".join(item.get("matched_terms", [])),
+                    item.get("match_basis", ""),
                 ]]
             )
 
@@ -1226,3 +1574,4 @@ def _write_xlsx(path: Path, payload: dict[str, Any]) -> None:
     temporary_path = path.with_suffix(".xlsx.tmp")
     workbook.save(temporary_path)
     temporary_path.replace(path)
+from artifact_io import atomic_write_json

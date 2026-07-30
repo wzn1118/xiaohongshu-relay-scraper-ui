@@ -386,14 +386,10 @@ def should_resume(args: argparse.Namespace, output_dir: Path) -> bool:
     return (output_dir / "xiaohongshu_notes_latest.json").exists() or (output_dir / "xiaohongshu_cards_latest.json").exists()
 
 
-def should_use_card_cache(resume_mode: bool, output_dir: Path, search_sort: str) -> bool:
-    # Latest mode must rescan the live result page so a previous checkpoint
-    # cannot reintroduce cards from an older search ordering.
-    return (
-        resume_mode
-        and search_sort != "latest"
-        and (output_dir / "xiaohongshu_cards_latest.json").exists()
-    )
+def should_use_card_cache(resume_mode: bool, output_dir: Path, _search_sort: str) -> bool:
+    # A resume run completes the exact card set copied from its source task.
+    # Fresh runs remain responsible for discovering and sorting new cards.
+    return resume_mode and (output_dir / "xiaohongshu_cards_latest.json").exists()
 
 
 @dataclass
@@ -1401,7 +1397,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scrolls", type=int, default=40)
     parser.add_argument("--stable-rounds", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--search-sort", choices=("latest", "comprehensive"), default="latest")
+    parser.add_argument("--search-sort", choices=("latest",), default="latest")
     parser.add_argument("--max-age-days", type=int, default=30)
     parser.add_argument("--goto-timeout-ms", type=int, default=15000)
     parser.add_argument("--note-delay-seconds", type=float, default=DEFAULT_NOTE_DELAY_SECONDS)

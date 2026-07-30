@@ -5,15 +5,16 @@ import { createWriteStream } from 'node:fs';
 import { copyFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { buildRunnerArgs } from './lib/contracts.mjs';
+import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 
-const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
+const TERMINAL = new Set(['succeeded', 'incomplete', 'failed', 'cancelled', 'interrupted']);
 
 export class JobManager {
   constructor({
     dataDir,
     pythonBin,
     runnerPath,
-    maxHistory = 100,
+    maxHistory = 1000,
     spawnImpl = spawn,
     terminateImpl = terminateChildTree,
     recoverImpl = terminatePersistedJobProcesses,
@@ -148,6 +149,7 @@ export class JobManager {
     const logPath = path.join(jobDir, 'run.log');
     await mkdir(outputDir, { recursive: true });
     const runtimeProfilePath = await createRuntimeProfile(profilePath, params.candidateProfile, jobDir);
+    let effectiveParams = params;
     if (params.resumeFromJobId) {
       const source = this.getInternal(params.resumeFromJobId);
       if (!source) {
@@ -155,13 +157,23 @@ export class JobManager {
         error.code = 'RESUME_SOURCE_NOT_FOUND';
         throw error;
       }
-      await copyResumeCheckpoints(source.outputDir, outputDir);
+      if (source.params?.searchSort === 'comprehensive') {
+        // Legacy comprehensive checkpoints cannot prove latest-first discovery.
+        // Preserve the resume relation, but rediscover cards from the live page.
+        effectiveParams = Object.freeze({
+          ...params,
+          searchSort: 'latest',
+          completeMissingOnly: false,
+        });
+      } else {
+        await copyResumeCheckpoints(source.outputDir, outputDir);
+      }
     }
     const now = new Date().toISOString();
     const job = {
       id,
       status: 'queued',
-      params,
+      params: effectiveParams,
       createdAt: now,
       startedAt: null,
       finishedAt: null,
@@ -173,6 +185,7 @@ export class JobManager {
       progress: 8,
       discoveredCount: 0,
       scrapedCount: 0,
+      bodyProcessedCount: 0,
       progressPhase: 'queued',
       progressLabel: '任务已创建，等待启动',
       progressCurrent: 0,
@@ -293,6 +306,7 @@ export class JobManager {
           PYTHONUNBUFFERED: '1',
           PYTHONUTF8: '1',
           PYTHONIOENCODING: 'utf-8',
+          XHS_RELAY_CONNECT_TIMEOUT_MS: process.env.XHS_RELAY_CONNECT_TIMEOUT_MS || '60000',
           XHS_AI_PROVIDER: runtime.ai?.provider || 'codex',
           XHS_AI_API_KEY: runtime.ai?.apiKey || '',
           XHS_AI_BASE_URL: runtime.ai?.baseUrl || '',
@@ -326,6 +340,12 @@ export class JobManager {
         job.progressPhase = 'completed';
         job.progressLabel = '任务已完成';
         job.progressUpdatedAt = new Date().toISOString();
+      } else if (result.code === 3) {
+        job.status = 'incomplete';
+        job.error = '质量门禁发现未完整岗位；当前岗位卡与投递文案已生成，可从检查点续跑。';
+        job.progressPhase = 'incomplete';
+        job.progressLabel = '当前检查点已完成分析，仍有岗位正文待补全';
+        job.progressUpdatedAt = new Date().toISOString();
       } else {
         job.status = 'failed';
         job.error = `Runner exited with code ${result.code ?? 'unknown'}.`;
@@ -353,7 +373,9 @@ export class JobManager {
         const materialized = await this.#materializeCheckpointApplications(job, append);
         if (materialized) {
           job.progressPhase = 'analyzing';
-          job.progressLabel = '已解析当前检查点中的全部岗位并生成投递语';
+          job.progressLabel = job.params?.analysisMode === 'general'
+            ? '已解析当前检查点中的全部内容，等待 AI 动态栏目补全'
+            : '已解析当前检查点中的全部岗位并生成投递语';
           job.progressUpdatedAt = new Date().toISOString();
         }
       } catch (error) {
@@ -375,7 +397,8 @@ export class JobManager {
     const expected = Number(job.discoveredCount || 0);
     if (expected < 1) return false;
     const existing = await countApplicationRecords(path.join(job.outputDir, 'application_intelligence.json'));
-    if (existing >= expected) {
+    const matchesCheckpoint = existing >= expected && await applicationRecordsMatchCheckpoint(job.outputDir);
+    if (matchesCheckpoint) {
       delete job.checkpointAnalysisError;
       return false;
     }
@@ -387,11 +410,15 @@ export class JobManager {
       runnerPath: this.runnerPath,
       outputDir: job.outputDir,
       profilePath,
+      analysisMode: job.params?.analysisMode === 'general' ? 'general' : 'job',
+      keyword: String(job.params?.keyword || ''),
+      contentPreset: String(job.params?.contentPreset || 'auto'),
+      contentGoal: String(job.params?.contentGoal || ''),
     });
     if (result?.stdout) append('stdout', result.stdout);
     if (result?.stderr) append('stderr', result.stderr);
     const generated = await countApplicationRecords(path.join(job.outputDir, 'application_intelligence.json'));
-    if (generated < expected) {
+    if (generated < expected || !await applicationRecordsMatchCheckpoint(job.outputDir)) {
       throw new Error(`Checkpoint analysis generated ${generated} of ${expected} required job cards.`);
     }
     job.checkpointAnalysisAt = new Date().toISOString();
@@ -410,7 +437,9 @@ export class JobManager {
         job.workflowSummary = await readWorkflowSummary(job.outputDir);
         job.artifactCount = await countArtifactFiles(job.outputDir);
         await this.persist();
-        append('system', `Live result panel now contains ${job.checkpointAnalysisCount} parsed jobs.\n`);
+        append('system', job.params?.analysisMode === 'general'
+          ? `Live result panel now contains ${job.checkpointAnalysisCount} parsed content records.\n`
+          : `Live result panel now contains ${job.checkpointAnalysisCount} parsed jobs.\n`);
         this.#emit(job.id, 'state', publicJob(job));
       } catch (error) {
         job.checkpointAnalysisError = String(error?.message || error);
@@ -445,10 +474,18 @@ export function publicJob(job) {
   const status = job.status === 'succeeded' ? 'completed' : job.status;
   const discoveredCount = Number(job.discoveredCount || job.workflowSummary?.cardsDiscovered || 0);
   const scrapedCount = Number(job.scrapedCount || job.workflowSummary?.notesCollected || 0);
+  const rawBodyProcessedCount = Math.max(
+    Number(job.bodyProcessedCount || 0),
+    Number(job.workflowSummary?.bodyAttempted || 0),
+    scrapedCount,
+  );
+  const bodyProcessedCount = discoveredCount > 0
+    ? Math.min(discoveredCount, Math.max(scrapedCount, rawBodyProcessedCount))
+    : Math.max(scrapedCount, rawBodyProcessedCount);
   const incompleteCount = Number.isFinite(job.checkpointIncompleteCount)
     ? Number(job.checkpointIncompleteCount)
     : Math.max(0, discoveredCount - scrapedCount);
-  const resumableStatus = ['interrupted', 'cancelled', 'failed'].includes(job.status)
+  const resumableStatus = ['incomplete', 'interrupted', 'cancelled', 'failed'].includes(job.status)
     || (job.status === 'succeeded' && incompleteCount > 0);
   const summarySecurity = job.workflowSummary?.securityVerification;
   const securityRestriction = job.securityRestriction || (
@@ -462,9 +499,21 @@ export function publicJob(job) {
         }
       : null
   );
+  const summaryRateLimit = job.workflowSummary?.rateLimit;
+  const rateLimit = job.rateLimit || (
+    summaryRateLimit && summaryRateLimit.status === 'stopped'
+      ? {
+          detected: true,
+          status: 'stopped',
+          detectedAt: summaryRateLimit.detectedAt || null,
+          recoveryAction: summaryRateLimit.recoveryAction || 'wait_then_resume',
+        }
+      : null
+  );
   const resumeAvailable = resumableStatus && (
     Boolean(job.checkpointAvailable)
     || securityRestriction?.status === 'timed_out'
+    || rateLimit?.status === 'stopped'
   );
   return {
     id: job.id,
@@ -482,6 +531,7 @@ export function publicJob(job) {
     progress: job.progress || 0,
     discoveredCount,
     scrapedCount,
+    bodyProcessedCount,
     incompleteCount,
     progressPhase: job.progressPhase || null,
     progressLabel: job.progressLabel || null,
@@ -490,6 +540,7 @@ export function publicJob(job) {
     progressUpdatedAt: job.progressUpdatedAt || null,
     workflowSummary: job.workflowSummary || null,
     securityRestriction,
+    rateLimit,
     resumeAvailable,
   };
 }
@@ -505,6 +556,19 @@ function updateProgressFromLog(job, message) {
     }
   };
   const setProgress = (next) => update({ progress: Math.max(job.progress || 0, next) });
+
+  if (/RATE_LIMIT detected/gi.test(message)) {
+    update({
+      progressPhase: 'rate_limited',
+      progressLabel: '平台访问频率受限，已停止新增访问并转入检查点智能补全',
+      rateLimit: {
+        detected: true,
+        status: 'stopped',
+        detectedAt: job.rateLimit?.detectedAt || new Date().toISOString(),
+        recoveryAction: 'wait_then_resume',
+      },
+    });
+  }
 
   for (const match of message.matchAll(/SECURITY_VERIFICATION detected timeout=(\d+)s/gi)) {
     const now = new Date().toISOString();
@@ -588,7 +652,9 @@ function updateProgressFromLog(job, message) {
     });
     setProgress(22);
   }
-  for (const match of message.matchAll(/Collected\s+(\d+)\s+note links/gi)) {
+  // Match only the standalone discovery summary. Scroll lines also contain
+  // "collected N note links" and must remain in the discovery phase.
+  for (const match of message.matchAll(/^(?:\[[^\]\r\n]+\]\s*)?Collected\s+(\d+)\s+note links\.?\s*$/gim)) {
     const total = Number(match[1]);
     update({
       progressPhase: 'scraping',
@@ -610,20 +676,53 @@ function updateProgressFromLog(job, message) {
     });
     setProgress(25);
   }
-  for (const match of message.matchAll(/PARALLEL_PROGRESS\s+processed=(\d+)\s+total=(\d+)\s+complete=(\d+)\s+status=([a-z_]+)/gi)) {
+  for (const match of message.matchAll(/CARD_CHECKPOINT_NORMALIZED\s+before=(\d+)\s+after=(\d+)\s+duplicates=(\d+)/gi)) {
+    const total = Number(match[2]);
+    const duplicates = Number(match[3]);
+    update({
+      progressPhase: 'scraping',
+      progressLabel: `已合并 ${duplicates} 条重复卡片，继续处理 ${total} 篇`,
+      progressCurrent: Math.min(Number(job.scrapedCount || 0), total),
+      progressTotal: total,
+      discoveredCount: total,
+    });
+  }
+  for (const match of message.matchAll(/PARALLEL_ROUND\s+(\d+)\/(\d+)\s+pending=(\d+)\s+workers=(\d+)/gi)) {
+    const round = Number(match[1]);
+    const attempts = Number(match[2]);
+    const pending = Number(match[3]);
+    const total = Number(job.discoveredCount || job.progressTotal || pending);
+    const processed = Math.max(Number(job.bodyProcessedCount || 0), total - pending, 0);
+    update({
+      progressPhase: 'scraping',
+      progressLabel: round > 1
+        ? `第 ${round} / ${attempts} 轮补采准备中 · 待检查 ${pending} 篇`
+        : `正文采集已启动 · 待检查 ${pending} 篇`,
+      progressCurrent: processed,
+      progressTotal: total,
+      bodyProcessedCount: processed,
+    });
+  }
+  for (const match of message.matchAll(/PARALLEL_PROGRESS\s+processed=(\d+)\s+total=(\d+)\s+complete=(\d+)\s+status=([a-z_]+)(?:\s+round=(\d+)\s+round_processed=(\d+)\s+round_total=(\d+))?/gi)) {
     const processed = Number(match[1]);
     const total = Number(match[2]);
     const complete = Number(match[3]);
     const status = String(match[4]).toLowerCase();
+    const round = Number(match[5] || 1);
+    const roundProcessed = Number(match[6] || 0);
+    const roundTotal = Number(match[7] || 0);
     update({
       progressPhase: 'scraping',
-      progressLabel: status === 'detail_ok'
-        ? `正文已保存 · 已处理 ${processed} / ${total} 篇`
-        : `已记录 ${status} · 已处理 ${processed} / ${total} 篇`,
+      progressLabel: round > 1
+        ? `第 ${round} 轮补采 ${roundProcessed} / ${roundTotal} · 正文 ${complete} / ${total} 篇`
+        : status === 'detail_ok'
+          ? `正文已保存 · 已检查 ${processed} / ${total} 篇`
+          : `已记录 ${status} · 已检查 ${processed} / ${total} 篇`,
       progressCurrent: processed,
       progressTotal: total,
       discoveredCount: total,
       scrapedCount: complete,
+      bodyProcessedCount: processed,
     });
     setProgress(Math.min(82, 25 + Math.round((processed / Math.max(1, total)) * 57)));
   }
@@ -638,6 +737,7 @@ function updateProgressFromLog(job, message) {
       progressTotal: total,
       discoveredCount: total,
       scrapedCount: complete,
+      bodyProcessedCount: total,
     });
     setProgress(82);
   }
@@ -672,6 +772,7 @@ function updateProgressFromLog(job, message) {
       progressTotal: total,
       discoveredCount: total,
       scrapedCount: saved,
+      bodyProcessedCount: current,
     });
     setProgress(Math.min(82, 25 + Math.round((current / Math.max(1, total)) * 57)));
   }
@@ -685,6 +786,7 @@ function updateProgressFromLog(job, message) {
       progressTotal: total,
       discoveredCount: total,
       scrapedCount: Math.max(job.scrapedCount || 0, current),
+      bodyProcessedCount: current,
     });
     setProgress(Math.min(82, 25 + Math.round((current / Math.max(1, total)) * 57)));
   }
@@ -759,7 +861,7 @@ async function reconcileJobCheckpoint(job) {
   const [cards, notes, applications] = await Promise.all([
     countJsonArray(path.join(job.outputDir, 'xiaohongshu_cards_latest.json')),
     countJsonArray(path.join(job.outputDir, 'xiaohongshu_notes_latest.json')),
-    inspectApplicationRecords(path.join(job.outputDir, 'application_intelligence.json')),
+    inspectApplicationRecords(path.join(job.outputDir, 'application_intelligence.json'), job.params?.analysisMode),
   ]);
   let changed = false;
   if (cards > Number(job.discoveredCount || 0)) {
@@ -815,17 +917,41 @@ async function countApplicationRecords(filePath) {
   }
 }
 
-async function inspectApplicationRecords(filePath) {
+function recordCheckpointKey(record) {
+  return String(record?.note_id || record?.note_url || '').trim();
+}
+
+async function applicationRecordsMatchCheckpoint(outputDir) {
+  try {
+    const [cardsPayload, applicationPayload] = await Promise.all([
+      readFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), 'utf8').then(JSON.parse),
+      readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8').then(JSON.parse),
+    ]);
+    const cards = Array.isArray(cardsPayload) ? cardsPayload : [];
+    const records = Array.isArray(applicationPayload?.records) ? applicationPayload.records : [];
+    const cardKeys = cards.map(recordCheckpointKey).filter(Boolean);
+    const recordKeys = records.map(recordCheckpointKey).filter(Boolean);
+    if (cardKeys.length !== cards.length || recordKeys.length !== records.length || cardKeys.length !== recordKeys.length) {
+      return false;
+    }
+    const expected = new Set(cardKeys);
+    return expected.size === cardKeys.length && recordKeys.every((key) => expected.has(key));
+  } catch (error) {
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) return false;
+    throw error;
+  }
+}
+
+async function inspectApplicationRecords(filePath, analysisMode = 'job') {
   try {
     const payload = JSON.parse(await readFile(filePath, 'utf8'));
     const records = Array.isArray(payload?.records) ? payload.records : [];
+    const incompleteRecord = payload?.analysis_mode === 'general' || analysisMode === 'general'
+      ? isIncompleteGeneralRecord
+      : isIncompleteApplicationRecord;
     return {
       total: records.length,
-      incomplete: records.filter((record) => (
-        !String(record?.body || '').trim()
-        || record?.job_card?.parse_basis === 'search_card'
-        || String(record?.outreach?.runtime_status || '').startsWith('fallback_missing')
-      )).length,
+      incomplete: records.filter(incompleteRecord).length,
     };
   } catch (error) {
     if (error.code === 'ENOENT' || error instanceof SyntaxError) return { total: 0, incomplete: 0 };
@@ -844,9 +970,17 @@ async function resolveCheckpointProfilePath(job, fallback) {
   }
 }
 
-async function analyzeCheckpoint({ pythonBin, runnerPath, outputDir, profilePath }) {
+async function analyzeCheckpoint({ pythonBin, runnerPath, outputDir, profilePath, analysisMode = 'job', keyword = '', contentPreset = 'auto', contentGoal = '' }) {
   const args = [
     runnerPath,
+    '--analysis-mode',
+    analysisMode,
+    '--keyword',
+    keyword,
+    '--content-preset',
+    contentPreset,
+    '--content-goal',
+    contentGoal,
     '--analyze-checkpoint',
     '--output-dir',
     outputDir,
@@ -977,20 +1111,24 @@ async function countArtifactFiles(root) {
 
 async function copyResumeCheckpoints(sourceDir, destinationDir) {
   const names = [
+    'xiaohongshu_cards_discovered.json',
     'xiaohongshu_cards_latest.json',
     'xiaohongshu_notes_latest.json',
     'xiaohongshu_notes_latest.csv',
+    'application_intelligence.json',
+    'application_intelligence.checkpoint.json',
   ];
-  let copied = 0;
+  const required = new Set(['xiaohongshu_cards_latest.json', 'xiaohongshu_notes_latest.json']);
+  let requiredCopied = 0;
   for (const name of names) {
     try {
       await copyFile(path.join(sourceDir, name), path.join(destinationDir, name));
-      copied += 1;
+      if (required.has(name)) requiredCopied += 1;
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
   }
-  if (copied < 2) {
+  if (requiredCopied < required.size) {
     const error = new Error('Resume source does not contain both card and note checkpoints.');
     error.code = 'RESUME_CHECKPOINTS_MISSING';
     throw error;

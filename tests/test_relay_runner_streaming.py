@@ -40,11 +40,17 @@ def test_streaming_command_raises_for_nonzero_exit() -> None:
             RUNNER.run_streaming_command(["sample"])
 
 
-def test_latest_resume_refreshes_live_search_cards(tmp_path: Path) -> None:
+def test_resume_reuses_checkpoint_cards_even_when_source_sort_is_latest(tmp_path: Path) -> None:
     (tmp_path / "xiaohongshu_cards_latest.json").write_text("[]", encoding="utf-8")
 
-    assert not RUNNER.should_use_card_cache(True, tmp_path, "latest")
-    assert RUNNER.should_use_card_cache(True, tmp_path, "comprehensive")
+    assert RUNNER.should_use_card_cache(True, tmp_path, "latest")
+    assert not RUNNER.should_use_card_cache(False, tmp_path, "latest")
+
+
+def test_runner_cli_rejects_non_latest_search_sort(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["runner", "--search-sort", "comprehensive"])
+    with pytest.raises(SystemExit):
+        RUNNER.parse_args()
 
 
 def test_runner_accepts_search_security_wait_configuration(monkeypatch) -> None:

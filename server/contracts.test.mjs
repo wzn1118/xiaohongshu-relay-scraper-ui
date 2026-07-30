@@ -6,9 +6,12 @@ import { ValidationError, buildRunnerArgs, validateRunRequest } from './lib/cont
 
 test('validateRunRequest applies bounded production defaults', () => {
   const result = validateRunRequest({});
+  assert.equal(result.analysisMode, 'job');
   assert.equal(result.keyword, '实习继任');
+  assert.equal(result.contentPreset, 'auto');
+  assert.equal(result.contentGoal, '');
   assert.equal(result.searchSort, 'latest');
-  assert.equal(result.maxAgeDays, 30);
+  assert.equal(result.maxAgeDays, 0);
   assert.equal(result.limit, 0);
   assert.equal(result.maxScrolls, 40);
   assert.equal(result.stableRounds, 4);
@@ -18,6 +21,7 @@ test('validateRunRequest applies bounded production defaults', () => {
   assert.equal(result.randomDelayMaxSeconds, 2.4);
   assert.equal(result.noAutoAttach, true);
   assert.equal(result.mode, 'fresh');
+  assert.equal(result.completeMissingOnly, false);
   assert.equal(result.securityVerificationTimeoutSeconds, 600);
   assert.equal(result.useCodexRuntime, true);
   assert.equal(result.codexBatchSize, 8);
@@ -32,11 +36,33 @@ test('validateRunRequest rejects unknown and malformed parameters', () => {
   assert.throws(() => validateRunRequest({ keyword: 'bad\nvalue' }), ValidationError);
   assert.throws(() => validateRunRequest({ searchSort: 'oldest' }), ValidationError);
   assert.throws(() => validateRunRequest({ maxAgeDays: 366 }), ValidationError);
+  assert.throws(() => validateRunRequest({ analysisMode: 'marketing' }), ValidationError);
+  assert.throws(() => validateRunRequest({ contentPreset: 'recruitment' }), ValidationError);
+  assert.throws(() => validateRunRequest({ contentGoal: 'bad\nvalue' }), ValidationError);
+});
+
+test('validateRunRequest accepts a bounded non-job research brief', () => {
+  const result = validateRunRequest({
+    analysisMode: 'general',
+    keyword: '城市徒步',
+    contentPreset: 'experience',
+    contentGoal: '提炼适合第一次徒步者的路线、准备事项和常见踩坑。',
+  });
+  assert.equal(result.analysisMode, 'general');
+  assert.equal(result.keyword, '城市徒步');
+  assert.equal(result.contentPreset, 'experience');
+  assert.equal(result.contentGoal, '提炼适合第一次徒步者的路线、准备事项和常见踩坑。');
 });
 
 test('validateRunRequest always normalizes collection to full-body mode', () => {
   assert.equal(validateRunRequest({ limit: 0 }).limit, 0);
   assert.equal(validateRunRequest({ limit: 1000 }).limit, 0);
+  assert.equal(validateRunRequest({ maxAgeDays: 30 }).maxAgeDays, 0);
+});
+
+test('validateRunRequest always normalizes collection to latest-first search', () => {
+  assert.equal(validateRunRequest({ searchSort: 'latest' }).searchSort, 'latest');
+  assert.equal(validateRunRequest({ searchSort: 'comprehensive' }).searchSort, 'latest');
 });
 
 test('validateRunRequest validates collection pacing ranges', () => {
@@ -53,10 +79,12 @@ test('validateRunRequest validates collection pacing ranges', () => {
 });
 
 test('validateRunRequest accepts only valid resume source ids in resume mode', () => {
-  const params = validateRunRequest({ mode: 'resume', resumeFromJobId: '20260728034820-6b942873' });
+  const params = validateRunRequest({ mode: 'resume', resumeFromJobId: '20260728034820-6b942873', completeMissingOnly: true });
   assert.equal(params.resumeFromJobId, '20260728034820-6b942873');
+  assert.equal(params.completeMissingOnly, true);
   assert.throws(() => validateRunRequest({ mode: 'fresh', resumeFromJobId: '20260728034820-6b942873' }), ValidationError);
   assert.throws(() => validateRunRequest({ mode: 'resume', resumeFromJobId: '../escape' }), ValidationError);
+  assert.throws(() => validateRunRequest({ mode: 'resume', completeMissingOnly: true }), ValidationError);
 });
 
 test('validateRunRequest accepts bounded runtime candidate application fields', () => {
@@ -79,15 +107,30 @@ test('validateRunRequest accepts bounded runtime candidate application fields', 
 });
 
 test('buildRunnerArgs only emits the normalized whitelist', () => {
-  const params = validateRunRequest({ keyword: '测试', mode: 'resume', skipPostprocess: true });
+  const params = validateRunRequest({
+    keyword: '测试',
+    mode: 'resume',
+    resumeFromJobId: '20260728034820-6b942873',
+    completeMissingOnly: true,
+    skipPostprocess: true,
+  });
   const args = buildRunnerArgs(params, path.resolve('output'));
-  assert.deepEqual(args.slice(0, 4), ['--keyword', '测试', '--output-dir', path.resolve('output')]);
+  assert.equal(args[args.indexOf('--keyword') + 1], '测试');
+  assert.equal(args[args.indexOf('--output-dir') + 1], path.resolve('output'));
+  assert.equal(args[args.indexOf('--analysis-mode') + 1], 'job');
+  assert.equal(args[args.indexOf('--content-preset') + 1], 'auto');
+  assert.equal(args[args.indexOf('--content-goal') + 1], '');
   assert.ok(args.includes('--resume'));
+  assert.ok(args.includes('--complete-missing-only'));
   assert.ok(args.includes('--skip-postprocess'));
   assert.ok(args.includes('--no-auto-attach'));
   assert.ok(args.includes('--codex-runtime'));
   assert.equal(args[args.indexOf('--search-sort') + 1], 'latest');
-  assert.equal(args[args.indexOf('--max-age-days') + 1], '30');
+  const tamperedArgs = buildRunnerArgs({ ...params, searchSort: 'comprehensive' }, path.resolve('output'));
+  assert.equal(tamperedArgs[tamperedArgs.indexOf('--search-sort') + 1], 'latest');
+  assert.equal(args[args.indexOf('--max-age-days') + 1], '0');
+  const tamperedAgeArgs = buildRunnerArgs({ ...params, maxAgeDays: 30 }, path.resolve('output'));
+  assert.equal(tamperedAgeArgs[tamperedAgeArgs.indexOf('--max-age-days') + 1], '0');
   assert.equal(args[args.indexOf('--security-verification-timeout-seconds') + 1], '600');
   assert.equal(args[args.indexOf('--speed-mode') + 1], 'random');
   assert.equal(args[args.indexOf('--random-delay-min-seconds') + 1], '0.8');

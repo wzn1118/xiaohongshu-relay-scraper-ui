@@ -7,13 +7,26 @@ import { ValidationError, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
 import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
 import { setupRelayRuntime } from './lib/relay-setup.mjs';
+import { recoverRelay } from './lib/relay-recovery.mjs';
+import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
+
+export { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
 const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
+const CONTENT_RESEARCH_LABELS = Object.freeze({
+  auto: 'AI 自动识别',
+  experience: '经验攻略',
+  people: '人群与风格',
+  trend: '趋势观察',
+  product: '产品口碑',
+  place: '地点清单',
+  custom: '自定义研究',
+});
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
@@ -104,6 +117,32 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         });
         return json(res, 200, status);
       }
+      if (req.method === 'POST' && url.pathname === '/api/relay/recover') {
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        const configured = getRelayConfig();
+        const requested = body?.port;
+        const port = requested === undefined ? configured.port : Number(requested);
+        const profile = String(body?.profile || configured.profile || 'openclaw').trim();
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
+        if (!/^[\p{L}\p{N}_.-]+$/u.test(profile)) return json(res, 400, errorBody('INVALID_PROFILE', 'Invalid browser profile.'));
+        const connection = await relayConnector({
+          port,
+          openClawConfigPath: config.openClawConfigPath,
+          managedBrowserDataDir: config.managedBrowserDataDir,
+          profile,
+        });
+        if (!connection.running || !connection.cdpReady) {
+          return json(res, 503, { ...connection, ready: false, repaired: false, port, profile });
+        }
+        const recovery = await relayRecoverer({
+          port,
+          profile,
+          openClawConfigPath: config.openClawConfigPath,
+          pythonBin: config.pythonBin,
+          connectionCheckScriptPath: config.relayConnectionCheckScriptPath,
+        });
+        return json(res, recovery.ok ? 200 : 503, recovery);
+      }
       if (req.method === 'POST' && url.pathname === '/api/relay/setup') {
         const body = await readJsonBody(req, config.maxBodyBytes);
         const configured = getRelayConfig();
@@ -193,6 +232,85 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         const internal = manager.getInternal(id);
         if (!internal) return json(res, 404, errorBody('NOT_FOUND', 'Task not found.'));
         if (req.method === 'GET' && parts.length === 3) return json(res, 200, manager.get(id));
+        if (req.method === 'POST' && parts[3] === 'complete-missing' && parts.length === 4) {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          if (!body || typeof body !== 'object' || Array.isArray(body)) {
+            throw new ValidationError('Request body must be a JSON object.');
+          }
+          const unsupported = Object.keys(body).filter((key) => key !== 'aiSessionId');
+          if (unsupported.length) {
+            throw new ValidationError('Unsupported completion parameters.', unsupported.map((field) => ({ field, reason: 'not_allowed' })));
+          }
+
+          const sourceJob = manager.get(id);
+          const allJobs = manager.list();
+          const activeCompletion = allJobs.find((job) => (
+            ['queued', 'running'].includes(job.status)
+            && isCompletionDescendant(job, id, allJobs)
+          ));
+          if (activeCompletion) {
+            return json(res, 200, {
+              action: 'attached',
+              sourceJobId: id,
+              incompleteBefore: null,
+              job: activeCompletion,
+              message: 'An existing completion task is already running.',
+            });
+          }
+          if (sourceJob && ['queued', 'running'].includes(sourceJob.status)) {
+            return json(res, 200, {
+              action: 'attached',
+              sourceJobId: id,
+              incompleteBefore: null,
+              job: sourceJob,
+              message: 'The source task is still collecting and will fill incomplete records automatically.',
+            });
+          }
+
+          const sourceParams = internal.params || internal.config || sourceJob?.config || {};
+          const analysisMode = sourceParams.analysisMode === 'general' ? 'general' : 'job';
+          const currentResults = await readApplicationResults(
+            internal.outputDir,
+            new URLSearchParams({ analysisMode, offset: '0', limit: '1', sort: 'newest', timeRange: 'all' }),
+            internal,
+          );
+          if (!currentResults.available) {
+            const error = new Error('The source task does not have structured results to complete yet.');
+            error.code = 'COMPLETION_SOURCE_UNAVAILABLE';
+            throw error;
+          }
+          const incompleteBefore = Number(currentResults.filters?.stats?.incomplete || 0);
+          if (incompleteBefore === 0) {
+            return json(res, 200, {
+              action: 'already_complete',
+              sourceJobId: id,
+              incompleteBefore: 0,
+              job: sourceJob,
+              message: 'All records are already complete.',
+            });
+          }
+
+          const params = validateRunRequest({
+            ...sourceParams,
+            analysisMode,
+            searchSort: 'latest',
+            maxAgeDays: 0,
+            limit: 0,
+            mode: 'resume',
+            resumeFromJobId: id,
+            completeMissingOnly: true,
+            checkOnly: false,
+            ...(Object.hasOwn(body, 'aiSessionId') ? { aiSessionId: body.aiSessionId } : {}),
+          });
+          const job = await manager.start(params);
+          return json(res, 202, {
+            action: 'started',
+            sourceJobId: id,
+            incompleteBefore,
+            job,
+            message: `Started completion for ${incompleteBefore} incomplete records.`,
+          });
+        }
         if (req.method === 'POST' && parts[3] === 'cancel' && parts.length === 4) {
           const result = await manager.cancel(id);
           return json(res, 202, { ...result.job, cancelRequested: result.changed });
@@ -209,7 +327,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           }
         }
         if (req.method === 'GET' && parts[3] === 'results' && parts.length === 4) {
-          return json(res, 200, await readApplicationResults(internal.outputDir, url.searchParams));
+          return json(res, 200, await readApplicationResults(internal.outputDir, url.searchParams, internal));
         }
         if (req.method === 'POST' && parts[3] === 'delivery' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
@@ -221,7 +339,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         }
         if (req.method === 'POST' && parts[3] === 'send-email' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
-          const replyTo = String(internal.config?.candidateProfile?.email || '').trim();
+          const replyTo = String(internal.params?.candidateProfile?.email || '').trim();
           return json(res, 200, await sendApplicationEmail(internal.outputDir, body, deliveryMailer, replyTo));
         }
         if (req.method === 'GET' && parts[3] === 'artifacts' && parts.length === 4) {
@@ -246,8 +364,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'RESUME_SOURCE_NOT_FOUND' || error.code === 'RESUME_CHECKPOINTS_MISSING') {
         return json(res, 400, errorBody(error.code, error.message));
       }
+      if (error.code === 'COMPLETION_SOURCE_UNAVAILABLE') return json(res, 409, errorBody(error.code, error.message));
       if (error.code === 'BODY_TOO_LARGE') return json(res, 413, errorBody('BODY_TOO_LARGE', 'Request body is too large.'));
-      if (['AI_VALIDATION', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
+      if (['AI_VALIDATION', 'AI_SESSION_EXPIRED', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'AI_MODEL_DISCOVERY_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'LOCAL_MODEL_VALIDATION') return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'LOCAL_MODEL_BUSY') return json(res, 409, { ...errorBody(error.code, error.message), install: error.install });
@@ -267,23 +386,75 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
   };
 }
 
-async function readApplicationResults(outputDir, searchParams) {
+function isCompletionDescendant(job, sourceJobId, jobs) {
+  const byId = new Map(jobs.map((item) => [item.id, item]));
+  const visited = new Set();
+  let current = job;
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    const parentId = current.config?.completeMissingOnly ? current.config?.resumeFromJobId : null;
+    if (!parentId) return false;
+    if (parentId === sourceJobId) return true;
+    current = byId.get(parentId);
+  }
+  return false;
+}
+
+function toGeneralContentRecord(record) {
+  return {
+    note_id: record.note_id,
+    title: record.title,
+    note_url: record.note_url,
+    body: record.body,
+    access_status: record.access_status,
+    collected_at: record.collected_at,
+    publish_time: record.publish_time,
+    media: record.media,
+    ...(record.content_analysis ? { content_analysis: record.content_analysis } : {}),
+    quality: record.quality || {},
+  };
+}
+
+function contentResearchContext(payload, task) {
+  const stored = payload?.content_research && typeof payload.content_research === 'object'
+    ? payload.content_research
+    : {};
+  const presetCandidate = String(stored.preset || task.params?.contentPreset || task.config?.contentPreset || 'auto');
+  const preset = Object.hasOwn(CONTENT_RESEARCH_LABELS, presetCandidate) ? presetCandidate : 'auto';
+  const goal = String(stored.goal || task.params?.contentGoal || task.config?.contentGoal || '').trim().slice(0, 500);
+  return {
+    preset,
+    label: String(stored.label || CONTENT_RESEARCH_LABELS[preset]),
+    goal,
+  };
+}
+
+async function readApplicationResults(outputDir, searchParams, task = {}) {
   const offset = boundedInteger(searchParams.get('offset'), 0, 0, 1000000);
   const limit = boundedInteger(searchParams.get('limit'), 50, 1, 100);
+  const requestedAnalysisMode = ['job', 'general'].includes(searchParams.get('analysisMode'))
+    ? searchParams.get('analysisMode')
+    : null;
   const query = String(searchParams.get('query') || '').trim().toLocaleLowerCase('zh-CN').slice(0, 100);
   const sort = searchParams.get('sort') === 'oldest' ? 'oldest' : 'newest';
   const requestedTimeRange = String(searchParams.get('timeRange') || 'all');
-  const timeRange = ['all', '7', '30', '90', 'unknown'].includes(requestedTimeRange) ? requestedTimeRange : 'all';
+  const timeRange = ['all', '1', '3', '7', '30', '90', 'unknown'].includes(requestedTimeRange) ? requestedTimeRange : 'all';
   try {
-    const payload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
+    const payload = await readLatestApplicationPayload(outputDir);
+    const storedAnalysisMode = ['job', 'general'].includes(payload.analysis_mode) ? payload.analysis_mode : null;
+    const analysisMode = requestedAnalysisMode || storedAnalysisMode || 'job';
+    const incompleteRecord = analysisMode === 'general' ? isIncompleteGeneralRecord : isIncompleteApplicationRecord;
     const delivery = await readDeliveryState(outputDir);
     const legacyMedia = await readLegacyMediaSources(outputDir);
-    const source = Array.isArray(payload.records)
+    const hydratedSource = Array.isArray(payload.records)
       ? payload.records.map((record) => mergeApplicationState(
         hydrateApplicationMedia(record, legacyMedia.get(record.note_id)),
         delivery[record.note_id],
       ))
       : [];
+    const source = analysisMode === 'general'
+      ? hydratedSource.map(toGeneralContentRecord)
+      : hydratedSource;
     const queried = query
       ? source.filter((record) => `${record.title || ''}\n${record.body || ''}`.toLocaleLowerCase('zh-CN').includes(query))
       : source;
@@ -291,7 +462,7 @@ async function readApplicationResults(outputDir, searchParams) {
       all: queried.length,
       dated: queried.filter((record) => applicationTimestamp(record) !== null).length,
       unknown: queried.filter((record) => applicationTimestamp(record) === null).length,
-      incomplete: queried.filter(isIncompleteApplicationRecord).length,
+      incomplete: queried.filter(incompleteRecord).length,
       withImages: queried.filter((record) => Array.isArray(record.media?.images) && record.media.images.length > 0).length,
     };
     const cutoff = /^\d+$/.test(timeRange)
@@ -316,6 +487,10 @@ async function readApplicationResults(outputDir, searchParams) {
       .map(({ record }) => record);
     return {
       available: true,
+      analysisMode,
+      keyword: String(payload.keyword || task.params?.keyword || task.config?.keyword || ''),
+      research: analysisMode === 'general' ? contentResearchContext(payload, task) : null,
+      presentation: analysisMode === 'general' && payload.content_presentation ? payload.content_presentation : null,
       total: records.length,
       offset,
       limit,
@@ -327,6 +502,10 @@ async function readApplicationResults(outputDir, searchParams) {
   } catch (error) {
     if (error.code === 'ENOENT') return {
       available: false,
+      analysisMode: requestedAnalysisMode || 'job',
+      keyword: '',
+      research: null,
+      presentation: null,
       total: 0,
       offset,
       limit,
@@ -337,6 +516,35 @@ async function readApplicationResults(outputDir, searchParams) {
     };
     throw error;
   }
+}
+
+async function readLatestApplicationPayload(outputDir) {
+  const candidates = await Promise.all(
+    ['application_intelligence.checkpoint.json', 'application_intelligence.json'].map(async (filename) => {
+      const filePath = path.join(outputDir, filename);
+      try {
+        const metadata = await stat(filePath);
+        return { filePath, modifiedAt: metadata.mtimeMs };
+      } catch (error) {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      }
+    }),
+  );
+  const available = candidates.filter(Boolean).sort((left, right) => right.modifiedAt - left.modifiedAt);
+  let lastError = null;
+  for (const candidate of available) {
+    try {
+      const payload = JSON.parse(await readFile(candidate.filePath, 'utf8'));
+      if (payload && Array.isArray(payload.records)) return payload;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  if (lastError) throw lastError;
+  const error = new Error('Application results are not available.');
+  error.code = 'ENOENT';
+  throw error;
 }
 
 async function readLegacyMediaSources(outputDir) {
@@ -412,12 +620,6 @@ function applicationTimestamp(record) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
-function isIncompleteApplicationRecord(record) {
-  return !String(record?.body || '').trim()
-    || record?.job_card?.parse_basis === 'search_card'
-    || String(record?.outreach?.runtime_status || '').startsWith('fallback_missing');
-}
-
 async function readApplicationRecord(outputDir, noteId) {
   const payload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
   const record = Array.isArray(payload.records) ? payload.records.find((item) => item.note_id === noteId) : null;
@@ -482,6 +684,7 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo) {
   const state = await readDeliveryState(outputDir);
   const draft = normalizeDraft(value?.outreach || state[noteId]?.draft || record.outreach);
   if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
+  validateDeliveryDraft(draft, record);
   state[noteId] = { ...state[noteId], draft, updatedAt: new Date().toISOString() };
   try {
     const sent = await mailer.send({
@@ -525,6 +728,36 @@ function normalizeDraft(value) {
     draft[field] = text;
   }
   return draft;
+}
+
+function validateDeliveryDraft(draft, record) {
+  const subject = String(draft.email_subject || '').trim();
+  const body = String(draft.email_body || '').trim();
+  if (subject.length < 8 || subject.length > 120) {
+    throw new ValidationError('Email subject must contain 8-120 characters.');
+  }
+  if (body.length < 80 || body.length > 300) {
+    throw new ValidationError('Email body must contain 80-300 characters before delivery.');
+  }
+  if (!body.includes('我')) {
+    throw new ValidationError('Email body must use a clear first-person introduction.');
+  }
+  const combined = `${subject}\n${body}`;
+  if (/(?:X{2,}|候选人姓名|公司名|岗位名|可用天数|实习时长|此处填|待补充|待填写)/i.test(combined)) {
+    throw new ValidationError('Email still contains placeholder content.');
+  }
+  const candidateName = String(record?.candidate_profile?.name || '').trim();
+  const metaScan = candidateName ? combined.replaceAll(candidateName, '') : combined;
+  if (/(?:简历|附件|原帖|岗位提到|候选人|材料显示)/.test(metaScan)) {
+    throw new ValidationError('Email contains unsupported meta wording or refers to an attachment that is not sent.');
+  }
+  const roleName = String(record?.job_card?.role_name || record?.title || '').trim();
+  if (roleName && !subject.includes(roleName) && !body.includes(roleName)) {
+    throw new ValidationError('Email subject or body must identify the current role.');
+  }
+  if (!/(?:期待|希望|方便|愿意).{0,18}(?:沟通|交流|面试|进一步了解)/.test(body)) {
+    throw new ValidationError('Email body must include a clear communication next step.');
+  }
 }
 
 function extractedEmails(record) {

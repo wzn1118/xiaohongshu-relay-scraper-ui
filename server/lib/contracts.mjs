@@ -1,5 +1,8 @@
 const ALLOWED_KEYS = new Set([
+  'analysisMode',
   'keyword',
+  'contentPreset',
+  'contentGoal',
   'searchSort',
   'maxAgeDays',
   'browserProfile',
@@ -13,6 +16,7 @@ const ALLOWED_KEYS = new Set([
   'randomDelayMinSeconds',
   'randomDelayMaxSeconds',
   'mode',
+  'completeMissingOnly',
   'skipPostprocess',
   'noAutoAttach',
   'checkOnly',
@@ -46,13 +50,27 @@ export function validateRunRequest(value) {
     throw new ValidationError('Unsupported parameters.', unknown.map((key) => ({ field: key, reason: 'not_allowed' })));
   }
 
+  const analysisMode = value.analysisMode ?? 'job';
+  if (analysisMode !== 'job' && analysisMode !== 'general') {
+    throw fieldError('analysisMode', 'must_be_job_or_general');
+  }
+
   const keyword = stringField(value.keyword, 'keyword', { defaultValue: '实习继任', min: 1, max: 80 });
   if (/\p{Cc}/u.test(keyword)) throw fieldError('keyword', 'contains_control_character');
 
-  const searchSort = value.searchSort ?? 'latest';
-  if (searchSort !== 'latest' && searchSort !== 'comprehensive') {
+  const contentPreset = value.contentPreset ?? 'auto';
+  if (!['auto', 'experience', 'people', 'trend', 'product', 'place', 'custom'].includes(contentPreset)) {
+    throw fieldError('contentPreset', 'unsupported_content_preset');
+  }
+  const contentGoal = boundedCandidateString(value.contentGoal, 'contentGoal', '', 500);
+
+  const requestedSearchSort = value.searchSort ?? 'latest';
+  if (requestedSearchSort !== 'latest' && requestedSearchSort !== 'comprehensive') {
     throw fieldError('searchSort', 'must_be_latest_or_comprehensive');
   }
+  // Collection is latest-first by product policy. Accept the legacy value so
+  // stale clients upgrade cleanly, but never let it reach the runner.
+  const searchSort = 'latest';
 
   const browserProfile = stringField(value.browserProfile, 'browserProfile', {
     defaultValue: 'openclaw',
@@ -67,6 +85,10 @@ export function validateRunRequest(value) {
   const resumeFromJobId = optionalStringField(value.resumeFromJobId, 'resumeFromJobId', 64);
   if (resumeFromJobId && !JOB_ID.test(resumeFromJobId)) throw fieldError('resumeFromJobId', 'invalid_job_id');
   if (resumeFromJobId && mode !== 'resume') throw fieldError('resumeFromJobId', 'requires_resume_mode');
+  const completeMissingOnly = booleanField(value.completeMissingOnly, 'completeMissingOnly', false);
+  if (completeMissingOnly && (!resumeFromJobId || mode !== 'resume')) {
+    throw fieldError('completeMissingOnly', 'requires_resume_source');
+  }
 
   const speedMode = value.speedMode ?? 'random';
   if (speedMode !== 'steady' && speedMode !== 'random') throw fieldError('speedMode', 'must_be_steady_or_random');
@@ -77,10 +99,18 @@ export function validateRunRequest(value) {
     throw fieldError('randomDelayMaxSeconds', 'must_be_greater_than_or_equal_to_randomDelayMinSeconds');
   }
 
+  // Validate the legacy field so malformed clients still receive a useful
+  // response, then normalize collection to lossless discovery. Recency is a
+  // result-view filter and must never delete cards before body collection.
+  integerField(value.maxAgeDays, 'maxAgeDays', 0, 0, 365);
+
   return Object.freeze({
+    analysisMode,
     keyword,
+    contentPreset,
+    contentGoal,
     searchSort,
-    maxAgeDays: integerField(value.maxAgeDays, 'maxAgeDays', 30, 0, 365),
+    maxAgeDays: 0,
     browserProfile,
     relayPort: integerField(value.relayPort, 'relayPort', 18800, 1, 65535),
     // Every production run must collect the body for every discovered card.
@@ -95,11 +125,14 @@ export function validateRunRequest(value) {
     randomDelayMinSeconds,
     randomDelayMaxSeconds,
     mode,
+    completeMissingOnly,
     skipPostprocess: booleanField(value.skipPostprocess, 'skipPostprocess', false),
     noAutoAttach: booleanField(value.noAutoAttach, 'noAutoAttach', true),
     checkOnly: booleanField(value.checkOnly, 'checkOnly', false),
     securityVerificationTimeoutSeconds: integerField(value.securityVerificationTimeoutSeconds, 'securityVerificationTimeoutSeconds', 600, 60, 3600),
-    useCodexRuntime: booleanField(value.useCodexRuntime, 'useCodexRuntime', true),
+    useCodexRuntime: analysisMode === 'general'
+      ? true
+      : booleanField(value.useCodexRuntime, 'useCodexRuntime', true),
     codexBatchSize: integerField(value.codexBatchSize, 'codexBatchSize', 8, 1, 20),
     codexTimeoutSeconds: integerField(value.codexTimeoutSeconds, 'codexTimeoutSeconds', 300, 30, 1800),
     aiSessionId: optionalUuidField(value.aiSessionId, 'aiSessionId'),
@@ -144,10 +177,13 @@ function boundedCandidateString(value, field, defaultValue, max) {
 
 export function buildRunnerArgs(params, outputDir) {
   const args = [
+    '--analysis-mode', params.analysisMode,
     '--keyword', params.keyword,
+    '--content-preset', params.contentPreset,
+    '--content-goal', params.contentGoal,
     '--output-dir', outputDir,
-    '--search-sort', params.searchSort,
-    '--max-age-days', String(params.maxAgeDays),
+    '--search-sort', 'latest',
+    '--max-age-days', '0',
     '--browser-profile', params.browserProfile,
     '--relay-port', String(params.relayPort),
     '--limit', String(params.limit),
@@ -166,6 +202,7 @@ export function buildRunnerArgs(params, outputDir) {
     '--cover-letter-max-attempts', String(params.coverLetterMaxAttempts),
   ];
   args.push(params.useCodexRuntime ? '--codex-runtime' : '--no-codex-runtime');
+  if (params.completeMissingOnly) args.push('--complete-missing-only');
   if (params.skipPostprocess) args.push('--skip-postprocess');
   if (params.noAutoAttach) args.push('--no-auto-attach');
   if (params.checkOnly) args.push('--check-only');

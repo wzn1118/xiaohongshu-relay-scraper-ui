@@ -50,9 +50,13 @@ SECURITY_VERIFICATION_MARKERS = (
     "验证后继续",
     "拖动滑块",
     "滑块验证",
-    "访问频繁",
-    "异常访问",
     "captcha",
+)
+RATE_LIMIT_MARKERS = (
+    "访问频繁",
+    "请稍后再试",
+    "error_code=300013",
+    "detail_rate_limited",
 )
 
 
@@ -61,8 +65,40 @@ def contains_security_verification(value: Any) -> bool:
     return any(marker.casefold() in text for marker in SECURITY_VERIFICATION_MARKERS)
 
 
+def contains_rate_limit(value: Any) -> bool:
+    text = str(value or "").casefold()
+    return any(marker.casefold() in text for marker in RATE_LIMIT_MARKERS)
+
+
 def record_key(record: dict[str, Any]) -> str:
     return str(record.get("note_id") or record.get("note_url") or "").strip()
+
+
+def deduplicate_cards(cards: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    unique: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    duplicates = 0
+    for card in cards:
+        key = record_key(card)
+        if not key:
+            raise ValueError("Card checkpoints must have non-empty note identifiers")
+        if key not in unique:
+            unique[key] = dict(card)
+            order.append(key)
+            continue
+        duplicates += 1
+        merged = unique[key]
+        for field, value in card.items():
+            if value not in (None, "", [], {}) and merged.get(field) in (None, "", [], {}):
+                merged[field] = value
+        ranks = [
+            int(value)
+            for value in (merged.get("card_rank"), card.get("card_rank"))
+            if str(value or "").isdigit() and int(value) > 0
+        ]
+        if ranks:
+            merged["card_rank"] = min(ranks)
+    return [unique[key] for key in order], duplicates
 
 
 def record_is_complete(record: dict[str, Any]) -> bool:
@@ -75,14 +111,15 @@ def record_is_complete(record: dict[str, Any]) -> bool:
         and bool(str(record.get("body") or "").strip())
         and str(record.get("access_status") or "").strip() == "detail_ok"
         and not contains_security_verification(detail_text)
+        and not contains_rate_limit(detail_text)
     )
 
 
 def detail_url_candidates(card: dict[str, Any]) -> list[str]:
     candidates = [
-        card.get("explore_url", ""),
         card.get("search_result_url", ""),
         card.get("note_url", ""),
+        card.get("explore_url", ""),
     ]
     return list(dict.fromkeys(str(url).strip() for url in candidates if str(url).strip()))
 
@@ -152,8 +189,16 @@ def complete_bodies(
     cards = load_json_list(cards_path)
     if not cards:
         raise ValueError("The card checkpoint is empty")
+    original_card_count = len(cards)
+    cards, duplicate_count = deduplicate_cards(cards)
+    if duplicate_count:
+        atomic_json(cards_path, cards)
+        print(
+            f"CARD_CHECKPOINT_NORMALIZED before={original_card_count} after={len(cards)} duplicates={duplicate_count}",
+            flush=True,
+        )
     card_keys = [record_key(card) for card in cards]
-    if any(not key for key in card_keys) or len(set(card_keys)) != len(card_keys):
+    if len(set(card_keys)) != len(card_keys):
         raise ValueError("Card checkpoints must have unique note identifiers")
 
     existing = load_json_list(notes_path) if notes_path.exists() else []
@@ -161,6 +206,7 @@ def complete_bodies(
     complete_by_key = {key: value for key, value in complete_by_key.items() if key in set(card_keys)}
     last_failures: dict[str, dict[str, Any]] = {}
     attempted_keys: set[str] = set()
+    round_progress: dict[int, int] = {}
     upstream = None
     lock = threading.Lock()
     stop_event = threading.Event()
@@ -170,6 +216,7 @@ def complete_bodies(
     security_detected_at = ""
     security_status = "not_detected"
     security_owner_id: int | None = None
+    rate_limit_detected_at = ""
     stop_reason = ""
 
     source_search_url = next(
@@ -213,6 +260,10 @@ def complete_bodies(
                     "access_status": "detail_worker_error",
                     "worker_error": str(error),
                 }
+            challenge_text = json.dumps(last_payload, ensure_ascii=False)
+            if contains_rate_limit(challenge_text) or contains_security_verification(challenge_text):
+                last_payload["attempted_detail_urls"] = attempted_urls
+                return last_payload
             if record_is_complete(last_payload):
                 return last_payload
         last_payload.setdefault("note_id", card.get("note_id", ""))
@@ -220,8 +271,14 @@ def complete_bodies(
         last_payload["attempted_detail_urls"] = attempted_urls
         return last_payload
 
-    def run_worker(worker_id: int, work: queue.Queue[dict[str, Any]]) -> None:
-        nonlocal successful_since_checkpoint, security_detected_at, security_status, security_owner_id, stop_reason
+    def run_worker(
+        worker_id: int,
+        work: queue.Queue[dict[str, Any]],
+        round_number: int,
+        round_total: int,
+    ) -> None:
+        nonlocal successful_since_checkpoint, security_detected_at, security_status, security_owner_id
+        nonlocal rate_limit_detected_at, stop_reason
         try:
             from playwright.sync_api import sync_playwright
 
@@ -243,6 +300,9 @@ def complete_bodies(
                             card = work.get_nowait()
                         except queue.Empty:
                             break
+                        if stop_event.is_set():
+                            work.task_done()
+                            break
                         key = record_key(card)
                         try:
                             payload = scrape_with_url_fallback(page, card)
@@ -254,12 +314,33 @@ def complete_bodies(
                                 "access_status": "detail_worker_error",
                                 "worker_error": str(error),
                             }
+                        # Another worker may have timed out while this request was
+                        # in flight. Discard the late result before it mutates the
+                        # checkpoint or advances to another card.
+                        if stop_event.is_set():
+                            work.task_done()
+                            break
                         if not record_is_complete(payload):
                             challenge_text = json.dumps(payload, ensure_ascii=False)
                             try:
                                 challenge_text += "\n" + page.locator("body").inner_text(timeout=3000)
                             except Exception:  # noqa: BLE001
                                 pass
+                            if contains_rate_limit(challenge_text):
+                                with lock:
+                                    attempted_keys.add(key)
+                                    last_failures[key] = payload
+                                    rate_limit_detected_at = rate_limit_detected_at or utc_now()
+                                    stop_reason = "rate_limited"
+                                    stop_event.set()
+                                    security_gate.set()
+                                    checkpoint(force=True)
+                                print(
+                                    "RATE_LIMIT detected; stopping new collection and preserving checkpoint",
+                                    flush=True,
+                                )
+                                work.task_done()
+                                break
                             if contains_security_verification(challenge_text):
                                 owns_verification = False
                                 with lock:
@@ -319,6 +400,7 @@ def complete_bodies(
                                 break
                         with lock:
                             attempted_keys.add(key)
+                            round_progress[round_number] = round_progress.get(round_number, 0) + 1
                             if record_is_complete(payload):
                                 complete_by_key[key] = payload
                                 last_failures.pop(key, None)
@@ -326,12 +408,14 @@ def complete_bodies(
                                 checkpoint()
                             else:
                                 last_failures[key] = payload
-                            processed_count = len(attempted_keys)
+                            processed_count = min(len(cards), len(complete_by_key) + len(last_failures))
                             complete_count = len(complete_by_key)
+                            round_processed = round_progress[round_number]
                         print(
                             "PARALLEL_PROGRESS "
                             f"processed={processed_count} total={len(cards)} complete={complete_count} "
-                            f"status={payload.get('access_status') or 'missing_record'}",
+                            f"status={payload.get('access_status') or 'missing_record'} "
+                            f"round={round_number} round_processed={round_processed} round_total={round_total}",
                             flush=True,
                         )
                         page_uses += 1
@@ -372,7 +456,11 @@ def complete_bodies(
         for card in pending:
             work.put(card)
         threads = [
-            threading.Thread(target=run_worker, args=(worker_id, work), daemon=True)
+            threading.Thread(
+                target=run_worker,
+                args=(worker_id, work, attempt, len(pending)),
+                daemon=True,
+            )
             for worker_id in range(1, workers + 1)
         ]
         for thread in threads:
@@ -406,9 +494,19 @@ def complete_bodies(
         "workers": workers,
         "attempts": attempts,
         "failureStatuses": status_counts,
-        "transitionedToAnalysis": stop_reason == "security_verification_timeout",
-        "newAccessStopped": stop_reason == "security_verification_timeout",
+        "collectionStatus": "partial" if missing else "completed",
+        "partial": bool(missing),
+        "workersExited": True,
+        "queueConsumptionStopped": stop_event.is_set(),
+        "readyForPartialAnalysis": bool(missing and stop_reason),
+        "transitionedToAnalysis": False,
+        "newAccessStopped": stop_reason in {"security_verification_timeout", "rate_limited"},
         "stopReason": stop_reason,
+        "rateLimit": {
+            "detectedAt": rate_limit_detected_at,
+            "status": "stopped" if stop_reason == "rate_limited" else "not_detected",
+            "recoveryAction": "wait_then_resume" if stop_reason == "rate_limited" else "",
+        },
         "securityVerification": {
             "detectedAt": security_detected_at,
             "timeoutSeconds": security_verification_timeout_seconds,

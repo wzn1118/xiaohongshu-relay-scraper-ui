@@ -12,9 +12,11 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable
-from urllib.parse import unquote, urljoin
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 from playwright.sync_api import Browser, BrowserContext, Error, Page, TimeoutError, sync_playwright
+from websockets.sync.client import connect as websocket_connect
 
 from collection_pacing import (
     DEFAULT_NOTE_DELAY_SECONDS,
@@ -201,12 +203,199 @@ def get_relay_headers(port: int) -> dict[str, str]:
     return {"x-openclaw-relay-token": relay_token}
 
 
+class RelaySecurityRestrictionError(RuntimeError):
+    pass
+
+
+def is_security_restriction_target(target: dict[str, Any]) -> bool:
+    text = f"{target.get('title', '')} {target.get('url', '')}".casefold()
+    return (
+        "/website-login/error" in text
+        or "error_code=300013" in text
+        or "access_denied" in text
+    )
+
+
+def is_xiaohongshu_target(target: dict[str, Any]) -> bool:
+    try:
+        hostname = (urlsplit(str(target.get("url") or "")).hostname or "").casefold()
+    except ValueError:
+        return False
+    return hostname == "xiaohongshu.com" or hostname.endswith(".xiaohongshu.com")
+
+
+def relay_target_pressure(targets: Any) -> tuple[bool, list[str]]:
+    if not isinstance(targets, list):
+        raise RuntimeError("Relay returned an invalid target list.")
+    pages = [target for target in targets if target.get("type", "page") == "page"]
+    xiaohongshu_pages = [target for target in pages if is_xiaohongshu_target(target)]
+    reasons: list[str] = []
+    if len(targets) >= 9:
+        reasons.append("target_count")
+    if len(pages) >= 3:
+        reasons.append("page_count")
+    if len(xiaohongshu_pages) >= 3:
+        reasons.append("duplicate_target_pages")
+    if any(is_security_restriction_target(target) for target in pages):
+        reasons.append("security_restriction")
+    return bool(reasons), reasons
+
+
+def fetch_relay_json(port: int, path: str, headers: dict[str, str], timeout_seconds: float) -> Any:
+    request = Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+    with urlopen(request, timeout=timeout_seconds) as response:
+        return json.load(response)
+
+
+def relay_websocket_url(raw_url: str, relay_token: str) -> str:
+    if not relay_token:
+        return raw_url
+    parts = urlsplit(raw_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["token"] = relay_token
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def send_relay_cdp_command(socket, command_id: int, method: str, params: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+    socket.send(json.dumps({"id": command_id, "method": method, "params": params}))
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        response = json.loads(socket.recv(timeout=max(0.1, deadline - time.monotonic())))
+        if response.get("id") != command_id:
+            continue
+        if response.get("error"):
+            raise RuntimeError(response["error"].get("message") or f"Relay CDP command {method} failed.")
+        return response.get("result", {})
+    raise TimeoutError(f"Relay CDP command {method} timed out.")
+
+
+def reset_overloaded_relay_targets(relay_port: int, timeout_seconds: float = 5.0, *, force: bool = False) -> int:
+    headers = get_relay_headers(relay_port)
+    targets = fetch_relay_json(relay_port, "/json/list", headers, timeout_seconds)
+    pressured, _reasons = relay_target_pressure(targets)
+    if not pressured and not force:
+        return 0
+
+    page_targets = [target for target in targets if target.get("type", "page") == "page"]
+    version = fetch_relay_json(relay_port, "/json/version", headers, timeout_seconds)
+    websocket_url = str(version.get("webSocketDebuggerUrl") or "").strip()
+    if not websocket_url:
+        raise RuntimeError("Relay version response has no WebSocket endpoint.")
+
+    relay_token = headers.get("x-openclaw-relay-token", "")
+    closed = 0
+    with websocket_connect(
+        relay_websocket_url(websocket_url, relay_token),
+        open_timeout=timeout_seconds,
+        close_timeout=1,
+    ) as socket:
+        created = send_relay_cdp_command(
+            socket,
+            1,
+            "Target.createTarget",
+            {"url": "https://www.xiaohongshu.com/explore"},
+            timeout_seconds,
+        )
+        if not str(created.get("targetId") or "").strip():
+            raise RuntimeError("Relay did not create a clean replacement target.")
+        for command_id, target in enumerate(page_targets, start=2):
+            target_id = str(target.get("id") or "").strip()
+            if not target_id:
+                continue
+            result = send_relay_cdp_command(
+                socket,
+                command_id,
+                "Target.closeTarget",
+                {"targetId": target_id},
+                timeout_seconds,
+            )
+            if result.get("success") is not False:
+                closed += 1
+    return closed
+
+
+def cleanup_security_restriction_targets(relay_port: int, timeout_seconds: float = 5.0) -> int:
+    headers = get_relay_headers(relay_port)
+    targets = fetch_relay_json(relay_port, "/json/list", headers, timeout_seconds)
+    if not isinstance(targets, list):
+        raise RuntimeError("Relay returned an invalid target list.")
+    page_targets = [target for target in targets if target.get("type", "page") == "page"]
+    restricted = [target for target in page_targets if is_security_restriction_target(target)]
+    if not restricted:
+        return 0
+    usable = [target for target in page_targets if not is_security_restriction_target(target)]
+    if not usable:
+        raise RelaySecurityRestrictionError(
+            "Relay only has a security-restriction page. Refresh the search page, reconnect Relay, then retry."
+        )
+
+    version = fetch_relay_json(relay_port, "/json/version", headers, timeout_seconds)
+    websocket_url = str(version.get("webSocketDebuggerUrl") or "").strip()
+    if not websocket_url:
+        raise RuntimeError("Relay version response has no WebSocket endpoint.")
+    relay_token = headers.get("x-openclaw-relay-token", "")
+    closed = 0
+    with websocket_connect(
+        relay_websocket_url(websocket_url, relay_token),
+        open_timeout=timeout_seconds,
+        close_timeout=1,
+    ) as socket:
+        for command_id, target in enumerate(restricted, start=1):
+            target_id = str(target.get("id") or "").strip()
+            if not target_id:
+                continue
+            socket.send(json.dumps({
+                "id": command_id,
+                "method": "Target.closeTarget",
+                "params": {"targetId": target_id},
+            }))
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                response = json.loads(socket.recv(timeout=max(0.1, deadline - time.monotonic())))
+                if response.get("id") != command_id:
+                    continue
+                if response.get("error"):
+                    raise RuntimeError(response["error"].get("message") or "Relay could not close the restricted page.")
+                if response.get("result", {}).get("success"):
+                    closed += 1
+                break
+    return closed
+
+
 def connect_browser(playwright, relay_port: int) -> Browser:
     endpoint = f"http://127.0.0.1:{relay_port}"
     headers = get_relay_headers(relay_port)
-    if headers:
-        return playwright.chromium.connect_over_cdp(endpoint, headers=headers, timeout=120000)
-    return playwright.chromium.connect_over_cdp(endpoint, timeout=120000)
+    timeout = int(os.environ.get("XHS_RELAY_CONNECT_TIMEOUT_MS") or 60000)
+    recovery_timeout = max(1.0, min(timeout / 1000, 8.0))
+    try:
+        reset_targets = reset_overloaded_relay_targets(relay_port, timeout_seconds=recovery_timeout)
+        if reset_targets:
+            log(f"Relay auto-recovery replaced an overloaded target set and closed {reset_targets} stale page(s).")
+    except Exception as error:  # noqa: BLE001
+        log(f"Relay preflight recovery warning: {error}")
+    closed_targets = cleanup_security_restriction_targets(
+        relay_port,
+        timeout_seconds=recovery_timeout,
+    )
+    if closed_targets:
+        log(f"Relay recovery closed {closed_targets} stale security-restriction tab(s).")
+
+    def connect() -> Browser:
+        if headers:
+            return playwright.chromium.connect_over_cdp(endpoint, headers=headers, timeout=timeout)
+        return playwright.chromium.connect_over_cdp(endpoint, timeout=timeout)
+
+    try:
+        return connect()
+    except TimeoutError:
+        log("Relay Playwright initialization timed out; applying a forced target reset and retrying once.")
+        reset_targets = reset_overloaded_relay_targets(
+            relay_port,
+            timeout_seconds=recovery_timeout,
+            force=True,
+        )
+        log(f"Relay forced recovery closed {reset_targets} stale page(s); retrying with a {timeout} ms connection window.")
+        return connect()
 
 
 def get_or_create_context(browser: Browser) -> BrowserContext:
@@ -299,6 +488,9 @@ def open_search_page(context: BrowserContext, search_url: str) -> Page:
         try:
             page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
             wait_for_search_results(page)
+            if not search_request_matches(page.url, search_url):
+                raise RuntimeError(f"search page did not reach the requested keyword: {page.url}")
+            log(f"Search page ready for requested keyword: {page.url}")
             return page
         except Exception as exc:  # noqa: BLE001
             last_error = exc
@@ -308,8 +500,9 @@ def open_search_page(context: BrowserContext, search_url: str) -> Page:
                     page.evaluate("(url) => { location.href = url; }", search_url)
                     deadline = time.time() + 30
                     while time.time() < deadline:
-                        if "xiaohongshu.com/search_result" in (page.url or ""):
+                        if search_request_matches(page.url, search_url):
                             wait_for_search_results(page)
+                            log(f"Search page ready for requested keyword: {page.url}")
                             return page
                         page.wait_for_timeout(1000)
                 except Exception as fallback_exc:  # noqa: BLE001
@@ -319,6 +512,22 @@ def open_search_page(context: BrowserContext, search_url: str) -> Page:
                 page = context.new_page()
 
     raise RuntimeError(f"Search page navigation failed after replacing the tab: {last_error}")
+
+
+def search_request_matches(actual_url: str, expected_url: str) -> bool:
+    try:
+        actual = urlsplit(actual_url)
+        expected = urlsplit(expected_url)
+        if (
+            actual.netloc.casefold() != expected.netloc.casefold()
+            or actual.path.rstrip("/") != expected.path.rstrip("/")
+        ):
+            return False
+        actual_query = dict(parse_qsl(actual.query, keep_blank_values=True))
+        expected_query = dict(parse_qsl(expected.query, keep_blank_values=True))
+        return bool(expected_query.get("keyword")) and actual_query.get("keyword") == expected_query.get("keyword")
+    except ValueError:
+        return False
 
 
 def dismiss_common_popups(page: Page) -> None:
@@ -407,6 +616,10 @@ def wait_for_search_results(page: Page) -> None:
         except Exception:  # noqa: BLE001
             continue
     page.wait_for_timeout(1500)
+
+
+def should_apply_live_search_sort(use_card_cache: bool) -> bool:
+    return not use_card_cache
 
 
 def select_latest_sort(page: Page) -> None:
@@ -545,6 +758,11 @@ def filter_cards_by_recency(
         else:
             removed += 1
     return kept, removed, unknown
+
+
+def collection_max_age_days(limit: int, max_age_days: int) -> int:
+    """Full collection is lossless; recency belongs to the result view."""
+    return 0 if limit <= 0 else max_age_days
 
 
 def resume_record_matches_cards(record: NoteRecord, cards: list[dict[str, Any]]) -> bool:
@@ -759,6 +977,40 @@ def extract_cards(page: Page) -> list[dict[str, Any]]:
     return page.evaluate(js)
 
 
+def card_identity(card: dict[str, Any]) -> str:
+    note_id = str(card.get("note_id") or "").strip()
+    if note_id:
+        return f"note:{note_id}"
+    raw_url = str(card.get("note_url") or card.get("search_result_url") or card.get("explore_url") or "").strip()
+    if not raw_url:
+        return ""
+    try:
+        parsed = urlsplit(raw_url)
+        return f"url:{urlunsplit((parsed.scheme.casefold(), parsed.netloc.casefold(), parsed.path, '', ''))}"
+    except ValueError:
+        return f"url:{raw_url}"
+
+
+def merge_discovered_cards(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    for key, value in incoming.items():
+        if value not in (None, "", [], {}) and merged.get(key) in (None, "", [], {}):
+            merged[key] = value
+    ranks = [
+        int(value)
+        for value in (existing.get("card_rank"), incoming.get("card_rank"))
+        if str(value or "").isdigit() and int(value) > 0
+    ]
+    if ranks:
+        merged["card_rank"] = min(ranks)
+    for key in ("note_url", "search_result_url"):
+        current = str(merged.get(key) or "")
+        candidate = str(incoming.get(key) or "")
+        if candidate and "xsec_source=pc_search" in candidate and "xsec_source=pc_search" not in current:
+            merged[key] = candidate
+    return merged
+
+
 def collect_note_links(
     page: Page,
     *,
@@ -792,8 +1044,13 @@ def collect_note_links(
             continue
         before_count = len(all_cards)
         for card in cards:
-            if card["note_url"] not in all_cards:
-                all_cards[card["note_url"]] = card
+            identity = card_identity(card)
+            if not identity:
+                continue
+            if identity in all_cards:
+                all_cards[identity] = merge_discovered_cards(all_cards[identity], card)
+            else:
+                all_cards[identity] = card
         after_count = len(all_cards)
 
         if checkpoint is not None:
@@ -1249,8 +1506,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scrolls", type=int, default=40)
     parser.add_argument("--stable-rounds", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0, help="Optional max note count to scrape. 0 means no cap.")
-    parser.add_argument("--search-sort", choices=("latest", "comprehensive"), default="latest")
-    parser.add_argument("--max-age-days", type=int, default=30, help="Keep cards no older than this many days. 0 disables the date filter.")
+    parser.add_argument("--search-sort", choices=("latest",), default="latest")
+    parser.add_argument("--max-age-days", type=int, default=0, help="Legacy bounded-run filter. Full collection always keeps every discovered card.")
     parser.add_argument("--goto-timeout-ms", type=int, default=45000)
     parser.add_argument("--note-delay-seconds", type=float, default=DEFAULT_NOTE_DELAY_SECONDS)
     parser.add_argument("--speed-mode", choices=("steady", "random"), default=DEFAULT_SPEED_MODE)
@@ -1318,6 +1575,7 @@ def main() -> int:
     latest_json = output_dir / "xiaohongshu_notes_latest.json"
     latest_csv = output_dir / "xiaohongshu_notes_latest.csv"
     latest_cards_json = output_dir / "xiaohongshu_cards_latest.json"
+    discovered_cards_json = output_dir / "xiaohongshu_cards_discovered.json"
     security_restriction_json = output_dir / "security-restriction.json"
     security_restriction_json.unlink(missing_ok=True)
 
@@ -1349,15 +1607,16 @@ def main() -> int:
             )
             return 3
 
-        if args.search_sort == "latest":
+        if should_apply_live_search_sort(args.use_card_cache):
             log("Selecting latest-first search order before collection...")
             select_latest_sort(search_page)
         else:
-            log("Search sort: 综合 (platform default).")
+            log("Resume checkpoint keeps its verified latest-first source card order.")
 
         security_timed_out = False
-        if args.use_card_cache and latest_cards_json.exists():
-            cards = json.loads(latest_cards_json.read_text(encoding="utf-8"))
+        card_cache_json = discovered_cards_json if discovered_cards_json.exists() else latest_cards_json
+        if args.use_card_cache and card_cache_json.exists():
+            cards = json.loads(card_cache_json.read_text(encoding="utf-8"))
             log(f"Loaded {len(cards)} cached note links.")
         else:
             log("Collecting note links from the search results...")
@@ -1370,7 +1629,10 @@ def main() -> int:
                 random_delay_min_seconds=args.random_delay_min_seconds,
                 random_delay_max_seconds=args.random_delay_max_seconds,
                 security_verification_timeout_seconds=args.security_verification_timeout_seconds,
-                checkpoint=lambda discovered: write_json_payload(discovered, latest_cards_json),
+                checkpoint=lambda discovered: (
+                    write_json_payload(discovered, discovered_cards_json),
+                    write_json_payload(discovered, latest_cards_json),
+                ),
             )
             if security_timed_out:
                 write_json_payload(
@@ -1383,10 +1645,20 @@ def main() -> int:
                     },
                     security_restriction_json,
                 )
-        cards, removed_count, unknown_count = filter_cards_by_recency(cards, args.max_age_days)
-        if args.max_age_days > 0:
+        write_json_payload(cards, discovered_cards_json)
+        effective_max_age_days = collection_max_age_days(args.limit, args.max_age_days)
+        cards, removed_count, unknown_count = filter_cards_by_recency(cards, effective_max_age_days)
+        if args.limit <= 0:
+            if args.max_age_days > 0:
+                log(
+                    f"Full collection ignored legacy --max-age-days={args.max_age_days}; "
+                    f"kept all {len(cards)} discovered cards. Apply recency only in result views."
+                )
+            else:
+                log(f"Full collection kept all {len(cards)} discovered cards for body collection.")
+        elif effective_max_age_days > 0:
             log(
-                f"Recency filter kept {len(cards)} cards within {args.max_age_days} days; "
+                f"Recency filter kept {len(cards)} cards within {effective_max_age_days} days; "
                 f"removed {removed_count} older cards; kept {unknown_count} cards with unknown dates."
             )
         write_json_payload(cards, latest_cards_json)

@@ -9,6 +9,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 SCRIPT = ROOT / "vendor" / "xiaohongshu-relay-scrape" / "scripts" / "scrape_xiaohongshu_search.py"
 sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("xhs_scraper", SCRIPT)
@@ -16,6 +17,8 @@ assert SPEC and SPEC.loader
 SCRAPER = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = SCRAPER
 SPEC.loader.exec_module(SCRAPER)
+
+import run_project_workflow as WORKFLOW  # noqa: E402
 
 
 def make_record(status: str, **overrides):
@@ -38,6 +41,167 @@ def test_resume_retries_failed_detail_records() -> None:
     assert not SCRAPER.is_complete_resume_record(make_record("detail_playwright_error"))
     assert not SCRAPER.is_complete_resume_record(make_record("detail_rate_limited"))
     assert not SCRAPER.is_complete_resume_record(make_record("detail_security_verification"))
+
+
+def test_discovery_identity_deduplicates_query_variants_and_keeps_richer_url() -> None:
+    first = {
+        "note_id": "n1",
+        "note_url": "https://www.xiaohongshu.com/search_result/n1?xsec_source=",
+        "card_rank": 8,
+        "title": "同一篇内容",
+    }
+    second = {
+        "note_id": "n1",
+        "note_url": "https://www.xiaohongshu.com/search_result/n1?xsec_source=pc_search",
+        "card_rank": 12,
+        "card_cover_url": "https://img.example/n1.webp",
+    }
+
+    assert SCRAPER.card_identity(first) == SCRAPER.card_identity(second) == "note:n1"
+    merged = SCRAPER.merge_discovered_cards(first, second)
+    assert merged["note_url"].endswith("xsec_source=pc_search")
+    assert merged["card_rank"] == 8
+    assert merged["card_cover_url"] == "https://img.example/n1.webp"
+
+
+def test_search_request_match_requires_the_requested_keyword() -> None:
+    expected = "https://www.xiaohongshu.com/search_result/?keyword=%E9%95%BF%E5%8F%91%E7%94%B7&type=51"
+    assert SCRAPER.search_request_matches(
+        "https://www.xiaohongshu.com/search_result?keyword=%E9%95%BF%E5%8F%91%E7%94%B7&source=web_note_detail_r10",
+        expected,
+    )
+    assert not SCRAPER.search_request_matches(
+        "https://www.xiaohongshu.com/search_result/?keyword=%E7%9F%AD%E5%8F%91%E5%A5%B3",
+        expected,
+    )
+
+
+def test_failed_discovery_retries_body_checkpoint_when_cards_are_available(tmp_path, monkeypatch) -> None:
+    calls = {}
+
+    def fake_complete_bodies(output_dir, **kwargs):
+        calls["output_dir"] = output_dir
+        calls["kwargs"] = kwargs
+        return {"collectionStatus": "partial", "missingBodies": 1}
+
+    monkeypatch.setattr(WORKFLOW, "complete_bodies", fake_complete_bodies)
+
+    summary = WORKFLOW.collect_body_checkpoint(
+        tmp_path,
+        scrape_failed=True,
+        checkpoint_fallback=True,
+        relay_port=18800,
+        goto_timeout_ms=15000,
+        security_verification_timeout_seconds=600,
+        upstream_scraper=SCRIPT,
+    )
+
+    assert summary["collectionStatus"] == "partial"
+    assert calls["output_dir"] == tmp_path
+    assert calls["kwargs"]["workers"] == 2
+    assert calls["kwargs"]["attempts"] == 3
+
+
+def test_security_restriction_target_detection() -> None:
+    assert SCRAPER.is_security_restriction_target({"url": "https://example.test/website-login/error?error_code=300013"})
+    assert not SCRAPER.is_security_restriction_target({"url": "https://example.test/search_result/?keyword=test"})
+
+
+def test_relay_cleanup_closes_restricted_target_when_search_target_remains(monkeypatch) -> None:
+    responses = {
+        "/json/list": [
+            {"id": "blocked", "type": "page", "url": "https://example.test/website-login/error?error_code=300013"},
+            {"id": "search", "type": "page", "url": "https://example.test/search_result/?keyword=test"},
+        ],
+        "/json/version": {"webSocketDebuggerUrl": "ws://127.0.0.1:18800/devtools/browser/test"},
+    }
+    sent: list[dict] = []
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def send(self, payload: str) -> None:
+            sent.append(__import__("json").loads(payload))
+
+        def recv(self, **_kwargs) -> str:
+            return '{"id": 1, "result": {"success": true}}'
+
+    monkeypatch.setattr(SCRAPER, "get_relay_headers", lambda _port: {"x-openclaw-relay-token": "token"})
+    monkeypatch.setattr(SCRAPER, "fetch_relay_json", lambda _port, path, _headers, _timeout: responses[path])
+    monkeypatch.setattr(SCRAPER, "websocket_connect", lambda *_args, **_kwargs: FakeSocket())
+
+    assert SCRAPER.cleanup_security_restriction_targets(18800) == 1
+    assert sent == [{"id": 1, "method": "Target.closeTarget", "params": {"targetId": "blocked"}}]
+
+
+def test_relay_cleanup_fails_fast_when_only_restricted_target_remains(monkeypatch) -> None:
+    monkeypatch.setattr(SCRAPER, "get_relay_headers", lambda _port: {})
+    monkeypatch.setattr(
+        SCRAPER,
+        "fetch_relay_json",
+        lambda *_args: [{"id": "blocked", "type": "page", "url": "https://example.test/website-login/error"}],
+    )
+
+    with pytest.raises(SCRAPER.RelaySecurityRestrictionError, match="only has a security-restriction page"):
+        SCRAPER.cleanup_security_restriction_targets(18800)
+
+
+def test_relay_target_pressure_detects_overloaded_browser_context() -> None:
+    targets = [
+        {"id": "search", "type": "page", "url": "https://www.xiaohongshu.com/search_result?keyword=test"},
+        {"id": "detail", "type": "page", "url": "https://www.xiaohongshu.com/explore/note"},
+        {"id": "other", "type": "page", "url": "https://www.douyin.com/search/test"},
+        *({"id": f"worker-{index}", "type": "worker", "url": "https://example.test/worker.js"} for index in range(6)),
+    ]
+
+    pressured, reasons = SCRAPER.relay_target_pressure(targets)
+
+    assert pressured is True
+    assert "target_count" in reasons
+    assert "page_count" in reasons
+
+
+def test_relay_overload_reset_creates_clean_target_before_closing_old_pages(monkeypatch) -> None:
+    responses = {
+        "/json/list": [
+            {"id": "search", "type": "page", "url": "https://www.xiaohongshu.com/search_result?keyword=test"},
+            {"id": "detail", "type": "page", "url": "https://www.xiaohongshu.com/explore/note"},
+            {"id": "other", "type": "page", "url": "https://www.douyin.com/search/test"},
+        ],
+        "/json/version": {"webSocketDebuggerUrl": "ws://127.0.0.1:18800/devtools/browser/test"},
+    }
+    sent: list[dict] = []
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def send(self, payload: str) -> None:
+            sent.append(__import__("json").loads(payload))
+
+        def recv(self, **_kwargs) -> str:
+            command = sent[-1]
+            result = {"targetId": "clean"} if command["method"] == "Target.createTarget" else {"success": True}
+            return __import__("json").dumps({"id": command["id"], "result": result})
+
+    monkeypatch.setattr(SCRAPER, "get_relay_headers", lambda _port: {})
+    monkeypatch.setattr(SCRAPER, "fetch_relay_json", lambda _port, path, _headers, _timeout: responses[path])
+    monkeypatch.setattr(SCRAPER, "websocket_connect", lambda *_args, **_kwargs: FakeSocket())
+
+    assert SCRAPER.reset_overloaded_relay_targets(18800) == 3
+    assert sent[0] == {
+        "id": 1,
+        "method": "Target.createTarget",
+        "params": {"url": "https://www.xiaohongshu.com/explore"},
+    }
+    assert [command["params"]["targetId"] for command in sent[1:]] == ["search", "detail", "other"]
 
 
 class FakeSortPage:
@@ -99,6 +263,17 @@ def test_latest_sort_stops_before_scraping_when_filter_is_missing(monkeypatch) -
         raise AssertionError("Missing latest-sort control must stop collection")
 
 
+def test_latest_sort_is_only_applied_during_live_card_discovery() -> None:
+    assert SCRAPER.should_apply_live_search_sort(False)
+    assert not SCRAPER.should_apply_live_search_sort(True)
+
+
+def test_scraper_cli_rejects_non_latest_search_sort(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--search-sort", "comprehensive"])
+    with pytest.raises(SystemExit):
+        SCRAPER.parse_args()
+
+
 def test_recency_filter_removes_old_cards_and_keeps_unknown_dates() -> None:
     now = datetime(2026, 7, 29, 12, 0)
     cards = [
@@ -112,6 +287,11 @@ def test_recency_filter_removes_old_cards_and_keeps_unknown_dates() -> None:
     assert [card["note_id"] for card in kept] == ["recent", "unknown"]
     assert removed == 1
     assert unknown == 1
+
+
+def test_full_collection_ignores_legacy_recency_filter() -> None:
+    assert SCRAPER.collection_max_age_days(0, 30) == 0
+    assert SCRAPER.collection_max_age_days(100, 30) == 30
 
 
 def test_latest_resume_only_reuses_records_still_present_in_live_cards() -> None:

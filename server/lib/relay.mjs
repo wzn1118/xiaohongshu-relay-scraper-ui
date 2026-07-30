@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { relayTargetSummary } from './relay-targets.mjs';
 
 export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, fetchImpl = fetch }) {
   const checkedAt = new Date().toISOString();
@@ -17,6 +18,7 @@ export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, f
       if (!response.ok) throw new Error(`Relay responded with HTTP ${response.status}.`);
       const tabs = await response.json();
       if (!Array.isArray(tabs)) throw new Error('Relay returned an invalid tab list.');
+      const targetSummary = relayTargetSummary(tabs);
       return {
         ok: true,
         running: true,
@@ -25,7 +27,13 @@ export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, f
         port,
         tabs: tabs.length,
         tabCount: tabs.length,
-        xiaohongshuTabs: tabs.filter((tab) => /xiaohongshu\.com/i.test(String(tab?.url || ''))).length,
+        xiaohongshuTabs: targetSummary.xiaohongshuPages,
+        pageCount: targetSummary.pageCount,
+        iframeCount: targetSummary.iframeCount,
+        workerCount: targetSummary.workerCount,
+        targetPressure: targetSummary.pressure,
+        pressureReasons: targetSummary.pressureReasons,
+        recoveryRecommended: targetSummary.recoveryRecommended,
         checkedAt,
       };
     } finally {
@@ -49,7 +57,7 @@ export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, f
   }
 }
 
-async function resolveRelayToken({ port, openClawConfigPath }) {
+export async function resolveRelayToken({ port, openClawConfigPath }) {
   if (!openClawConfigPath) return '';
   try {
     const gatewayConfig = JSON.parse(await readFile(openClawConfigPath, 'utf8'));

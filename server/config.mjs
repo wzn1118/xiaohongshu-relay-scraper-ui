@@ -30,6 +30,7 @@ export const config = Object.freeze({
   smtpConfigPath: path.resolve(process.env.XHS_SMTP_CONFIG_PATH || path.join(dataDir, '..', 'smtp-config.json')),
   profileDir: path.resolve(process.env.XHS_PROFILE_DATA_DIR || path.join(serverDir, '..', 'data', 'profiles')),
   profileScriptPath: path.resolve(serverDir, '..', 'scripts', 'profile_memory.py'),
+  relayConnectionCheckScriptPath: path.resolve(serverDir, '..', 'scripts', 'check_relay_connection.py'),
   legacyProfilePath: path.resolve(serverDir, '..', 'profiles', 'candidate_profile.json'),
   smtp: Object.freeze({
     provider: String(process.env.SMTP_PROVIDER || '').trim(),
@@ -52,7 +53,7 @@ export const config = Object.freeze({
   openClawConfigPath:
     process.env.OPENCLAW_CONFIG_PATH ||
     path.join(process.env.USERPROFILE || process.env.HOME || '', '.openclaw', 'openclaw.json'),
-  maxHistory: readInt(process.env.XHS_MAX_HISTORY, 100, 10, 1000),
+  maxHistory: readInt(process.env.XHS_MAX_HISTORY, 1000, 10, 5000),
   maxBodyBytes: readInt(process.env.XHS_MAX_BODY_BYTES, 32 * 1024 * 1024, 1024, 64 * 1024 * 1024),
 });
 

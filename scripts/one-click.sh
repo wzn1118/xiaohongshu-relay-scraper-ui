@@ -114,7 +114,7 @@ if [ "$NODE_MAJOR" -ge 22 ] 2>/dev/null && [ "$PYTHON_CODE" -ge 311 ] 2>/dev/nul
 fi
 
 PYTHON_DEPS=0
-if command -v "$PYTHON_BIN" >/dev/null 2>&1 && "$PYTHON_BIN" -c 'import docx, openpyxl, playwright, pypdf' >/dev/null 2>&1; then
+if command -v "$PYTHON_BIN" >/dev/null 2>&1 && "$PYTHON_BIN" -c 'import docx, openpyxl, playwright, pypdf, websockets' >/dev/null 2>&1; then
   PYTHON_DEPS=1
 fi
 BOOTSTRAP_REQUIRED=1

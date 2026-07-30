@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -129,14 +130,38 @@ def write_json(path: Path, payload: list[dict]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def all_fieldnames(rows: list[dict]) -> list[str]:
+    fieldnames: list[str] = []
+    seen_fields: set[str] = set()
+    for row in rows:
+        for field in row:
+            if field not in seen_fields:
+                seen_fields.add(field)
+                fieldnames.append(field)
+    return fieldnames
+
+
 def write_csv(path: Path, rows: list[dict]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
+    fieldnames = all_fieldnames(rows)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def spreadsheet_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple, set)):
+        value = json.dumps(value, ensure_ascii=False, default=str)
+    if isinstance(value, str):
+        value = ILLEGAL_CHARACTERS_RE.sub("", value)
+        if value.startswith(("=", "+", "-", "@")):
+            value = f"'{value}"
+    return value
 
 
 def first_match(patterns: list[str], text: str) -> str:
@@ -402,7 +427,7 @@ def write_sheet(ws, headers: list[str], rows: list[dict], width_map: dict[str, f
     for row_idx, row in enumerate(rows, start=2):
         for col_idx, header in enumerate(headers, start=1):
             value = row.get(header, "")
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell = ws.cell(row=row_idx, column=col_idx, value=spreadsheet_value(value))
             cell.alignment = WRAP_TOP
             if header in {"笔记链接", "作者主页"} and value:
                 cell.hyperlink = value
@@ -443,7 +468,7 @@ def write_dedup_workbook(records: list[dict], output_path: Path, source_json: Pa
     summary.column_dimensions["B"].width = 100
     summary.freeze_panes = "A2"
 
-    raw_headers = list(records[0].keys()) if records else []
+    raw_headers = all_fieldnames(records)
     raw_rows = [{key: record.get(key, "") for key in raw_headers} for record in records]
     raw_widths = {
         "note_id": 18,
@@ -520,7 +545,7 @@ def write_structured_workbook(records: list[dict], output_path: Path, source_jso
     }
     write_sheet(structured, structured_headers, structured_rows, structured_widths)
 
-    raw_headers = list(records[0].keys()) if records else []
+    raw_headers = all_fieldnames(records)
     raw_rows = [{key: record.get(key, "") for key in raw_headers} for record in records]
     raw_widths = {
         "note_id": 18,

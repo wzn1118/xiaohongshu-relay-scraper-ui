@@ -18,7 +18,7 @@ except ImportError:
     from ai_provider_runtime import AIProvider
 
 
-PROMPT_VERSION = "xhs-outreach-v3"
+PROMPT_VERSION = "xhs-outreach-v6-fixed-cn-format"
 
 
 def _text(value: Any) -> str:
@@ -158,6 +158,8 @@ def _legacy_prompt(items: list[dict[str, Any]], candidate_name: str) -> str:
 3. 不得虚构公司、岗位、成果、技能、联系方式或量化数字；信息不足时使用克制表达。
 4. greeting 适合私信；email_body 是完整邮件；cover_letter 是独立求职信，三者不能完全相同。
 5. 全部使用第一人称，直接展示能力对应的行动和结果；禁止出现“简历”“附件”“原帖”“候选人”“材料显示”等元叙述，不得复述招聘正文。
+5.1 greeting 必须以“您好，我是候选人姓名”开场；作者昵称、账号名、发布时间、互动量和页面标签是来源元数据，不得用作称呼或写入文案。
+5.2 greeting 前 80 字必须出现准确岗位名及一项最强匹配证据或明确到岗安排，并以岗位是否仍在招聘等明确问题收尾。
 6. requirement_matches 要简要说明能力与所用经历的对应关系。
 7. 只输出符合给定 JSON Schema 的 JSON，不要添加 Markdown。
 
@@ -195,7 +197,7 @@ Cover Letter 必须优先遵循以下结构，并把岗位正文中明确出现�
 您好！我是学校、专业、年级/学历学生姓名，了解到贵公司的岗位后，希望申请该职位。
 我曾参与与岗位相关的实习或项目，负责候选人证据能够证明的工作，积累了可由证据支持的数据敏感度、沟通协作或其他能力。在此过程中，只写证据中真实出现的工具、方法和结果。
 目前我每周可实习可用天数天，预计可连续实习实习时长。希望将已有能力应用于岗位对应的业务，并继续提升业务理解和分析能力。
-简历随信附上，感谢您的阅读，期待有机会进一步沟通！
+感谢您的阅读，期待有机会进一步沟通岗位的实际重点！
 此致
 敬礼！
 姓名：候选人姓名
@@ -206,10 +208,14 @@ Cover Letter 必须优先遵循以下结构，并把岗位正文中明确出现�
 1. 逐条返回，note_id 原样保留；每条文案必须针对岗位职责或要求，不能批量套用同一句话。
 2. 只能使用 candidate_evidence 中的事实；used_evidence_ids 只能引用当前输入实际存在的 id。
 3. 不得虚构公司、岗位、经历、成果、技能、联系方式或量化数字；候选人信息字段为空时整行省略。
-4. greeting 适合私信；email_body 是完整邮件；cover_letter 是包含主题和署名信息的独立求职信，三者不能完全相同。
+4. greeting 为 30-180 字私信；email_body 为 80-300 字完整邮件；cover_letter 为 280-520 字、包含主题和署名信息的独立求职信，三者不能复用同一整段。
 5. 全部使用第一人称，直接展示与岗位匹配的行动和结果；禁止元叙述、复述招聘正文或声称“材料显示”。
-6. requirement_matches 简要说明岗位能力与所用经历的对应关系。
-7. 只输出符合给定 JSON Schema 的 JSON，不添加 Markdown。
+5.1 greeting 必须以“您好，我是候选人姓名”开场；作者昵称、账号名、发布时间、互动量和页面标签是来源元数据，不得用作称呼或写入文案。
+5.2 greeting 前 80 字必须出现准确岗位名及一项最强匹配证据或明确到岗安排，并以岗位是否仍在招聘等明确问题收尾。
+6. 每个工具、组织、数字和结果都必须能在当前条目的 candidate_evidence 中逐项找到；接触过不得改写为精通或熟练。
+7. requirement_matches 简要说明岗位能力与所用经历的对应关系。
+8. 输出前检查主题、招聘负责人称呼、此致敬礼、真实署名、到岗安排、沟通下一步和占位符，任何一项缺失都先重写。
+9. 只输出符合给定 JSON Schema 的 JSON，不添加 Markdown。
 JOB_INPUT:
 {payload}
 """
@@ -364,11 +370,30 @@ class CodexRuntimeOutreachAgent:
         required_text = ("greeting", "email_subject", "email_body", "cover_letter")
         if any(not _text(item.get(field)) for field in required_text):
             raise ValueError("Codex CLI returned an incomplete outreach draft")
+        greeting = _text(item["greeting"])
+        subject = _text(item["email_subject"])
+        email = _text(item["email_body"])
+        cover = _text(item["cover_letter"])
+        joined = "\n".join((greeting, subject, email, cover))
+        if not (30 <= len(greeting) <= 180 and 80 <= len(email) <= 300 and 280 <= len(cover) <= 520):
+            raise ValueError("Codex CLI returned outreach outside the strict length contract")
+        if not greeting.startswith("您好，我是"):
+            raise ValueError("Codex CLI returned an invalid private-message salutation")
+        if any(token in greeting[:48] for token in ("分钟前", "小时前", "天前", "昨天", "前天", "点赞", "收藏", "评论", "浏览")):
+            raise ValueError("Codex CLI returned source metadata in the private-message salutation")
+        if any(token in joined for token in ("简历", "附件", "原帖", "候选人", "材料显示", "XX", "待填写", "此处填")):
+            raise ValueError("Codex CLI returned meta narration or placeholders")
+        if not cover.startswith("主题：") or "招聘负责人" not in cover or "此致" not in cover or "敬礼" not in cover:
+            raise ValueError("Codex CLI returned an incomplete Cover Letter structure")
+        compact_email = "".join(email.split())
+        compact_cover = "".join(cover.split())
+        if compact_email == compact_cover or compact_email in compact_cover:
+            raise ValueError("Codex CLI returned duplicate email and Cover Letter copy")
         return {
-            "greeting": _text(item["greeting"]),
-            "email_subject": _text(item["email_subject"]),
-            "email_body": _text(item["email_body"]),
-            "cover_letter": _text(item["cover_letter"]),
+            "greeting": greeting,
+            "email_subject": subject,
+            "email_body": email,
+            "cover_letter": cover,
             "used_evidence_ids": list(dict.fromkeys(used)),
             "requirement_matches": [
                 _text(value) for value in item.get("requirement_matches", []) if _text(value)

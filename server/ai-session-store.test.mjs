@@ -36,6 +36,14 @@ test('AI provider relay configuration persists without exposing the API key', as
   }
 });
 
+test('expired or server-restarted AI sessions expose a recoverable error code', () => {
+  const store = new AiSessionStore();
+  assert.throws(
+    () => store.resolve('missing-session'),
+    (error) => error.code === 'AI_SESSION_EXPIRED' && /missing or expired/i.test(error.message),
+  );
+});
+
 test('AI model discovery reuses a saved key only for its saved Base URL', async () => {
   const calls = [];
   const store = new AiSessionStore({

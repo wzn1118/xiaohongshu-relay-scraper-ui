@@ -201,7 +201,7 @@ export class AiSessionStore {
   resolve(id) {
     this.cleanup();
     const session = this.sessions.get(String(id || ''));
-    if (!session) throw validation('AI session is missing or expired. Configure the provider again.');
+    if (!session) throw sessionExpired('AI session is missing or expired. Configure the provider again.');
     return { ...session };
   }
 
@@ -317,6 +317,12 @@ function discoveryStatusMessage(status) {
 function validation(message) {
   const error = new Error(message);
   error.code = 'AI_VALIDATION';
+  return error;
+}
+
+function sessionExpired(message) {
+  const error = new Error(message);
+  error.code = 'AI_SESSION_EXPIRED';
   return error;
 }
 

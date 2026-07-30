@@ -25,7 +25,9 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
         responsibilities: [],
         requirements: [],
       },
+      job_card: { parse_basis: 'full_body' },
       outreach: {
+        runtime_status: 'fallback_missing_candidate_evidence',
         greeting: '您好，我希望申请内容运营实习。',
         email_subject: '内容运营实习申请',
         email_body: '您好，我希望申请内容运营实习。',
@@ -42,7 +44,12 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     status: 'running',
     createdAt: new Date().toISOString(),
   };
-  const internal = { ...job, outputDir, logPath: path.join(fixture, 'run.log'), config: { candidateProfile: { email: 'candidate@example.com' } } };
+  const internal = {
+    ...job,
+    outputDir,
+    logPath: path.join(fixture, 'run.log'),
+    params: { keyword: job.keyword, candidateProfile: { email: 'candidate@example.com' } },
+  };
   const manager = {
     active: null,
     list: () => [],
@@ -67,6 +74,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   let smtpDeliveryStatus = { configured: true, from: 's***@example.com', authMode: 'login' };
   const sentMessages = [];
   const relaySetupCalls = [];
+  const relayRecoveryCalls = [];
   const modelDiscoveryCalls = [];
   const localInstallCalls = [];
   const server = http.createServer(createApp({
@@ -113,6 +121,41 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       tabCount: 1,
       message: 'Relay 已智能连接。',
     }),
+    relayRecoverer: async (options) => {
+      relayRecoveryCalls.push(options);
+      const summary = {
+        targetCount: 1,
+        pageCount: 1,
+        xiaohongshuPages: 1,
+        unrelatedPages: 0,
+        iframeCount: 0,
+        workerCount: 0,
+        securityPages: 0,
+        pressure: 'normal',
+        pressureReasons: [],
+        recoveryRecommended: false,
+      };
+      return {
+        ok: true,
+        ready: true,
+        running: true,
+        cdpReady: true,
+        repaired: true,
+        port: options.port,
+        profile: options.profile,
+        tabs: 1,
+        xiaohongshuTabs: 1,
+        before: { ...summary, targetCount: 12, pageCount: 5, pressure: 'high', recoveryRecommended: true },
+        after: summary,
+        closedTargets: 5,
+        createdFreshTarget: true,
+        sessionPreserved: true,
+        playwrightVerified: true,
+        connectionTimeoutMs: 60000,
+        warnings: [],
+        message: 'Relay recovered.',
+      };
+    },
     relaySetup: async (options) => {
       relaySetupCalls.push(options);
       return { ok: true, supported: true, installed: true, message: 'Relay runtime prepared.' };
@@ -249,6 +292,19 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(connected.status, 200);
     assert.equal((await connected.json()).ready, true);
 
+    const recovered = await fetch(`${origin}/api/relay/recover`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(recovered.status, 200);
+    const recoveredPayload = await recovered.json();
+    assert.equal(recoveredPayload.playwrightVerified, true);
+    assert.equal(recoveredPayload.closedTargets, 5);
+    assert.equal(relayRecoveryCalls.length, 1);
+    assert.equal(relayRecoveryCalls[0].port, 18801);
+    assert.equal(relayRecoveryCalls[0].profile, 'work-profile');
+
     const setup = await fetch(`${origin}/api/relay/setup`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -301,6 +357,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(results.total, 1);
     assert.equal(results.items[0].note_id, 'n1');
     assert.equal(results.codexRuntime.status, 'completed');
+    assert.equal(results.filters.stats.incomplete, 0);
 
     const savedDraft = await fetch(`${origin}/api/jobs/${job.id}/draft`, {
       method: 'POST',
@@ -309,8 +366,8 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
         noteId: 'n1',
         outreach: {
           greeting: '编辑后的私信',
-          email_subject: '编辑后的主题',
-          email_body: '编辑后的邮件正文',
+          email_subject: '应聘内容运营实习｜示例用户',
+          email_body: '您好，我希望申请内容运营实习。我曾负责社交媒体内容运营与市场调研，能够围绕目标受众梳理信息，并根据反馈调整内容重点和推进节奏。这段实践与岗位的内容策划和数据分析要求直接相关，期待进一步了解团队当前最需要推进的任务。',
           cover_letter: '编辑后的求职信',
         },
       }),
@@ -319,7 +376,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal((await savedDraft.json()).delivery.action, 'draft_saved');
 
     const resultsWithDraft = await fetch(`${origin}/api/jobs/${job.id}/results?limit=20`).then((response) => response.json());
-    assert.equal(resultsWithDraft.items[0].outreach.email_subject, '编辑后的主题');
+    assert.equal(resultsWithDraft.items[0].outreach.email_subject, '应聘内容运营实习｜示例用户');
 
     const sentEmail = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',
@@ -335,7 +392,23 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(sentMessages.length, 1);
     assert.equal(sentMessages[0].to, 'jobs@example.com');
     assert.equal(sentMessages[0].replyTo, 'candidate@example.com');
-    assert.equal(sentMessages[0].subject, '编辑后的主题');
+    assert.equal(sentMessages[0].subject, '应聘内容运营实习｜示例用户');
+
+    const rejectedLowQualityEdit = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        noteId: 'n1',
+        to: 'jobs@example.com',
+        outreach: {
+          ...resultsWithDraft.items[0].outreach,
+          email_subject: '申请岗位',
+          email_body: '您好，附件是我的简历。',
+        },
+      }),
+    });
+    assert.equal(rejectedLowQualityEdit.status, 400);
+    assert.equal(sentMessages.length, 1);
 
     const invalidRecipient = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',

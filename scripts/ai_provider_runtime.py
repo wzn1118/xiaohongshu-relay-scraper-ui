@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import ipaddress
 import json
 import os
@@ -42,6 +43,8 @@ class AIProvider:
         except (TypeError, ValueError):
             self.timeout = 600
         self.last_request_used_images = False
+        self.last_request_model = ""
+        self._vision_model_cache: str | None = None
 
     @property
     def requires_api_key(self) -> bool:
@@ -60,21 +63,29 @@ class AIProvider:
             if isinstance(value, str) and value.strip().lower().startswith(("http://", "https://"))
         ][:4]
         self.last_request_used_images = False
+        self.last_request_model = ""
         schema_instruction = (
             "\nReturn exactly one JSON object matching this JSON Schema; do not add Markdown:\n"
             + json.dumps(schema, ensure_ascii=False)
         )
         if self.provider == "local_qwen":
             local_images = self._download_local_images(images)
-            if local_images:
+            vision_model = self._select_local_vision_model() if local_images else ""
+            if local_images and vision_model:
                 try:
-                    result = self._local_chat(system + schema_instruction, user, schema, local_images)
+                    result = self._local_chat(
+                        system + schema_instruction,
+                        user,
+                        schema,
+                        local_images,
+                        model=vision_model,
+                    )
                     self.last_request_used_images = True
                     return result
                 except AIProviderError:
                     # Text-only local models still produce a useful result from the note and image alt text.
                     pass
-            return self._local_chat(system + schema_instruction, user, schema)
+            return self._local_chat(system + schema_instruction, user, schema, model=self.model)
         if self.provider == "codex" and not (self.api_key and self.base_url and self.model):
             return self._codex(system + schema_instruction, user, schema)
         if not images:
@@ -123,9 +134,87 @@ class AIProvider:
                 continue
             if (content_type and not content_type.startswith("image/")) or not image_bytes or len(image_bytes) > byte_limit:
                 continue
-            encoded_images.append(base64.b64encode(image_bytes).decode("ascii"))
-            total_bytes += len(image_bytes)
+            prepared = self._prepare_local_image(image_bytes, content_type)
+            if not prepared or len(prepared) > byte_limit:
+                continue
+            encoded_images.append(base64.b64encode(prepared).decode("ascii"))
+            total_bytes += len(prepared)
         return encoded_images
+
+    @staticmethod
+    def _prepare_local_image(image_bytes: bytes, content_type: str) -> bytes:
+        if "webp" not in content_type and "avif" not in content_type:
+            return image_bytes
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                converted = image.convert("RGB")
+                output = io.BytesIO()
+                converted.save(output, format="PNG", optimize=True)
+                return output.getvalue()
+        except (ImportError, OSError, ValueError):
+            return b""
+
+    @staticmethod
+    def _is_vision_model(model: str) -> bool:
+        lowered = str(model or "").casefold()
+        return any(marker in lowered for marker in ("qwen2.5vl", "qwen3-vl", "qwen-vl", "vision", "llava", "minicpm-v"))
+
+    def _ollama_model_capabilities(self, model: str) -> set[str]:
+        if not self.base_url or not model:
+            return set()
+        root_url = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        request = urllib.request.Request(
+            f"{root_url}/api/show",
+            data=json.dumps({"model": model}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=min(self.timeout, 10)) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError, OSError, ValueError):
+            return set()
+        return {
+            str(capability).strip().casefold()
+            for capability in payload.get("capabilities", [])
+            if str(capability).strip()
+        }
+
+    def _select_local_vision_model(self) -> str:
+        configured = os.environ.get("XHS_AI_VISION_MODEL", "").strip()
+        if configured:
+            return configured
+        if self._is_vision_model(self.model):
+            return self.model
+        if self._vision_model_cache is not None:
+            return self._vision_model_cache
+        if not self.base_url:
+            return ""
+        if "vision" in self._ollama_model_capabilities(self.model):
+            self._vision_model_cache = self.model
+            return self._vision_model_cache
+        root_url = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        try:
+            with urllib.request.urlopen(f"{root_url}/api/tags", timeout=min(self.timeout, 10)) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError, OSError, ValueError):
+            self._vision_model_cache = ""
+            return ""
+        names = [
+            str(item.get("name") or item.get("model") or "").strip()
+            for item in payload.get("models", [])
+            if isinstance(item, dict)
+        ]
+        vision_models = [name for name in names if self._is_vision_model(name)]
+        preferences = ("qwen2.5vl", "qwen3-vl", "qwen-vl", "minicpm-v", "llava", "vision")
+        vision_models.sort(key=lambda name: next(
+            (index for index, marker in enumerate(preferences) if marker in name.casefold()),
+            len(preferences),
+        ))
+        self._vision_model_cache = vision_models[0] if vision_models else ""
+        return self._vision_model_cache
 
     def _local_chat(
         self,
@@ -133,42 +222,59 @@ class AIProvider:
         user: str,
         schema: dict[str, Any],
         images: list[str] | None = None,
+        model: str = "",
     ) -> dict[str, Any]:
-        if not self.base_url or not self.model:
+        selected_model = model or self.model
+        if not self.base_url or not selected_model:
             raise AIProviderError("Local AI provider configuration is incomplete")
         root_url = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
         user_message: dict[str, Any] = {"role": "user", "content": f"{user}\n/no_think"}
         if images:
             user_message["images"] = images
-        payload = {
-            "model": self.model,
-            "stream": False,
-            "think": False,
-            "format": schema,
-            "options": {"temperature": 0},
-            "messages": [
-                {"role": "system", "content": system},
-                user_message,
-            ],
-        }
-        request = urllib.request.Request(
-            f"{root_url}/api/chat",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")[:500]
-            raise AIProviderError(f"Local AI provider returned HTTP {error.code}: {detail}") from error
-        except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as error:
-            raise AIProviderError(f"Local AI provider request failed: {error}") from error
-        try:
-            return _parse_json_object(str(result["message"]["content"]))
-        except (KeyError, TypeError) as error:
-            raise AIProviderError("Local AI provider response did not contain a message") from error
+        parse_error: Exception | None = None
+        for attempt in range(1, 4):
+            attempt_message = dict(user_message)
+            if attempt > 1:
+                attempt_message["content"] += (
+                    "\nThe previous response was invalid or incomplete JSON. "
+                    "Regenerate the complete object from the original input and schema."
+                )
+            payload = {
+                "model": selected_model,
+                "stream": False,
+                "think": False,
+                "format": schema,
+                "options": {"temperature": 0, "num_predict": 4096},
+                "messages": [
+                    {"role": "system", "content": system},
+                    attempt_message,
+                ],
+            }
+            request = urllib.request.Request(
+                f"{root_url}/api/chat",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                self.last_request_model = selected_model
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                raise AIProviderError(f"Local AI provider returned HTTP {error.code}: {detail}") from error
+            except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as error:
+                raise AIProviderError(f"Local AI provider request failed: {error}") from error
+            try:
+                return _parse_json_object(str(result["message"]["content"]))
+            except (KeyError, TypeError) as error:
+                raise AIProviderError("Local AI provider response did not contain a message") from error
+            except (json.JSONDecodeError, AIProviderError) as error:
+                parse_error = error
+
+        raise AIProviderError(
+            f"Local AI provider returned invalid structured JSON after 3 attempts: {parse_error}"
+        ) from parse_error
 
     def _openai_compatible(
         self,

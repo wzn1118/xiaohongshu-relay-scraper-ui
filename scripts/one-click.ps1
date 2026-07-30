@@ -150,7 +150,7 @@ $prerequisitesReady =
     $pythonVersion -ge [Version]'3.11'
 $pythonDependenciesReady = $false
 if ($pythonCommand) {
-    & $pythonCommand.Source -c 'import docx, openpyxl, playwright, pypdf' 2>$null
+    & $pythonCommand.Source -c 'import docx, openpyxl, playwright, pypdf, websockets' 2>$null
     $pythonDependenciesReady = $LASTEXITCODE -eq 0
 }
 $installationReady =

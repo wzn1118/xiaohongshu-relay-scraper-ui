@@ -1,4 +1,4 @@
-export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+export type JobStatus = 'queued' | 'running' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | 'interrupted'
 
 export type SecurityRestriction = {
   detected: boolean
@@ -8,6 +8,13 @@ export type SecurityRestriction = {
   timedOutAt?: string | null
   timeoutSeconds?: number
   recoveryAction?: 'manual_verification' | 'manual_verification_then_resume' | null
+}
+
+export type RateLimitState = {
+  detected: boolean
+  status: 'stopped'
+  detectedAt?: string | null
+  recoveryAction?: 'wait_then_resume' | null
 }
 
 export type Artifact = {
@@ -38,6 +45,7 @@ export type Job = {
   workflowSummary?: Record<string, unknown> | null
   discoveredCount?: number
   scrapedCount?: number
+  bodyProcessedCount?: number
   incompleteCount?: number
   progressPhase?: string | null
   progressLabel?: string | null
@@ -45,7 +53,16 @@ export type Job = {
   progressTotal?: number
   progressUpdatedAt?: string | null
   securityRestriction?: SecurityRestriction | null
+  rateLimit?: RateLimitState | null
   resumeAvailable?: boolean
+}
+
+export type MissingCompletionResponse = {
+  action: 'started' | 'attached' | 'already_complete'
+  sourceJobId: string
+  incompleteBefore: number | null
+  job: Job
+  message: string
 }
 
 export type CoverageSummary = {
@@ -73,10 +90,42 @@ export type RelayStatus = {
   helperTimedOut?: boolean
   helperExitCode?: number | null
   xiaohongshuTabs?: number
+  pageCount?: number
+  iframeCount?: number
+  workerCount?: number
+  targetPressure?: 'normal' | 'high'
+  pressureReasons?: string[]
+  recoveryRecommended?: boolean
   setupRequired?: boolean
   setupStep?: 'install' | 'start' | 'login' | 'ready'
   checkedAt?: string
   message?: string
+}
+
+export type RelayTargetSummary = {
+  targetCount: number
+  pageCount: number
+  xiaohongshuPages: number
+  unrelatedPages: number
+  iframeCount: number
+  workerCount: number
+  securityPages: number
+  pressure: 'normal' | 'high'
+  pressureReasons: string[]
+  recoveryRecommended: boolean
+}
+
+export type RelayRecoveryResult = RelayStatus & {
+  ok: boolean
+  repaired: boolean
+  closedTargets: number
+  createdFreshTarget: boolean
+  sessionPreserved: boolean
+  playwrightVerified: boolean
+  connectionTimeoutMs: number
+  before: RelayTargetSummary
+  after: RelayTargetSummary
+  warnings: string[]
 }
 
 export type RelayConfig = {
@@ -243,9 +292,20 @@ export type CandidateApplicationProfile = {
 
 export type CollectionSpeedMode = 'steady' | 'random'
 export type SearchSortMode = 'latest' | 'comprehensive'
+export type AnalysisMode = 'job' | 'general'
+export type ContentResearchPreset = 'auto' | 'experience' | 'people' | 'trend' | 'product' | 'place' | 'custom'
+
+export type ContentResearchContext = {
+  preset: ContentResearchPreset
+  label: string
+  goal: string
+}
 
 export type JobRequest = {
+  analysisMode: AnalysisMode
   keyword: string
+  contentPreset: ContentResearchPreset
+  contentGoal: string
   searchSort: SearchSortMode
   maxAgeDays: number
   browserProfile: string
@@ -260,6 +320,7 @@ export type JobRequest = {
   randomDelayMaxSeconds: number
   mode: 'fresh' | 'resume'
   resumeFromJobId?: string | null
+  completeMissingOnly: boolean
   skipPostprocess: boolean
   noAutoAttach: boolean
   checkOnly: boolean
@@ -286,6 +347,12 @@ export type ApplicationRoute = {
   evidence: string
   channel?: 'email' | 'direct_message' | 'link' | 'other'
   confidence?: number
+  source_field?: string
+  source_fields?: string[]
+  source_image_index?: number
+  source_image_url?: string
+  verification_status?: 'body_verified' | 'body_extracted' | 'image_format_verified' | 'cross_verified' | 'needs_manual_review' | string
+  actionable?: boolean
 }
 
 export type OutreachDraft = {
@@ -317,10 +384,46 @@ export type ApplicationMedia = {
   analysis?: {
     status: 'analyzed' | 'alt_text_only' | 'alt_text_available' | 'pending_ai' | 'no_images' | 'unavailable'
     summary?: string
+    visible_text?: string
     job_signals?: string[]
     source?: 'vision_model' | 'image_alt_text' | 'model_error' | 'none' | string
     reason?: string
+    application_route_count?: number
+    application_requested_in_image?: boolean
   }
+}
+
+export type ContentModuleDefinition = {
+  id: string
+  title: string
+  question: string
+}
+
+export type ContentPresentation = {
+  eyebrow: string
+  title: string
+  description: string
+  modules: ContentModuleDefinition[]
+}
+
+export type ContentAnalysisModule = {
+  id: string
+  title: string
+  summary: string
+  items: string[]
+  evidence: string[]
+}
+
+export type ContentAnalysis = {
+  status: 'completed' | 'fallback' | 'failed' | string
+  overview: string
+  content_type: string
+  relevance_score: number
+  relevance_reason: string
+  topics: string[]
+  entities: string[]
+  image_insights: string[]
+  modules: ContentAnalysisModule[]
 }
 
 export type ApplicationResult = {
@@ -351,6 +454,7 @@ export type ApplicationResult = {
     image_context_used?: boolean
   }
   media?: ApplicationMedia
+  content_analysis?: ContentAnalysis
   application_info: {
     contacts: ApplicationRoute[]
     application_routes: ApplicationRoute[]
@@ -390,13 +494,17 @@ export type ApplicationMutationResponse = {
 
 export type ApplicationResultsResponse = {
   available: boolean
+  analysisMode: AnalysisMode
+  keyword: string
+  research: ContentResearchContext | null
+  presentation: ContentPresentation | null
   total: number
   offset: number
   limit: number
   items: ApplicationResult[]
   filters: {
     sort: 'newest' | 'oldest'
-    timeRange: 'all' | '7' | '30' | '90' | 'unknown'
+    timeRange: 'all' | '1' | '3' | '7' | '30' | '90' | 'unknown'
     stats: {
       all: number
       dated: number
@@ -410,9 +518,10 @@ export type ApplicationResultsResponse = {
 }
 
 export type ApplicationResultsQuery = {
+  analysisMode?: AnalysisMode
   query?: string
   sort?: 'newest' | 'oldest'
-  timeRange?: 'all' | '7' | '30' | '90' | 'unknown'
+  timeRange?: 'all' | '1' | '3' | '7' | '30' | '90' | 'unknown'
 }
 
 export type JobEvent = {

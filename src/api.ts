@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, OutreachDraft, RelayConfig, RelayStatus, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, RelayConfig, RelayRecoveryResult, RelayStatus, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -8,7 +8,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }))
     const errorMessage = typeof body.error === 'string' ? body.error : body.error?.message
-    throw new Error(body.message || errorMessage || `请求失败 (${response.status})`)
+    const error = new Error(body.message || errorMessage || `请求失败 (${response.status})`) as Error & { code?: string; status?: number }
+    error.code = typeof body.error === 'object' ? body.error?.code : body.code
+    error.status = response.status
+    throw error
   }
   return response.json() as Promise<T>
 }
@@ -43,6 +46,10 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ port, profile }),
   }),
+  recoverRelay: (port: number, profile: string) => request<RelayRecoveryResult>('/api/relay/recover', {
+    method: 'POST',
+    body: JSON.stringify({ port, profile }),
+  }),
   openRelayLogin: (profile: string) => request<{ opened: boolean; message?: string; profile?: string; url?: string }>('/api/relay/login', {
     method: 'POST',
     body: JSON.stringify({ profile, url: 'https://www.xiaohongshu.com' }),
@@ -51,11 +58,17 @@ export const api = {
   job: (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`),
   createJob: (payload: JobRequest) =>
     request<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
+  completeMissing: (id: string, aiSessionId: string | null) =>
+    request<MissingCompletionResponse>(`/api/jobs/${encodeURIComponent(id)}/complete-missing`, {
+      method: 'POST',
+      body: JSON.stringify(aiSessionId ? { aiSessionId } : {}),
+    }),
   cancelJob: (id: string) =>
     request<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
   artifacts: (id: string) => request<Artifact[]>(`/api/jobs/${encodeURIComponent(id)}/artifacts`),
   results: (id: string, offset = 0, limit = 50, options: ApplicationResultsQuery = {}) => {
     const params = new URLSearchParams({ offset: String(offset), limit: String(limit) })
+    if (options.analysisMode) params.set('analysisMode', options.analysisMode)
     if (options.query?.trim()) params.set('query', options.query.trim())
     if (options.sort) params.set('sort', options.sort)
     if (options.timeRange) params.set('timeRange', options.timeRange)
