@@ -27,6 +27,7 @@ import {
   Mail,
   Maximize2,
   MessageSquare,
+  MessagesSquare,
   Copy,
   Cpu,
   Pause,
@@ -45,6 +46,7 @@ import {
   Send,
   Upload,
   UserRoundSearch,
+  UsersRound,
   Wifi,
   WifiOff,
   WandSparkles,
@@ -55,6 +57,9 @@ import type {
   Artifact,
   ApplicationResult,
   ApplicationResultsResponse,
+  AudienceComment,
+  AudiencePublicProfile,
+  AudienceResultsResponse,
   CoverageSummary,
   Health,
   Job,
@@ -193,6 +198,8 @@ const defaultRequest: JobRequest = {
   randomDelayMaxSeconds: 2.4,
   mode: 'fresh',
   completeMissingOnly: false,
+  collectAudience: false,
+  audienceOnly: false,
   skipPostprocess: false,
   noAutoAttach: true,
   checkOnly: false,
@@ -820,6 +827,87 @@ function GeneralResultsWorkspace({
   )
 }
 
+type GeneralResultModule = 'insights' | 'audience'
+
+function audienceStatusLabel(status: AudienceResultsResponse['summary']['status']) {
+  return status === 'complete' ? '全量完成' : status === 'partial' ? '部分完成' : status === 'failed' ? '采集失败' : '等待采集'
+}
+
+function audienceMetric(value: number | null | undefined) {
+  return typeof value === 'number' ? value.toLocaleString('zh-CN') : '-'
+}
+
+function AudienceAvatar({ user }: { user: AudiencePublicProfile }) {
+  const initial = user.display_name?.trim().slice(0, 1) || '用'
+  return <span className="audience-avatar">{user.avatar_url ? <img src={user.avatar_url} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <b>{initial}</b>}</span>
+}
+
+function AudienceWorkspace({
+  results,
+  loading,
+  kind,
+  postId,
+  query,
+  resuming,
+  onKind,
+  onPost,
+  onQuery,
+  onPage,
+  onResume,
+}: {
+  results: AudienceResultsResponse | null
+  loading: boolean
+  kind: 'comments' | 'users'
+  postId: string
+  query: string
+  resuming: boolean
+  onKind: (kind: 'comments' | 'users') => void
+  onPost: (postId: string) => void
+  onQuery: (query: string) => void
+  onPage: (offset: number) => void
+  onResume: () => void
+}) {
+  const summary = results?.summary
+  const incomplete = !summary || summary.status !== 'complete'
+  const statusClass = summary?.status || 'pending'
+  const items = results?.items || []
+  const offset = results?.offset || 0
+  const limit = results?.limit || 40
+  return <div className="audience-workspace">
+    <section className="audience-summary-band" aria-label="受众采集覆盖率">
+      <div className={`audience-status ${statusClass}`}><Activity size={17} /><span><small>采集状态</small><strong>{audienceStatusLabel(statusClass)}</strong></span></div>
+      <dl>
+        <div><dt>原帖覆盖</dt><dd>{audienceMetric(summary?.postsComplete)}<small> / {audienceMetric(summary?.postsTotal)}</small></dd></div>
+        <div><dt>评论与回复</dt><dd>{audienceMetric(summary?.commentsCollected)}</dd></div>
+        <div><dt>独立用户</dt><dd>{audienceMetric(summary?.usersDiscovered)}</dd></div>
+        <div><dt>用户资料完成</dt><dd>{audienceMetric(summary?.profilesComplete)}<small> / {audienceMetric(summary?.usersDiscovered)}</small></dd></div>
+      </dl>
+      {incomplete && <button type="button" className="audience-resume-button" disabled={resuming || loading} onClick={onResume}>{resuming ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{results?.available ? '继续全量采集' : '开始采集评论与用户'}</button>}
+    </section>
+    {incomplete && <div className={`audience-coverage-callout ${statusClass}`} role="status"><CircleAlert size={17} /><span><strong>当前结果尚未证明全量完成</strong><small>{summary?.stopReason ? `停止原因：${summary.stopReason}。` : '系统会逐帖展开回复并滚动到底。'} 已保存评论和用户检查点，可从断点继续。</small></span></div>}
+    <p className="audience-data-scope"><ShieldCheck size={14} />仅整理帖子和公开主页中可见的评论与用户字段，不推断联系方式或私密属性。</p>
+    <div className="audience-toolbar">
+      <div className="audience-view-switch" role="tablist" aria-label="受众数据视图">
+        <button type="button" role="tab" aria-selected={kind === 'comments'} className={kind === 'comments' ? 'active' : ''} onClick={() => onKind('comments')}><MessagesSquare size={16} />评论流 <b>{audienceMetric(results?.totals.comments)}</b></button>
+        <button type="button" role="tab" aria-selected={kind === 'users'} className={kind === 'users' ? 'active' : ''} onClick={() => onKind('users')}><UsersRound size={16} />用户卡 <b>{audienceMetric(results?.totals.users)}</b></button>
+      </div>
+      <label className="audience-post-filter"><span>原帖</span><select aria-label="按原帖筛选受众" value={postId} onChange={(event) => onPost(event.target.value)}><option value="">全部原帖</option>{results?.posts.map((post) => <option key={post.post_id} value={post.post_id}>{post.title} · {post.collected_comment_count || 0} 条</option>)}</select></label>
+      <label className="audience-search"><Search size={15} /><input aria-label="搜索评论或用户" value={query} placeholder={kind === 'comments' ? '搜索评论、昵称或地区' : '搜索昵称、小红书号或简介'} onChange={(event) => onQuery(event.target.value)} /></label>
+    </div>
+    <div className="audience-results-meta"><span>{postId ? '当前原帖' : '全部原帖'} · {kind === 'comments' ? '评论与楼中楼回复' : '原帖主与评论者'}</span><strong>{audienceMetric(results?.total)} 条结果</strong></div>
+    {loading && !results ? <div className="result-empty audience-empty"><LoaderCircle className="spin" size={28} /><strong>正在读取受众数据</strong></div> : items.length === 0 ? <div className="result-empty audience-empty"><UserRoundSearch size={28} /><strong>{results?.available ? '当前筛选没有结果' : '尚未采集评论与用户信息'}</strong><small>{results?.available ? '调整原帖或搜索条件后重试。' : '点击上方按钮从已保存帖子检查点开始采集。'}</small></div> : kind === 'comments' ? <div className="audience-comment-list">{(items as AudienceComment[]).map((comment) => <article className={`audience-comment ${comment.level === 'reply' ? 'is-reply' : ''}`} key={comment.comment_id}>
+      <AudienceAvatar user={comment.user} />
+      <div><header><span><strong>{comment.user.display_name || '未命名用户'}</strong>{comment.level === 'reply' && <i>回复</i>}{comment.user.roles?.includes('author') && <i className="author">原帖主</i>}</span>{comment.user.profile_url && <a href={comment.user.profile_url} target="_blank" rel="noreferrer" title="打开公开主页"><ExternalLink size={14} /></a>}</header><p>{comment.text}</p><footer><span>{comment.post_title || '未命名原帖'}</span><small>{comment.publish_time || '时间未显示'}{comment.location ? ` · ${comment.location}` : ''}{comment.likes ? ` · ${comment.likes} 赞` : ''}</small></footer></div>
+    </article>)}</div> : <div className="audience-user-grid">{(items as AudiencePublicProfile[]).map((user) => <article className={`audience-user-card ${user.roles?.includes('author') ? 'author' : 'commenter'}`} key={user.user_id}>
+      <header><AudienceAvatar user={user} /><div><strong>{user.display_name || '未命名用户'}</strong><span>{user.roles?.includes('author') && <i className="author">原帖主</i>}{user.roles?.includes('commenter') && <i>评论者</i>}</span></div>{user.profile_url && <a href={user.profile_url} target="_blank" rel="noreferrer" title="打开公开主页"><ExternalLink size={15} /></a>}</header>
+      <p>{user.bio || '公开主页未显示简介'}</p>
+      <dl><div><dt>粉丝</dt><dd>{audienceMetric(user.follower_count)}</dd></div><div><dt>关注</dt><dd>{audienceMetric(user.following_count)}</dd></div><div><dt>互动</dt><dd>{audienceMetric(user.liked_and_collected_count)}</dd></div><div><dt>评论</dt><dd>{audienceMetric(user.comment_count)}</dd></div></dl>
+      <footer><span>{user.xhs_id ? `小红书号 ${user.xhs_id}` : '小红书号未公开'}</span><small>{user.location || '地区未显示'} · {user.enrichment_status === 'complete' ? '公开资料已采集' : '资料待续采'}</small></footer>
+    </article>)}</div>}
+    {results && results.total > 0 && <div className="audience-pagination"><span>{offset + 1}-{Math.min(offset + items.length, results.total)} / {results.total}</span><div><button type="button" title="上一页" disabled={offset === 0 || loading} onClick={() => onPage(Math.max(0, offset - limit))}><ChevronLeft size={16} /></button><button type="button" title="下一页" disabled={offset + limit >= results.total || loading} onClick={() => onPage(offset + limit)}><ChevronRight size={16} /></button></div></div>}
+  </div>
+}
+
 function StatusPill({ status }: { status: JobStatus }) {
   return <span className={`status-pill status-${status}`}><i />{statusText[status]}</span>
 }
@@ -910,6 +998,11 @@ function workspacePath(mode: AnalysisMode) {
   return mode === 'general' ? '/content' : '/'
 }
 
+function generalResultModuleFromLocation(): GeneralResultModule {
+  if (typeof window === 'undefined') return 'insights'
+  return new URLSearchParams(window.location.search).get('module') === 'audience' ? 'audience' : 'insights'
+}
+
 const legacyJobIntentPattern = /(?:岗位|职位|招聘|招募|求职|应聘|内推|校招|社招|实习|面试|简历|job|jobs|hiring|hire|career|careers|recruit|recruitment|intern|internship|position|vacancy)/i
 
 function jobAnalysisMode(job: Job): AnalysisMode {
@@ -939,9 +1032,10 @@ function isIncompleteApplicationResult(result: ApplicationResult) {
 
 function App() {
   const [workspaceMode, setWorkspaceMode] = useState<AnalysisMode>(() => workspaceModeFromLocation())
+  const [generalResultModule, setGeneralResultModule] = useState<GeneralResultModule>(() => generalResultModuleFromLocation())
   const requestCache = useRef<Record<AnalysisMode, JobRequest>>({
     job: { ...defaultRequest, analysisMode: 'job', candidateProfile: loadCandidateProfile() },
-    general: { ...defaultRequest, analysisMode: 'general', keyword: '', useCodexRuntime: true, candidateProfile: loadCandidateProfile() },
+    general: { ...defaultRequest, analysisMode: 'general', keyword: '', useCodexRuntime: true, collectAudience: true, candidateProfile: loadCandidateProfile() },
   })
   const [request, setRequest] = useState<JobRequest>(() => ({ ...requestCache.current[workspaceMode] }))
   const [health, setHealth] = useState<Health | null>(null)
@@ -976,6 +1070,13 @@ function App() {
   const [resultsLoading, setResultsLoading] = useState(false)
   const [resultSort, setResultSort] = useState<'newest' | 'oldest'>('newest')
   const [resultTimeRange, setResultTimeRange] = useState<'all' | '1' | '3' | '7' | '30' | '90' | 'unknown'>('all')
+  const [audienceResults, setAudienceResults] = useState<AudienceResultsResponse | null>(null)
+  const [audienceKind, setAudienceKind] = useState<'comments' | 'users'>('comments')
+  const [audiencePostId, setAudiencePostId] = useState('')
+  const [audienceQuery, setAudienceQuery] = useState('')
+  const [audienceOffset, setAudienceOffset] = useState(0)
+  const [audienceLoading, setAudienceLoading] = useState(false)
+  const [audienceResuming, setAudienceResuming] = useState(false)
   const resultViewCache = useRef<Record<AnalysisMode, WorkspaceResultView>>({
     job: { activeJobId: null, results: null, selectedNoteId: null, resultOffset: 0, resultSort: 'newest', resultTimeRange: 'all' },
     general: { activeJobId: null, results: null, selectedNoteId: null, resultOffset: 0, resultSort: 'newest', resultTimeRange: 'all' },
@@ -1018,6 +1119,7 @@ function App() {
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
   const rateLimitAlertRef = useRef<string | null>(null)
   const resultsRequestRef = useRef(0)
+  const audienceRequestRef = useRef(0)
   const relayGuideAutoOpened = useRef(false)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
@@ -1042,6 +1144,7 @@ function App() {
   const switchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true) => {
     if (mode === workspaceMode) return
     resultsRequestRef.current += 1
+    audienceRequestRef.current += 1
     requestCache.current[workspaceMode] = request
     if (activeJob && jobAnalysisMode(activeJob) === workspaceMode) {
       activeJobIdCache.current[workspaceMode] = activeJob.id
@@ -1065,6 +1168,7 @@ function App() {
     if (updateHistory && window.location.pathname !== workspacePath(mode)) {
       window.history.pushState({ workspaceMode: mode }, '', workspacePath(mode))
     }
+    if (mode === 'general') setGeneralResultModule(updateHistory ? 'insights' : generalResultModuleFromLocation())
     setWorkspaceMode(mode)
     setRequest({ ...requestCache.current[mode] })
     const scopedJobs = jobs.filter((job) => jobAnalysisMode(job) === mode)
@@ -1077,6 +1181,10 @@ function App() {
     setArtifacts([])
     setCoverage(null)
     setResults(nextResults)
+    setAudienceResults(null)
+    setAudienceOffset(0)
+    setAudiencePostId('')
+    setAudienceQuery('')
     setSelectedResult(nextResults?.items.find((item) => item.note_id === nextView.selectedNoteId) || nextResults?.items[0] || null)
     setLogs([])
     setResultOffset(canRestoreView ? nextView.resultOffset : 0)
@@ -1086,6 +1194,14 @@ function App() {
     setNotice(null)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }, [activeJob, jobs, request, resultOffset, results, resultSort, resultTimeRange, selectedResult, workspaceMode])
+
+  const switchGeneralResultModule = useCallback((module: GeneralResultModule) => {
+    setGeneralResultModule(module)
+    const url = new URL(window.location.href)
+    if (module === 'audience') url.searchParams.set('module', 'audience')
+    else url.searchParams.delete('module')
+    window.history.replaceState({ ...(window.history.state || {}), generalResultModule: module }, '', `${url.pathname}${url.search}${url.hash}`)
+  }, [])
 
   useEffect(() => {
     requestCache.current[workspaceMode] = request
@@ -1109,7 +1225,10 @@ function App() {
   }, [activeJob?.id, resultOffset, results, resultSort, resultTimeRange, selectedResult?.note_id, workspaceMode])
 
   useEffect(() => {
-    const handlePopState = () => switchWorkspace(workspaceModeFromLocation(), false)
+    const handlePopState = () => {
+      setGeneralResultModule(generalResultModuleFromLocation())
+      switchWorkspace(workspaceModeFromLocation(), false)
+    }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
   }, [switchWorkspace])
@@ -1670,6 +1789,29 @@ function App() {
     }
   }, [resultSort, resultTimeRange, workspaceMode])
 
+  const loadAudienceResults = useCallback(async (
+    jobId: string,
+    offset = 0,
+    options: { silent?: boolean } = {},
+  ) => {
+    const requestId = ++audienceRequestRef.current
+    if (!options.silent) setAudienceLoading(true)
+    try {
+      const payload = await api.audience(jobId, audienceKind, offset, 40, {
+        postId: audiencePostId,
+        query: audienceQuery,
+      })
+      if (requestId !== audienceRequestRef.current) return
+      setAudienceResults(payload)
+      setAudienceOffset(offset)
+    } catch (error) {
+      if (requestId !== audienceRequestRef.current || options.silent) return
+      setNotice(`受众数据读取失败：${(error as Error).message}`)
+    } finally {
+      if (!options.silent && requestId === audienceRequestRef.current) setAudienceLoading(false)
+    }
+  }, [audienceKind, audiencePostId, audienceQuery])
+
   useEffect(() => {
     let mounted = true
     const boot = async () => {
@@ -1844,6 +1986,7 @@ function App() {
       setArtifacts([])
       setResults(null)
       setSelectedResult(null)
+      setAudienceResults(null)
       return
     }
     api.artifacts(activeJob.id).then(setArtifacts).catch(() => setArtifacts(activeJob.artifacts || []))
@@ -1857,6 +2000,20 @@ function App() {
     }, 5_000)
     return () => window.clearInterval(timer)
   }, [activeJob?.id, activeJob?.status, loadResults, resultOffset])
+
+  useEffect(() => {
+    if (!activeJob || workspaceMode !== 'general' || generalResultModule !== 'audience') return
+    const timer = window.setTimeout(() => void loadAudienceResults(activeJob.id, 0), audienceQuery ? 250 : 0)
+    return () => window.clearTimeout(timer)
+  }, [activeJob?.id, activeJob?.status, activeJob?.applicationCount, audienceKind, audiencePostId, audienceQuery, generalResultModule, loadAudienceResults, workspaceMode])
+
+  useEffect(() => {
+    if (!activeJob || workspaceMode !== 'general' || generalResultModule !== 'audience' || !['queued', 'running'].includes(activeJob.status)) return
+    const timer = window.setInterval(() => {
+      void loadAudienceResults(activeJob.id, audienceOffset, { silent: true })
+    }, 5_000)
+    return () => window.clearInterval(timer)
+  }, [activeJob?.id, activeJob?.status, audienceOffset, generalResultModule, loadAudienceResults, workspaceMode])
 
   useEffect(() => {
     if (!completionFlow?.jobId || !activeJob || activeJob.id !== completionFlow.jobId) return
@@ -2022,6 +2179,35 @@ function App() {
       return null
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const resumeAudienceCollection = async () => {
+    if (!activeJob || jobAnalysisMode(activeJob) !== 'general') {
+      setNotice('请先选择一条非岗位内容采集任务。')
+      return
+    }
+    setAudienceResuming(true)
+    setNotice(null)
+    try {
+      const response = await api.resumeAudience(activeJob.id)
+      setActiveJob(response.job)
+      setJobs((current) => [response.job, ...current.filter((item) => item.id !== response.job.id)])
+      if (['queued', 'running'].includes(response.job.status)) connectJob(response.job)
+      switchGeneralResultModule('audience')
+      await loadAudienceResults(response.job.id, 0)
+      setNotice(response.action === 'already_complete'
+        ? '评论、回复与用户公开资料已经全量完成。'
+        : response.action === 'attached'
+          ? '已接管正在运行的受众采集任务，页面会实时刷新覆盖率。'
+          : '受众采集已从检查点续跑，将逐帖展开评论与楼中楼回复。')
+    } catch (error) {
+      const apiError = error as Error & { code?: string }
+      setNotice(apiError.code === 'JOB_BUSY'
+        ? '当前已有另一项采集任务运行；完成后可继续受众采集。'
+        : `受众采集启动失败：${apiError.message}`)
+    } finally {
+      setAudienceResuming(false)
     }
   }
 
@@ -2389,6 +2575,7 @@ function App() {
   const runningLog = logs.slice(-120).join('\n')
   const terminalAnalysisReady = Boolean(activeJob && ['completed', 'incomplete'].includes(activeJob.status) && coverage)
   const activeAnalysisMode = workspaceMode
+  const audienceModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'audience'
   const activeAgentStages = activeAnalysisMode === 'general' ? generalAgentStages : jobAgentStages
   const activeAgentIndex = terminalAnalysisReady
     ? activeAgentStages.length
@@ -3109,15 +3296,31 @@ function App() {
             </div>
           </section>
 
-          <section className="panel results-panel" id="results" aria-label={activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
+          <section className="panel results-panel" id="results" aria-label={audienceModuleActive ? '受众及用户界面结果' : activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
             <div className="panel-heading compact">
-              <div><span className="step-label">{activeAnalysisMode === 'general' ? results?.presentation?.eyebrow || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{activeAnalysisMode === 'general' ? results?.presentation?.title || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{activeAnalysisMode === 'general' && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
+              <div><span className="step-label">{audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? results?.presentation?.eyebrow || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? results?.presentation?.title || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
               <div className="result-heading-meta">
-                <span className={`runtime-badge ${codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · {String(codexRuntime?.status || '等待结果')}</span>
-                <span className="count-badge">{results?.total ?? activeJob?.applicationCount ?? 0}</span>
+                <span className={`runtime-badge ${audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{audienceModuleActive ? `全量评论流 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · ${String(codexRuntime?.status || '等待结果')}`}</span>
+                <span className="count-badge">{audienceModuleActive ? audienceResults?.total ?? 0 : results?.total ?? activeJob?.applicationCount ?? 0}</span>
               </div>
             </div>
-            {completionFlow && <MissingCompletionFlowPanel
+            {activeAnalysisMode === 'general' && <nav className="general-result-tabs" aria-label="非岗位研究结果模块">
+              <button type="button" className={generalResultModule === 'insights' ? 'active' : ''} aria-current={generalResultModule === 'insights' ? 'page' : undefined} onClick={() => switchGeneralResultModule('insights')}><BookOpenCheck size={16} /><span>内容洞察</span><small>正文、图片与 AI 结构</small></button>
+              <button type="button" className={generalResultModule === 'audience' ? 'active' : ''} aria-current={generalResultModule === 'audience' ? 'page' : undefined} onClick={() => switchGeneralResultModule('audience')}><UsersRound size={16} /><span>受众及用户界面</span><small>评论、回复与用户卡</small></button>
+            </nav>}
+            {audienceModuleActive ? <AudienceWorkspace
+              results={audienceResults}
+              loading={audienceLoading}
+              kind={audienceKind}
+              postId={audiencePostId}
+              query={audienceQuery}
+              resuming={audienceResuming}
+              onKind={(value) => { setAudienceKind(value); setAudienceOffset(0) }}
+              onPost={(value) => { setAudiencePostId(value); setAudienceOffset(0) }}
+              onQuery={(value) => { setAudienceQuery(value); setAudienceOffset(0) }}
+              onPage={(offset) => activeJob && void loadAudienceResults(activeJob.id, offset)}
+              onResume={() => void resumeAudienceCollection()}
+            /> : <>{completionFlow && <MissingCompletionFlowPanel
               flow={completionFlow}
               job={completionFlow.jobId === activeJob?.id ? activeJob : null}
               noun={activeAnalysisMode === 'general' ? '内容分析' : '岗位信息'}
@@ -3268,7 +3471,7 @@ function App() {
                 ) : <div className="result-empty"><FileText size={28} /><strong>选择一个岗位查看详情</strong></div>}
               </div>
               </>
-            )}
+            )}</>}
           </section>
 
           <div className="secondary-grid">

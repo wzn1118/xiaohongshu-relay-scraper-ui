@@ -18,6 +18,7 @@ from ai_application_workflow import (
     record_needs_completion,
     record_needs_content_completion,
 )
+from audience_collection import collect_audience
 from parallel_body_completion import complete_bodies
 
 
@@ -101,6 +102,8 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser.add_argument("--candidate-profile", default=str(DEFAULT_CANDIDATE_PROFILE))
     parser.add_argument("--analyze-checkpoint", action="store_true")
     parser.add_argument("--complete-missing-only", action="store_true")
+    parser.add_argument("--collect-audience", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--audience-only", action="store_true")
     parser.add_argument("--upstream-runner", default="")
     parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
     parser.add_argument("--codex-runtime", action=argparse.BooleanOptionalAction, default=True)
@@ -427,6 +430,67 @@ def emit_stage(index: int, label: str, status: str = "completed") -> None:
     print(f"AGENT_STAGE {index}/8 {label} {status}", flush=True)
 
 
+def merge_audience_summary(output_dir: Path, audience: dict[str, Any]) -> dict[str, Any]:
+    summary_path = output_dir / "workflow-summary.json"
+    summary = load_json_object(summary_path)
+    notes = load_json_array(output_dir / "xiaohongshu_notes_latest.json")
+    bodies = sum(1 for item in notes if str(item.get("body") or "").strip())
+    summary.setdefault("schemaVersion", 1)
+    summary.setdefault("runner", "xiaohongshu-project-workflow")
+    summary.setdefault("checks", {})
+    summary.setdefault("issues", [])
+    summary.setdefault("notesCollected", len(notes))
+    summary.setdefault("bodiesCaptured", bodies)
+    summary.setdefault("generatedAt", utc_now())
+    summary["audience"] = audience
+    if audience.get("status") != "complete":
+        summary["status"] = "completed_partial"
+    atomic_json(summary_path, summary)
+    return summary
+
+
+def load_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def load_json_array(path: Path) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+
+def pending_audience_summary(output_dir: Path, stop_reason: str) -> dict[str, Any]:
+    posts = load_json_array(output_dir / "audience-posts.json")
+    comments = load_json_array(output_dir / "audience-comments.json")
+    users = load_json_array(output_dir / "audience-users.json")
+    notes = load_json_array(output_dir / "xiaohongshu_notes_latest.json")
+    summary = {
+        "schemaVersion": 1,
+        "status": "partial" if comments else "pending",
+        "postsTotal": len(posts) or len(notes),
+        "postsComplete": sum(1 for item in posts if item.get("status") == "complete"),
+        "postsPartial": sum(1 for item in posts if item.get("status") == "partial"),
+        "postsFailed": sum(1 for item in posts if item.get("status") == "failed"),
+        "commentsCollected": len(comments),
+        "topLevelComments": sum(1 for item in comments if not item.get("parent_comment_id")),
+        "repliesCollected": sum(1 for item in comments if item.get("parent_comment_id")),
+        "usersDiscovered": len(users),
+        "profilesComplete": sum(1 for item in users if item.get("enrichment_status") == "complete"),
+        "postCoveragePercent": 0,
+        "profileCoveragePercent": 0,
+        "stopReason": stop_reason,
+        "generatedAt": utc_now(),
+    }
+    atomic_json(output_dir / "audience-summary.json", summary)
+    return summary
+
+
 def materialize_checkpoint(
     output_dir: Path,
     candidate_profile: Path,
@@ -492,6 +556,22 @@ def main(arguments: list[str] | None = None) -> int:
         return 0
 
     upstream = resolve_upstream_runner(wrapper.upstream_runner)
+    if wrapper.audience_only:
+        if not output_dir_value:
+            raise ValueError("--output-dir is required for audience collection")
+        output_dir = Path(output_dir_value).resolve()
+        audience = collect_audience(
+            output_dir,
+            relay_port=int(option_value(upstream_arguments, "--relay-port") or 18800),
+            goto_timeout_ms=int(option_value(upstream_arguments, "--goto-timeout-ms") or 15000),
+            note_delay_seconds=float(option_value(upstream_arguments, "--note-delay-seconds") or 1.2),
+            stable_rounds=int(option_value(upstream_arguments, "--stable-rounds") or 5),
+            security_verification_timeout_seconds=wrapper.security_verification_timeout_seconds,
+            upstream_scraper=resolve_upstream_scraper(upstream),
+        )
+        summary = merge_audience_summary(output_dir, audience)
+        write_project_manifest(output_dir, summary)
+        return 0 if audience.get("status") == "complete" else 3
     print("[coverage-agent] discovering all job cards before guarded body collection", flush=True)
     scrape_arguments = add_flag_once(unlimited_arguments, "--skip-postprocess")
     scrape_arguments = add_flag_once(scrape_arguments, "--cards-only")
@@ -657,9 +737,32 @@ def main(arguments: list[str] | None = None) -> int:
     )
     for issue in gate["issues"]:
         print(f"[quality-gate] {issue['message']}", flush=True)
+    audience_summary: dict[str, Any] | None = None
+    if wrapper.analysis_mode == "general" and wrapper.collect_audience:
+        collection_stop_reason = str(body_summary.get("stopReason") or "")
+        if collection_stop_reason in {"rate_limited", "security_verification_timeout"}:
+            audience_summary = pending_audience_summary(output_dir, collection_stop_reason)
+            print(
+                f"AUDIENCE_PENDING reason={collection_stop_reason}; resume after the Relay page is available",
+                flush=True,
+            )
+        else:
+            audience_summary = collect_audience(
+                output_dir,
+                relay_port=int(option_value(unlimited_arguments, "--relay-port") or 18800),
+                goto_timeout_ms=int(option_value(unlimited_arguments, "--goto-timeout-ms") or 15000),
+                note_delay_seconds=float(option_value(unlimited_arguments, "--note-delay-seconds") or 1.2),
+                stable_rounds=int(option_value(unlimited_arguments, "--stable-rounds") or 5),
+                security_verification_timeout_seconds=wrapper.security_verification_timeout_seconds,
+                upstream_scraper=resolve_upstream_scraper(upstream),
+            )
     summary = build_workflow_summary(result.payload, body_summary)
+    if audience_summary is not None:
+        summary["audience"] = audience_summary
+        if audience_summary.get("status") != "complete":
+            summary["status"] = "completed_partial"
     atomic_json(output_dir / "workflow-summary.json", summary)
-    result.passed = bool(gate["passed"])
+    result.passed = bool(gate["passed"] and (audience_summary is None or audience_summary.get("status") == "complete"))
     emit_stage(8, "quality-gate-and-artifacts", "passed" if result.passed else "failed")
     write_project_manifest(output_dir, summary)
     return 0 if result.passed else 3

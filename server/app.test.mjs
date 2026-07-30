@@ -38,6 +38,19 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     codex_runtime: { status: 'completed', generated: 1 },
     quality_gate: { passed: true },
   }), 'utf8');
+  await writeFile(path.join(outputDir, 'audience-summary.json'), JSON.stringify({
+    status: 'partial', postsTotal: 1, postsComplete: 0, commentsCollected: 1,
+    usersDiscovered: 1, profilesComplete: 1,
+  }), 'utf8');
+  await writeFile(path.join(outputDir, 'audience-posts.json'), JSON.stringify([
+    { post_id: 'n1', title: '内容运营实习', status: 'partial' },
+  ]), 'utf8');
+  await writeFile(path.join(outputDir, 'audience-comments.json'), JSON.stringify([
+    { comment_id: 'c1', post_id: 'n1', text: '请问还在招吗', user: { user_id: 'u1' } },
+  ]), 'utf8');
+  await writeFile(path.join(outputDir, 'audience-users.json'), JSON.stringify([
+    { user_id: 'u1', display_name: '公开用户', post_ids: ['n1'], enrichment_status: 'complete' },
+  ]), 'utf8');
   const job = {
     id: '20260728080000-abcdef12',
     keyword: '实习继任',
@@ -349,8 +362,10 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal((await cancelled.json()).status, 'cancelled');
 
     const artifacts = await fetch(`${origin}/api/jobs/${job.id}/artifacts`).then((response) => response.json());
-    assert.equal(artifacts.length, 2);
+    assert.equal(artifacts.length, 6);
     assert.ok(artifacts.some((artifact) => artifact.name === 'result.json'));
+    assert.ok(artifacts.some((artifact) => artifact.name === 'audience-comments.json'));
+    assert.ok(artifacts.some((artifact) => artifact.name === 'audience-users.json'));
 
     const results = await fetch(`${origin}/api/jobs/${job.id}/results?limit=20`).then((response) => response.json());
     assert.equal(results.available, true);
@@ -358,6 +373,12 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(results.items[0].note_id, 'n1');
     assert.equal(results.codexRuntime.status, 'completed');
     assert.equal(results.filters.stats.incomplete, 0);
+
+    const audience = await fetch(`${origin}/api/jobs/${job.id}/audience?kind=comments&postId=n1`).then((response) => response.json());
+    assert.equal(audience.available, true);
+    assert.equal(audience.total, 1);
+    assert.equal(audience.items[0].post_title, '内容运营实习');
+    assert.equal(audience.items[0].user.display_name, '公开用户');
 
     const savedDraft = await fetch(`${origin}/api/jobs/${job.id}/draft`, {
       method: 'POST',

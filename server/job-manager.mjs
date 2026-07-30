@@ -570,6 +570,32 @@ function updateProgressFromLog(job, message) {
     });
   }
 
+  for (const match of message.matchAll(/AUDIENCE_PROGRESS posts=(\d+)\/(\d+) comments=(\d+) users=(\d+) profiles=(\d+)\/(\d+) phase=(comments|profiles)/gi)) {
+    const phase = match[7].toLowerCase();
+    const current = phase === 'comments' ? Number(match[1]) : Number(match[5]);
+    const total = phase === 'comments' ? Number(match[2]) : Number(match[6]);
+    update({
+      progressPhase: phase === 'comments' ? 'audience_comments' : 'audience_profiles',
+      progressLabel: phase === 'comments'
+        ? `正在全量采集评论与回复，已处理 ${match[1]} / ${match[2]} 篇，收集 ${match[3]} 条评论`
+        : `正在补全评论者公开资料，已处理 ${match[5]} / ${match[6]} 位`,
+      progressCurrent: current,
+      progressTotal: total,
+    });
+    setProgress(Math.min(98, 88 + Math.round((current / Math.max(1, total)) * 10)));
+  }
+  for (const match of message.matchAll(/AUDIENCE_COMPLETE posts=(\d+)\/(\d+) comments=(\d+) users=(\d+) profiles=(\d+)\/(\d+) status=(\w+)/gi)) {
+    update({
+      progressPhase: match[7] === 'complete' ? 'audience_complete' : 'audience_partial',
+      progressLabel: match[7] === 'complete'
+        ? `评论与用户公开资料采集完成：${match[3]} 条评论，${match[4]} 位用户`
+        : `评论与用户采集已保存检查点：${match[3]} 条评论，仍可续跑`,
+      progressCurrent: Number(match[1]),
+      progressTotal: Number(match[2]),
+    });
+    setProgress(match[7] === 'complete' ? 99 : 96);
+  }
+
   for (const match of message.matchAll(/SECURITY_VERIFICATION detected timeout=(\d+)s/gi)) {
     const now = new Date().toISOString();
     update({
@@ -1117,6 +1143,13 @@ async function copyResumeCheckpoints(sourceDir, destinationDir) {
     'xiaohongshu_notes_latest.csv',
     'application_intelligence.json',
     'application_intelligence.checkpoint.json',
+    'workflow-summary.json',
+    'artifact-manifest.json',
+    'audience-comments.json',
+    'audience-users.json',
+    'audience-posts.json',
+    'audience-summary.json',
+    'audience-failures.json',
   ];
   const required = new Set(['xiaohongshu_cards_latest.json', 'xiaohongshu_notes_latest.json']);
   let requiredCopied = 0;

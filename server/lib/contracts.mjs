@@ -17,6 +17,8 @@ const ALLOWED_KEYS = new Set([
   'randomDelayMaxSeconds',
   'mode',
   'completeMissingOnly',
+  'collectAudience',
+  'audienceOnly',
   'skipPostprocess',
   'noAutoAttach',
   'checkOnly',
@@ -89,6 +91,13 @@ export function validateRunRequest(value) {
   if (completeMissingOnly && (!resumeFromJobId || mode !== 'resume')) {
     throw fieldError('completeMissingOnly', 'requires_resume_source');
   }
+  const audienceOnly = booleanField(value.audienceOnly, 'audienceOnly', false);
+  if (audienceOnly && (analysisMode !== 'general' || !resumeFromJobId || mode !== 'resume')) {
+    throw fieldError('audienceOnly', 'requires_general_resume_source');
+  }
+  const collectAudience = analysisMode === 'general'
+    ? booleanField(value.collectAudience, 'collectAudience', true)
+    : false;
 
   const speedMode = value.speedMode ?? 'random';
   if (speedMode !== 'steady' && speedMode !== 'random') throw fieldError('speedMode', 'must_be_steady_or_random');
@@ -126,6 +135,8 @@ export function validateRunRequest(value) {
     randomDelayMaxSeconds,
     mode,
     completeMissingOnly,
+    collectAudience: collectAudience || audienceOnly,
+    audienceOnly,
     skipPostprocess: booleanField(value.skipPostprocess, 'skipPostprocess', false),
     noAutoAttach: booleanField(value.noAutoAttach, 'noAutoAttach', true),
     checkOnly: booleanField(value.checkOnly, 'checkOnly', false),
@@ -203,6 +214,8 @@ export function buildRunnerArgs(params, outputDir) {
   ];
   args.push(params.useCodexRuntime ? '--codex-runtime' : '--no-codex-runtime');
   if (params.completeMissingOnly) args.push('--complete-missing-only');
+  args.push(params.collectAudience ? '--collect-audience' : '--no-collect-audience');
+  if (params.audienceOnly) args.push('--audience-only');
   if (params.skipPostprocess) args.push('--skip-postprocess');
   if (params.noAutoAttach) args.push('--no-auto-attach');
   if (params.checkOnly) args.push('--check-only');

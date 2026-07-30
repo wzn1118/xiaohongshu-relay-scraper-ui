@@ -22,6 +22,8 @@ test('validateRunRequest applies bounded production defaults', () => {
   assert.equal(result.noAutoAttach, true);
   assert.equal(result.mode, 'fresh');
   assert.equal(result.completeMissingOnly, false);
+  assert.equal(result.collectAudience, false);
+  assert.equal(result.audienceOnly, false);
   assert.equal(result.securityVerificationTimeoutSeconds, 600);
   assert.equal(result.useCodexRuntime, true);
   assert.equal(result.codexBatchSize, 8);
@@ -52,6 +54,22 @@ test('validateRunRequest accepts a bounded non-job research brief', () => {
   assert.equal(result.keyword, '城市徒步');
   assert.equal(result.contentPreset, 'experience');
   assert.equal(result.contentGoal, '提炼适合第一次徒步者的路线、准备事项和常见踩坑。');
+  assert.equal(result.collectAudience, true);
+});
+
+test('audience-only collection requires a general resume source', () => {
+  const sourceId = '20260728034820-6b942873';
+  const result = validateRunRequest({
+    analysisMode: 'general',
+    mode: 'resume',
+    resumeFromJobId: sourceId,
+    collectAudience: true,
+    audienceOnly: true,
+  });
+  assert.equal(result.collectAudience, true);
+  assert.equal(result.audienceOnly, true);
+  assert.throws(() => validateRunRequest({ audienceOnly: true }), ValidationError);
+  assert.throws(() => validateRunRequest({ analysisMode: 'job', mode: 'resume', resumeFromJobId: sourceId, audienceOnly: true }), ValidationError);
 });
 
 test('validateRunRequest always normalizes collection to full-body mode', () => {
@@ -125,6 +143,7 @@ test('buildRunnerArgs only emits the normalized whitelist', () => {
   assert.ok(args.includes('--skip-postprocess'));
   assert.ok(args.includes('--no-auto-attach'));
   assert.ok(args.includes('--codex-runtime'));
+  assert.ok(args.includes('--no-collect-audience'));
   assert.equal(args[args.indexOf('--search-sort') + 1], 'latest');
   const tamperedArgs = buildRunnerArgs({ ...params, searchSort: 'comprehensive' }, path.resolve('output'));
   assert.equal(tamperedArgs[tamperedArgs.indexOf('--search-sort') + 1], 'latest');
@@ -136,6 +155,19 @@ test('buildRunnerArgs only emits the normalized whitelist', () => {
   assert.equal(args[args.indexOf('--random-delay-min-seconds') + 1], '0.8');
   assert.equal(args[args.indexOf('--random-delay-max-seconds') + 1], '2.4');
   assert.equal(args.some((arg) => /[;&|]/.test(arg)), false);
+});
+
+test('buildRunnerArgs emits the isolated audience resume mode', () => {
+  const params = validateRunRequest({
+    analysisMode: 'general',
+    mode: 'resume',
+    resumeFromJobId: '20260728034820-6b942873',
+    audienceOnly: true,
+  });
+  const args = buildRunnerArgs(params, path.resolve('output'));
+  assert.ok(args.includes('--collect-audience'));
+  assert.ok(args.includes('--audience-only'));
+  assert.equal(args.includes('--no-collect-audience'), false);
 });
 
 test('artifact ids round-trip safe nested paths', () => {

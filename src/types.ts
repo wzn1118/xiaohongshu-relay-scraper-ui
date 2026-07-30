@@ -321,6 +321,8 @@ export type JobRequest = {
   mode: 'fresh' | 'resume'
   resumeFromJobId?: string | null
   completeMissingOnly: boolean
+  collectAudience: boolean
+  audienceOnly: boolean
   skipPostprocess: boolean
   noAutoAttach: boolean
   checkOnly: boolean
@@ -333,6 +335,98 @@ export type JobRequest = {
   candidateProfile: CandidateApplicationProfile
   coverLetterThreshold: number
   coverLetterMaxAttempts: number
+}
+
+export type AudienceStatus = 'complete' | 'partial' | 'pending' | 'failed'
+
+export type AudiencePublicProfile = {
+  user_id: string
+  display_name: string
+  profile_url: string
+  avatar_url: string
+  xhs_id: string
+  bio: string
+  location: string
+  following_count: number | null
+  follower_count: number | null
+  liked_and_collected_count: number | null
+  roles: Array<'author' | 'commenter' | string>
+  comment_count: number
+  post_ids: string[]
+  enrichment_status: 'complete' | 'partial' | 'pending' | string
+  access_status: string
+  last_enriched_at: string
+}
+
+export type AudienceComment = {
+  comment_id: string
+  post_id: string
+  post_title?: string
+  parent_comment_id: string
+  level: 'comment' | 'reply' | string
+  text: string
+  likes: number
+  publish_time: string
+  location: string
+  source_url: string
+  user: AudiencePublicProfile
+  collected_at: string
+}
+
+export type AudiencePost = {
+  post_id: string
+  title: string
+  note_url: string
+  author: AudiencePublicProfile
+  expected_comment_count: number | null
+  collected_comment_count?: number
+  top_level_count?: number
+  reply_count?: number
+  unique_user_count?: number
+  status?: AudienceStatus
+  completion_basis?: string
+  failure_reason?: string
+  last_collected_at?: string
+}
+
+export type AudienceSummary = {
+  schemaVersion: number
+  status: AudienceStatus
+  postsTotal: number
+  postsComplete: number
+  postsPartial: number
+  postsFailed: number
+  commentsCollected: number
+  topLevelComments: number
+  repliesCollected: number
+  usersDiscovered: number
+  profilesComplete: number
+  postCoveragePercent: number
+  profileCoveragePercent: number
+  stopReason: string
+  generatedAt: string
+}
+
+type AudienceResultsBase = {
+  available: boolean
+  summary: AudienceSummary
+  posts: AudiencePost[]
+  total: number
+  offset: number
+  limit: number
+  totals: { posts: number; comments: number; users: number }
+  filters: { postId: string; query: string }
+}
+
+export type AudienceResultsResponse =
+  | (AudienceResultsBase & { kind: 'comments'; items: AudienceComment[] })
+  | (AudienceResultsBase & { kind: 'users'; items: AudiencePublicProfile[] })
+
+export type AudienceResumeResponse = {
+  action: 'started' | 'attached' | 'already_complete'
+  sourceJobId: string
+  job: Job
+  message: string
 }
 
 export type ProvenanceText = {

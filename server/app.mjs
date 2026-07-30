@@ -9,6 +9,7 @@ import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
 import { setupRelayRuntime } from './lib/relay-setup.mjs';
 import { recoverRelay } from './lib/relay-recovery.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
+import { readAudienceResults } from './lib/audience-results.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 
 export { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
@@ -328,6 +329,65 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         }
         if (req.method === 'GET' && parts[3] === 'results' && parts.length === 4) {
           return json(res, 200, await readApplicationResults(internal.outputDir, url.searchParams, internal));
+        }
+        if (req.method === 'GET' && parts[3] === 'audience' && parts.length === 4) {
+          return json(res, 200, await readAudienceResults(internal.outputDir, url.searchParams));
+        }
+        if (req.method === 'POST' && parts[3] === 'audience' && parts[4] === 'resume' && parts.length === 5) {
+          const sourceJob = manager.get(id);
+          const current = await readAudienceResults(internal.outputDir, new URLSearchParams({ limit: '1' }));
+          if (current.summary.status === 'complete') {
+            return json(res, 200, {
+              action: 'already_complete',
+              sourceJobId: id,
+              job: sourceJob,
+              message: 'All comments and public audience profiles are already complete.',
+            });
+          }
+          const activeAudience = manager.list().find((job) => (
+            ['queued', 'running'].includes(job.status)
+            && job.config?.audienceOnly
+            && job.config?.resumeFromJobId === id
+          ));
+          if (activeAudience) {
+            return json(res, 200, {
+              action: 'attached',
+              sourceJobId: id,
+              job: activeAudience,
+              message: 'An audience collection task is already running.',
+            });
+          }
+          if (sourceJob && ['queued', 'running'].includes(sourceJob.status) && sourceJob.config?.collectAudience) {
+            return json(res, 200, {
+              action: 'attached',
+              sourceJobId: id,
+              job: sourceJob,
+              message: 'The source task is already collecting audience data.',
+            });
+          }
+          const sourceParams = internal.params || internal.config || sourceJob?.config || {};
+          const params = validateRunRequest({
+            ...sourceParams,
+            analysisMode: 'general',
+            searchSort: 'latest',
+            maxAgeDays: 0,
+            limit: 0,
+            mode: 'resume',
+            resumeFromJobId: id,
+            completeMissingOnly: false,
+            collectAudience: true,
+            audienceOnly: true,
+            checkOnly: false,
+            aiSessionId: null,
+            profileId: null,
+          });
+          const job = await manager.start(params);
+          return json(res, 202, {
+            action: 'started',
+            sourceJobId: id,
+            job,
+            message: 'Audience collection resumed from the saved checkpoint.',
+          });
         }
         if (req.method === 'POST' && parts[3] === 'delivery' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);

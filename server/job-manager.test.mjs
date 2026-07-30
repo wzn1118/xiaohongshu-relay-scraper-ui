@@ -390,6 +390,10 @@ test('JobManager copies card and note checkpoints into a resumed task', async ()
   const notesCsv = 'note_id,access_status\nnote-1,detail_ok\n';
   const application = { records: [{ note_id: 'note-1', outreach: { runtime_status: 'completed' } }] };
   const applicationCheckpoint = { records: [{ note_id: 'note-2', outreach: { runtime_status: 'fallback_missing_job_body' } }] };
+  const audienceComments = [{ comment_id: 'comment-1', post_id: 'note-1', text: '评论' }];
+  const audienceUsers = [{ user_id: 'user-1', display_name: '用户一' }];
+  const audiencePosts = [{ post_id: 'note-1', status: 'partial' }];
+  const audienceSummary = { status: 'partial', postsTotal: 1, commentsCollected: 1 };
   await mkdir(sourceOutputDir, { recursive: true });
   await writeFile(fakeRunner, '', 'utf8');
   await writeFile(path.join(sourceOutputDir, 'xiaohongshu_cards_discovered.json'), JSON.stringify(cards), 'utf8');
@@ -398,6 +402,10 @@ test('JobManager copies card and note checkpoints into a resumed task', async ()
   await writeFile(path.join(sourceOutputDir, 'xiaohongshu_notes_latest.csv'), notesCsv, 'utf8');
   await writeFile(path.join(sourceOutputDir, 'application_intelligence.json'), JSON.stringify(application), 'utf8');
   await writeFile(path.join(sourceOutputDir, 'application_intelligence.checkpoint.json'), JSON.stringify(applicationCheckpoint), 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'audience-comments.json'), JSON.stringify(audienceComments), 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'audience-users.json'), JSON.stringify(audienceUsers), 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'audience-posts.json'), JSON.stringify(audiencePosts), 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'audience-summary.json'), JSON.stringify(audienceSummary), 'utf8');
   await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
     id: sourceId,
     status: 'interrupted',
@@ -450,6 +458,22 @@ test('JobManager copies card and note checkpoints into a resumed task', async ()
     assert.deepEqual(
       JSON.parse(await readFile(path.join(resumedOutputDir, 'application_intelligence.checkpoint.json'), 'utf8')),
       applicationCheckpoint,
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(resumedOutputDir, 'audience-comments.json'), 'utf8')),
+      audienceComments,
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(resumedOutputDir, 'audience-users.json'), 'utf8')),
+      audienceUsers,
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(resumedOutputDir, 'audience-posts.json'), 'utf8')),
+      audiencePosts,
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(resumedOutputDir, 'audience-summary.json'), 'utf8')),
+      audienceSummary,
     );
 
     const ended = new Promise((resolve) => {
