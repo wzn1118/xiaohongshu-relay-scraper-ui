@@ -10,11 +10,13 @@ import random
 import sys
 import threading
 import time
+import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from body_completion_ledger import BodyCompletionLedger, LEDGER_FILENAME
 from workflow_state import open_workflow_state_from_args
 
 
@@ -210,13 +212,28 @@ def complete_bodies(
         raise ValueError("Card checkpoints must have unique note identifiers")
 
     existing = load_json_list(notes_path) if notes_path.exists() else []
+    existing_failures = load_json_list(failures_path) if failures_path.exists() else []
     complete_by_key = {record_key(record): record for record in existing if record_is_complete(record)}
     complete_by_key = {key: value for key, value in complete_by_key.items() if key in set(card_keys)}
-    last_failures: dict[str, dict[str, Any]] = {}
-    attempted_keys: set[str] = set()
+    last_failures = {
+        record_key(record): record
+        for record in existing_failures
+        if record_key(record) in set(card_keys)
+    }
+    ledger = BodyCompletionLedger.open(
+        output_dir,
+        cards,
+        complete_by_key.values(),
+        existing_failures,
+    )
+    ledger_records = ledger.records
+    attempted_keys = {
+        key for key, record in ledger_records.items()
+        if int(record.get("attemptCount") or 0) > 0
+    }
     round_progress: dict[int, int] = {}
     upstream = None
-    lock = threading.Lock()
+    lock = threading.RLock()
     stop_event = threading.Event()
     security_gate = threading.Event()
     security_gate.set()
@@ -227,6 +244,7 @@ def complete_bodies(
     rate_limit_detected_at = ""
     stop_reason = ""
     checkpoint_error: BaseException | None = None
+    invocation_id = uuid.uuid4().hex
 
     def next_body_delay() -> float:
         if str(speed_mode).strip().casefold() == "steady":
@@ -243,38 +261,86 @@ def complete_bodies(
     def ordered_complete() -> list[dict[str, Any]]:
         return [complete_by_key[key] for key in card_keys if key in complete_by_key]
 
-    def checkpoint(force: bool = False) -> None:
+    def notify_progress(
+        *,
+        event: str,
+        status: str = "running",
+        summary: dict[str, Any] | None = None,
+    ) -> None:
+        nonlocal checkpoint_error
+        if progress_callback is None:
+            return
+        try:
+            progress_callback({
+                "event": event,
+                "cards": [dict(item) for item in cards],
+                "completeRecords": [dict(item) for item in ordered_complete()],
+                "failures": [dict(item) for item in last_failures.values()],
+                "attemptedIds": sorted(attempted_keys),
+                "ledger": ledger.snapshot(),
+                "status": status,
+                "summary": summary,
+                "lastCheckpointAt": utc_now(),
+            })
+        except BaseException as error:
+            checkpoint_error = error
+            stop_event.set()
+            security_gate.set()
+            raise
+
+    def checkpoint(force: bool = False, *, event: str = "checkpoint") -> None:
         nonlocal successful_since_checkpoint, checkpoint_error
         if not force and successful_since_checkpoint < checkpoint_every:
             return
         records = ordered_complete()
         atomic_json(notes_path, records)
         successful_since_checkpoint = 0
-        if progress_callback is not None:
-            try:
-                progress_callback({
-                    "cards": [dict(item) for item in cards],
-                    "completeRecords": [dict(item) for item in records],
-                    "failures": [dict(item) for item in last_failures.values()],
-                    "attemptedIds": sorted(attempted_keys),
-                    "status": "running",
-                    "lastCheckpointAt": utc_now(),
-                })
-            except BaseException as error:
-                checkpoint_error = error
-                stop_event.set()
-                security_gate.set()
-                raise
+        notify_progress(event=event)
         print(f"PARALLEL_BODY {len(records)}/{len(cards)} checkpoint", flush=True)
 
-    def scrape_with_url_fallback(page: Any, card: dict[str, Any]) -> dict[str, Any]:
+    def finish_request(
+        key: str,
+        request_id: str,
+        payload: dict[str, Any],
+        status: str,
+        *,
+        stop_reason_value: str,
+        recoverable: bool,
+    ) -> None:
+        if not request_id:
+            return
+        failure_code = str(payload.get("access_status") or "missing_record")
+        failure_message = str(payload.get("worker_error") or payload.get("error") or "")
+        with lock:
+            ledger.finish_attempt(
+                key,
+                request_id,
+                status,
+                failure_code=failure_code,
+                failure_message=failure_message,
+                recoverable=recoverable,
+                stop_reason=stop_reason_value,
+            )
+            notify_progress(event="attempt_finished")
+
+    def scrape_with_url_fallback(page: Any, card: dict[str, Any]) -> tuple[dict[str, Any], str]:
         last_payload: dict[str, Any] = {}
         attempted_urls: list[str] = []
-        for target_url in detail_url_candidates(card):
+        last_request_id = ""
+        key = record_key(card)
+        target_urls = detail_url_candidates(card)
+        for target_index, target_url in enumerate(target_urls):
             attempted_urls.append(target_url)
             candidate = dict(card)
             candidate["search_result_url"] = target_url
             candidate["note_url"] = target_url
+            request_id = f"{invocation_id}:{key}:{uuid.uuid4().hex}"
+            with lock:
+                if not ledger.start_attempt(key, request_id):
+                    raise RuntimeError(f"Body request is not eligible for ledger transition: {key}")
+                attempted_keys.add(key)
+                notify_progress(event="attempt_started")
+            last_request_id = request_id
             try:
                 record = upstream.scrape_note(
                     page,
@@ -294,13 +360,25 @@ def complete_bodies(
             challenge_text = json.dumps(last_payload, ensure_ascii=False)
             if contains_rate_limit(challenge_text) or contains_security_verification(challenge_text):
                 last_payload["attempted_detail_urls"] = attempted_urls
-                return last_payload
+                return last_payload, request_id
             if record_is_complete(last_payload):
-                return last_payload
+                return last_payload, request_id
+            if target_index < len(target_urls) - 1:
+                failure_code = str(last_payload.get("access_status") or "missing_record")
+                finish_request(
+                    key,
+                    request_id,
+                    last_payload,
+                    "failed",
+                    stop_reason_value="request_timeout" if "timeout" in failure_code else "request_failed",
+                    recoverable=True,
+                )
+            else:
+                return last_payload, request_id
         last_payload.setdefault("note_id", card.get("note_id", ""))
         last_payload.setdefault("note_url", card.get("note_url", ""))
         last_payload["attempted_detail_urls"] = attempted_urls
-        return last_payload
+        return last_payload, last_request_id
 
     def run_worker(
         worker_id: int,
@@ -335,8 +413,9 @@ def complete_bodies(
                             work.task_done()
                             break
                         key = record_key(card)
+                        request_id = ""
                         try:
-                            payload = scrape_with_url_fallback(page, card)
+                            payload, request_id = scrape_with_url_fallback(page, card)
                         except Exception as error:  # noqa: BLE001
                             payload = {
                                 "note_id": card.get("note_id", ""),
@@ -349,6 +428,14 @@ def complete_bodies(
                         # in flight. Discard the late result before it mutates the
                         # checkpoint or advances to another card.
                         if stop_event.is_set():
+                            finish_request(
+                                key,
+                                request_id,
+                                payload,
+                                "cancelled",
+                                stop_reason_value=stop_reason or "task_interrupted",
+                                recoverable=True,
+                            )
                             work.task_done()
                             break
                         if not record_is_complete(payload):
@@ -358,8 +445,15 @@ def complete_bodies(
                             except Exception:  # noqa: BLE001
                                 pass
                             if contains_rate_limit(challenge_text):
+                                finish_request(
+                                    key,
+                                    request_id,
+                                    payload,
+                                    "blocked",
+                                    stop_reason_value="rate_limited",
+                                    recoverable=True,
+                                )
                                 with lock:
-                                    attempted_keys.add(key)
                                     last_failures[key] = payload
                                     rate_limit_detected_at = rate_limit_detected_at or utc_now()
                                     stop_reason = "rate_limited"
@@ -373,6 +467,14 @@ def complete_bodies(
                                 work.task_done()
                                 break
                             if contains_security_verification(challenge_text):
+                                finish_request(
+                                    key,
+                                    request_id,
+                                    payload,
+                                    "blocked",
+                                    stop_reason_value="security_verification",
+                                    recoverable=True,
+                                )
                                 owns_verification = False
                                 with lock:
                                     last_failures[key] = payload
@@ -420,6 +522,12 @@ def complete_bodies(
                                 with lock:
                                     security_status = "timed_out"
                                     stop_reason = "security_verification_timeout"
+                                    ledger.annotate_terminal(
+                                        key,
+                                        failure_code="detail_security_verification",
+                                        recoverable=True,
+                                        stop_reason="security_verification_timeout",
+                                    )
                                     stop_event.set()
                                     security_gate.set()
                                     checkpoint(force=True)
@@ -429,6 +537,27 @@ def complete_bodies(
                                 )
                                 work.task_done()
                                 break
+                        if record_is_complete(payload):
+                            finish_request(
+                                key,
+                                request_id,
+                                payload,
+                                "succeeded",
+                                stop_reason_value="",
+                                recoverable=False,
+                            )
+                        else:
+                            failure_code = str(payload.get("access_status") or "missing_record")
+                            finish_request(
+                                key,
+                                request_id,
+                                payload,
+                                "failed",
+                                stop_reason_value=(
+                                    "request_timeout" if "timeout" in failure_code else "request_failed"
+                                ),
+                                recoverable=True,
+                            )
                         with lock:
                             attempted_keys.add(key)
                             round_progress[round_number] = round_progress.get(round_number, 0) + 1
@@ -474,14 +603,25 @@ def complete_bodies(
     attempts = max(1, min(int(attempts), 5))
     security_verification_timeout_seconds = max(5, min(int(security_verification_timeout_seconds), 3600))
     started_at = utc_now()
+    checkpoint(force=True, event="discovered")
     for attempt in range(1, attempts + 1):
         if stop_event.is_set():
             break
-        pending = [card for card in cards if record_key(card) not in complete_by_key]
+        pending = [
+            card for card in cards
+            if record_key(card) not in complete_by_key and ledger.can_resume(record_key(card))
+        ]
         if not pending:
             break
+        ledger.queue(record_key(card) for card in pending)
+        notify_progress(event="queued")
         if upstream is None:
-            upstream = load_upstream(upstream_scraper)
+            try:
+                upstream = load_upstream(upstream_scraper)
+            except BaseException:
+                ledger.finalize_pending("task_interrupted")
+                notify_progress(event="interrupted", status="failed")
+                raise
         print(
             f"PARALLEL_ROUND {attempt}/{attempts} pending={len(pending)} workers={workers}",
             flush=True,
@@ -503,6 +643,7 @@ def complete_bodies(
         for thread in threads:
             thread.join()
         if checkpoint_error is not None:
+            ledger.finalize_pending("task_interrupted")
             raise checkpoint_error
         checkpoint(force=True)
         if stop_event.is_set():
@@ -511,6 +652,11 @@ def complete_bodies(
     records = ordered_complete()
     write_csv(records, csv_path)
     missing = [key for key in card_keys if key not in complete_by_key]
+    if missing and not stop_reason:
+        stop_reason = "attempt_limit_reached"
+    ledger.finalize_pending(stop_reason or "completed")
+    ledger_payload = ledger.snapshot()
+    ledger_counts = ledger_payload["summary"]
     failure_payload = [last_failures.get(key, {"note_id": key, "access_status": "missing_record"}) for key in missing]
     if failure_payload:
         atomic_json(failures_path, failure_payload)
@@ -527,6 +673,19 @@ def complete_bodies(
         "cards": len(cards),
         "completeBodies": len(records),
         "missingBodies": len(missing),
+        "bodyAttempted": ledger_counts["attemptedCount"],
+        "bodySucceeded": ledger_counts["succeededCount"],
+        "bodyFailed": ledger_counts["failedCount"],
+        "bodyNotAttempted": ledger_counts["notAttemptedCount"],
+        "bodyBlocked": ledger_counts["blockedCount"],
+        "bodyCancelled": ledger_counts["cancelledCount"],
+        "statisticsSource": ledger_payload["statisticsSource"],
+        "bodyCompletionLedger": {
+            "schemaVersion": ledger_payload["schemaVersion"],
+            "artifact": LEDGER_FILENAME,
+            "summary": ledger_counts,
+            "shadowComparison": ledger_payload["shadowComparison"],
+        },
         "workers": workers,
         "pacing": {
             "mode": speed_mode,
@@ -558,16 +717,11 @@ def complete_bodies(
         "passed": not missing,
     }
     atomic_json(summary_path, summary)
-    if progress_callback is not None:
-        progress_callback({
-            "cards": [dict(item) for item in cards],
-            "completeRecords": [dict(item) for item in records],
-            "failures": [dict(item) for item in failure_payload],
-            "attemptedIds": sorted(attempted_keys),
-            "status": "completed" if not missing else "blocked" if stop_reason else "partial",
-            "summary": summary,
-            "lastCheckpointAt": utc_now(),
-        })
+    notify_progress(
+        event="completed",
+        status="completed" if not missing else "blocked" if stop_reason else "partial",
+        summary=summary,
+    )
     print(
         f"PARALLEL_COMPLETE cards={len(cards)} bodies={len(records)} missing={len(missing)}",
         flush=True,
@@ -620,6 +774,7 @@ def main(arguments: list[str] | None = None) -> int:
             complete_records=progress["completeRecords"],
             failures=progress["failures"],
             attempted_ids=set(progress["attemptedIds"]),
+            ledger=progress.get("ledger"),
             summary=progress.get("summary"),
             status=str(progress.get("status") or "running"),
         )
@@ -642,10 +797,20 @@ def main(arguments: list[str] | None = None) -> int:
             progress_callback=update_state,
         )
     except BaseException as error:
+        if isinstance(error, KeyboardInterrupt):
+            try:
+                cards = load_json_list(output_dir / "xiaohongshu_cards_latest.json")
+                BodyCompletionLedger.open(
+                    output_dir,
+                    cards,
+                    recover_interrupted=False,
+                ).finalize_pending("user_cancelled")
+            except BaseException:
+                pass
         if state is not None:
             try:
-                state.finish_stage("bodyCompletion", "failed", {
-                    "failureCode": type(error).__name__,
+                state.finish_stage("bodyCompletion", "cancelled" if isinstance(error, KeyboardInterrupt) else "failed", {
+                    "failureCode": "user_cancelled" if isinstance(error, KeyboardInterrupt) else type(error).__name__,
                     "failureMessage": str(error)[:1000],
                 })
             except BaseException:

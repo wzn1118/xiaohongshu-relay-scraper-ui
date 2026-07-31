@@ -20,6 +20,7 @@ from ai_application_workflow import (
     record_needs_content_completion,
 )
 from audience_collection import collect_audience, normalize_audience_post_status
+from body_completion_ledger import BodyCompletionLedger, LEDGER_FILENAME, load_ledger
 from parallel_body_completion import complete_bodies
 from workflow_state import (
     WorkflowStateSession,
@@ -170,6 +171,24 @@ def checkpoint_body_summary(output_dir: Path, *, stop_reason: str) -> dict[str, 
 
     cards = load_list("xiaohongshu_cards_latest.json")
     notes = load_list("xiaohongshu_notes_latest.json")
+    ledger = load_ledger(output_dir / LEDGER_FILENAME)
+    if ledger is not None:
+        counts = ledger["summary"]
+        return {
+            "transitionedToAnalysis": True,
+            "stopReason": stop_reason,
+            "cardsDiscovered": counts["discoveredCount"],
+            "bodyAttempted": counts["attemptedCount"],
+            "bodySucceeded": counts["succeededCount"],
+            "bodyFailed": counts["failedCount"],
+            "bodyNotAttempted": counts["notAttemptedCount"],
+            "bodyBlocked": counts["blockedCount"],
+            "bodyCancelled": counts["cancelledCount"],
+            "missingBodies": max(0, counts["discoveredCount"] - counts["succeededCount"]),
+            "statisticsSource": ledger.get("statisticsSource", "bodyCompletionLedger"),
+            "bodyCompletionLedger": ledger,
+            "checkpointFallback": True,
+        }
     completed = sum(
         1
         for note in notes
@@ -179,9 +198,14 @@ def checkpoint_body_summary(output_dir: Path, *, stop_reason: str) -> dict[str, 
         "transitionedToAnalysis": True,
         "stopReason": stop_reason,
         "cardsDiscovered": len(cards),
-        "bodyAttempted": 0,
+        "bodyAttempted": completed,
         "bodySucceeded": completed,
+        "bodyFailed": 0,
+        "bodyNotAttempted": max(0, len(cards) - completed),
+        "bodyBlocked": 0,
+        "bodyCancelled": 0,
         "missingBodies": max(0, len(cards) - completed),
+        "statisticsSource": "legacyInferred",
         "checkpointFallback": True,
     }
 
@@ -431,7 +455,7 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         "securityVerification": security_verification,
         "rateLimit": rate_limit,
         "generatedAt": utc_now(),
-        "cardsDiscovered": gate["discovered_count"],
+        "cardsDiscovered": int(body_summary.get("cardsDiscovered", gate["discovered_count"])),
         "notesCollected": gate["record_count"],
         "bodiesCaptured": gate["body_count"],
         "bodyCoveragePercent": round(gate["body_coverage_rate"] * 100, 2),
@@ -453,9 +477,15 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         "checks": gate["checks"],
         "issues": gate["issues"],
         "agentStages": agent_stages,
-        "discovered": gate["discovered_count"],
-        "bodyAttempted": gate["discovered_count"],
-        "bodySucceeded": gate["body_count"],
+        "discovered": int(body_summary.get("cardsDiscovered", gate["discovered_count"])),
+        "bodyAttempted": int(body_summary.get("bodyAttempted", gate["body_count"])),
+        "bodySucceeded": int(body_summary.get("bodySucceeded", gate["body_count"])),
+        "bodyFailed": int(body_summary.get("bodyFailed", 0)),
+        "bodyNotAttempted": int(body_summary.get("bodyNotAttempted", 0)),
+        "bodyBlocked": int(body_summary.get("bodyBlocked", 0)),
+        "bodyCancelled": int(body_summary.get("bodyCancelled", 0)),
+        "bodyStatisticsSource": str(body_summary.get("statisticsSource") or "legacyInferred"),
+        "bodyCompletionLedger": body_summary.get("bodyCompletionLedger"),
         "timesNormalized": time_normalized,
         "applicationInfo": job_cards,
         "draftsGenerated": application_copy,
@@ -646,6 +676,20 @@ def run_discovery_process(
             signature = (int(patch["discoveredCount"]), len(patch["discoveredIds"]))
             if signature != previous_signature:
                 state.update_stage("discovery", patch)
+                cards = load_json_array(output_dir / "xiaohongshu_cards_latest.json")
+                ledger = BodyCompletionLedger.open(
+                    output_dir,
+                    cards,
+                    recover_interrupted=False,
+                ).snapshot()
+                state.checkpoint_body(
+                    cards=cards,
+                    complete_records=[],
+                    failures=[],
+                    attempted_ids=set(),
+                    ledger=ledger,
+                    status=state.stage_status("bodyCompletion"),
+                )
                 previous_signature = signature
             if return_code is not None:
                 return return_code
@@ -669,6 +713,7 @@ def body_state_callback(state: WorkflowStateSession | None):
             complete_records=progress["completeRecords"],
             failures=progress["failures"],
             attempted_ids=set(progress["attemptedIds"]),
+            ledger=progress.get("ledger"),
             summary=progress.get("summary"),
             status=str(progress.get("status") or "running"),
         )
@@ -838,6 +883,19 @@ def main_stateful(
             state.finish_stage("bodyCompletion", body_status, {
                 "stopReason": str(body_summary.get("stopReason") or ""),
             })
+        except KeyboardInterrupt:
+            cards = load_json_array(output_dir / "xiaohongshu_cards_latest.json")
+            BodyCompletionLedger.open(
+                output_dir,
+                cards,
+                recover_interrupted=False,
+            ).finalize_pending("user_cancelled")
+            state.finish_stage("bodyCompletion", "cancelled", {
+                "failureCode": "user_cancelled",
+                "failureMessage": "",
+                "stopReason": "user_cancelled",
+            })
+            raise
         except BaseException as error:
             fail_state_stage(state, "bodyCompletion", error)
             raise

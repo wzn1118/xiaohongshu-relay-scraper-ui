@@ -18,7 +18,9 @@ const WORKFLOW_STAGE_STATUSES = new Set([
   'failed',
   'cancelled',
 ]);
-const BODY_RECORD_STATUSES = new Set(['not_attempted', 'attempted', 'succeeded', 'failed', 'blocked']);
+const BODY_RECORD_STATUSES = new Set([
+  'discovered', 'queued', 'attempted', 'succeeded', 'failed', 'not_attempted', 'blocked', 'cancelled',
+]);
 const ANALYSIS_RECORD_STATUSES = new Set(['not_started', 'running', 'partial', 'completed', 'failed', 'blocked']);
 const AUDIENCE_ENTRY_STATUSES = new Set(['pending', 'partial', 'complete', 'failed', 'blocked']);
 
@@ -40,10 +42,19 @@ export function emptyWorkflowStages() {
     },
     bodyCompletion: {
       status: 'not_started',
+      ledgerSchemaVersion: 1,
+      statisticsSource: 'bodyCompletionLedger',
       records: {},
       totalCount: 0,
       completedCount: 0,
       remainingCount: 0,
+      attemptedCount: 0,
+      failedCount: 0,
+      notAttemptedCount: 0,
+      blockedCount: 0,
+      cancelledCount: 0,
+      pendingCount: 0,
+      conservationValid: true,
       lastCheckpointAt: null,
     },
     analysis: {
@@ -197,12 +208,20 @@ function normalizeWorkflowState(value) {
     if (stageName === 'bodyCompletion') {
       stage.records = normalizeLedger(stage.records, normalizeBodyRecord);
       const records = isPlainObject(stage.records) ? stage.records : {};
+      const counts = bodyRecordCounts(records);
+      if (original.ledgerSchemaVersion === undefined) {
+        stage.ledgerSchemaVersion = 1;
+        stage.statisticsSource = 'legacyInferred';
+      }
       if (original.totalCount === undefined) stage.totalCount = Object.keys(records).length;
       if (original.completedCount === undefined) {
         stage.completedCount = Object.values(records).filter((record) => bodyRecordIsCompleted(record)).length;
       }
       if (original.remainingCount === undefined) {
         stage.remainingCount = Math.max(0, stage.totalCount - stage.completedCount);
+      }
+      for (const [field, count] of Object.entries(counts)) {
+        if (original[field] === undefined) stage[field] = count;
       }
     }
     if (stageName === 'analysis') {
@@ -251,7 +270,15 @@ function validateStageShape(stageName, stage, filePath) {
   if (stageName === 'bodyCompletion') {
     validateLedger(stage.records, filePath, `stage_${stageName}_records`);
     validateBodyRecords(stage.records, filePath);
-    validateNonNegativeIntegers(stage, ['totalCount', 'completedCount', 'remainingCount'], filePath, stageName);
+    validateNonNegativeIntegers(stage, [
+      'totalCount', 'completedCount', 'remainingCount', 'attemptedCount', 'failedCount',
+      'notAttemptedCount', 'blockedCount', 'cancelledCount', 'pendingCount',
+    ], filePath, stageName);
+    const expectedCounts = bodyRecordCounts(stage.records);
+    if (stage.conservationValid !== true
+      || Object.entries(expectedCounts).some(([field, count]) => stage[field] !== count)) {
+      throw invalidState(filePath, 'stage_bodyCompletion_ledger_count_mismatch');
+    }
     if (stage.completedCount > stage.totalCount) {
       throw invalidState(filePath, `stage_${stageName}_completed_count_exceeds_total`);
     }
@@ -332,7 +359,7 @@ function validateLedger(value, filePath, reason) {
 
 function validateBodyRecords(records, filePath) {
   for (const record of Object.values(records)) {
-    if (!BODY_RECORD_STATUSES.has(record.status)) {
+    if (!BODY_RECORD_STATUSES.has(record.bodyStatus)) {
       throw invalidState(filePath, 'stage_bodyCompletion_record_status_invalid');
     }
     validateEntryNonNegativeIntegers(record, ['attemptCount'], filePath, 'stage_bodyCompletion_record');
@@ -416,11 +443,43 @@ function normalizeLedger(value, normalizeEntry) {
 }
 
 function normalizeBodyRecord(value) {
-  const status = value.status === 'completed' ? 'succeeded' : (value.status || 'not_attempted');
+  const rawStatus = value.bodyStatus || value.status || 'not_attempted';
+  const status = rawStatus === 'completed' ? 'succeeded' : rawStatus;
   return {
     ...value,
+    bodyStatus: status,
     status,
     attemptCount: value.attemptCount ?? 0,
+    noteId: String(value.noteId || ''),
+    discoveredAt: value.discoveredAt ?? null,
+    firstAttemptAt: value.firstAttemptAt ?? null,
+    lastAttemptAt: value.lastAttemptAt ?? null,
+    completedAt: value.completedAt ?? null,
+    failureCode: String(value.failureCode || ''),
+    failureMessage: String(value.failureMessage || ''),
+    recoverable: value.recoverable ?? (status !== 'succeeded'),
+    stopReason: String(value.stopReason || ''),
+    updatedAt: value.updatedAt ?? null,
+  };
+}
+
+function bodyRecordCounts(records) {
+  const statuses = Object.fromEntries([...BODY_RECORD_STATUSES].map((status) => [status, 0]));
+  for (const record of Object.values(records)) {
+    const status = record.bodyStatus || record.status || 'not_attempted';
+    statuses[BODY_RECORD_STATUSES.has(status) ? status : 'not_attempted'] += 1;
+  }
+  const pendingCount = statuses.discovered + statuses.queued + statuses.attempted;
+  const terminalCount = statuses.succeeded + statuses.failed + statuses.not_attempted
+    + statuses.blocked + statuses.cancelled;
+  return {
+    attemptedCount: Object.values(records).filter((record) => Number(record.attemptCount || 0) > 0).length,
+    failedCount: statuses.failed,
+    notAttemptedCount: statuses.not_attempted,
+    blockedCount: statuses.blocked,
+    cancelledCount: statuses.cancelled,
+    pendingCount,
+    conservationValid: Object.keys(records).length === terminalCount + pendingCount,
   };
 }
 
@@ -462,7 +521,7 @@ function normalizeAudienceUser(value) {
 }
 
 function bodyRecordIsCompleted(record) {
-  return isPlainObject(record) && record.status === 'succeeded';
+  return isPlainObject(record) && (record.bodyStatus || record.status) === 'succeeded';
 }
 
 function analysisRecordIsCompleted(record) {

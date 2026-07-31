@@ -432,6 +432,58 @@ def test_body_checkpoint_keeps_succeeded_records_and_attempt_counts_idempotent(t
     assert persisted["stages"]["bodyCompletion"]["remainingCount"] == 1
 
 
+def test_body_checkpoint_persists_exact_ledger_diagnostics(tmp_path: Path) -> None:
+    output_dir, state_path, _ = state_fixture(tmp_path)
+    session = open_session(output_dir, state_path)
+    ledger = {
+        "schemaVersion": 1,
+        "statisticsSource": "bodyCompletionLedger",
+        "records": {
+            "note-1": {
+                "noteId": "note-1",
+                "bodyStatus": "succeeded",
+                "attemptCount": 1,
+                "discoveredAt": "2026-08-01T00:00:00Z",
+                "firstAttemptAt": "2026-08-01T00:00:01Z",
+                "lastAttemptAt": "2026-08-01T00:00:01Z",
+                "completedAt": "2026-08-01T00:00:02Z",
+                "failureCode": "",
+                "failureMessage": "",
+                "recoverable": False,
+                "stopReason": "",
+                "updatedAt": "2026-08-01T00:00:02Z",
+            },
+            "note-2": {
+                "noteId": "note-2",
+                "bodyStatus": "not_attempted",
+                "attemptCount": 0,
+                "recoverable": True,
+                "stopReason": "attempt_limit_reached",
+            },
+        },
+    }
+
+    session.checkpoint_body(
+        cards=[],
+        complete_records=[],
+        failures=[],
+        attempted_ids=set(),
+        ledger=ledger,
+        summary={"stopReason": "attempt_limit_reached"},
+        status="blocked",
+    )
+
+    stage = json.loads(state_path.read_text(encoding="utf-8"))["stages"]["bodyCompletion"]
+    assert stage["statisticsSource"] == "bodyCompletionLedger"
+    assert stage["attemptedCount"] == 1
+    assert stage["completedCount"] == 1
+    assert stage["notAttemptedCount"] == 1
+    assert stage["pendingCount"] == 0
+    assert stage["conservationValid"] is True
+    assert stage["records"]["note-1"]["firstAttemptAt"] == "2026-08-01T00:00:01Z"
+    assert stage["records"]["note-2"]["stopReason"] == "attempt_limit_reached"
+
+
 def test_audience_checkpoint_counts_started_attempts_once(tmp_path: Path) -> None:
     output_dir, state_path, _ = state_fixture(tmp_path)
     session = open_session(output_dir, state_path)

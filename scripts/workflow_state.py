@@ -32,7 +32,8 @@ STAGE_STATUSES = frozenset((
     *TERMINAL_STAGE_STATUSES,
 ))
 BODY_RECORD_STATUSES = frozenset((
-    "not_attempted", "attempted", "succeeded", "failed", "blocked",
+    "discovered", "queued", "attempted", "succeeded", "failed",
+    "not_attempted", "blocked", "cancelled",
 ))
 ANALYSIS_RECORD_STATUSES = frozenset((
     "not_started", "running", "partial", "completed", "failed", "blocked",
@@ -309,10 +310,19 @@ def _empty_stages() -> dict[str, dict[str, Any]]:
         },
         "bodyCompletion": {
             "status": "not_started",
+            "ledgerSchemaVersion": 1,
+            "statisticsSource": "bodyCompletionLedger",
             "records": {},
             "totalCount": 0,
             "completedCount": 0,
             "remainingCount": 0,
+            "attemptedCount": 0,
+            "failedCount": 0,
+            "notAttemptedCount": 0,
+            "blockedCount": 0,
+            "cancelledCount": 0,
+            "pendingCount": 0,
+            "conservationValid": True,
             "lastCheckpointAt": None,
         },
         "analysis": {
@@ -365,6 +375,10 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
                 _normalize_body_record,
             )
             records = stage.get("records") if isinstance(stage.get("records"), dict) else {}
+            counts = _body_record_counts(records)
+            if "ledgerSchemaVersion" not in original:
+                stage["ledgerSchemaVersion"] = 1
+                stage["statisticsSource"] = "legacyInferred"
             if "totalCount" not in original:
                 stage["totalCount"] = len(records)
             if "completedCount" not in original:
@@ -377,6 +391,9 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
                     0,
                     stage["totalCount"] - stage["completedCount"],
                 )
+            for field, value in counts.items():
+                if field not in original:
+                    stage[field] = value
         elif stage_name == "analysis":
             stage["records"] = _normalize_ledger(
                 stage.get("records"),
@@ -437,10 +454,47 @@ def _normalize_ledger(value: Any, normalize_entry: Callable[[dict[str, Any]], di
 
 def _normalize_body_record(value: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(value)
-    status = normalized.get("status") or "not_attempted"
-    normalized["status"] = "succeeded" if status == "completed" else status
+    status = normalized.get("bodyStatus") or normalized.get("status") or "not_attempted"
+    status = "succeeded" if status == "completed" else status
+    normalized["bodyStatus"] = status
+    normalized["status"] = status
     normalized["attemptCount"] = normalized.get("attemptCount", 0)
+    normalized["noteId"] = str(normalized.get("noteId") or "")
+    normalized.setdefault("discoveredAt", None)
+    normalized.setdefault("firstAttemptAt", None)
+    normalized.setdefault("lastAttemptAt", None)
+    normalized.setdefault("completedAt", None)
+    normalized["failureCode"] = str(normalized.get("failureCode") or "")
+    normalized["failureMessage"] = str(normalized.get("failureMessage") or "")
+    normalized["recoverable"] = bool(normalized.get("recoverable", status != "succeeded"))
+    normalized["stopReason"] = str(normalized.get("stopReason") or "")
+    normalized.setdefault("updatedAt", None)
     return normalized
+
+
+def _body_record_counts(records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    statuses = {
+        status: sum(
+            1 for record in records.values()
+            if (record.get("bodyStatus") or record.get("status")) == status
+        )
+        for status in BODY_RECORD_STATUSES
+    }
+    pending = statuses["discovered"] + statuses["queued"] + statuses["attempted"]
+    terminal = sum(statuses[status] for status in (
+        "succeeded", "failed", "not_attempted", "blocked", "cancelled",
+    ))
+    return {
+        "attemptedCount": sum(
+            int(record.get("attemptCount") or 0) > 0 for record in records.values()
+        ),
+        "failedCount": statuses["failed"],
+        "notAttemptedCount": statuses["not_attempted"],
+        "blockedCount": statuses["blocked"],
+        "cancelledCount": statuses["cancelled"],
+        "pendingCount": pending,
+        "conservationValid": len(records) == terminal + pending,
+    }
 
 
 def _normalize_analysis_record(value: dict[str, Any]) -> dict[str, Any]:
@@ -489,7 +543,9 @@ def _normalize_audience_user(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _body_record_is_completed(record: Any) -> bool:
-    return isinstance(record, dict) and record.get("status") == "succeeded"
+    return isinstance(record, dict) and (
+        record.get("bodyStatus") or record.get("status")
+    ) == "succeeded"
 
 
 def _analysis_record_is_completed(record: Any) -> bool:
@@ -539,7 +595,7 @@ def _require_non_negative_integers(
 
 def _validate_body_records(records: dict[str, dict[str, Any]]) -> None:
     for record in records.values():
-        if record.get("status") not in BODY_RECORD_STATUSES:
+        if record.get("bodyStatus") not in BODY_RECORD_STATUSES:
             raise WorkflowStateError("Workflow-state body record has an invalid status")
         _require_non_negative_entry_integers(record, ("attemptCount",), "body record")
 
@@ -721,9 +777,23 @@ class WorkflowStateSession:
             _validate_body_records(stage["records"])
             _require_non_negative_integers(
                 stage,
-                ("totalCount", "completedCount", "remainingCount"),
+                (
+                    "totalCount", "completedCount", "remainingCount", "attemptedCount",
+                    "failedCount", "notAttemptedCount", "blockedCount", "cancelledCount",
+                    "pendingCount",
+                ),
                 stage_name,
             )
+            if stage.get("conservationValid") is not True:
+                raise WorkflowStateError(
+                    "Workflow-state bodyCompletion ledger violates conservation"
+                )
+            expected_counts = _body_record_counts(stage["records"])
+            for field, value in expected_counts.items():
+                if stage.get(field) != value:
+                    raise WorkflowStateError(
+                        "Workflow-state bodyCompletion aggregate counts do not match its ledger"
+                    )
             if stage["completedCount"] > stage["totalCount"]:
                 raise WorkflowStateError(
                     f"Workflow-state {stage_name}.completedCount exceeds totalCount"
@@ -876,6 +946,7 @@ class WorkflowStateSession:
         complete_records: list[dict[str, Any]],
         failures: list[dict[str, Any]],
         attempted_ids: set[str],
+        ledger: dict[str, Any] | None = None,
         summary: dict[str, Any] | None = None,
         status: str = "running",
     ) -> dict[str, Any]:
@@ -885,8 +956,40 @@ class WorkflowStateSession:
 
         def mutate(next_state: dict[str, Any]) -> None:
             stage = next_state.setdefault("stages", {}).setdefault("bodyCompletion", {})
-            records = stage.setdefault("records", {})
             source_revision = int(next_state.get("revision") or self.revision)
+            if isinstance(ledger, dict) and isinstance(ledger.get("records"), dict):
+                records = {
+                    str(note_id): {
+                        **_normalize_body_record(record),
+                        "noteId": str(note_id),
+                        "sourceRevision": source_revision,
+                    }
+                    for note_id, record in ledger["records"].items()
+                    if str(note_id) and isinstance(record, dict)
+                }
+                counts = _body_record_counts(records)
+                completed_count = sum(
+                    _body_record_is_completed(record) for record in records.values()
+                )
+                stage.update({
+                    "status": status,
+                    "attemptId": self.attempt_id,
+                    "ledgerSchemaVersion": int(ledger.get("schemaVersion") or 1),
+                    "statisticsSource": str(
+                        ledger.get("statisticsSource") or "bodyCompletionLedger"
+                    ),
+                    "records": records,
+                    "lastCheckpointAt": now,
+                    "totalCount": len(records),
+                    "completedCount": completed_count,
+                    "remainingCount": len(records) - completed_count,
+                    **counts,
+                })
+                if summary:
+                    stage["stopReason"] = str(summary.get("stopReason") or "")
+                return
+
+            records = stage.setdefault("records", {})
             for card in cards:
                 note_id = _record_id(card)
                 if not note_id:
@@ -901,27 +1004,57 @@ class WorkflowStateSession:
                     record["lastAttemptId"] = self.attempt_id
                 failure = failures_by_id.get(note_id, {})
                 failure_code = str(failure.get("access_status") or "")
-                if note_id in complete_ids:
+                if (record.get("bodyStatus") or record.get("status")) == "succeeded":
                     record.update({
+                        "bodyStatus": "succeeded",
+                        "status": "succeeded",
+                        "recoverable": False,
+                    })
+                elif note_id in complete_ids:
+                    record.update({
+                        "bodyStatus": "succeeded",
                         "status": "succeeded",
                         "completedAt": record.get("completedAt") or now,
                         "failureCode": "",
+                        "failureMessage": "",
                         "recoverable": False,
+                        "stopReason": "",
                     })
                 elif failure:
                     blocked = "security" in failure_code or "rate_limit" in failure_code
                     record.update({
+                        "bodyStatus": "blocked" if blocked else "failed",
                         "status": "blocked" if blocked else "failed",
+                        "completedAt": now,
                         "failureCode": failure_code or "missing_record",
+                        "failureMessage": str(failure.get("worker_error") or ""),
                         "recoverable": True,
+                        "stopReason": (
+                            "security_verification" if "security" in failure_code
+                            else "rate_limited" if "rate_limit" in failure_code
+                            else "request_failed"
+                        ),
                     })
                 elif attempted:
-                    record.update({"status": "attempted", "recoverable": True})
+                    record.update({
+                        "bodyStatus": "attempted",
+                        "status": "attempted",
+                        "recoverable": True,
+                    })
                 else:
-                    record.setdefault("status", "not_attempted")
+                    record.setdefault("bodyStatus", "not_attempted")
+                    record.setdefault("status", record["bodyStatus"])
                     record.setdefault("attemptCount", 0)
                     record.setdefault("recoverable", True)
                 record["noteId"] = note_id
+                record.setdefault("discoveredAt", now)
+                record.setdefault("firstAttemptAt", None)
+                record.setdefault("lastAttemptAt", None)
+                record.setdefault("completedAt", None)
+                record.setdefault("failureCode", "")
+                record.setdefault("failureMessage", "")
+                record.setdefault("stopReason", "")
+                record["updatedAt"] = now
                 record["sourceRevision"] = source_revision
                 records[note_id] = record
             completed_count = sum(
@@ -930,10 +1063,13 @@ class WorkflowStateSession:
             stage.update({
                 "status": status,
                 "attemptId": self.attempt_id,
+                "ledgerSchemaVersion": 1,
+                "statisticsSource": "legacyInferred",
                 "lastCheckpointAt": now,
                 "totalCount": len(records),
                 "completedCount": completed_count,
                 "remainingCount": len(records) - completed_count,
+                **_body_record_counts(records),
             })
             if summary:
                 stage["stopReason"] = str(summary.get("stopReason") or "")

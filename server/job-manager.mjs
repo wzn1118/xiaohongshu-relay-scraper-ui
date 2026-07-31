@@ -1028,10 +1028,11 @@ function hasRecoverableCheckpoint(job, state, scope) {
   const relevant = scope === 'full'
     ? Object.values(stages)
     : [stages[stageKeyForScope(scope)]];
+  const metadataFields = new Set(['status', 'ledgerSchemaVersion', 'statisticsSource', 'conservationValid']);
   return relevant.filter(Boolean).some((stage) => {
     if (stage.status && stage.status !== 'not_started') return true;
     return Object.entries(stage).some(([key, value]) => (
-      key !== 'status'
+      !metadataFields.has(key)
       && value != null
       && (
         typeof value === 'object'

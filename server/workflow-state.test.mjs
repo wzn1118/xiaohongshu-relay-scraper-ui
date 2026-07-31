@@ -29,6 +29,8 @@ test('workflow state commits atomically and rejects stale revisions', async () =
     assert.deepEqual(initial.stages.discovery.discoveredIds, []);
     assert.equal(initial.stages.discovery.scrollCount, 0);
     assert.deepEqual(initial.stages.bodyCompletion.records, {});
+    assert.equal(initial.stages.bodyCompletion.statisticsSource, 'bodyCompletionLedger');
+    assert.equal(initial.stages.bodyCompletion.conservationValid, true);
     assert.equal(initial.stages.analysis.remainingCount, 0);
     assert.deepEqual(initial.stages.audience.posts, {});
     assert.deepEqual(initial.stages.artifacts.generatedFiles, []);
@@ -180,6 +182,8 @@ test('legacy schema 2 stage fields are normalized before validation', async () =
       ],
       [1, 1, 0],
     );
+    assert.equal(normalized.stages.bodyCompletion.statisticsSource, 'legacyInferred');
+    assert.equal(normalized.stages.bodyCompletion.records['note-1'].bodyStatus, 'succeeded');
     assert.deepEqual(
       [
         normalized.stages.analysis.totalCount,
