@@ -54,6 +54,10 @@ import {
   X,
 } from 'lucide-react'
 import { api } from './api'
+import { draftContentHash } from './draft-state.mjs'
+import { UnsavedDraftDialog } from './UnsavedDraftDialog'
+import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
+import type { DraftSaveRequest } from './useUnsavedDraftGuard'
 import type {
   Artifact,
   ApplicationResult,
@@ -708,6 +712,14 @@ function outreachDraft(result: ApplicationResult): OutreachDraft {
   }
 }
 
+function hasVerifiedDraftQuality(result: ApplicationResult): boolean {
+  const draft = result.draftVersion
+  if (!draft) return Boolean(result.cover_letter_evaluation?.passed)
+  return draft.qualityStatus === 'passed'
+    && draft.qualityCheckedVersion === draft.version
+    && draft.qualityCheckedHash === draft.contentHash
+}
+
 function resultFilterStats(results: ApplicationResultsResponse) {
   const items = Array.isArray(results.items) ? results.items : []
   return results.filters?.stats ?? {
@@ -1337,9 +1349,7 @@ function App() {
   const [coverage, setCoverage] = useState<CoverageSummary | null>(null)
   const [results, setResults] = useState<ApplicationResultsResponse | null>(null)
   const [selectedResult, setSelectedResult] = useState<ApplicationResult | null>(null)
-  const [draftDirty, setDraftDirty] = useState(false)
   const draftDirtyRef = useRef(false)
-  const [draftSaving, setDraftSaving] = useState(false)
   const [emailSending, setEmailSending] = useState(false)
   const [resultOffset, setResultOffset] = useState(0)
   const [resultsLoading, setResultsLoading] = useState(false)
@@ -1400,12 +1410,38 @@ function App() {
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
   const rateLimitAlertRef = useRef<string | null>(null)
   const resultsRequestRef = useRef(0)
+  const draftViewRevisionRef = useRef(0)
+  const draftSaveResponseRef = useRef(0)
   const audienceRequestRef = useRef(0)
   const audienceResultsRef = useRef<{ sourceJobId: string; value: AudienceResultsResponse } | null>(null)
   const relayGuideAutoOpened = useRef(false)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
   const handledLocalInstall = useRef<string | null>(null)
+  const draftSaveHandlerRef = useRef<(request: DraftSaveRequest) => Promise<boolean>>(async () => false)
+  const draftGuard = useUnsavedDraftGuard({
+    content: selectedResult ? outreachDraft(selectedResult) : null,
+    draftVersion: selectedResult?.draftVersion || null,
+    save: (saveRequest) => draftSaveHandlerRef.current(saveRequest),
+    discard: ({ content, draftVersion }) => {
+      setSelectedResult((current) => current ? {
+        ...current,
+        outreach: { ...current.outreach, ...content },
+        draftVersion,
+      } : current)
+      setResults((current) => current ? {
+        ...current,
+        items: current.items.map((item) => item.note_id === selectedResult?.note_id ? {
+          ...item,
+          outreach: { ...item.outreach, ...content },
+          draftVersion,
+        } : item),
+      } : current)
+    },
+  })
+  const draftDirty = draftGuard.dirty
+  const draftSaving = draftGuard.saveStatus === 'saving'
+  draftDirtyRef.current = draftDirty
   const detectedSmtpPreset = smtpPresetForEmail(smtpConfig.from)
   const detectedSmtpProvider = detectedSmtpPreset
     ? smtpProviderOptions.find((item) => item.id === detectedSmtpPreset.provider)
@@ -1436,8 +1472,9 @@ function App() {
     cleanupStream.current = null
   }, [])
 
-  const switchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true) => {
+  const performSwitchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true) => {
     if (mode === workspaceMode) return
+    draftViewRevisionRef.current += 1
     disconnectJobStream()
     resultsRequestRef.current += 1
     audienceRequestRef.current += 1
@@ -1501,7 +1538,11 @@ function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }, [activeJob, disconnectJobStream, jobs, request, resultOffset, results, resultSort, resultTimeRange, selectedResult, workspaceMode])
 
-  const switchGeneralResultModule = useCallback((module: GeneralResultModule, preferredJobId = '') => {
+  const switchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true) => (
+    draftGuard.requestTransition('切换工作台', () => performSwitchWorkspace(mode, updateHistory))
+  ), [draftGuard.requestTransition, performSwitchWorkspace])
+
+  const performSwitchGeneralResultModule = useCallback((module: GeneralResultModule, preferredJobId = '') => {
     setGeneralResultModule(module)
     const url = new URL(window.location.href)
     if (module === 'audience') {
@@ -1523,6 +1564,10 @@ function App() {
     }
     window.history.replaceState({ ...(window.history.state || {}), generalResultModule: module }, '', `${url.pathname}${url.search}${url.hash}`)
   }, [activeJob, audienceDataJobId, jobs])
+
+  const switchGeneralResultModule = useCallback((module: GeneralResultModule, preferredJobId = '') => (
+    draftGuard.requestTransition('离开当前结果页面', () => performSwitchGeneralResultModule(module, preferredJobId))
+  ), [draftGuard.requestTransition, performSwitchGeneralResultModule])
 
   useEffect(() => {
     requestCache.current[workspaceMode] = request
@@ -1547,21 +1592,43 @@ function App() {
 
   useEffect(() => {
     const handlePopState = () => {
-      const nextModule = generalResultModuleFromLocation()
-      setGeneralResultModule(nextModule)
-      if (nextModule === 'audience') {
-        const preferredJobId = audienceDataJobIdFromLocation()
-        void findBestAudienceDataJob(jobs, preferredJobId, audienceSourceJobIdFor(activeJob, jobs)).then((job) => {
-          setAudienceDataJobId(job?.id || preferredJobId)
-        })
-      } else {
-        setAudienceDataJobId('')
+      const targetUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
+      const targetMode = workspaceModeFromLocation()
+      const targetModule = generalResultModuleFromLocation()
+      const applyTarget = () => {
+        setGeneralResultModule(targetModule)
+        if (targetModule === 'audience') {
+          const preferredJobId = audienceDataJobIdFromLocation()
+          void findBestAudienceDataJob(jobs, preferredJobId, audienceSourceJobIdFor(activeJob, jobs)).then((job) => {
+            setAudienceDataJobId(job?.id || preferredJobId)
+          })
+        } else {
+          setAudienceDataJobId('')
+        }
+        performSwitchWorkspace(targetMode, false)
       }
-      switchWorkspace(workspaceModeFromLocation(), false)
+      if (!draftDirtyRef.current) {
+        applyTarget()
+        return
+      }
+      const currentUrl = new URL(window.location.href)
+      currentUrl.pathname = workspacePath(workspaceMode)
+      if (workspaceMode !== 'general' || generalResultModule !== 'audience') {
+        currentUrl.searchParams.delete('module')
+        currentUrl.searchParams.delete('job')
+      } else {
+        currentUrl.searchParams.set('module', 'audience')
+        if (audienceDataJobId) currentUrl.searchParams.set('job', audienceDataJobId)
+      }
+      window.history.pushState({ workspaceMode, generalResultModule }, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
+      void draftGuard.requestTransition('浏览器返回', () => {
+        window.history.pushState({ workspaceMode: targetMode, generalResultModule: targetModule }, '', targetUrl)
+        applyTarget()
+      })
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [activeJob, jobs, switchWorkspace])
+  }, [activeJob, audienceDataJobId, draftGuard.requestTransition, generalResultModule, jobs, performSwitchWorkspace, workspaceMode])
 
   useEffect(() => {
     document.title = workspaceMode === 'general' ? '继任非岗位内容研究工作台' : '继任采集与投递工作台'
@@ -2233,7 +2300,6 @@ function App() {
       setResultOffset(offset)
       if (!options.preserveDraft || !draftDirtyRef.current) {
         setSelectedResult((current) => payload.items.find((item) => item.note_id === current?.note_id) || payload.items[0] || null)
-        setDraftDirty(false)
       }
     } catch {
       if (requestId !== resultsRequestRef.current) return
@@ -2241,7 +2307,9 @@ function App() {
         const cached = resultViewCache.current[requestMode]
         const cachedResults = cached.activeJobId === jobId && cached.results?.analysisMode === requestMode ? cached.results : null
         setResults(cachedResults)
-        setSelectedResult(cachedResults?.items.find((item) => item.note_id === cached.selectedNoteId) || cachedResults?.items[0] || null)
+        if (!options.preserveDraft || !draftDirtyRef.current) {
+          setSelectedResult(cachedResults?.items.find((item) => item.note_id === cached.selectedNoteId) || cachedResults?.items[0] || null)
+        }
         setNotice(cachedResults ? '最新结果读取失败，当前继续显示已缓存的采集内容。' : '结果暂时读取失败，请稍后刷新；已采集文件和任务检查点未受影响。')
       }
     } finally {
@@ -2477,6 +2545,10 @@ function App() {
   }, [draftDirty])
 
   useEffect(() => {
+    draftViewRevisionRef.current += 1
+  }, [activeJob?.id, resultOffset, resultSort, resultTimeRange, selectedResult?.note_id, workspaceMode])
+
+  useEffect(() => {
     setCoverage(activeJob?.coverage || parseCoverage(activeJob?.workflowSummary) || null)
     if (!activeJob) {
       setArtifacts([])
@@ -2486,7 +2558,7 @@ function App() {
       return
     }
     api.artifacts(activeJob.id).then(setArtifacts).catch(() => setArtifacts(activeJob.artifacts || []))
-    void loadResults(activeJob.id, 0)
+    void loadResults(activeJob.id, 0, { preserveDraft: true })
   }, [activeJob?.id, activeJob?.status, activeJob?.applicationCount, loadResults])
 
   useEffect(() => {
@@ -2551,8 +2623,9 @@ function App() {
       if (workspaceMode === mode) {
         setResults(payload)
         setResultOffset(0)
-        setSelectedResult((current) => payload.items.find((item) => item.note_id === current?.note_id) || payload.items[0] || null)
-        setDraftDirty(false)
+        if (!draftDirtyRef.current) {
+          setSelectedResult((current) => payload.items.find((item) => item.note_id === current?.note_id) || payload.items[0] || null)
+        }
       }
       const remaining = payload.filters.stats.incomplete
       const completed = activeJob.status === 'completed' && remaining === 0
@@ -2689,7 +2762,7 @@ function App() {
     }
   }, [activeJob?.id, activeJob?.status, connectJob, disconnectJobStream])
 
-  const runJob = async (payload: JobRequest, sessionHint: AiSession | null = aiSession): Promise<Job | null> => {
+  const performRunJob = async (payload: JobRequest, sessionHint: AiSession | null = aiSession): Promise<Job | null> => {
     if (payload.mode === 'resume' || payload.resumeFromJobId) {
       setNotice('续跑必须通过原任务恢复入口执行。')
       return null
@@ -2754,7 +2827,11 @@ function App() {
     }
   }
 
-  const resumeAudienceCollection = async () => {
+  const runJob = (payload: JobRequest, sessionHint: AiSession | null = aiSession) => (
+    draftGuard.requestTransition(payload.checkOnly ? '执行启动检查' : '启动新任务', () => performRunJob(payload, sessionHint))
+  )
+
+  const performResumeAudienceCollection = async () => {
     const resumeTargetJobId = audienceSourceJobId
     if (!activeJob || !resumeTargetJobId || jobAnalysisMode(activeJob) !== 'general') {
       const message = '请先选择一条非岗位内容采集任务。'
@@ -2772,7 +2849,7 @@ function App() {
       setAudienceTask(resumedJob)
       setJobs((current) => replaceJobInPlace(current, resumedJob))
       if (['queued', 'resuming', 'running'].includes(resumedJob.status)) connectJob(resumedJob)
-      switchGeneralResultModule('audience', resumeTargetJobId)
+      performSwitchGeneralResultModule('audience', resumeTargetJobId)
       setAudienceDataJobId(resumeTargetJobId)
       writeAudienceDataJobToLocation(resumeTargetJobId)
       await loadAudienceResults(resumeTargetJobId, 0, {
@@ -2794,6 +2871,10 @@ function App() {
       setAudienceResuming(false)
     }
   }
+
+  const resumeAudienceCollection = () => (
+    draftGuard.requestTransition('恢复其他任务', performResumeAudienceCollection)
+  )
 
   const submit = (event: FormEvent) => {
     event.preventDefault()
@@ -2826,7 +2907,7 @@ function App() {
     }
   }
 
-  const resumeJob = async (job: Job, scope: ResumeScope = 'full', sessionHint: AiSession | null = aiSession) => {
+  const performResumeJob = async (job: Job, scope: ResumeScope = 'full', sessionHint: AiSession | null = aiSession) => {
     if (scope !== 'audience' && !job.resumeAvailable && !['queued', 'resuming', 'running'].includes(job.status)) return null
     const needsAi = !['audience', 'artifacts', 'discovery'].includes(scope)
     let session = sessionHint
@@ -2895,6 +2976,10 @@ function App() {
     }
   }
 
+  const resumeJob = (job: Job, scope: ResumeScope = 'full', sessionHint: AiSession | null = aiSession) => (
+    draftGuard.requestTransition(job.id === activeJob?.id ? '恢复当前任务' : '恢复其他任务', () => performResumeJob(job, scope, sessionHint))
+  )
+
   const refreshSecurityAndContinue = async (job: Job) => {
     if (securityRecovering || submitting) return
     setSecurityRecovering(true)
@@ -2924,7 +3009,7 @@ function App() {
         return
       }
 
-      const resumed = await resumeJob(refreshedJob, 'full')
+      const resumed = await performResumeJob(refreshedJob, 'full')
       if (resumed) setNotice('安全验证已完成，已从原任务检查点继续。')
     } catch (error) {
       setRelay({ running: false, cdpReady: false, port: relayConfig.port, message: (error as Error).message })
@@ -2934,13 +3019,9 @@ function App() {
     }
   }
 
-  const completeMissingResults = async () => {
+  const performCompleteMissingResults = async () => {
     if (!activeJob || completingMissing || submitting) return
     const generalMode = workspaceMode === 'general' || results?.analysisMode === 'general' || jobAnalysisMode(activeJob) === 'general'
-    if (!generalMode && draftDirty) {
-      setNotice('当前岗位有未保存的文案修改，请先保存后再补全。')
-      return
-    }
     const sourceJobId = activeJob.id
     const noun = generalMode ? '内容分析' : '岗位信息'
     const knownIncomplete = results?.filters.stats.incomplete ?? null
@@ -2986,7 +3067,7 @@ function App() {
 
       let response
       try {
-        const resumedJob = await resumeJob(activeJob, 'body_completion', session)
+        const resumedJob = await performResumeJob(activeJob, 'body_completion', session)
         if (!resumedJob) throw new Error('原任务未能从正文检查点恢复。')
         response = {
           action: 'started' as const,
@@ -3008,7 +3089,7 @@ function App() {
               message: 'The source task is still running.',
             }
           } else {
-            const resumedJob = await resumeJob(refreshedJob, 'body_completion', session)
+            const resumedJob = await performResumeJob(refreshedJob, 'body_completion', session)
             if (!resumedJob) {
               const fallbackError = new Error('当前版本未找到可复用的正文检查点。') as Error & { code?: string }
               fallbackError.code = 'RESUME_CHECKPOINTS_MISSING'
@@ -3035,7 +3116,7 @@ function App() {
           } finally {
             setRestoringAi(false)
           }
-          const resumedJob = await resumeJob(activeJob, 'body_completion', session)
+          const resumedJob = await performResumeJob(activeJob, 'body_completion', session)
           if (!resumedJob) throw new Error('原任务未能从正文检查点恢复。')
           response = {
             action: 'started' as const,
@@ -3086,7 +3167,12 @@ function App() {
     }
   }
 
-  const selectJob = (job: Job) => {
+  const completeMissingResults = () => (
+    draftGuard.requestTransition('重新生成当前文案', performCompleteMissingResults)
+  )
+
+  const performSelectJob = (job: Job) => {
+    draftViewRevisionRef.current += 1
     disconnectJobStream()
     const targetMode = jobAnalysisMode(job)
     const scopedJobs = jobs.filter((candidate) => jobAnalysisMode(candidate) === targetMode)
@@ -3104,12 +3190,17 @@ function App() {
     setActiveJob(sourceJob)
     setAudienceTask(nextAudienceTask)
     setLogs([])
-    if (isAudienceOnlyJob(job)) switchGeneralResultModule('audience', job.id)
+    if (isAudienceOnlyJob(job)) performSwitchGeneralResultModule('audience', job.id)
     const liveJob = nextAudienceTask && ['running', 'resuming', 'queued'].includes(nextAudienceTask.status)
       ? nextAudienceTask
       : sourceJob
     if (liveJob && ['running', 'resuming', 'queued'].includes(liveJob.status)) connectJob(liveJob)
   }
+
+
+  const selectJob = (job: Job) => (
+    draftGuard.requestTransition('切换任务', () => performSelectJob(job))
+  )
 
   const openHistoryJob = (job: Job) => {
     const targetMode = jobAnalysisMode(job)
@@ -3118,7 +3209,7 @@ function App() {
       switchWorkspace(targetMode)
       return
     }
-    selectJob(job)
+    void selectJob(job)
   }
 
   const tabCount = Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)
@@ -3282,6 +3373,19 @@ function App() {
   const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email' && route.actionable)
   const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message' && route.actionable)
   const selectedResultIncomplete = Boolean(selectedResult && isIncompleteApplicationResult(selectedResult))
+  const draftOperationPending = draftSaving || emailSending || deliveryUpdating
+  const selectedDraftQualityVerified = Boolean(selectedResult && hasVerifiedDraftQuality(selectedResult))
+  const selectedDraftQualityStale = selectedResult?.draftVersion?.qualityStatus === 'stale'
+  const selectedDraftQualityRetryable = Boolean(selectedResult?.draftVersion && !draftDirty && !selectedDraftQualityVerified)
+  const draftSaveLabel = draftSaving
+    ? '保存中'
+    : draftGuard.saveStatus === 'error'
+      ? '保存失败'
+      : draftDirty
+        ? '保存修改'
+        : selectedDraftQualityRetryable
+          ? '质量已失效'
+          : '已保存'
   const openImagePreview = useCallback((title: string, images: PreviewImage[], index = 0) => {
     if (!images.length) return
     setImagePreview({ title, images, index: Math.min(Math.max(index, 0), images.length - 1) })
@@ -3295,19 +3399,48 @@ function App() {
     setResults((current) => current ? { ...current, items: current.items.map((item) => item.note_id === next.note_id ? next : item) } : current)
   }
 
-  const chooseResult = (next: ApplicationResult) => {
-    if (results?.analysisMode !== 'general' && draftDirty && selectedResult?.note_id !== next.note_id) {
-      setNotice('当前岗位有未保存的文案修改，请先保存后再切换。')
+  const captureDraftView = () => ({
+    revision: draftViewRevisionRef.current,
+    jobId: activeJob?.id || '',
+    noteId: selectedResult?.note_id || '',
+  })
+
+  const draftViewIsCurrent = (view: ReturnType<typeof captureDraftView>) => (
+    draftViewRevisionRef.current === view.revision
+  )
+
+  const replaceResultInDraftView = (view: ReturnType<typeof captureDraftView>, next: ApplicationResult) => {
+    if (!draftViewIsCurrent(view) || next.note_id !== view.noteId) return false
+    setSelectedResult((current) => current?.note_id === view.noteId ? next : current)
+    setResults((current) => current
+      ? { ...current, items: current.items.map((item) => item.note_id === view.noteId ? next : item) }
+      : current)
+    return true
+  }
+
+  const performChooseResult = (next: ApplicationResult) => {
+    if (draftOperationPending && selectedResult?.note_id !== next.note_id) {
+      setNotice('当前投递文案操作尚未完成，请稍候。')
       return
     }
+    if (selectedResult?.note_id !== next.note_id) draftViewRevisionRef.current += 1
     setSelectedResult(next)
-    setDraftDirty(false)
+  }
+
+  const chooseResult = (next: ApplicationResult) => {
+    if (selectedResult?.note_id === next.note_id) return
+    void draftGuard.requestTransition('切换岗位', () => performChooseResult(next))
   }
 
   const updateDraft = (field: keyof OutreachDraft, value: string) => {
     if (!selectedResult) return
-    replaceResult({ ...selectedResult, outreach: { ...selectedResult.outreach, [field]: value } })
-    setDraftDirty(true)
+    replaceResult({
+      ...selectedResult,
+      outreach: { ...selectedResult.outreach, [field]: value },
+      draftVersion: selectedResult.draftVersion
+        ? { ...selectedResult.draftVersion, qualityStatus: 'stale' }
+        : selectedResult.draftVersion,
+    })
   }
 
   const copyText = (value: string) => {
@@ -3315,43 +3448,128 @@ function App() {
     void navigator.clipboard.writeText(value).then(() => setNotice('内容已复制到剪贴板'))
   }
 
-  const saveDraft = async () => {
-    if (!activeJob || !selectedResult) return
-    setDraftSaving(true)
+  const saveDraft = async (saveRequest: DraftSaveRequest): Promise<boolean> => {
+    if (!activeJob || !selectedResult) return false
+    const jobId = activeJob.id
+    const submittedResult = selectedResult
+    const submittedDraft = outreachDraft(submittedResult)
+    const submittedHash = draftContentHash(submittedDraft)
+    if (saveRequest.contentHash !== submittedHash) return false
+    const draftView = captureDraftView()
+    let savedResult: ApplicationResult | null = null
+    const responseIsCurrent = () => saveRequest.requestId === draftSaveResponseRef.current && draftViewIsCurrent(draftView)
+    draftSaveResponseRef.current = saveRequest.requestId
     try {
-      const response = await api.saveDraft(activeJob.id, selectedResult.note_id, outreachDraft(selectedResult))
-      replaceResult({ ...selectedResult, outreach: { ...selectedResult.outreach, ...response.outreach }, delivery: response.delivery })
-      setDraftDirty(false)
-      setNotice('投递文案已保存到当前任务')
+      const response = await api.saveDraft(jobId, submittedResult.note_id, submittedDraft, submittedResult.draftVersion)
+      if (!response.draftVersion) throw new Error('服务端未返回草稿版本，请刷新后重试。')
+      if (response.draftVersion.contentHash !== submittedHash) throw new Error('服务端返回的草稿内容哈希不一致，请刷新后重试。')
+      savedResult = {
+        ...submittedResult,
+        outreach: { ...submittedResult.outreach, ...response.outreach },
+        draftVersion: response.draftVersion,
+        delivery: response.delivery,
+      }
+      if (!responseIsCurrent()) return false
+      replaceResultInDraftView(draftView, savedResult)
+      const session = aiSession || await restoreAiSession()
+      const checked = await api.checkDraft(jobId, submittedResult.note_id, response.draftVersion, session.id)
+      if (!checked.draftVersion) throw new Error('服务端未返回质量检查版本，请刷新后重试。')
+      if (checked.draftVersion.contentHash !== submittedHash) throw new Error('质量检查返回了过期的草稿版本，请重新检查。')
+      const checkedResult: ApplicationResult = {
+        ...savedResult,
+        draftVersion: checked.draftVersion,
+        delivery: checked.delivery,
+        cover_letter_evaluation: checked.cover_letter_evaluation || savedResult.cover_letter_evaluation,
+      }
+      if (responseIsCurrent() && replaceResultInDraftView(draftView, checkedResult)) {
+        setNotice(hasVerifiedDraftQuality(checkedResult) ? '投递文案已保存并通过质量复检' : '投递文案已保存，质量复检未通过')
+      }
+      return true
     } catch (error) {
-      setNotice((error as Error).message)
-    } finally {
-      setDraftSaving(false)
+      const requestError = error as Error & { code?: string; currentVersion?: number | null }
+      if (savedResult) {
+        if (responseIsCurrent()) {
+          setNotice(`投递文案已保存，但质量复检未完成：${requestError.message}`)
+        }
+        return true
+      } else if (requestError.code === 'DRAFT_VERSION_CONFLICT') {
+        try {
+          if (!responseIsCurrent()) return false
+          const latest = await api.results(jobId, resultOffset, results?.limit || 20, {
+            analysisMode: 'job',
+            sort: resultSort,
+            timeRange: resultTimeRange,
+          })
+          if (!responseIsCurrent()) return false
+          const remote = latest.items.find((item) => item.note_id === submittedResult.note_id)
+          if (remote?.draftVersion) {
+            const rebased: ApplicationResult = {
+              ...remote,
+              outreach: { ...remote.outreach, ...submittedDraft },
+              draftVersion: { ...remote.draftVersion, qualityStatus: 'stale' },
+            }
+            setResults({ ...latest, items: latest.items.map((item) => item.note_id === rebased.note_id ? rebased : item) })
+            setSelectedResult(rebased)
+            setNotice('草稿已在其他窗口更新；已载入最新版本并保留本地修改，请再次保存。')
+          } else {
+            setNotice(`草稿版本冲突，服务端当前版本为 ${requestError.currentVersion ?? '未知'}；请刷新结果后重试。`)
+          }
+        } catch {
+          if (draftViewIsCurrent(draftView)) {
+            setNotice(`草稿版本冲突，服务端当前版本为 ${requestError.currentVersion ?? '未知'}；请刷新结果后重试。`)
+          }
+        }
+      } else {
+        if (responseIsCurrent()) setNotice(requestError.message)
+      }
+      return false
     }
   }
 
+  draftSaveHandlerRef.current = saveDraft
+
   const prepareMessage = async () => {
-    if (!activeJob || !selectedResult) return
-    copyText(outreachDraft(selectedResult).greeting)
+    if (!activeJob || !selectedResult || !selectedMessageRoute || !selectedDraftQualityVerified || draftDirty) return
+    const jobId = activeJob.id
+    const submittedResult = selectedResult
+    const draftView = captureDraftView()
+    setDeliveryUpdating(true)
     try {
-      const response = await api.setDelivery(activeJob.id, selectedResult.note_id, 'ready_to_message')
-      replaceResult({ ...selectedResult, delivery: response.delivery })
+      const response = await api.setDelivery(jobId, submittedResult.note_id, 'ready_to_message', submittedResult.draftVersion)
+      if (!draftViewIsCurrent(draftView)) return
+      copyText(outreachDraft(submittedResult).greeting)
+      replaceResultInDraftView(draftView, {
+        ...submittedResult,
+        draftVersion: response.draftVersion ?? submittedResult.draftVersion,
+        delivery: response.delivery,
+      })
       setNotice('私信文案已复制，可打开原帖发送')
     } catch (error) {
-      setNotice((error as Error).message)
+      if (draftViewIsCurrent(draftView)) setNotice((error as Error).message)
+    } finally {
+      setDeliveryUpdating(false)
     }
   }
 
   const sendEmail = async () => {
-    if (!activeJob || !selectedResult || !selectedEmailRoute) return
+    if (!activeJob || !selectedResult || !selectedEmailRoute || !selectedDraftQualityVerified || draftDirty) return
+    const jobId = activeJob.id
+    const submittedResult = selectedResult
+    const submittedRoute = selectedEmailRoute
+    const draftView = captureDraftView()
     setEmailSending(true)
     try {
-      const response = await api.sendEmail(activeJob.id, selectedResult.note_id, selectedEmailRoute.target, outreachDraft(selectedResult))
-      replaceResult({ ...selectedResult, outreach: { ...selectedResult.outreach, ...response.outreach }, delivery: response.delivery })
-      setDraftDirty(false)
-      setNotice(`邮件已发送至 ${selectedEmailRoute.target}`)
+      const response = await api.sendEmail(jobId, submittedResult.note_id, submittedRoute.target, outreachDraft(submittedResult), submittedResult.draftVersion)
+      if (replaceResultInDraftView(draftView, {
+        ...submittedResult,
+        outreach: { ...submittedResult.outreach, ...response.outreach },
+        draftVersion: response.draftVersion ?? submittedResult.draftVersion,
+        delivery: response.delivery,
+      })) {
+        setNotice(`邮件已发送至 ${submittedRoute.target}`)
+      }
     } catch (error) {
-      setNotice((error as Error).message)
+      if (draftViewIsCurrent(draftView)) setNotice((error as Error).message)
     } finally {
       setEmailSending(false)
     }
@@ -3680,7 +3898,10 @@ function App() {
                 <label className="upload-zone"><input type="file" multiple accept=".pdf,.docx,.txt,.md,.json,.csv,.rtf" onChange={(event) => setBackgroundFiles(Array.from(event.target.files || []))} /><Upload size={18} /><span>{backgroundFiles.length ? `已选择 ${backgroundFiles.length} 个文件` : '选择多格式背景文件'}</span></label>
                 <textarea className="background-text" value={backgroundText} onChange={(event) => setBackgroundText(event.target.value)} placeholder="可补充项目背景、工作偏好或可验证成果" />
                 <div className="profile-actions">
-                  <select value={request.profileId || ''} onChange={(event) => updateRequest('profileId', event.target.value || null)}><option value="">选择背景记忆</option>{profiles.map((item) => <option key={item.id} value={item.id}>{item.display_name || item.id}</option>)}</select>
+                  <select value={request.profileId || ''} onChange={(event) => {
+                    const profileId = event.target.value || null
+                    void draftGuard.requestTransition('切换 Profile', () => updateRequest('profileId', profileId))
+                  }}><option value="">选择背景记忆</option>{profiles.map((item) => <option key={item.id} value={item.id}>{item.display_name || item.id}</option>)}</select>
                   <button type="button" className="secondary-button" disabled={!aiSession || importingProfile || !backgroundFiles.length} onClick={() => void importProfile()}>{importingProfile ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}解析并写入记忆</button>
                 </div>
                 {activeProfile && <div className="memory-preview"><strong>{activeProfile.summary}</strong><span>{(activeProfile.skills || []).slice(0, 6).join(' · ')}</span></div>}
@@ -3868,7 +4089,7 @@ function App() {
                       </ol>
                       <div className="security-recovery-actions">
                         <button type="button" onClick={() => void openRelayLogin()} disabled={relayLoginOpening}><ExternalLink size={15} />{relayLoginOpening ? '正在打开' : '打开验证页'}</button>
-                        <button type="button" className="primary-button" onClick={() => void refreshSecurityAndContinue(activeJob)} disabled={securityRecovering || submitting || (!securityJobRunning && !activeJob.resumeAvailable)} title={securityJobRunning ? '完成页面验证后刷新状态，当前任务会自动继续' : '完成页面验证后刷新 Relay，并自动从检查点续跑'}><RefreshCw className={securityRecovering ? 'spin' : ''} size={15} />{securityRecovering ? '正在刷新并恢复' : securityJobRunning ? '我已完成验证，刷新状态' : '我已完成验证，刷新并继续'}</button>
+                        <button type="button" className="primary-button" onClick={() => void draftGuard.requestTransition('刷新验证并继续原任务', () => refreshSecurityAndContinue(activeJob))} disabled={securityRecovering || submitting || (!securityJobRunning && !activeJob.resumeAvailable)} title={securityJobRunning ? '完成页面验证后刷新状态，当前任务会自动继续' : '完成页面验证后刷新 Relay，并自动从检查点续跑'}><RefreshCw className={securityRecovering ? 'spin' : ''} size={15} />{securityRecovering ? '正在刷新并恢复' : securityJobRunning ? '我已完成验证，刷新状态' : '我已完成验证，刷新并继续'}</button>
                       </div>
                       <p><ShieldCheck size={14} />不自动绕过验证，不在受限状态下反复请求；恢复时沿用已保存检查点。</p>
                     </div>
@@ -3992,11 +4213,11 @@ function App() {
                 resultsLoading={resultsLoading}
                 completingMissing={completingMissing || restoringAi || submitting}
                 onSelect={chooseResult}
-                onSort={(value) => { setResultOffset(0); setResultSort(value) }}
-                onTimeRange={(value) => { setResultOffset(0); setResultTimeRange(value) }}
-                onReset={() => { setResultOffset(0); setResultSort('newest'); setResultTimeRange('all') }}
+                onSort={(value) => { draftViewRevisionRef.current += 1; setResultOffset(0); setResultSort(value) }}
+                onTimeRange={(value) => { draftViewRevisionRef.current += 1; setResultOffset(0); setResultTimeRange(value) }}
+                onReset={() => { draftViewRevisionRef.current += 1; setResultOffset(0); setResultSort('newest'); setResultTimeRange('all') }}
                 onComplete={() => void completeMissingResults()}
-                onPage={(offset) => activeJob && void loadResults(activeJob.id, offset)}
+                onPage={(offset) => { draftViewRevisionRef.current += 1; if (activeJob) void loadResults(activeJob.id, offset) }}
                 onPreview={openImagePreview}
                 onCopy={copyText}
               />
@@ -4011,9 +4232,15 @@ function App() {
                   <span><strong>{resultFilterStats(results).unknown}</strong>日期待确认</span>
                 </div>
                 <div className="result-controls" aria-busy={resultsLoading}>
-                  <label><ArrowUpDown size={15} /><span>排序</span><select aria-label="岗位卡时间排序" value={resultSort} disabled={resultsLoading} onChange={(event) => { setResultOffset(0); setResultSort(event.target.value as typeof resultSort) }}><option value="newest">最新发布优先</option><option value="oldest">最早发布优先</option></select></label>
-                  <label><CalendarClock size={15} /><span>时间</span><select aria-label="岗位卡时间筛选" value={resultTimeRange} disabled={resultsLoading} onChange={(event) => { setResultOffset(0); setResultTimeRange(event.target.value as typeof resultTimeRange) }}><option value="all">全部时间</option><option value="1">近 24 小时</option><option value="3">近 3 天</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option><option value="unknown">日期待确认</option></select></label>
-                  {(resultSort !== 'newest' || resultTimeRange !== 'all') && <button className="reset-result-filter" type="button" disabled={resultsLoading} onClick={() => { setResultOffset(0); setResultSort('newest'); setResultTimeRange('all') }} title="恢复最新发布优先并显示全部时间"><RotateCcw size={15} />重置筛选</button>}
+                  <label><ArrowUpDown size={15} /><span>排序</span><select aria-label="岗位卡时间排序" value={resultSort} disabled={resultsLoading} onChange={(event) => {
+                    const value = event.target.value as typeof resultSort
+                    void draftGuard.requestTransition('更改结果排序', () => { draftViewRevisionRef.current += 1; setResultOffset(0); setResultSort(value) })
+                  }}><option value="newest">最新发布优先</option><option value="oldest">最早发布优先</option></select></label>
+                  <label><CalendarClock size={15} /><span>时间</span><select aria-label="岗位卡时间筛选" value={resultTimeRange} disabled={resultsLoading} onChange={(event) => {
+                    const value = event.target.value as typeof resultTimeRange
+                    void draftGuard.requestTransition('更改结果筛选', () => { draftViewRevisionRef.current += 1; setResultOffset(0); setResultTimeRange(value) })
+                  }}><option value="all">全部时间</option><option value="1">近 24 小时</option><option value="3">近 3 天</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option><option value="unknown">日期待确认</option></select></label>
+                  {(resultSort !== 'newest' || resultTimeRange !== 'all') && <button className="reset-result-filter" type="button" disabled={resultsLoading} onClick={() => void draftGuard.requestTransition('重置结果筛选', () => { draftViewRevisionRef.current += 1; setResultOffset(0); setResultSort('newest'); setResultTimeRange('all') })} title="恢复最新发布优先并显示全部时间"><RotateCcw size={15} />重置筛选</button>}
                 <button className="complete-missing-button" type="button" disabled={!resultFilterStats(results).incomplete || completingMissing || submitting || restoringAi || resultsLoading} onClick={() => void completeMissingResults()} title={aiSession ? '自动核对缺失项，并从原任务检查点继续' : '自动恢复已保存的 AI 配置并补全缺失项'}>{restoringAi || completingMissing ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{restoringAi ? '正在恢复 AI' : completingMissing ? '正在核对任务' : ['running', 'resuming', 'queued'].includes(activeJob?.status || '') ? '查看补全进度' : '一键智能补全'}</button>
                 </div>
               </div>
@@ -4023,15 +4250,19 @@ function App() {
                   <div className="result-rows">
                     {results.items.map((item) => {
                       const routeLabels = deliveryRoutes(item).map((route) => route.label)
+                      const draftQualityStale = item.draftVersion?.qualityStatus === 'stale'
+                      const draftQualityVerified = hasVerifiedDraftQuality(item)
                       const draftState = item.delivery?.action === 'email_sent'
                         ? '已发送'
-                        : item.cover_letter_evaluation?.passed
-                          ? '≥ 90'
-                          : item.outreach?.runtime_status === 'fallback_missing_job_body'
-                            ? '信息未完整'
-                            : item.outreach?.runtime_status === 'fallback_model_error'
-                              ? 'AI 失败 · 有初稿'
-                              : '待重写'
+                        : draftQualityStale
+                          ? '质量失效'
+                          : draftQualityVerified
+                            ? '≥ 90'
+                            : item.outreach?.runtime_status === 'fallback_missing_job_body'
+                              ? '信息未完整'
+                              : item.outreach?.runtime_status === 'fallback_model_error'
+                                ? 'AI 失败 · 有初稿'
+                                : '待重写'
                       return (
                         <div key={item.note_id} className={`result-row ${selectedResult?.note_id === item.note_id ? 'selected' : ''}`}>
                           <ResultCardMedia result={item} onPreview={(images, index) => openImagePreview(item.title || '未命名岗位', images, index)} />
@@ -4039,9 +4270,9 @@ function App() {
                             <span className="result-card-copy">
                             <span className="result-card-heading">
                               <strong>{item.title || '未命名岗位'}</strong>
-                              <i className={item.delivery?.action === 'email_sent' ? 'sent' : item.cover_letter_evaluation?.passed ? 'ready' : ''}>{draftState}</i>
+                              <i className={item.delivery?.action === 'email_sent' ? 'sent' : draftQualityVerified ? 'ready' : ''}>{draftState}</i>
                             </span>
-                            <small>{item.publish_time?.value || '日期待核验'} · {item.cover_letter_evaluation?.score ?? '-'} 分 · {routeLabels.length ? [...new Set(routeLabels)].join(' / ') : '投递方式待确认'}</small>
+                            <small>{item.publish_time?.value || '日期待核验'} · {draftQualityStale ? '-' : item.cover_letter_evaluation?.score ?? '-'} 分 · {routeLabels.length ? [...new Set(routeLabels)].join(' / ') : '投递方式待确认'}</small>
                             </span>
                           </button>
                         </div>
@@ -4049,8 +4280,8 @@ function App() {
                     })}
                   </div>
                   <div className="result-pagination">
-                    <button title={draftDirty ? '请先保存当前文案' : '上一页'} disabled={draftDirty || resultOffset === 0 || resultsLoading} onClick={() => activeJob && void loadResults(activeJob.id, Math.max(0, resultOffset - 20))}><ChevronLeft size={16} /></button>
-                    <button title={draftDirty ? '请先保存当前文案' : '下一页'} disabled={draftDirty || resultOffset + results.limit >= results.total || resultsLoading} onClick={() => activeJob && void loadResults(activeJob.id, resultOffset + 20)}><ChevronRight size={16} /></button>
+                    <button title="上一页" disabled={draftOperationPending || resultOffset === 0 || resultsLoading} onClick={() => void draftGuard.requestTransition('切换结果页', () => { draftViewRevisionRef.current += 1; if (activeJob) void loadResults(activeJob.id, Math.max(0, resultOffset - 20)) })}><ChevronLeft size={16} /></button>
+                    <button title="下一页" disabled={draftOperationPending || resultOffset + results.limit >= results.total || resultsLoading} onClick={() => void draftGuard.requestTransition('切换结果页', () => { draftViewRevisionRef.current += 1; if (activeJob) void loadResults(activeJob.id, resultOffset + 20) })}><ChevronRight size={16} /></button>
                   </div>
                 </div>
                 {selectedResult ? (
@@ -4097,16 +4328,16 @@ function App() {
                     <div className="draft-stack">
                       <div className="draft-toolbar">
                         <div><span className="step-label">EDITABLE APPLICATION COPY</span><h4>投递文案编辑器</h4><p>每个岗位均生成可编辑初稿；90 分以上方可发送，发送时使用当前内容。</p></div>
-                        <button className={draftDirty ? 'dirty' : ''} disabled={draftSaving || !draftDirty} onClick={() => void saveDraft()}>{draftSaving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{draftDirty ? '保存修改' : '已保存'}</button>
+                        <button className={draftDirty ? 'dirty' : ''} disabled={draftOperationPending || (!draftDirty && !selectedDraftQualityRetryable)} onClick={() => void draftGuard.saveNow()}>{draftSaving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{draftSaveLabel}</button>
                       </div>
-                      <section className="draft-editor"><div><h4><MessageSquare size={15} />私信文案</h4><button title="复制私信文案" onClick={() => copyText(outreachDraft(selectedResult).greeting)}><Copy size={15} /></button></div><textarea aria-label="私信文案" value={outreachDraft(selectedResult).greeting} onChange={(event) => updateDraft('greeting', event.target.value)} rows={4} /><small>{outreachDraft(selectedResult).greeting.length} 字</small></section>
-                      <section className="draft-editor email-editor"><div><h4><Mail size={15} />邮件文案</h4><button title="复制投递邮件" onClick={() => copyText(`${outreachDraft(selectedResult).email_subject}\n\n${outreachDraft(selectedResult).email_body}`)}><Copy size={15} /></button></div><label><span>邮件主题</span><input aria-label="邮件主题" value={outreachDraft(selectedResult).email_subject} onChange={(event) => updateDraft('email_subject', event.target.value)} /></label><label><span>邮件正文（实际发送）</span><textarea aria-label="邮件正文" value={outreachDraft(selectedResult).email_body} onChange={(event) => updateDraft('email_body', event.target.value)} rows={7} /></label><small>{outreachDraft(selectedResult).email_body.length} 字</small></section>
-                      <section className="draft-editor"><div><h4><FileText size={15} />专属 Cover Letter</h4><button title="复制 Cover Letter" onClick={() => copyText(outreachDraft(selectedResult).cover_letter)}><Copy size={15} /></button></div><textarea aria-label="Cover Letter" value={outreachDraft(selectedResult).cover_letter} onChange={(event) => updateDraft('cover_letter', event.target.value)} rows={10} /><small>{outreachDraft(selectedResult).cover_letter.length} 字 · 初稿可编辑，发送仍需通过 90 分门槛</small></section>
+                      <section className="draft-editor"><div><h4><MessageSquare size={15} />私信文案</h4><button title="复制私信文案" disabled={draftOperationPending} onClick={() => copyText(outreachDraft(selectedResult).greeting)}><Copy size={15} /></button></div><textarea aria-label="私信文案" value={outreachDraft(selectedResult).greeting} disabled={draftOperationPending} onChange={(event) => updateDraft('greeting', event.target.value)} rows={4} /><small>{outreachDraft(selectedResult).greeting.length} 字</small></section>
+                      <section className="draft-editor email-editor"><div><h4><Mail size={15} />邮件文案</h4><button title="复制投递邮件" disabled={draftOperationPending} onClick={() => copyText(`${outreachDraft(selectedResult).email_subject}\n\n${outreachDraft(selectedResult).email_body}`)}><Copy size={15} /></button></div><label><span>邮件主题</span><input aria-label="邮件主题" value={outreachDraft(selectedResult).email_subject} disabled={draftOperationPending} onChange={(event) => updateDraft('email_subject', event.target.value)} /></label><label><span>邮件正文（实际发送）</span><textarea aria-label="邮件正文" value={outreachDraft(selectedResult).email_body} disabled={draftOperationPending} onChange={(event) => updateDraft('email_body', event.target.value)} rows={7} /></label><small>{outreachDraft(selectedResult).email_body.length} 字</small></section>
+                      <section className="draft-editor"><div><h4><FileText size={15} />专属 Cover Letter</h4><button title="复制 Cover Letter" disabled={draftOperationPending} onClick={() => copyText(outreachDraft(selectedResult).cover_letter)}><Copy size={15} /></button></div><textarea aria-label="Cover Letter" value={outreachDraft(selectedResult).cover_letter} disabled={draftOperationPending} onChange={(event) => updateDraft('cover_letter', event.target.value)} rows={10} /><small>{outreachDraft(selectedResult).cover_letter.length} 字 · 初稿可编辑，发送仍需通过 90 分门槛</small></section>
                     </div>
                     <div className="evaluation-panel">
-                      <div><span>用人单位评分</span><strong>{selectedResult.cover_letter_evaluation?.score ?? '-'}<small>/ 100</small></strong></div>
-                      <div><span>重写轮次</span><strong>{selectedResult.cover_letter_evaluation?.attempts ?? '-'}</strong></div>
-                      <p>{selectedResult.cover_letter_evaluation?.passed ? '已通过 90 分投递门槛' : (selectedResult.cover_letter_evaluation?.problems || []).join('；') || '等待评分'}</p>
+                      <div><span>用人单位评分</span><strong>{selectedDraftQualityStale ? '-' : selectedResult.cover_letter_evaluation?.score ?? '-'}<small>/ 100</small></strong></div>
+                      <div><span>重写轮次</span><strong>{selectedDraftQualityStale ? '-' : selectedResult.cover_letter_evaluation?.attempts ?? '-'}</strong></div>
+                      <p>{selectedDraftQualityStale ? '草稿质量已失效，请保存后重新检查' : selectedResult.cover_letter_evaluation?.passed ? '已通过 90 分投递门槛' : (selectedResult.cover_letter_evaluation?.problems || []).join('；') || '等待评分'}</p>
                     </div>
                     <div className="delivery-console">
                       <div className="delivery-target">
@@ -4114,9 +4345,9 @@ function App() {
                         <div><small>邮件收件人</small><strong>{selectedEmailRoute?.target || '岗位正文未提取到邮箱'}</strong><p>{health?.emailDelivery?.configured ? `${health.emailDelivery.authMode === 'oauth2' ? 'Outlook OAuth2' : 'SMTP'} 已就绪 · 发件人 ${health.emailDelivery.from}` : '发件邮箱尚未配置，可在当前页面保存并测试后立即启用'}</p></div>
                       </div>
                       <div className="delivery-actions">
-                        <button className="send-email-action" disabled={!selectedResult.cover_letter_evaluation?.passed || !selectedEmailRoute || !health?.emailDelivery?.configured || emailSending} onClick={() => void sendEmail()} title={!selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : '立即发送当前邮件正文'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}{emailSending ? '发送中' : '发送邮件'}</button>
+                        <button className="send-email-action" disabled={draftDirty || !selectedDraftQualityVerified || !selectedEmailRoute || !health?.emailDelivery?.configured || !smtpConfig?.verified || draftOperationPending} onClick={() => void sendEmail()} title={!selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : !smtpConfig?.verified ? '请先测试 SMTP' : '立即发送当前邮件正文'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}{emailSending ? '发送中' : '发送邮件'}</button>
                         <button onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={16} />发件邮箱</button>
-                        <button disabled={!selectedResult.cover_letter_evaluation?.passed || !selectedMessageRoute} onClick={() => void prepareMessage()}><MessageSquare size={16} />复制私信</button>
+                        <button disabled={draftDirty || !selectedDraftQualityVerified || !selectedMessageRoute || draftOperationPending} onClick={() => void prepareMessage()}><MessageSquare size={16} />复制私信</button>
                         {selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer"><ExternalLink size={16} />打开岗位</a>}
                       </div>
                     </div>
@@ -4134,7 +4365,7 @@ function App() {
                 <div><span className="step-label">RUN HISTORY</span><h2>全部历史任务 <small>{historyJobs.length}</small></h2></div>
                 <div className="history-heading-actions">
                   <span>已保存 {jobs.length} 条任务</span>
-                  <button className="icon-text-button" disabled={dataManaging} onClick={() => void manageLocalData()}>{dataManaging ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}本地数据</button>
+                  <button className="icon-text-button" disabled={dataManaging} onClick={() => void draftGuard.requestTransition('删除当前任务或本地数据', manageLocalData)}>{dataManaging ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}本地数据</button>
                   <button className="icon-text-button" onClick={loadJobs}><RefreshCw size={15} />刷新</button>
                 </div>
               </div>
@@ -4190,6 +4421,13 @@ function App() {
         </main>
       </div>
       {imagePreview && <ImagePreview preview={imagePreview} onClose={closeImagePreview} onChange={changePreviewImage} />}
+      {draftGuard.pendingTransition && <UnsavedDraftDialog
+        reason={draftGuard.pendingTransition.reason}
+        saveStatus={draftGuard.saveStatus}
+        onSave={() => void draftGuard.saveAndContinue()}
+        onDiscard={() => void draftGuard.discardAndContinue()}
+        onCancel={() => void draftGuard.cancelTransition()}
+      />}
     </div>
   )
 }
