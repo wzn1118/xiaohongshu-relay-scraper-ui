@@ -55,6 +55,7 @@ export class JobManager {
     this.liveCheckpointAnalyses = new Map();
     this.recoveryBlockers = [];
     this.jobLocks = new Map();
+    this.deletingJobs = new Set();
   }
 
   async initialize() {
@@ -264,6 +265,9 @@ export class JobManager {
     return this.#withJobLock(jobId, async () => {
       const job = this.getInternal(jobId);
       if (!job) throw jobError('RESUME_SOURCE_NOT_FOUND', 'Resume source task was not found.');
+      if (this.deletingJobs.has(jobId)) {
+        throw jobError('JOB_DELETION_IN_PROGRESS', 'The task is being deleted and cannot be resumed.');
+      }
       const scope = normalizeResumeScope(options.scope);
       const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
       const duplicate = idempotencyKey
@@ -424,6 +428,166 @@ export class JobManager {
     this.#emit(id, 'state', publicJob(job));
     await this.persist();
     return { found: true, job: publicJob(job), changed: true };
+  }
+
+  async quiesceForDeletion(id, { timeoutMs = 15000, rejectActive = false } = {}) {
+    const job = this.getInternal(id);
+    if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+
+    return this.#withJobLock(id, async () => {
+      const ownsRuntime = !TERMINAL.has(job.status)
+        || this.processes.has(id)
+        || this.runtimeContexts.has(id)
+        || this.liveCheckpointAnalyses.has(id)
+        || this.active?.id === id;
+      if (rejectActive && ownsRuntime) {
+        throw jobError('JOB_ACTIVE_RETENTION', 'Automatic cleanup skipped a task that became active.');
+      }
+      this.deletingJobs.add(id);
+      this.#emit(id, 'closing', { reason: 'deletion' });
+      try {
+        if (TERMINAL.has(job.status) && !this.processes.has(id) && this.active?.id !== id && !this.liveCheckpointAnalyses.has(id)) {
+          this.runtimeContexts.delete(id);
+        }
+        const requiresExit = !TERMINAL.has(job.status)
+          || this.processes.has(id)
+          || this.runtimeContexts.has(id)
+          || this.liveCheckpointAnalyses.has(id)
+          || this.active?.id === id;
+        if (requiresExit) {
+          const mustObserveEnd = !TERMINAL.has(job.status)
+            || this.processes.has(id)
+            || this.runtimeContexts.has(id)
+            || this.active?.id === id;
+          let unsubscribeEnd = () => {};
+          const ended = new Promise((resolve) => {
+            unsubscribeEnd = this.subscribe(id, (event) => {
+              if (event.type !== 'end') return;
+              unsubscribeEnd();
+              resolve(true);
+            });
+          });
+          const child = this.processes.get(id);
+          if (TERMINAL.has(job.status) && child) {
+            job.cancelRequested = true;
+            await this.terminateImpl(child);
+          } else if (!TERMINAL.has(job.status)) {
+            await this.cancel(id);
+          }
+          if (mustObserveEnd) {
+            let timeoutId;
+            let completed;
+            try {
+              completed = await Promise.race([
+                ended,
+                new Promise((resolve) => {
+                  timeoutId = setTimeout(() => resolve(false), timeoutMs);
+                }),
+              ]);
+            } finally {
+              clearTimeout(timeoutId);
+              unsubscribeEnd();
+            }
+            if (!completed) throw jobError('JOB_STOP_TIMEOUT', 'The task process did not release its resources before deletion.');
+          } else {
+            unsubscribeEnd();
+          }
+        }
+        const liveAnalysis = this.liveCheckpointAnalyses.get(id);
+        if (liveAnalysis) await liveAnalysis;
+        await this.writeQueue;
+        if (this.processes.has(id) || this.runtimeContexts.has(id) || this.liveCheckpointAnalyses.has(id) || this.active?.id === id) {
+          throw jobError('JOB_RESOURCES_BUSY', 'The task still owns live process or file resources.');
+        }
+        return publicJob(job);
+      } catch (error) {
+        this.deletingJobs.delete(id);
+        throw error;
+      }
+    });
+  }
+
+  releaseDeletionIntent(id) {
+    this.deletingJobs.delete(id);
+  }
+
+  async removeJobRecord(id) {
+    const removed = await this.removeJobRecords([id]);
+    if (!removed.length) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+    return removed[0];
+  }
+
+  async removeJobRecords(ids) {
+    const selected = new Set(ids.map(String));
+    for (const id of selected) {
+      if (this.processes.has(id) || this.runtimeContexts.has(id) || this.liveCheckpointAnalyses.has(id) || this.active?.id === id) {
+        throw jobError('JOB_RESOURCES_BUSY', 'The task still owns live process or file resources.');
+      }
+    }
+    const removed = this.jobs.filter((job) => selected.has(job.id));
+    if (!removed.length) return [];
+    this.jobs = this.jobs.filter((job) => !selected.has(job.id));
+    for (const job of removed) {
+      this.deletingJobs.delete(job.id);
+      this.runtimeContexts.delete(job.id);
+      this.liveCheckpointAnalyses.delete(job.id);
+      this.events.removeAllListeners(`job:${job.id}`);
+    }
+    await this.persist();
+    return removed.map(publicJob);
+  }
+
+  async detachProfile(profileId) {
+    const now = new Date().toISOString();
+    let changed = 0;
+    for (const job of this.jobs) {
+      const referenced = job.params?.profileId === profileId || job.config?.profileId === profileId;
+      if (!referenced) continue;
+      if (job.params && Object.hasOwn(job.params, 'profileId')) job.params.profileId = null;
+      if (job.config && Object.hasOwn(job.config, 'profileId')) job.config.profileId = null;
+      job.profileReferenceRemovedAt = now;
+      job.updatedAt = now;
+      changed += 1;
+    }
+    if (changed) await this.persist();
+    return changed;
+  }
+
+  async detachJobReferences(jobId) {
+    const now = new Date().toISOString();
+    let changed = 0;
+    for (const job of this.jobs) {
+      if (job.id === jobId) continue;
+      let detached = false;
+      if (job.params?.resumeFromJobId === jobId) {
+        delete job.params.resumeFromJobId;
+        detached = true;
+      }
+      if (job.sourceJobId === jobId) {
+        job.sourceJobId = null;
+        detached = true;
+      }
+      if (job.legacyResumeLineage?.sourceJobId === jobId) {
+        job.legacyResumeLineage = { ...job.legacyResumeLineage, sourceJobId: null };
+        detached = true;
+      }
+      if (!detached) continue;
+      job.historyReferenceRemovedAt = now;
+      job.updatedAt = now;
+      changed += 1;
+    }
+    if (changed) await this.persist();
+    return changed;
+  }
+
+  async refreshArtifactCount(id) {
+    const job = this.getInternal(id);
+    if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+    job.artifactCount = await countArtifactFiles(job.outputDir);
+    job.updatedAt = new Date().toISOString();
+    await this.persist();
+    this.#emit(id, 'state', publicJob(job));
+    return job.artifactCount;
   }
 
   async shutdown() {

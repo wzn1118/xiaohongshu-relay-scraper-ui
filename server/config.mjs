@@ -28,6 +28,8 @@ export const config = Object.freeze({
   relayConfigPath: path.resolve(process.env.XHS_RELAY_CONFIG_PATH || path.join(dataDir, '..', 'relay-config.json')),
   aiConfigPath: path.resolve(process.env.XHS_AI_CONFIG_PATH || path.join(dataDir, '..', 'ai-config.json')),
   smtpConfigPath: path.resolve(process.env.XHS_SMTP_CONFIG_PATH || path.join(dataDir, '..', 'smtp-config.json')),
+  dataRetentionPath: path.resolve(process.env.XHS_DATA_RETENTION_PATH || path.join(dataDir, '..', 'data-retention.json')),
+  deletionAuditPath: path.resolve(process.env.XHS_DELETION_AUDIT_PATH || path.join(dataDir, '..', 'deletion-audit.jsonl')),
   profileDir: path.resolve(process.env.XHS_PROFILE_DATA_DIR || path.join(serverDir, '..', 'data', 'profiles')),
   profileScriptPath: path.resolve(serverDir, '..', 'scripts', 'profile_memory.py'),
   relayConnectionCheckScriptPath: path.resolve(serverDir, '..', 'scripts', 'check_relay_connection.py'),

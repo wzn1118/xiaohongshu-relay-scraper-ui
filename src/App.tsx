@@ -44,6 +44,7 @@ import {
   Table2,
   Target,
   Send,
+  Trash2,
   Upload,
   UserRoundSearch,
   UsersRound,
@@ -82,6 +83,8 @@ import type {
   SmtpProvider,
   AnalysisMode,
   ContentResearchPreset,
+  DataDeletionPreview,
+  DataDeletionSpec,
   ResumeScope,
 } from './types'
 
@@ -1364,6 +1367,7 @@ function App() {
   const [relaySettingUp, setRelaySettingUp] = useState(false)
   const [securityRecovering, setSecurityRecovering] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [dataManaging, setDataManaging] = useState(false)
   const [completingMissing, setCompletingMissing] = useState(false)
   const [completionFlow, setCompletionFlow] = useState<MissingCompletionFlow | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -1853,6 +1857,126 @@ function App() {
       setNotice((error as Error).message)
     }
   }, [workspaceMode])
+
+  const manageLocalData = async () => {
+    const choice = window.prompt([
+      '本地数据管理',
+      '1 删除当前任务',
+      '2 删除当前背景记忆',
+      '3 删除当前草稿',
+      '4 删除当前任务的一个产物',
+      '5 配置自动留存策略',
+      '6 清除全部本地用户数据',
+    ].join('\n'))?.trim()
+    if (!choice) return
+    setDataManaging(true)
+    setNotice(null)
+    try {
+      if (choice === '5') {
+        const current = await api.dataRetention()
+        const rawDays = window.prompt('保留已结束任务的天数（1-3650）', String(current.days))
+        if (rawDays === null) return
+        const days = Number(rawDays)
+        if (!Number.isInteger(days) || days < 1 || days > 3650) throw new Error('保留天数必须是 1 到 3650 之间的整数。')
+        const enabled = window.confirm('启用自动清理？\n\n确定：启用；取消：保持关闭。运行中、续跑中和已固定任务始终跳过。')
+        let pinnedJobIds = current.pinnedJobIds
+        if (activeJob) {
+          const pinned = window.confirm(`是否固定当前任务 ${activeJob.id}，使其不参与自动清理？`)
+          pinnedJobIds = pinned
+            ? [...new Set([...pinnedJobIds, activeJob.id])]
+            : pinnedJobIds.filter((id) => id !== activeJob.id)
+        }
+        const saved = await api.updateDataRetention({ enabled, days, pinnedJobIds })
+        const preview = await api.cleanupExpiredData(true)
+        setNotice(`留存策略已保存：${saved.enabled ? `自动清理 ${saved.days} 天前的已结束任务` : '自动清理已关闭'}；当前预演命中 ${preview.eligible?.length || 0} 个任务。`)
+        return
+      }
+
+      let spec: DataDeletionSpec
+      if (choice === '1') {
+        if (!activeJob) throw new Error('请先在历史任务中选择一个任务。')
+        spec = { entityType: 'job', jobId: activeJob.id }
+      } else if (choice === '2') {
+        if (!request.profileId) throw new Error('请先选择一个背景记忆。')
+        spec = { entityType: 'profile', profileId: request.profileId }
+      } else if (choice === '3') {
+        if (!activeJob || !selectedResult) throw new Error('当前结果没有可删除的已保存草稿。')
+        const versionedDraftId = (selectedResult as ApplicationResult & { draftVersion?: { draftId?: string } }).draftVersion?.draftId
+        spec = { entityType: 'draft', jobId: activeJob.id, draftId: versionedDraftId || `legacy_${selectedResult.note_id}` }
+      } else if (choice === '4') {
+        if (!activeJob || !artifacts.length) throw new Error('当前任务没有可删除的产物。')
+        const selected = window.prompt(artifacts.map((artifact, index) => `${index + 1} ${artifact.name}（${formatBytes(artifact.size)}）`).join('\n'))
+        if (selected === null) return
+        const artifact = artifacts[Number(selected) - 1]
+        if (!artifact) throw new Error('请输入列表中的产物序号。')
+        spec = { entityType: 'artifact', jobId: activeJob.id, artifactId: artifact.id }
+      } else if (choice === '6') {
+        spec = { entityType: 'all', force: true }
+      } else {
+        throw new Error('请输入 1 到 6。')
+      }
+
+      let preview: DataDeletionPreview = await api.previewDataDeletion(spec)
+      if (spec.entityType === 'profile' && preview.requiresForce && !spec.force) {
+        const impact = preview.references.map((reference) => reference.id || reference.type).join('、')
+        if (!window.confirm(`该背景记忆仍被 ${preview.references.length} 个任务引用：${impact}\n\n继续将从这些任务中解除引用，再删除背景记忆。`)) return
+        spec = { ...spec, force: true }
+        preview = await api.previewDataDeletion(spec)
+      }
+      if (preview.status !== 'ready') {
+        throw new Error(preview.blockedReasons.map((reason) => reason.message).join(' ') || '当前数据不满足删除条件。')
+      }
+      const references = preview.references.length ? `\n关联引用：${preview.references.length} 条` : ''
+      if (!window.confirm(`即将物理删除 ${preview.entities.length} 个数据实体、${preview.fileCount} 个文件（${formatBytes(preview.totalBytes)}）。${references}\n\n删除后旧 ID 和下载地址将失效。`)) return
+      let confirmationPhrase: string | undefined
+      if (spec.entityType === 'all') {
+        confirmationPhrase = window.prompt(`请输入 ${preview.confirmationPhrase} 确认清除全部本地用户数据。`) || ''
+        if (confirmationPhrase !== preview.confirmationPhrase) throw new Error('确认短语不匹配，未执行清除。')
+      }
+      const result = await api.executeDataDeletion({
+        ...spec,
+        confirmationToken: preview.confirmationToken,
+        ...(confirmationPhrase ? { confirmationPhrase } : {}),
+      })
+
+      if (spec.entityType === 'job' || spec.entityType === 'all') {
+        disconnectJobStream()
+        activeJobIdCache.current = { job: null, general: null }
+        resultViewCache.current = {
+          job: { activeJobId: null, results: null, selectedNoteId: null, resultOffset: 0, resultSort: 'newest', resultTimeRange: 'all' },
+          general: { activeJobId: null, results: null, selectedNoteId: null, resultOffset: 0, resultSort: 'newest', resultTimeRange: 'all' },
+        }
+        setActiveJob(null)
+        setAudienceTask(null)
+        setArtifacts([])
+        setResults(null)
+        setSelectedResult(null)
+        setAudienceResults(null)
+        setLogs([])
+      }
+      if (spec.entityType === 'profile' || spec.entityType === 'all') {
+        const savedProfiles = await api.profiles()
+        setProfiles(savedProfiles)
+        if (spec.entityType === 'all' || request.profileId === spec.profileId) updateRequest('profileId', null)
+      }
+      if (spec.entityType === 'artifact' && activeJob) setArtifacts(await api.artifacts(activeJob.id))
+      if (spec.entityType === 'draft' && activeJob) await loadResults(activeJob.id, resultOffset)
+      if (spec.entityType === 'all') {
+        window.localStorage.removeItem(CANDIDATE_PROFILE_STORAGE_KEY)
+        for (const mode of ['job', 'general'] as AnalysisMode[]) {
+          requestCache.current[mode] = { ...requestCache.current[mode], profileId: null, candidateProfile: { ...defaultCandidateProfile } }
+        }
+        setRequest({ ...requestCache.current[workspaceMode] })
+        resumeIdempotencyKeys.current.clear()
+      }
+      await loadJobs()
+      setNotice(`本地数据已删除：${result.fileCount} 个文件，审计记录已写入。`)
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setDataManaging(false)
+    }
+  }
 
   const selectProvider = (id: AiProviderOption['id'], options = providers) => {
     setProviderId(id)
@@ -4010,6 +4134,7 @@ function App() {
                 <div><span className="step-label">RUN HISTORY</span><h2>全部历史任务 <small>{historyJobs.length}</small></h2></div>
                 <div className="history-heading-actions">
                   <span>已保存 {jobs.length} 条任务</span>
+                  <button className="icon-text-button" disabled={dataManaging} onClick={() => void manageLocalData()}>{dataManaging ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}本地数据</button>
                   <button className="icon-text-button" onClick={loadJobs}><RefreshCw size={15} />刷新</button>
                 </div>
               </div>

@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -31,6 +31,19 @@ export const api = {
   profiles: () => request<CandidateProfile[]>('/api/profiles'),
   importProfile: (payload: { aiSessionId: string; backgroundText: string; files: Array<{ name: string; base64: string }> }) =>
     request<CandidateProfile>('/api/profiles/import', { method: 'POST', body: JSON.stringify(payload) }),
+  previewDataDeletion: (payload: DataDeletionSpec) => request<DataDeletionPreview>('/api/data/deletions/preview', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
+  executeDataDeletion: (payload: DataDeletionSpec & { confirmationToken: string; confirmationPhrase?: string }) =>
+    request<DataDeletionResult>('/api/data/deletions/execute', { method: 'POST', body: JSON.stringify(payload) }),
+  dataRetention: () => request<DataRetentionPolicy>('/api/data/retention'),
+  updateDataRetention: (payload: Partial<Pick<DataRetentionPolicy, 'enabled' | 'days' | 'pinnedJobIds'>>) =>
+    request<DataRetentionPolicy>('/api/data/retention', { method: 'PUT', body: JSON.stringify(payload) }),
+  cleanupExpiredData: (dryRun = true) => request<DataRetentionCleanup>('/api/data/retention/cleanup', {
+    method: 'POST',
+    body: JSON.stringify({ dryRun }),
+  }),
   relayConfig: () => request<RelayConfig>('/api/relay/config'),
   updateRelayConfig: (payload: RelayConfig) => request<RelayConfig>('/api/relay/config', { method: 'PUT', body: JSON.stringify(payload) }),
   smtpConfig: () => request<SmtpConfig>('/api/email/config'),

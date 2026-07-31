@@ -32,7 +32,7 @@ const CONTENT_RESEARCH_LABELS = Object.freeze({
   custom: '自定义研究',
 });
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, preflightService, mediaFetcher = globalThis.fetch }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const readiness = preflightService || createPreflightService({
     config,
@@ -236,6 +236,28 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         const body = await readJsonBody(req, config.maxBodyBytes);
         const session = aiSessions.resolve(body.aiSessionId);
         return json(res, 201, await profileStore.create(body, session));
+      }
+      if (url.pathname.startsWith('/api/data/') && !dataLifecycle) {
+        return json(res, 503, errorBody('DATA_LIFECYCLE_UNAVAILABLE', 'Local data lifecycle management is unavailable.'));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/data/ownership') {
+        return json(res, 200, dataLifecycle.ownership());
+      }
+      if (req.method === 'POST' && url.pathname === '/api/data/deletions/preview') {
+        return json(res, 200, await dataLifecycle.preview(await readJsonBody(req, config.maxBodyBytes)));
+      }
+      if (req.method === 'POST' && url.pathname === '/api/data/deletions/execute') {
+        return json(res, 200, await dataLifecycle.execute(await readJsonBody(req, config.maxBodyBytes)));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/data/retention') {
+        return json(res, 200, dataLifecycle.getRetention());
+      }
+      if (req.method === 'PUT' && url.pathname === '/api/data/retention') {
+        return json(res, 200, await dataLifecycle.updateRetention(await readJsonBody(req, config.maxBodyBytes)));
+      }
+      if (req.method === 'POST' && url.pathname === '/api/data/retention/cleanup') {
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        return json(res, 200, await dataLifecycle.cleanupExpired({ dryRun: body.dryRun !== false }));
       }
       if (req.method === 'GET' && url.pathname === '/api/jobs') return json(res, 200, manager.list());
       if (req.method === 'POST' && url.pathname === '/api/preflight') {
@@ -506,10 +528,18 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error instanceof ValidationError) return json(res, 400, errorBody('VALIDATION_ERROR', error.message, error.details));
       if (error.code === 'JOB_BUSY') return json(res, 409, { ...errorBody('JOB_BUSY', error.message), activeJob: error.activeJob });
       if (error.code === 'JOB_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
+      if (['ARTIFACT_NOT_FOUND', 'DRAFT_NOT_FOUND'].includes(error.code)) return json(res, 404, errorBody(error.code, error.message));
+      if (['DELETION_BLOCKED', 'DELETION_PLAN_CHANGED', 'JOB_STOP_TIMEOUT', 'JOB_RESOURCES_BUSY', 'JOB_ACTIVE_RETENTION'].includes(error.code)) {
+        return json(res, 409, { ...errorBody(error.code, error.message), ...(error.plan ? { plan: error.plan } : {}) });
+      }
+      if (String(error.code || '').startsWith('DELETION_') || error.code === 'CLEAR_ALL_CONFIRMATION_REQUIRED' || error.code === 'RETENTION_CONFIG_INVALID') {
+        return json(res, 400, errorBody(error.code, error.message));
+      }
       if ([
         'JOB_ALREADY_RUNNING',
         'JOB_ALREADY_COMPLETED',
         'JOB_ATTEMPT_ACTIVE',
+        'JOB_DELETION_IN_PROGRESS',
         'JOB_NOT_RESUMABLE',
         'RESUME_CONTEXT_UNAVAILABLE',
         'RESUME_OUTPUT_MISSING',
@@ -1344,19 +1374,30 @@ function streamEvents(req, res, manager, id) {
     'X-Accel-Buffering': 'no',
   });
   writeEvent(res, 'snapshot', { type: 'snapshot', job: manager.get(id) });
-  const unsubscribe = manager.subscribe(id, ({ type, data }) => {
+  let closed = false;
+  let heartbeat;
+  let unsubscribe = () => {};
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+    res.end();
+  };
+  unsubscribe = manager.subscribe(id, ({ type, data }) => {
     if (type === 'log') {
       const level = data.stream === 'stderr' ? 'error' : data.stream === 'system' ? 'info' : 'info';
       return writeEvent(res, 'log', { type: 'log', line: data.message, level });
     }
     if (type === 'state') return writeEvent(res, 'status', { type: 'status', job: data });
+    if (type === 'closing') {
+      writeEvent(res, 'status', { type: 'status', job: manager.get(id), lifecycle: 'closing' });
+      return close();
+    }
     if (type === 'end') return writeEvent(res, 'done', { type: 'done', job: manager.get(id) });
   });
-  const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15000);
-  req.on('close', () => {
-    clearInterval(heartbeat);
-    unsubscribe();
-  });
+  heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15000);
+  req.on('close', close);
 }
 
 function writeEvent(res, event, data) {

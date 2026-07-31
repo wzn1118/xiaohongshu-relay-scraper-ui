@@ -743,3 +743,54 @@ export type JobEvent = {
   artifacts?: Artifact[]
   message?: string
 }
+
+export type DataDeletionSpec =
+  | { entityType: 'profile'; profileId: string; force?: boolean }
+  | { entityType: 'job'; jobId: string; force?: boolean }
+  | { entityType: 'draft'; jobId: string; draftId: string; force?: boolean }
+  | { entityType: 'artifact'; jobId: string; artifactId: string; force?: boolean }
+  | { entityType: 'all'; force?: boolean }
+
+export type DataDeletionPreview = {
+  schemaVersion: number
+  operation: string
+  entityType: DataDeletionSpec['entityType']
+  status: 'ready' | 'blocked'
+  entities: Array<{ type: string; id?: string; name?: string; jobId?: string; reason?: string }>
+  fileCount: number
+  totalBytes: number
+  references: Array<{ type: string; id?: string; relation?: string; status?: string }>
+  blockedReasons: Array<{ code: string; message: string }>
+  requiresForce: boolean
+  confirmationToken: string
+  confirmationExpiresAt: string
+  confirmationPhrase?: string
+}
+
+export type DataDeletionResult = {
+  schemaVersion: number
+  deleted: true
+  operation: string
+  entities: DataDeletionPreview['entities']
+  fileCount: number
+  totalBytes: number
+  audit: { recorded: boolean }
+}
+
+export type DataRetentionPolicy = {
+  schemaVersion: number
+  enabled: boolean
+  days: number
+  pinnedJobIds: string[]
+  updatedAt: string | null
+}
+
+export type DataRetentionCleanup = {
+  schemaVersion: number
+  enabled: boolean
+  dryRun: boolean
+  eligible?: DataDeletionPreview[]
+  deleted?: DataDeletionResult[]
+  skipped: Array<{ type: 'job'; id: string; reason: 'pinned' | 'active' }>
+  message?: string
+}
