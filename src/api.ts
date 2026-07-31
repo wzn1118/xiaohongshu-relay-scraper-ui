@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, RelayConfig, RelayRecoveryResult, RelayStatus, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -58,6 +58,11 @@ export const api = {
   job: (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`),
   createJob: (payload: JobRequest) =>
     request<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
+  resumeJob: (id: string, options: ResumeJobOptions) =>
+    request<Job>(`/api/jobs/${encodeURIComponent(id)}/resume`, {
+      method: 'POST',
+      body: JSON.stringify(options),
+    }),
   completeMissing: (id: string, aiSessionId: string | null) =>
     request<MissingCompletionResponse>(`/api/jobs/${encodeURIComponent(id)}/complete-missing`, {
       method: 'POST',

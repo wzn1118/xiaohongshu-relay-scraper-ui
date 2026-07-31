@@ -58,6 +58,7 @@ import type {
   ApplicationResult,
   ApplicationResultsResponse,
   AudienceComment,
+  AudiencePost,
   AudiencePublicProfile,
   AudienceResultsResponse,
   CoverageSummary,
@@ -81,6 +82,7 @@ import type {
   SmtpProvider,
   AnalysisMode,
   ContentResearchPreset,
+  ResumeScope,
 } from './types'
 
 const CANDIDATE_PROFILE_STORAGE_KEY = 'xhs-candidate-application-profile'
@@ -324,9 +326,11 @@ const defaultSmtpConfig: SmtpConfig = {
 
 const statusText: Record<JobStatus, string> = {
   queued: '待开始',
+  resuming: '正在续跑',
   running: '进行中',
   completed: '已完成',
   incomplete: '未完成 · 可续跑',
+  blocked: '等待人工处理',
   failed: '执行失败',
   cancelled: '未完成 · 已取消',
   interrupted: '未完成 · 已中断',
@@ -334,9 +338,11 @@ const statusText: Record<JobStatus, string> = {
 
 const progressByStatus: Record<JobStatus, number> = {
   queued: 4,
+  resuming: 48,
   running: 48,
   completed: 100,
   incomplete: 82,
+  blocked: 82,
   failed: 0,
   cancelled: 0,
   interrupted: 0,
@@ -421,6 +427,8 @@ function formatBytes(bytes = 0) {
 
 type PreviewImage = {
   url: string
+  originalUrl?: string
+  original_url?: string
   alt?: string
   source?: string
 }
@@ -433,8 +441,8 @@ type ImagePreviewState = {
 
 function resultImages(result: ApplicationResult): PreviewImage[] {
   const candidates = [
-    ...(result.media?.cover_url ? [{ url: result.media.cover_url, alt: `${result.title || '内容'}封面`, source: 'cover' }] : []),
-    ...(result.media?.images || []),
+    ...(result.media?.cover_url ? [{ url: result.media.cover_url, originalUrl: result.media.cover_original_url, alt: `${result.title || '内容'}封面`, source: 'cover' }] : []),
+    ...(result.media?.images || []).map((image) => ({ ...image, originalUrl: image.original_url })),
   ]
   return candidates.filter((image, index) => image.url && candidates.findIndex((candidate) => candidate.url === image.url) === index)
 }
@@ -443,21 +451,99 @@ function imageSourceLabel(source?: string) {
   return source === 'detail' ? '正文图片' : source === 'cover' ? '封面' : source === 'card' ? '搜索卡片' : '内容图片'
 }
 
+const IMAGE_RETRY_DELAYS_MS = [450, 1200]
+
+function imageSources(image: PreviewImage) {
+  return [image.url, image.originalUrl, image.original_url].filter((url, index, sources): url is string => Boolean(url) && sources.indexOf(url) === index)
+}
+
+function retryImageUrl(url: string, attempt: number) {
+  if (!attempt || !url.startsWith('/api/')) return url
+  return `${url}${url.includes('?') ? '&' : '?'}render_retry=${attempt}`
+}
+
+function RetryingImage({ image, alt, loading, allowManualRetry = false, onExhausted }: {
+  image: PreviewImage
+  alt: string
+  loading?: 'eager' | 'lazy'
+  allowManualRetry?: boolean
+  onExhausted?: () => void
+}) {
+  const sources = useMemo(() => imageSources(image), [image.originalUrl, image.original_url, image.url])
+  const [sourceIndex, setSourceIndex] = useState(0)
+  const [attempt, setAttempt] = useState(0)
+  const [waiting, setWaiting] = useState(false)
+  const [exhausted, setExhausted] = useState(false)
+  const retryTimer = useRef<number | null>(null)
+  const sourceKey = sources.join('|')
+
+  const reset = useCallback(() => {
+    if (retryTimer.current !== null) window.clearTimeout(retryTimer.current)
+    retryTimer.current = null
+    setSourceIndex(0)
+    setAttempt(0)
+    setWaiting(false)
+    setExhausted(false)
+  }, [])
+
+  useEffect(() => {
+    reset()
+    return () => {
+      if (retryTimer.current !== null) window.clearTimeout(retryTimer.current)
+    }
+  }, [reset, sourceKey])
+
+  const handleError = () => {
+    if (waiting || exhausted) return
+    if (attempt < IMAGE_RETRY_DELAYS_MS.length) {
+      setWaiting(true)
+      retryTimer.current = window.setTimeout(() => {
+        setAttempt((current) => current + 1)
+        setWaiting(false)
+        retryTimer.current = null
+      }, IMAGE_RETRY_DELAYS_MS[attempt])
+      return
+    }
+    if (sourceIndex + 1 < sources.length) {
+      setSourceIndex((current) => current + 1)
+      setAttempt(0)
+      return
+    }
+    setExhausted(true)
+    onExhausted?.()
+  }
+
+  if (waiting) {
+    return <span className="retrying-image-state is-loading" aria-label="图片正在重试"><LoaderCircle className="spin" size={18} /><small>重新加载中</small></span>
+  }
+
+  if (exhausted || !sources[sourceIndex]) {
+    if (allowManualRetry) {
+      return <button type="button" className="image-load-retry" onClick={reset}><RefreshCw size={18} />重新加载图片</button>
+    }
+    return <span className="retrying-image-state is-failed" aria-label="图片加载失败"><Images size={18} /><small>加载失败</small></span>
+  }
+
+  const src = retryImageUrl(sources[sourceIndex], attempt)
+  return <img key={`${sourceIndex}-${attempt}-${src}`} src={src} alt={alt} loading={loading} referrerPolicy="no-referrer" onError={handleError} />
+}
+
 function ResultCardMedia({ result, onPreview, noun = '岗位' }: { result: ApplicationResult; onPreview: (images: PreviewImage[], index: number) => void; noun?: string }) {
-  const [failedUrls, setFailedUrls] = useState<string[]>([])
   const images = useMemo(() => resultImages(result), [result])
-  const preview = images.find((image) => !failedUrls.includes(image.url))
-  const previewIndex = preview ? images.findIndex((image) => image.url === preview.url) : -1
+  const [previewIndex, setPreviewIndex] = useState(0)
+  const imageKey = images.map((image) => `${image.url}|${image.originalUrl || image.original_url || ''}`).join('||')
+  const preview = images[previewIndex]
+
+  useEffect(() => setPreviewIndex(0), [imageKey])
 
   if (preview) {
     return (
       <button className="result-card-media has-image" type="button" aria-label={`在当前页面查看${result.title || noun}的图片`} onClick={() => onPreview(images, previewIndex)}>
-        <img
-          src={preview.url}
+        <RetryingImage
+          image={preview}
           alt={preview.alt || `${result.title || noun}图片`}
           loading="lazy"
-          referrerPolicy="no-referrer"
-          onError={() => setFailedUrls((current) => current.includes(preview.url) ? current : [...current, preview.url])}
+          onExhausted={() => setPreviewIndex((current) => current + 1)}
         />
         <span className="result-card-media-open"><Maximize2 size={12} /></span>
         <span className="result-card-media-count"><Images size={11} />{images.length}</span>
@@ -466,9 +552,9 @@ function ResultCardMedia({ result, onPreview, noun = '岗位' }: { result: Appli
   }
 
   return (
-    <span className="result-card-media is-empty" aria-label={images.length ? `${images.length} 张${noun}图片暂不可用` : `暂无${noun}图片`}>
-      <span className="result-card-media-empty"><Images size={19} /><small>{images.length ? '图片暂不可用' : `暂无${noun}图片`}</small></span>
-    </span>
+    <button className="result-card-media is-empty" type="button" aria-label={images.length ? `重新加载 ${images.length} 张${noun}图片` : `暂无${noun}图片`} disabled={!images.length} onClick={() => setPreviewIndex(0)}>
+      <span className="result-card-media-empty">{images.length ? <RefreshCw size={18} /> : <Images size={19} />}<small>{images.length ? '重新加载图片' : `暂无${noun}图片`}</small></span>
+    </button>
   )
 }
 
@@ -500,14 +586,14 @@ function ImagePreview({ preview, onClose, onChange }: { preview: ImagePreviewSta
         </header>
         <div className="image-preview-stage">
           {multiple && <button className="image-preview-nav previous" type="button" onClick={() => onChange((preview.index - 1 + preview.images.length) % preview.images.length)} title="上一张" aria-label="上一张图片"><ChevronLeft size={24} /></button>}
-          <img src={current.url} alt={current.alt || `${preview.title}图片 ${preview.index + 1}`} referrerPolicy="no-referrer" />
+          <RetryingImage image={current} alt={current.alt || `${preview.title}图片 ${preview.index + 1}`} loading="eager" allowManualRetry />
           {multiple && <button className="image-preview-nav next" type="button" onClick={() => onChange((preview.index + 1) % preview.images.length)} title="下一张" aria-label="下一张图片"><ChevronRight size={24} /></button>}
         </div>
         {multiple && (
           <div className="image-preview-strip" aria-label="图片列表">
             {preview.images.map((image, index) => (
               <button key={`${image.url}-${index}`} className={index === preview.index ? 'active' : ''} type="button" onClick={() => onChange(index)} aria-label={`查看第 ${index + 1} 张图片`} aria-current={index === preview.index ? 'true' : undefined}>
-                <img src={image.url} alt="" referrerPolicy="no-referrer" />
+                <RetryingImage image={image} alt="" loading="lazy" />
               </button>
             ))}
           </div>
@@ -759,6 +845,8 @@ function GeneralResultsWorkspace({
   onCopy: (value: string) => void
 }) {
   const analysis = selectedResult?.content_analysis
+  const analysisReady = analysis?.status === 'completed'
+    && Number(analysis.grounded_evidence_count || 0) > 0
   const selectedImages = selectedResult ? resultImages(selectedResult) : []
   const resultItems = Array.isArray(results.items) ? results.items : []
   const resultStats = resultFilterStats(results)
@@ -768,6 +856,17 @@ function GeneralResultsWorkspace({
         <span className="content-research-context-icon"><BrainCircuit size={20} /></span>
         <span className="content-research-context-copy"><small>NON-JOB RESEARCH BRIEF</small><strong>{results.research.label}</strong><p>{results.research.goal || 'AI 将结合关键词、正文、图片和 OCR，动态决定本次研究栏目。'}</p></span>
         <span className="content-research-context-keyword"><small>搜索关键词</small><strong>{results.keyword || '未记录'}</strong></span>
+      </section> : null}
+      {results.insights ? <section className="content-evidence-insights" aria-label="跨样本证据洞察">
+        <header>
+          <div><small>CROSS-SAMPLE EVIDENCE</small><h3>跨样本证据洞察</h3><p>{results.insights.methodNote}</p></div>
+          <div className="content-insight-metrics"><span><strong>{results.insights.groundedRecords}</strong>可回溯样本</span><span><strong>{results.insights.sourceReady}</strong>原文充足</span><span><strong>{results.insights.coverageRate}%</strong>证据覆盖</span><span><strong>{results.insights.sampleSize}</strong>采集样本</span></div>
+        </header>
+        {results.insights.topTopics.length > 0 && <div className="content-topic-frequency"><strong>高频主题</strong><div>{results.insights.topTopics.map((topic) => <span key={topic.label}>{topic.label}<b>{topic.count}</b></span>)}</div></div>}
+        <div className="content-insight-modules">{results.insights.modules.map((module) => <section key={module.id}>
+          <header><div><small>{module.recordCount} 篇有证据 · 覆盖 {module.coverageRate}%</small><h4>{module.title}</h4></div><p>{module.question}</p></header>
+          {module.findings.length > 0 ? <ol>{module.findings.map((finding) => <li key={finding.label}><span><strong>{finding.label}</strong><b>{finding.count} 篇</b></span>{finding.evidence[0] && <blockquote>“{finding.evidence[0].quote}”<small>{finding.evidence[0].title}</small></blockquote>}</li>)}</ol> : <p className="content-insight-empty">当前没有通过原文校验的重复发现。</p>}
+        </section>)}</div>
       </section> : null}
       <div className="results-control-bar general-results-controls">
         <div className="result-stats" aria-label="内容统计">
@@ -791,7 +890,7 @@ function GeneralResultsWorkspace({
             {resultItems.map((item) => {
               const itemAnalysis = item.content_analysis
               const score = Number(itemAnalysis?.relevance_score || 0)
-              const ready = Boolean(itemAnalysis?.overview && itemAnalysis.modules?.length)
+              const ready = itemAnalysis?.status === 'completed' && Number(itemAnalysis.grounded_evidence_count || 0) > 0
               return <div key={item.note_id} className={`result-row ${selectedResult?.note_id === item.note_id ? 'selected' : ''}`}>
                 <ResultCardMedia noun="内容" result={item} onPreview={(images, index) => onPreview(item.title || '未命名内容', images, index)} />
                 <button className="result-card-select" type="button" onClick={() => onSelect(item)} aria-label={`查看内容：${item.title || '未命名内容'}`}>
@@ -806,19 +905,20 @@ function GeneralResultsWorkspace({
           </div>
         </div>
         {selectedResult ? <article className="result-detail general-content-detail">
-          <header><div><span>{selectedResult.publish_time?.value || '日期待核验'} · {analysis?.content_type || '内容类型待识别'}</span><h3>{selectedResult.title || '未命名内容'}</h3><small>采集时间 {formatTime(selectedResult.collected_at)} · 与“{results.keyword}”相关度 {analysis?.relevance_score ?? '-'} / 100</small></div>{selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer" title="打开原链接"><ExternalLink size={17} /></a>}</header>
+          <header><div><span>{selectedResult.publish_time?.value || '日期待核验'} · {analysisReady ? (analysis?.content_type || '内容类型待识别') : '内容类型待识别'}</span><h3>{selectedResult.title || '未命名内容'}</h3><small>采集时间 {formatTime(selectedResult.collected_at)} · 与“{results.keyword}”相关度 {analysisReady ? analysis?.relevance_score ?? '-' : '-'} / 100</small></div>{selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer" title="打开原链接"><ExternalLink size={17} /></a>}</header>
           {selectedImages.length > 0 && <section className="result-media" aria-label="采集图片与 AI 理解结果">
             <div className="result-media-heading"><span><Images size={16} /><strong>采集图片</strong><small>{selectedImages.length} 张</small></span><i>{selectedResult.media?.analysis?.source === 'vision_model' ? 'AI 已看图' : '等待视觉模型理解'}</i></div>
-            <div className="result-media-grid">{selectedImages.map((image, index) => <button key={`${image.url}-${index}`} type="button" onClick={() => onPreview(selectedResult.title || '未命名内容', selectedImages, index)} title={image.alt || `查看第 ${index + 1} 张图片`}><img src={image.url} alt={image.alt || `${selectedResult.title || '内容'}图片 ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" /><small>{imageSourceLabel(image.source)}</small><span><Maximize2 size={13} /></span></button>)}</div>
+            <div className="result-media-grid">{selectedImages.map((image, index) => <button key={`${image.url}-${index}`} type="button" onClick={() => onPreview(selectedResult.title || '未命名内容', selectedImages, index)} title={image.alt || `查看第 ${index + 1} 张图片`}><RetryingImage image={image} alt={image.alt || `${selectedResult.title || '内容'}图片 ${index + 1}`} loading="lazy" /><small>{imageSourceLabel(image.source)}</small><span><Maximize2 size={13} /></span></button>)}</div>
             <AiSectionBoundary resetSignal={selectedResult.media?.analysis} fallback={<AiSectionUnavailable label="图片理解" />}>
               <div className="image-analysis"><strong>图片信息理解</strong><p>{selectedResult.media?.analysis?.summary || '已保存原图，等待视觉模型读取。'}</p>{selectedResult.media?.analysis?.visible_text?.trim() && <div className="image-analysis-transcript"><div><span><strong>图片识别正文</strong><small>按原有换行展示</small></span><button type="button" title="复制图片识别正文" onClick={() => onCopy(selectedResult.media?.analysis?.visible_text?.trim() || '')}><Copy size={14} /></button></div><pre>{selectedResult.media?.analysis?.visible_text?.trim()}</pre></div>}</div>
             </AiSectionBoundary>
           </section>}
           <AiSectionBoundary resetSignal={analysis} fallback={<AiSectionUnavailable label="AI 内容结构" />}>
-            <section className="general-overview"><div><span>AI CONTENT BRIEF</span><h4>内容概览</h4></div><p>{analysis?.overview || '等待 AI 根据关键词、正文与图片生成概览。'}</p>{analysis?.relevance_reason && <small>{analysis.relevance_reason}</small>}</section>
-            {(analysis?.topics?.length || analysis?.entities?.length) ? <div className="content-taxonomy">{analysis?.topics?.length ? <section><h4>主题</h4><div>{analysis.topics.map((topic) => <span key={topic}>{topic}</span>)}</div></section> : null}{analysis?.entities?.length ? <section><h4>实体与对象</h4><div>{analysis.entities.map((entity) => <span key={entity}>{entity}</span>)}</div></section> : null}</div> : null}
-            <div className="content-module-grid">{analysis?.modules?.length ? analysis.modules.map((module) => <section className="content-module" key={module.id}><div><BookOpenCheck size={16} /><h4>{module.title}</h4></div><p>{module.summary}</p>{module.items.length > 0 && <ul>{module.items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul>}{module.evidence.length > 0 && <details><summary>查看原文依据</summary>{module.evidence.map((item, index) => <blockquote key={`${item}-${index}`}>{item}</blockquote>)}</details>}</section>) : <section className="content-module pending"><LoaderCircle size={18} /><h4>等待动态栏目分析</h4><p>AI 会根据本次关键词决定栏目，而不是套用岗位模板。</p></section>}</div>
-            {analysis?.image_insights?.length ? <section className="image-insight-list"><h4>图片线索</h4><ul>{analysis.image_insights.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section> : null}
+            {!analysisReady && <section className="content-evidence-warning"><WandSparkles size={17} /><span><strong>当前结论未通过证据门禁</strong><small>{analysis?.status === 'insufficient_source' ? '正文和图片可读信息过少，需要继续采集后再分析。' : analysis?.status === 'ungrounded' ? '模型引用无法在原始图文中复核，已撤销相关度分数。' : '分析尚未完成，可从检查点继续补全。'}</small></span></section>}
+            <section className="general-overview"><div><span>AI CONTENT BRIEF</span><h4>内容概览</h4></div><p>{analysisReady ? (analysis?.overview || '等待 AI 根据关键词、正文与图片生成概览。') : '等待 AI 根据可回溯的原文与图片证据重新生成。'}</p>{analysisReady && analysis?.relevance_reason && <small>{analysis.relevance_reason}</small>}</section>
+            {analysisReady && (analysis?.topics?.length || analysis?.entities?.length) ? <div className="content-taxonomy">{analysis?.topics?.length ? <section><h4>主题</h4><div>{analysis.topics.map((topic) => <span key={topic}>{topic}</span>)}</div></section> : null}{analysis?.entities?.length ? <section><h4>实体与对象</h4><div>{analysis.entities.map((entity) => <span key={entity}>{entity}</span>)}</div></section> : null}</div> : null}
+            <div className="content-module-grid">{analysisReady && analysis?.modules?.length ? analysis.modules.map((module) => <section className="content-module" key={module.id}><div><BookOpenCheck size={16} /><h4>{module.title}</h4></div><p>{module.summary}</p>{module.items.length > 0 && <ul>{module.items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul>}{module.evidence.length > 0 && <details><summary>查看原文依据</summary>{module.evidence.map((item, index) => <blockquote key={`${item}-${index}`}>{item}</blockquote>)}</details>}</section>) : <section className="content-module pending"><LoaderCircle size={18} /><h4>等待动态栏目分析</h4><p>AI 会根据本次关键词决定栏目，而不是套用岗位模板。</p></section>}</div>
+            {analysisReady && analysis?.image_insights?.length ? <section className="image-insight-list"><h4>图片线索</h4><ul>{analysis.image_insights.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section> : null}
           </AiSectionBoundary>
           <section className="body-section general-body"><div><h4>采集正文</h4><button type="button" title="复制采集正文" onClick={() => onCopy(selectedResult.body || '')}><Copy size={14} /></button></div><p>{selectedResult.body || '正文尚未采集；已保留图片和卡片文字供 AI 分析。'}</p></section>
         </article> : <div className="result-empty"><FileText size={28} /><strong>选择一条内容查看 AI 分析</strong></div>}
@@ -834,8 +934,32 @@ function audienceStatusLabel(status: AudienceResultsResponse['summary']['status'
   return status === 'complete' ? '全量完成' : status === 'partial' ? '部分完成' : status === 'failed' ? '采集失败' : '等待采集'
 }
 
+type AudiencePostCollectionState = 'uncollected' | 'partial' | 'complete'
+
+function audiencePostCollectionState(post: AudiencePost): AudiencePostCollectionState {
+  if (post.collectionStatus) return post.collectionStatus
+  if (post.status === 'complete') return 'complete'
+  if (post.status === 'partial' || post.status === 'failed' || Number(post.collected_comment_count || 0) > 0) return 'partial'
+  return 'uncollected'
+}
+
+function audiencePostCollectionLabel(state: AudiencePostCollectionState) {
+  return state === 'complete' ? '已采集' : state === 'partial' ? '部分采集' : '未采集'
+}
+
 function audienceMetric(value: number | null | undefined) {
   return typeof value === 'number' ? value.toLocaleString('zh-CN') : '-'
+}
+
+function audienceStopReasonLabel(reason: string | null | undefined) {
+  if (!reason) return ''
+  const labels: Record<string, string> = {
+    rate_limited: '平台限流，自动恢复重试已耗尽并保存检查点',
+    security_verification: '等待完成页面安全验证',
+    cancelled: '任务已取消，检查点仍然保留',
+    interrupted: '任务被中断，检查点仍然保留',
+  }
+  return labels[reason] || reason
 }
 
 function AudienceAvatar({ user }: { user: AudiencePublicProfile }) {
@@ -843,9 +967,33 @@ function AudienceAvatar({ user }: { user: AudiencePublicProfile }) {
   return <span className="audience-avatar">{user.avatar_url ? <img src={user.avatar_url} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <b>{initial}</b>}</span>
 }
 
+function audienceCommentUser(comment: AudienceComment): AudiencePublicProfile {
+  const persistedComment = comment as AudienceComment & { user?: AudiencePublicProfile; user_id?: string }
+  return persistedComment.user || {
+    user_id: persistedComment.user_id || '',
+    display_name: '未命名用户',
+    profile_url: '',
+    avatar_url: '',
+    xhs_id: '',
+    bio: '',
+    location: '',
+    following_count: null,
+    follower_count: null,
+    liked_and_collected_count: null,
+    roles: [],
+    comment_count: 0,
+    post_ids: [],
+    enrichment_status: 'pending',
+    access_status: 'discovered',
+    last_enriched_at: '',
+  }
+}
+
 function AudienceWorkspace({
   results,
   loading,
+  task,
+  actionMessage,
   kind,
   postId,
   query,
@@ -858,6 +1006,8 @@ function AudienceWorkspace({
 }: {
   results: AudienceResultsResponse | null
   loading: boolean
+  task: Job | null
+  actionMessage: string | null
   kind: 'comments' | 'users'
   postId: string
   query: string
@@ -869,43 +1019,88 @@ function AudienceWorkspace({
   onResume: () => void
 }) {
   const summary = results?.summary
+  const posts = results?.posts || []
+  const postsTotal = summary?.postsTotal ?? posts.length
+  const postsAttempted = typeof summary?.postsAttempted === 'number'
+    ? summary.postsAttempted
+    : posts.filter((post) => audiencePostCollectionState(post) !== 'uncollected').length
+  const postsWithComments = typeof summary?.postsWithComments === 'number'
+    ? summary.postsWithComments
+    : posts.filter((post) => Number(post.collected_comment_count || 0) > 0).length
   const incomplete = !summary || summary.status !== 'complete'
   const statusClass = summary?.status || 'pending'
-  const items = results?.items || []
-  const offset = results?.offset || 0
-  const limit = results?.limit || 40
+  const selectedResults = results?.kind === kind ? results : null
+  const changingKind = Boolean(results && !selectedResults)
+  const items = selectedResults?.items || []
+  const offset = selectedResults?.offset || 0
+  const limit = selectedResults?.limit || 40
+  const selectedTotal = selectedResults?.total ?? results?.totals[kind] ?? 0
+  const postStateCounts = posts.reduce<Record<AudiencePostCollectionState, number>>((counts, post) => {
+    counts[audiencePostCollectionState(post)] += 1
+    return counts
+  }, { uncollected: 0, partial: 0, complete: 0 })
+  const audienceTask = task?.config?.audienceOnly || task?.config?.collectAudience ? task : null
+  const taskActive = Boolean(audienceTask && ['queued', 'resuming', 'running'].includes(audienceTask.status))
+  const taskMessage = taskActive ? (audienceTask?.progressLabel || actionMessage) : actionMessage
+  const rateLimited = summary?.stopReason === 'rate_limited'
   return <div className="audience-workspace">
     <section className="audience-summary-band" aria-label="受众采集覆盖率">
       <div className={`audience-status ${statusClass}`}><Activity size={17} /><span><small>采集状态</small><strong>{audienceStatusLabel(statusClass)}</strong></span></div>
       <dl>
-        <div><dt>原帖覆盖</dt><dd>{audienceMetric(summary?.postsComplete)}<small> / {audienceMetric(summary?.postsTotal)}</small></dd></div>
-        <div><dt>评论与回复</dt><dd>{audienceMetric(summary?.commentsCollected)}</dd></div>
-        <div><dt>独立用户</dt><dd>{audienceMetric(summary?.usersDiscovered)}</dd></div>
-        <div><dt>用户资料完成</dt><dd>{audienceMetric(summary?.profilesComplete)}<small> / {audienceMetric(summary?.usersDiscovered)}</small></dd></div>
+        <div><dt>已检查帖子</dt><dd>{audienceMetric(postsAttempted)}<small> 篇 / {audienceMetric(postsTotal)}</small></dd></div>
+        <div><dt>有评论结果</dt><dd>{audienceMetric(postsWithComments)}<small> 篇</small></dd></div>
+        <div><dt>评论与回复</dt><dd>{audienceMetric(summary?.commentsCollected)}<small> 条</small></dd></div>
+        <div><dt>独立用户</dt><dd>{audienceMetric(summary?.usersDiscovered)}<small> 位</small></dd></div>
+        <div><dt>主页已补全</dt><dd>{audienceMetric(summary?.profilesComplete)}<small> 位 / {audienceMetric(summary?.usersDiscovered)}</small></dd></div>
       </dl>
-      {incomplete && <button type="button" className="audience-resume-button" disabled={resuming || loading} onClick={onResume}>{resuming ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{results?.available ? '继续全量采集' : '开始采集评论与用户'}</button>}
+      {incomplete && <button type="button" className="audience-resume-button" disabled={resuming || loading || taskActive} onClick={onResume}>{resuming || taskActive ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{taskActive ? (audienceTask?.status === 'queued' ? '已排队，等待自动启动' : '正在补采未完成帖子') : results?.available ? '继续补采未完成帖子' : '开始采集评论与用户'}</button>}
     </section>
-    {incomplete && <div className={`audience-coverage-callout ${statusClass}`} role="status"><CircleAlert size={17} /><span><strong>当前结果尚未证明全量完成</strong><small>{summary?.stopReason ? `停止原因：${summary.stopReason}。` : '系统会逐帖展开回复并滚动到底。'} 已保存评论和用户检查点，可从断点继续。</small></span></div>}
+    {taskMessage && <div className={`audience-action-status ${taskActive ? 'active' : ''}`} role="status" aria-live="polite">{taskActive && <LoaderCircle className="spin" size={15} />}<span>{taskMessage}</span></div>}
+    {incomplete && <div className={`audience-coverage-callout ${statusClass}`} role="status"><CircleAlert size={17} /><span><strong>{rateLimited ? '平台限流，自动恢复重试已耗尽' : '当前结果尚未证明全量完成'}</strong><small>{rateLimited ? `系统已自动冷却并多次探测恢复，当前已检查 ${audienceMetric(postsAttempted)} / ${audienceMetric(postsTotal)} 篇，检查点完整保留。平台恢复后点击继续补采，未检查帖子会优先处理。` : `${summary?.stopReason ? `停止原因：${audienceStopReasonLabel(summary.stopReason)}。` : '未采集和部分采集帖子仍待补采。'} 已保存的帖子、评论和用户结果会继续保留。`}</small></span></div>}
     <p className="audience-data-scope"><ShieldCheck size={14} />仅整理帖子和公开主页中可见的评论与用户字段，不推断联系方式或私密属性。</p>
+    {posts.length > 0 && <section className="audience-post-coverage" aria-label="内容洞察帖子采集状态">
+      <header>
+        <div><span>内容洞察已有帖子</span><strong>{audienceMetric(posts.length)}</strong></div>
+        <dl>
+          <div className="uncollected"><dt>未检查</dt><dd>{audienceMetric(postStateCounts.uncollected)}</dd></div>
+          <div className="partial"><dt>已检查未全量</dt><dd>{audienceMetric(postStateCounts.partial)}</dd></div>
+          <div className="complete"><dt>严格完整</dt><dd>{audienceMetric(postStateCounts.complete)}</dd></div>
+        </dl>
+      </header>
+      <div className="audience-post-list">
+        {posts.map((post) => {
+          const state = audiencePostCollectionState(post)
+          const expectedCount = typeof post.expected_comment_count === 'number' ? post.expected_comment_count : null
+          return <button type="button" key={post.post_id} className={postId === post.post_id ? 'active' : ''} aria-pressed={postId === post.post_id} onClick={() => onPost(postId === post.post_id ? '' : post.post_id)}>
+            <span className={`audience-post-state ${state}`}>{audiencePostCollectionLabel(state)}</span>
+            <span className="audience-post-copy"><strong>{post.title || '未命名原帖'}</strong><small>{audienceMetric(post.collected_comment_count || 0)} 条评论与回复{expectedCount === null ? '' : ` / 页面显示 ${audienceMetric(expectedCount)}`}</small></span>
+            {post.note_url && <ExternalLink size={14} aria-hidden="true" />}
+          </button>
+        })}
+      </div>
+    </section>}
     <div className="audience-toolbar">
       <div className="audience-view-switch" role="tablist" aria-label="受众数据视图">
-        <button type="button" role="tab" aria-selected={kind === 'comments'} className={kind === 'comments' ? 'active' : ''} onClick={() => onKind('comments')}><MessagesSquare size={16} />评论流 <b>{audienceMetric(results?.totals.comments)}</b></button>
-        <button type="button" role="tab" aria-selected={kind === 'users'} className={kind === 'users' ? 'active' : ''} onClick={() => onKind('users')}><UsersRound size={16} />用户卡 <b>{audienceMetric(results?.totals.users)}</b></button>
+        <button type="button" role="tab" aria-selected={kind === 'comments'} className={kind === 'comments' ? 'active' : ''} onClick={() => onKind('comments')}><MessagesSquare size={16} />评论流 <b>{audienceMetric(results?.totals.comments)} 条</b></button>
+        <button type="button" role="tab" aria-selected={kind === 'users'} className={kind === 'users' ? 'active' : ''} onClick={() => onKind('users')}><UsersRound size={16} />用户卡 <b>{audienceMetric(results?.totals.users)} 位</b></button>
       </div>
-      <label className="audience-post-filter"><span>原帖</span><select aria-label="按原帖筛选受众" value={postId} onChange={(event) => onPost(event.target.value)}><option value="">全部原帖</option>{results?.posts.map((post) => <option key={post.post_id} value={post.post_id}>{post.title} · {post.collected_comment_count || 0} 条</option>)}</select></label>
+      <label className="audience-post-filter"><span>原帖</span><select aria-label="按原帖筛选受众" value={postId} onChange={(event) => onPost(event.target.value)}><option value="">全部原帖</option>{posts.map((post) => <option key={post.post_id} value={post.post_id}>{audiencePostCollectionLabel(audiencePostCollectionState(post))} · {post.title} · {post.collected_comment_count || 0} 条</option>)}</select></label>
       <label className="audience-search"><Search size={15} /><input aria-label="搜索评论或用户" value={query} placeholder={kind === 'comments' ? '搜索评论、昵称或地区' : '搜索昵称、小红书号或简介'} onChange={(event) => onQuery(event.target.value)} /></label>
     </div>
-    <div className="audience-results-meta"><span>{postId ? '当前原帖' : '全部原帖'} · {kind === 'comments' ? '评论与楼中楼回复' : '原帖主与评论者'}</span><strong>{audienceMetric(results?.total)} 条结果</strong></div>
-    {loading && !results ? <div className="result-empty audience-empty"><LoaderCircle className="spin" size={28} /><strong>正在读取受众数据</strong></div> : items.length === 0 ? <div className="result-empty audience-empty"><UserRoundSearch size={28} /><strong>{results?.available ? '当前筛选没有结果' : '尚未采集评论与用户信息'}</strong><small>{results?.available ? '调整原帖或搜索条件后重试。' : '点击上方按钮从已保存帖子检查点开始采集。'}</small></div> : kind === 'comments' ? <div className="audience-comment-list">{(items as AudienceComment[]).map((comment) => <article className={`audience-comment ${comment.level === 'reply' ? 'is-reply' : ''}`} key={comment.comment_id}>
-      <AudienceAvatar user={comment.user} />
-      <div><header><span><strong>{comment.user.display_name || '未命名用户'}</strong>{comment.level === 'reply' && <i>回复</i>}{comment.user.roles?.includes('author') && <i className="author">原帖主</i>}</span>{comment.user.profile_url && <a href={comment.user.profile_url} target="_blank" rel="noreferrer" title="打开公开主页"><ExternalLink size={14} /></a>}</header><p>{comment.text}</p><footer><span>{comment.post_title || '未命名原帖'}</span><small>{comment.publish_time || '时间未显示'}{comment.location ? ` · ${comment.location}` : ''}{comment.likes ? ` · ${comment.likes} 赞` : ''}</small></footer></div>
-    </article>)}</div> : <div className="audience-user-grid">{(items as AudiencePublicProfile[]).map((user) => <article className={`audience-user-card ${user.roles?.includes('author') ? 'author' : 'commenter'}`} key={user.user_id}>
+    <div className="audience-results-meta"><span>{postId ? '当前原帖' : '全部原帖'} · {kind === 'comments' ? '评论与楼中楼回复' : '原帖主与评论者'}</span><strong>{audienceMetric(selectedTotal)} {kind === 'comments' ? '条评论' : '位用户'}</strong></div>
+    {(loading || changingKind) && items.length === 0 ? <div className="result-empty audience-empty"><LoaderCircle className="spin" size={28} /><strong>正在读取受众数据</strong></div> : items.length === 0 ? <div className="result-empty audience-empty"><UserRoundSearch size={28} /><strong>{selectedResults?.available ? '当前筛选没有结果' : '尚未采集评论与用户信息'}</strong><small>{selectedResults?.available ? '调整原帖或搜索条件后重试。' : '点击上方按钮从已保存帖子检查点开始采集。'}</small></div> : kind === 'comments' ? <div className="audience-comment-list">{(items as AudienceComment[]).map((comment) => {
+      const user = audienceCommentUser(comment)
+      return <article className={`audience-comment ${comment.level === 'reply' ? 'is-reply' : ''}`} key={comment.comment_id}>
+        <AudienceAvatar user={user} />
+        <div><header><span><strong>{user.display_name || '未命名用户'}</strong>{comment.level === 'reply' && <i>回复</i>}{user.roles?.includes('author') && <i className="author">原帖主</i>}</span>{user.profile_url && <a href={user.profile_url} target="_blank" rel="noreferrer" title="打开公开主页"><ExternalLink size={14} /></a>}</header><p>{comment.text}</p><footer><span>{comment.post_title || '未命名原帖'}</span><small>{comment.publish_time || '时间未显示'}{(comment.ip_location || comment.location) ? ` · IP属地：${comment.ip_location || comment.location}` : ''}{comment.likes ? ` · ${comment.likes} 赞` : ''}</small></footer></div>
+      </article>
+    })}</div> : <div className="audience-user-grid">{(items as AudiencePublicProfile[]).map((user) => <article className={`audience-user-card ${user.roles?.includes('author') ? 'author' : 'commenter'}`} key={user.user_id}>
       <header><AudienceAvatar user={user} /><div><strong>{user.display_name || '未命名用户'}</strong><span>{user.roles?.includes('author') && <i className="author">原帖主</i>}{user.roles?.includes('commenter') && <i>评论者</i>}</span></div>{user.profile_url && <a href={user.profile_url} target="_blank" rel="noreferrer" title="打开公开主页"><ExternalLink size={15} /></a>}</header>
       <p>{user.bio || '公开主页未显示简介'}</p>
       <dl><div><dt>粉丝</dt><dd>{audienceMetric(user.follower_count)}</dd></div><div><dt>关注</dt><dd>{audienceMetric(user.following_count)}</dd></div><div><dt>互动</dt><dd>{audienceMetric(user.liked_and_collected_count)}</dd></div><div><dt>评论</dt><dd>{audienceMetric(user.comment_count)}</dd></div></dl>
-      <footer><span>{user.xhs_id ? `小红书号 ${user.xhs_id}` : '小红书号未公开'}</span><small>{user.location || '地区未显示'} · {user.enrichment_status === 'complete' ? '公开资料已采集' : '资料待续采'}</small></footer>
+      <footer><span>{user.xhs_id ? `小红书号 ${user.xhs_id}` : '小红书号未公开'}</span><small>IP属地：{user.ip_location || '待采集'} · {user.enrichment_status === 'complete' ? '公开资料已采集' : '资料待续采'}</small></footer>
     </article>)}</div>}
-    {results && results.total > 0 && <div className="audience-pagination"><span>{offset + 1}-{Math.min(offset + items.length, results.total)} / {results.total}</span><div><button type="button" title="上一页" disabled={offset === 0 || loading} onClick={() => onPage(Math.max(0, offset - limit))}><ChevronLeft size={16} /></button><button type="button" title="下一页" disabled={offset + limit >= results.total || loading} onClick={() => onPage(offset + limit)}><ChevronRight size={16} /></button></div></div>}
+    {selectedResults && selectedResults.total > 0 && <div className="audience-pagination"><span>{offset + 1}-{Math.min(offset + items.length, selectedResults.total)} / {selectedResults.total}</span><div><button type="button" title="上一页" disabled={offset === 0 || loading} onClick={() => onPage(Math.max(0, offset - limit))}><ChevronLeft size={16} /></button><button type="button" title="下一页" disabled={offset + limit >= selectedResults.total || loading} onClick={() => onPage(offset + limit)}><ChevronRight size={16} /></button></div></div>}
   </div>
 }
 
@@ -975,19 +1170,60 @@ function fileBase64(file: File) {
   })
 }
 
-function latestCompletionJob(jobs: Job[], current: Job) {
-  let latest = jobs.find((job) => job.id === current.id) || current
+function replaceJobInPlace(jobs: Job[], next: Job) {
+  const index = jobs.findIndex((job) => job.id === next.id)
+  if (index < 0) return [next, ...jobs]
+  return jobs.map((job, itemIndex) => itemIndex === index ? next : job)
+}
+
+function newResumeIdempotencyKey(jobId: string, scope: ResumeScope) {
+  const unique = globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  return `${jobId}:${scope}:${unique}`
+}
+
+function isAudienceOnlyJob(job: Job | null | undefined) {
+  return Boolean(job?.config?.audienceOnly && job.config.resumeFromJobId)
+}
+
+function audienceSourceJobIdFor(job: Job | null | undefined, jobs: Job[] = []) {
+  if (!job) return null
+  let current = job
   const visited = new Set<string>()
-  while (!visited.has(latest.id)) {
-    visited.add(latest.id)
-    const child = jobs.find((job) => (
-      job.config?.completeMissingOnly
-      && job.config?.resumeFromJobId === latest.id
-    ))
-    if (!child) break
-    latest = child
+  while (isAudienceOnlyJob(current) && !visited.has(current.id)) {
+    visited.add(current.id)
+    const parentId = current.config?.resumeFromJobId
+    if (!parentId) break
+    const parent = jobs.find((candidate) => candidate.id === parentId)
+    if (!parent) return parentId
+    current = parent
   }
-  return latest
+  return current.id
+}
+
+function audienceSourceJobFor(jobs: Job[], job: Job | null | undefined) {
+  const sourceJobId = audienceSourceJobIdFor(job, jobs)
+  return sourceJobId ? jobs.find((candidate) => candidate.id === sourceJobId) || job || null : null
+}
+
+function audienceTaskForSource(jobs: Job[], sourceJobId: string | null) {
+  if (!sourceJobId) return null
+  const candidates = jobs.filter((job) => (
+    isAudienceOnlyJob(job) && audienceSourceJobIdFor(job, jobs) === sourceJobId
+  ))
+  return candidates.find((job) => ['queued', 'resuming', 'running'].includes(job.status)) || candidates[0] || null
+}
+
+function audienceSnapshotRegressed(current: AudienceResultsResponse, next: AudienceResultsResponse) {
+  if (!next.available) return true
+  return next.total < current.total
+    || next.posts.length < current.posts.length
+    || next.totals.posts < current.totals.posts
+    || next.totals.comments < current.totals.comments
+    || next.totals.users < current.totals.users
+    || next.summary.postsTotal < current.summary.postsTotal
+    || next.summary.commentsCollected < current.summary.commentsCollected
+    || next.summary.usersDiscovered < current.summary.usersDiscovered
 }
 
 function workspaceModeFromLocation(): AnalysisMode {
@@ -1002,6 +1238,40 @@ function workspacePath(mode: AnalysisMode) {
 function generalResultModuleFromLocation(): GeneralResultModule {
   if (typeof window === 'undefined') return 'insights'
   return new URLSearchParams(window.location.search).get('module') === 'audience' ? 'audience' : 'insights'
+}
+
+function audienceDataJobIdFromLocation() {
+  if (typeof window === 'undefined') return ''
+  return new URLSearchParams(window.location.search).get('job') || ''
+}
+
+function writeAudienceDataJobToLocation(jobId: string) {
+  const url = new URL(window.location.href)
+  if (jobId) url.searchParams.set('job', jobId)
+  else url.searchParams.delete('job')
+  window.history.replaceState(window.history.state || {}, '', `${url.pathname}${url.search}${url.hash}`)
+}
+
+async function findBestAudienceDataJob(jobs: Job[], preferredJobId = '', sourceJobId: string | null = null) {
+  const generalJobs = jobs.filter((job) => jobAnalysisMode(job) === 'general')
+  const linkedJobs = sourceJobId
+    ? generalJobs.filter((job) => audienceSourceJobIdFor(job, generalJobs) === sourceJobId)
+    : generalJobs
+  const ordered = [
+    ...generalJobs.filter((job) => job.id === preferredJobId),
+    ...linkedJobs.filter((job) => job.id !== preferredJobId),
+    ...generalJobs.filter((job) => job.id !== preferredJobId && !linkedJobs.some((linked) => linked.id === job.id)),
+  ]
+  const inspected = await Promise.all(ordered.map(async (job) => {
+    try {
+      return { job, payload: await api.audience(job.id, 'comments', 0, 1) }
+    } catch {
+      return null
+    }
+  }))
+  return inspected.find((entry) => entry && entry.payload.totals.comments > 0)?.job
+    || inspected.find((entry) => entry && entry.payload.available)?.job
+    || null
 }
 
 const legacyJobIntentPattern = /(?:岗位|职位|招聘|招募|求职|应聘|内推|校招|社招|实习|面试|简历|job|jobs|hiring|hire|career|careers|recruit|recruitment|intern|internship|position|vacancy)/i
@@ -1073,12 +1343,15 @@ function App() {
   const [resultSort, setResultSort] = useState<'newest' | 'oldest'>('newest')
   const [resultTimeRange, setResultTimeRange] = useState<'all' | '1' | '3' | '7' | '30' | '90' | 'unknown'>('all')
   const [audienceResults, setAudienceResults] = useState<AudienceResultsResponse | null>(null)
+  const [audienceTask, setAudienceTask] = useState<Job | null>(null)
+  const [audienceDataJobId, setAudienceDataJobId] = useState('')
   const [audienceKind, setAudienceKind] = useState<'comments' | 'users'>('comments')
   const [audiencePostId, setAudiencePostId] = useState('')
   const [audienceQuery, setAudienceQuery] = useState('')
   const [audienceOffset, setAudienceOffset] = useState(0)
   const [audienceLoading, setAudienceLoading] = useState(false)
   const [audienceResuming, setAudienceResuming] = useState(false)
+  const [audienceActionMessage, setAudienceActionMessage] = useState<string | null>(null)
   const resultViewCache = useRef<Record<AnalysisMode, WorkspaceResultView>>({
     job: { activeJobId: null, results: null, selectedNoteId: null, resultOffset: 0, resultSort: 'newest', resultTimeRange: 'all' },
     general: { activeJobId: null, results: null, selectedNoteId: null, resultOffset: 0, resultSort: 'newest', resultTimeRange: 'all' },
@@ -1118,10 +1391,13 @@ function App() {
   const [importingProfile, setImportingProfile] = useState(false)
   const [candidateImportStatus, setCandidateImportStatus] = useState<'recognized' | 'empty' | null>(null)
   const cleanupStream = useRef<null | (() => void)>(null)
+  const streamGeneration = useRef(0)
+  const resumeIdempotencyKeys = useRef(new Map<string, string>())
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
   const rateLimitAlertRef = useRef<string | null>(null)
   const resultsRequestRef = useRef(0)
   const audienceRequestRef = useRef(0)
+  const audienceResultsRef = useRef<{ sourceJobId: string; value: AudienceResultsResponse } | null>(null)
   const relayGuideAutoOpened = useRef(false)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
@@ -1142,9 +1418,23 @@ function App() {
   ))
   const smtpSetupGuide = smtpSetupGuides[smtpGuideProvider]
   const smtpGuideHost = smtpConfig.provider === smtpGuideProvider && smtpConfig.host ? smtpConfig.host : smtpSetupGuide.host
+  const audienceSourceJobId = audienceSourceJobIdFor(activeJob, jobs)
+  const linkedAudienceTask = audienceTask && audienceSourceJobIdFor(audienceTask, jobs) === audienceSourceJobId ? audienceTask : null
+  const trackedAudienceTask = linkedAudienceTask || (activeJob?.config?.collectAudience ? activeJob : null)
+  const selectedAudienceDataJob = jobs.find((job) => (
+    job.id === audienceDataJobId && audienceSourceJobIdFor(job, jobs) === audienceSourceJobId
+  ))
+  const audienceReadJobId = linkedAudienceTask?.id || selectedAudienceDataJob?.id || audienceSourceJobId
+
+  const disconnectJobStream = useCallback(() => {
+    streamGeneration.current += 1
+    cleanupStream.current?.()
+    cleanupStream.current = null
+  }, [])
 
   const switchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true) => {
     if (mode === workspaceMode) return
+    disconnectJobStream()
     resultsRequestRef.current += 1
     audienceRequestRef.current += 1
     requestCache.current[workspaceMode] = request
@@ -1175,15 +1465,25 @@ function App() {
     setRequest({ ...requestCache.current[mode] })
     const scopedJobs = jobs.filter((job) => jobAnalysisMode(job) === mode)
     const rememberedJobId = activeJobIdCache.current[mode]
-    const nextJob = scopedJobs.find((job) => job.id === rememberedJobId) || scopedJobs[0] || null
+    const nextCandidate = scopedJobs.find((job) => job.id === rememberedJobId)
+      || scopedJobs.find((job) => !isAudienceOnlyJob(job))
+      || scopedJobs[0]
+      || null
+    const nextJob = audienceSourceJobFor(scopedJobs, nextCandidate)
+    const nextAudienceTask = mode === 'general'
+      ? (isAudienceOnlyJob(nextCandidate) ? nextCandidate : audienceTaskForSource(scopedJobs, nextJob?.id || null))
+      : null
     const nextView = resultViewCache.current[mode]
     const canRestoreView = Boolean(nextJob && nextView.activeJobId === nextJob.id && nextView.results?.analysisMode === mode)
     const nextResults = canRestoreView ? nextView.results : null
     setActiveJob(nextJob)
+    setAudienceTask(nextAudienceTask)
     setArtifacts([])
     setCoverage(null)
     setResults(nextResults)
     setAudienceResults(null)
+    setAudienceDataJobId('')
+    setAudienceActionMessage(null)
     setAudienceOffset(0)
     setAudiencePostId('')
     setAudienceQuery('')
@@ -1195,15 +1495,30 @@ function App() {
     setResultsLoading(Boolean(nextJob) && !canRestoreView)
     setNotice(null)
     window.scrollTo({ top: 0, behavior: 'smooth' })
-  }, [activeJob, jobs, request, resultOffset, results, resultSort, resultTimeRange, selectedResult, workspaceMode])
+  }, [activeJob, disconnectJobStream, jobs, request, resultOffset, results, resultSort, resultTimeRange, selectedResult, workspaceMode])
 
-  const switchGeneralResultModule = useCallback((module: GeneralResultModule) => {
+  const switchGeneralResultModule = useCallback((module: GeneralResultModule, preferredJobId = '') => {
     setGeneralResultModule(module)
     const url = new URL(window.location.href)
-    if (module === 'audience') url.searchParams.set('module', 'audience')
-    else url.searchParams.delete('module')
+    if (module === 'audience') {
+      url.searchParams.set('module', 'audience')
+      const requestedJobId = preferredJobId || audienceDataJobId || audienceDataJobIdFromLocation()
+      if (requestedJobId) {
+        setAudienceDataJobId(requestedJobId)
+        url.searchParams.set('job', requestedJobId)
+      }
+      const sourceJobId = audienceSourceJobIdFor(activeJob, jobs)
+      void findBestAudienceDataJob(jobs, requestedJobId, sourceJobId).then((job) => {
+        if (!job) return
+        setAudienceDataJobId(job.id)
+        writeAudienceDataJobToLocation(job.id)
+      })
+    } else {
+      url.searchParams.delete('module')
+      url.searchParams.delete('job')
+    }
     window.history.replaceState({ ...(window.history.state || {}), generalResultModule: module }, '', `${url.pathname}${url.search}${url.hash}`)
-  }, [])
+  }, [activeJob, audienceDataJobId, jobs])
 
   useEffect(() => {
     requestCache.current[workspaceMode] = request
@@ -1228,12 +1543,21 @@ function App() {
 
   useEffect(() => {
     const handlePopState = () => {
-      setGeneralResultModule(generalResultModuleFromLocation())
+      const nextModule = generalResultModuleFromLocation()
+      setGeneralResultModule(nextModule)
+      if (nextModule === 'audience') {
+        const preferredJobId = audienceDataJobIdFromLocation()
+        void findBestAudienceDataJob(jobs, preferredJobId, audienceSourceJobIdFor(activeJob, jobs)).then((job) => {
+          setAudienceDataJobId(job?.id || preferredJobId)
+        })
+      } else {
+        setAudienceDataJobId('')
+      }
       switchWorkspace(workspaceModeFromLocation(), false)
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [switchWorkspace])
+  }, [activeJob, jobs, switchWorkspace])
 
   useEffect(() => {
     document.title = workspaceMode === 'general' ? '继任非岗位内容研究工作台' : '继任采集与投递工作台'
@@ -1507,11 +1831,21 @@ function App() {
       const next = Array.isArray(response) ? response : []
       const scoped = next.filter((job) => jobAnalysisMode(job) === workspaceMode)
       setJobs(next)
+      setAudienceTask((current) => {
+        if (workspaceMode !== 'general') return null
+        const sourceJobId = audienceSourceJobIdFor(current, next) || activeJobIdCache.current.general
+        return (current ? next.find((job) => job.id === current.id) : null)
+          || audienceTaskForSource(scoped, sourceJobId)
+      })
       setActiveJob((current) => {
         const rememberedJobId = activeJobIdCache.current[workspaceMode]
-        const nextActive = current && jobAnalysisMode(current) === workspaceMode
-          ? latestCompletionJob(scoped, current)
-          : scoped.find((job) => job.id === rememberedJobId) || scoped[0] || null
+        const nextCandidate = current && jobAnalysisMode(current) === workspaceMode
+          ? scoped.find((job) => job.id === current.id) || current
+          : scoped.find((job) => job.id === rememberedJobId)
+            || scoped.find((job) => !isAudienceOnlyJob(job))
+            || scoped[0]
+            || null
+        const nextActive = audienceSourceJobFor(scoped, nextCandidate)
         activeJobIdCache.current[workspaceMode] = nextActive?.id || null
         return nextActive
       })
@@ -1794,18 +2128,36 @@ function App() {
   const loadAudienceResults = useCallback(async (
     jobId: string,
     offset = 0,
-    options: { silent?: boolean } = {},
+    options: { silent?: boolean; preserveExisting?: boolean; fallbackJobId?: string | null; sourceJobId?: string | null } = {},
   ) => {
     const requestId = ++audienceRequestRef.current
     if (!options.silent) setAudienceLoading(true)
     try {
-      const payload = await api.audience(jobId, audienceKind, offset, 40, {
+      let payload = await api.audience(jobId, audienceKind, offset, 40, {
         postId: audiencePostId,
         query: audienceQuery,
       })
+      if (!payload.available && options.fallbackJobId && options.fallbackJobId !== jobId) {
+        payload = await api.audience(options.fallbackJobId, audienceKind, offset, 40, {
+          postId: audiencePostId,
+          query: audienceQuery,
+        })
+      }
       if (requestId !== audienceRequestRef.current) return
-      setAudienceResults(payload)
-      setAudienceOffset(offset)
+      const sourceJobId = options.sourceJobId || options.fallbackJobId || jobId
+      const previous = audienceResultsRef.current
+      const sameView = previous?.sourceJobId === sourceJobId
+        && previous.value.kind === payload.kind
+        && previous.value.filters.postId === payload.filters.postId
+        && previous.value.filters.query === payload.filters.query
+      const preservePrevious = Boolean(options.preserveExisting
+        && previous?.value.available
+        && sameView
+        && audienceSnapshotRegressed(previous.value, payload))
+      const nextResults = preservePrevious ? previous!.value : payload
+      audienceResultsRef.current = { sourceJobId, value: nextResults }
+      setAudienceResults(nextResults)
+      if (!preservePrevious) setAudienceOffset(offset)
     } catch (error) {
       if (requestId !== audienceRequestRef.current || options.silent) return
       setNotice(`受众数据读取失败：${(error as Error).message}`)
@@ -1825,7 +2177,25 @@ function App() {
         const nextJobs = Array.isArray(jobsResult.value) ? jobsResult.value : []
         const initialMode = workspaceModeFromLocation()
         setJobs(nextJobs)
-        const initialJob = nextJobs.find((job) => jobAnalysisMode(job) === initialMode) || null
+        const scopedJobs = nextJobs.filter((job) => jobAnalysisMode(job) === initialMode)
+        const initialCandidate = scopedJobs.find((job) => !isAudienceOnlyJob(job)) || scopedJobs[0] || null
+        let initialJob = audienceSourceJobFor(scopedJobs, initialCandidate)
+        if (initialMode === 'general' && generalResultModuleFromLocation() === 'audience') {
+          const audienceDataJob = await findBestAudienceDataJob(nextJobs, audienceDataJobIdFromLocation())
+          if (!mounted) return
+          if (audienceDataJob) {
+            initialJob = audienceSourceJobFor(scopedJobs, audienceDataJob) || initialJob
+            setAudienceDataJobId(audienceDataJob.id)
+            writeAudienceDataJobToLocation(audienceDataJob.id)
+            setAudienceTask(isAudienceOnlyJob(audienceDataJob)
+              ? audienceDataJob
+              : audienceTaskForSource(scopedJobs, initialJob?.id || null))
+          } else {
+            setAudienceTask(audienceTaskForSource(scopedJobs, initialJob?.id || null))
+          }
+        } else if (initialMode === 'general') {
+          setAudienceTask(audienceTaskForSource(scopedJobs, initialJob?.id || null))
+        }
         activeJobIdCache.current[initialMode] = initialJob?.id || null
         setActiveJob(initialJob)
       }
@@ -2004,22 +2374,31 @@ function App() {
   }, [activeJob?.id, activeJob?.status, loadResults, resultOffset])
 
   useEffect(() => {
-    if (!activeJob || workspaceMode !== 'general' || generalResultModule !== 'audience') return
-    const timer = window.setTimeout(() => void loadAudienceResults(activeJob.id, 0), audienceQuery ? 250 : 0)
+    if (!audienceReadJobId || workspaceMode !== 'general' || generalResultModule !== 'audience') return
+    const timer = window.setTimeout(() => void loadAudienceResults(audienceReadJobId, 0, {
+      preserveExisting: audienceReadJobId !== audienceSourceJobId,
+      fallbackJobId: audienceSourceJobId,
+      sourceJobId: audienceSourceJobId,
+    }), audienceQuery ? 250 : 0)
     return () => window.clearTimeout(timer)
-  }, [activeJob?.id, activeJob?.status, activeJob?.applicationCount, audienceKind, audiencePostId, audienceQuery, generalResultModule, loadAudienceResults, workspaceMode])
+  }, [audienceKind, audiencePostId, audienceQuery, audienceReadJobId, audienceSourceJobId, generalResultModule, loadAudienceResults, trackedAudienceTask?.status, workspaceMode])
 
   useEffect(() => {
-    if (!activeJob || workspaceMode !== 'general' || generalResultModule !== 'audience' || !['queued', 'running'].includes(activeJob.status)) return
+    if (!audienceReadJobId || !trackedAudienceTask || workspaceMode !== 'general' || generalResultModule !== 'audience' || !['queued', 'resuming', 'running'].includes(trackedAudienceTask.status)) return
     const timer = window.setInterval(() => {
-      void loadAudienceResults(activeJob.id, audienceOffset, { silent: true })
+      void loadAudienceResults(audienceReadJobId, audienceOffset, {
+        silent: true,
+        preserveExisting: true,
+        fallbackJobId: audienceSourceJobId,
+        sourceJobId: audienceSourceJobId,
+      })
     }, 5_000)
     return () => window.clearInterval(timer)
-  }, [activeJob?.id, activeJob?.status, audienceOffset, generalResultModule, loadAudienceResults, workspaceMode])
+  }, [audienceOffset, audienceReadJobId, audienceSourceJobId, generalResultModule, loadAudienceResults, trackedAudienceTask?.id, trackedAudienceTask?.status, workspaceMode])
 
   useEffect(() => {
     if (!completionFlow?.jobId || !activeJob || activeJob.id !== completionFlow.jobId) return
-    if (activeJob.status === 'queued' || activeJob.status === 'running') {
+    if (['queued', 'resuming', 'running'].includes(activeJob.status)) {
       if (completionFlow.stage !== 'running') {
         setCompletionFlow((current) => current ? {
           ...current,
@@ -2080,12 +2459,47 @@ function App() {
   }, [activeJob, completionFlow, resultSort, resultTimeRange, workspaceMode])
 
   useEffect(() => {
-    if (!activeJob?.rateLimit?.detected) return
-    const alertKey = `${activeJob.id}:${activeJob.rateLimit.detectedAt || 'detected'}`
+    const rateLimitStatus = activeJob?.rateLimit?.status
+    if (!activeJob?.rateLimit?.detected || !['waiting', 'stopped'].includes(rateLimitStatus || '')) return
+    const alertKey = `${activeJob.id}:${activeJob.rateLimit.detectedAt || 'detected'}:${rateLimitStatus}:${activeJob.rateLimit.retryAttempt || 0}`
     if (rateLimitAlertRef.current === alertKey) return
     rateLimitAlertRef.current = alertKey
-    setNotice('检测到平台限流：系统已停止新增访问并保留检查点。请先手动打开小红书确认访问恢复，再从检查点续跑。')
-  }, [activeJob?.id, activeJob?.rateLimit?.detected, activeJob?.rateLimit?.detectedAt])
+    setNotice(rateLimitStatus === 'waiting'
+      ? `检测到平台限流：系统正在自动冷却并进行第 ${activeJob.rateLimit.retryAttempt || 1} / ${activeJob.rateLimit.maxRetries || 5} 次恢复探测。`
+      : '平台限流自动恢复重试已耗尽，检查点已保存；平台恢复后可继续补采。')
+  }, [activeJob?.id, activeJob?.rateLimit?.detected, activeJob?.rateLimit?.detectedAt, activeJob?.rateLimit?.status, activeJob?.rateLimit?.retryAttempt, activeJob?.rateLimit?.maxRetries])
+
+  useEffect(() => {
+    if (!trackedAudienceTask) return
+    const summary = trackedAudienceTask.workflowSummary?.audience as Record<string, unknown> | undefined
+    if (trackedAudienceTask.rateLimit?.status === 'waiting') {
+      const users = Number(summary?.usersDiscovered || 0)
+      setAudienceActionMessage(`平台触发限流，已发现 ${users} 个公开用户并保存检查点；系统正在自动冷却并探测恢复，无需手动反复续跑。`)
+      return
+    }
+    if (trackedAudienceTask.rateLimit?.status === 'stopped') {
+      const users = Number(summary?.usersDiscovered || 0)
+      setAudienceActionMessage(`平台限流自动恢复重试已耗尽，已发现 ${users} 个公开用户，检查点完整保留；平台恢复后可继续补采。`)
+      return
+    }
+    if (trackedAudienceTask.status === 'failed') {
+      setAudienceActionMessage(`受众采集执行失败：${trackedAudienceTask.message || '请查看运行日志后重试。'}`)
+      return
+    }
+    if (trackedAudienceTask.status === 'cancelled' || trackedAudienceTask.status === 'interrupted') {
+      setAudienceActionMessage('受众采集已停止，已完成结果和检查点均已保留，可继续补采未完成帖子。')
+      return
+    }
+    if (trackedAudienceTask.status === 'incomplete') {
+      setAudienceActionMessage('本轮受众采集尚未达到全量覆盖，已完成结果和检查点均已保留，可继续补采未完成帖子。')
+      return
+    }
+    if (trackedAudienceTask.status === 'completed') {
+      setAudienceActionMessage(String(summary?.status || '') === 'complete'
+        ? '评论、楼中楼回复与公开用户资料已完成全量采集。'
+        : '本轮采集已结束，未覆盖部分已保留为待续跑状态。')
+    }
+  }, [trackedAudienceTask?.id, trackedAudienceTask?.status, trackedAudienceTask?.message, trackedAudienceTask?.rateLimit?.status, trackedAudienceTask?.workflowSummary?.audience])
 
   useEffect(() => {
     if (!activeJob || activeJob.coverage || activeJob.workflowSummary || coverage) return
@@ -2105,11 +2519,21 @@ function App() {
 
   const applyEvent = useCallback((event: JobEvent) => {
     if (event.line) setLogs((current) => [...current.slice(-399), event.line!])
-    if (event.job) {
-      if (jobAnalysisMode(event.job) === workspaceMode) setActiveJob(event.job)
-      setJobs((current) => [event.job!, ...current.filter((item) => item.id !== event.job!.id)])
+    const eventJob = event.job
+    const currentAttempt = eventJob?.attempts?.find((attempt) => attempt.attemptId === eventJob.currentAttemptId)
+      || eventJob?.attempts?.at(-1)
+    const legacyAudienceEvent = isAudienceOnlyJob(eventJob)
+    const audienceEvent = legacyAudienceEvent || currentAttempt?.resumeScope === 'audience'
+    if (eventJob) {
+      if (audienceEvent) setAudienceTask(eventJob)
+      setActiveJob((current) => {
+        if (current?.id === eventJob.id) return eventJob
+        if (legacyAudienceEvent) return current
+        return jobAnalysisMode(eventJob) === workspaceMode ? eventJob : current
+      })
+      setJobs((current) => replaceJobInPlace(current, eventJob))
     }
-    if (event.artifacts) setArtifacts(event.artifacts)
+    if (event.artifacts && !legacyAudienceEvent) setArtifacts(event.artifacts)
     if (event.message && event.type === 'error') setNotice(event.message)
     if (
       event.type === 'done'
@@ -2118,22 +2542,34 @@ function App() {
   }, [loadJobs, workspaceMode])
 
   const connectJob = useCallback((job: Job) => {
+    const generation = streamGeneration.current + 1
+    streamGeneration.current = generation
     cleanupStream.current?.()
-    cleanupStream.current = api.subscribe(job.id, applyEvent, () => {
+    const expectedJobId = job.id
+    cleanupStream.current = api.subscribe(job.id, (event) => {
+      if (streamGeneration.current !== generation) return
+      if (event.job && event.job.id !== expectedJobId) return
+      applyEvent(event)
+    }, () => {
+      if (streamGeneration.current !== generation) return
       window.setTimeout(() => void loadJobs(), 800)
     })
+    return generation
   }, [applyEvent, loadJobs])
 
   useEffect(() => {
-    if (!activeJob || !['queued', 'running'].includes(activeJob.status)) return
-    connectJob(activeJob)
+    if (!activeJob || !['queued', 'resuming', 'running'].includes(activeJob.status)) return
+    const generation = connectJob(activeJob)
     return () => {
-      cleanupStream.current?.()
-      cleanupStream.current = null
+      if (streamGeneration.current === generation) disconnectJobStream()
     }
-  }, [activeJob?.id, activeJob?.status, connectJob])
+  }, [activeJob?.id, activeJob?.status, connectJob, disconnectJobStream])
 
   const runJob = async (payload: JobRequest, sessionHint: AiSession | null = aiSession): Promise<Job | null> => {
+    if (payload.mode === 'resume' || payload.resumeFromJobId) {
+      setNotice('续跑必须通过原任务恢复入口执行。')
+      return null
+    }
     if (payload.analysisMode === 'general' && !payload.checkOnly && !sessionHint) {
       setNotice('内容模式需要先连接 AI 模型，正文、图片和动态栏目才会进入同一次分析。')
       document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -2185,29 +2621,41 @@ function App() {
   }
 
   const resumeAudienceCollection = async () => {
-    if (!activeJob || jobAnalysisMode(activeJob) !== 'general') {
-      setNotice('请先选择一条非岗位内容采集任务。')
+    const resumeTargetJobId = audienceSourceJobId
+    if (!activeJob || !resumeTargetJobId || jobAnalysisMode(activeJob) !== 'general') {
+      const message = '请先选择一条非岗位内容采集任务。'
+      setAudienceActionMessage(message)
+      setNotice(message)
       return
     }
     setAudienceResuming(true)
+    setAudienceActionMessage('正在从检查点恢复原任务…')
     setNotice(null)
     try {
-      const response = await api.resumeAudience(activeJob.id)
-      setActiveJob(response.job)
-      setJobs((current) => [response.job, ...current.filter((item) => item.id !== response.job.id)])
-      if (['queued', 'running'].includes(response.job.status)) connectJob(response.job)
-      switchGeneralResultModule('audience')
-      await loadAudienceResults(response.job.id, 0)
-      setNotice(response.action === 'already_complete'
-        ? '评论、回复与用户公开资料已经全量完成。'
-        : response.action === 'attached'
-          ? '已接管正在运行的受众采集任务，页面会实时刷新覆盖率。'
-          : '受众采集已从检查点续跑，将逐帖展开评论与楼中楼回复。')
+      const resumeTargetJob = jobs.find((job) => job.id === resumeTargetJobId) || activeJob
+      const resumedJob = await resumeJob(resumeTargetJob, 'audience', null)
+      if (!resumedJob) throw new Error('原任务未能恢复，请查看任务状态。')
+      setAudienceTask(resumedJob)
+      setJobs((current) => replaceJobInPlace(current, resumedJob))
+      if (['queued', 'resuming', 'running'].includes(resumedJob.status)) connectJob(resumedJob)
+      switchGeneralResultModule('audience', resumeTargetJobId)
+      setAudienceDataJobId(resumeTargetJobId)
+      writeAudienceDataJobToLocation(resumeTargetJobId)
+      await loadAudienceResults(resumeTargetJobId, 0, {
+        preserveExisting: true,
+        fallbackJobId: linkedAudienceTask?.id !== resumeTargetJobId ? linkedAudienceTask?.id : undefined,
+        sourceJobId: resumeTargetJobId,
+      })
+      const message = '已从原任务检查点继续，只补采未采集和部分采集的链接；已有内容保持显示。'
+      setAudienceActionMessage(message)
+      setNotice(message)
     } catch (error) {
       const apiError = error as Error & { code?: string }
-      setNotice(apiError.code === 'JOB_BUSY'
-        ? '当前已有另一项采集任务运行；完成后可继续受众采集。'
-        : `受众采集启动失败：${apiError.message}`)
+      const message = apiError.code === 'JOB_BUSY'
+        ? '当前任务仍在运行，受众采集暂未排入队列，请刷新后重试。'
+        : `受众采集启动失败：${apiError.message}`
+      setAudienceActionMessage(message)
+      setNotice(message)
     } finally {
       setAudienceResuming(false)
     }
@@ -2244,10 +2692,11 @@ function App() {
     }
   }
 
-  const resumeJob = async (job: Job, completeMissingOnly = false, sessionHint: AiSession | null = aiSession) => {
-    if (!job.resumeAvailable) return null
+  const resumeJob = async (job: Job, scope: ResumeScope = 'full', sessionHint: AiSession | null = aiSession) => {
+    if (scope !== 'audience' && !job.resumeAvailable && !['queued', 'resuming', 'running'].includes(job.status)) return null
+    const needsAi = !['audience', 'artifacts', 'discovery'].includes(scope)
     let session = sessionHint
-    if (!session) {
+    if (needsAi && !session) {
       setRestoringAi(true)
       setNotice('AI 会话已失效，正在自动恢复已保存的模型配置…')
       try {
@@ -2260,37 +2709,56 @@ function App() {
         setRestoringAi(false)
       }
     }
-    const source = job.config
-    if (!source) {
-      setNotice('该任务缺少原始配置，无法构造续跑请求。')
+    const operationId = `${job.id}:${scope}`
+    const idempotencyKey = resumeIdempotencyKeys.current.get(operationId)
+      || newResumeIdempotencyKey(job.id, scope)
+    resumeIdempotencyKeys.current.set(operationId, idempotencyKey)
+    setSubmitting(true)
+    setNotice('正在恢复原任务…')
+    try {
+      const requestResume = () => api.resumeJob(job.id, {
+        scope,
+        idempotencyKey,
+        ...(session ? { aiSessionId: session.id } : {}),
+      })
+      let resumedJob: Job
+      try {
+        resumedJob = await requestResume()
+      } catch (error) {
+        const apiError = error as Error & { code?: string }
+        if (apiError.code === 'JOB_ALREADY_RUNNING' || apiError.code === 'JOB_ATTEMPT_ACTIVE') {
+          resumedJob = await api.job(job.id)
+        } else if (apiError.code === 'AI_SESSION_EXPIRED' && needsAi) {
+          setRestoringAi(true)
+          try {
+            session = await restoreAiSession()
+          } finally {
+            setRestoringAi(false)
+          }
+          resumedJob = await requestResume()
+        } else {
+          throw error
+        }
+      }
+      if (resumedJob.id !== job.id) {
+        throw new Error('恢复响应返回了不同的任务 ID。')
+      }
+      setActiveJob((current) => current?.id === job.id ? resumedJob : current)
+      setJobs((current) => replaceJobInPlace(current, resumedJob))
+      if (scope === 'audience') setAudienceTask(resumedJob)
+      if (['queued', 'resuming', 'running'].includes(resumedJob.status)) connectJob(resumedJob)
+      return resumedJob
+    } catch (error) {
+      setNotice((error as Error).message)
       return null
+    } finally {
+      setSubmitting(false)
+      window.setTimeout(() => {
+        if (resumeIdempotencyKeys.current.get(operationId) === idempotencyKey) {
+          resumeIdempotencyKeys.current.delete(operationId)
+        }
+      }, 5_000)
     }
-    const analysisMode = jobAnalysisMode(job)
-    const profileId = source.profileId || request.profileId
-    if (analysisMode === 'job' && !profileId) {
-      setNotice('请先选择背景记忆，再从检查点续跑。')
-      return null
-    }
-    const payload: JobRequest = {
-      ...defaultRequest,
-      ...source,
-      searchSort: 'latest',
-      maxAgeDays: 0,
-      limit: 0,
-      relayPort: relayConfig.port,
-      mode: 'resume',
-      resumeFromJobId: job.id,
-      completeMissingOnly,
-      checkOnly: false,
-      aiSessionId: session.id,
-      analysisMode,
-      profileId: analysisMode === 'job' ? profileId : null,
-      candidateProfile: {
-        ...defaultCandidateProfile,
-        ...(source.candidateProfile || request.candidateProfile),
-      },
-    }
-    return runJob(payload, session)
   }
 
   const refreshSecurityAndContinue = async (job: Job) => {
@@ -2309,22 +2777,11 @@ function App() {
 
       const nextJobs = await api.jobs()
       setJobs(nextJobs)
-      const existingResume = nextJobs.find((candidate) => (
-        ['queued', 'running'].includes(candidate.status)
-        && candidate.config?.resumeFromJobId === job.id
-      ))
-      if (existingResume) {
-        setActiveJob(existingResume)
-        connectJob(existingResume)
-        setNotice('验证状态已刷新，已切换到正在执行的续跑任务。')
-        return
-      }
-
       const refreshedJob = nextJobs.find((candidate) => candidate.id === job.id) || job
       setActiveJob(refreshedJob)
-      if (['queued', 'running'].includes(refreshedJob.status)) {
+      if (['queued', 'resuming', 'running'].includes(refreshedJob.status)) {
         connectJob(refreshedJob)
-        setNotice('验证状态已刷新。运行中的任务会在下一次检测时自动继续，无需再次点击。')
+        setNotice('验证状态已刷新，原任务会继续使用同一任务 ID。')
         window.setTimeout(() => void loadJobs(), 5_500)
         return
       }
@@ -2333,8 +2790,8 @@ function App() {
         return
       }
 
-      const resumed = await resumeJob(refreshedJob)
-      if (resumed) setNotice('安全验证已完成，已从保存的检查点自动续跑。')
+      const resumed = await resumeJob(refreshedJob, 'full')
+      if (resumed) setNotice('安全验证已完成，已从原任务检查点继续。')
     } catch (error) {
       setRelay({ running: false, cdpReady: false, port: relayConfig.port, message: (error as Error).message })
       setNotice((error as Error).message)
@@ -2353,6 +2810,17 @@ function App() {
     const sourceJobId = activeJob.id
     const noun = generalMode ? '内容分析' : '岗位信息'
     const knownIncomplete = results?.filters.stats.incomplete ?? null
+    if (knownIncomplete === 0) {
+      setCompletionFlow({
+        stage: 'complete',
+        sourceJobId,
+        jobId: sourceJobId,
+        incompleteBefore: 0,
+        message: `核对完成，当前没有未完整${noun}。`,
+      })
+      setNotice(`所有${noun}均已完整，无需重复运行。`)
+      return
+    }
     setCompletingMissing(true)
     setCompletionFlow({
       stage: 'checking',
@@ -2379,17 +2847,25 @@ function App() {
       setCompletionFlow((current) => current ? {
         ...current,
         stage: 'starting',
-        message: '正在接管已有任务或创建仅处理缺失记录的补全任务。',
+        message: '正在从检查点恢复原任务，仅处理缺失记录。',
       } : current)
 
       let response
       try {
-        response = await api.completeMissing(sourceJobId, session?.id || null)
+        const resumedJob = await resumeJob(activeJob, 'body_completion', session)
+        if (!resumedJob) throw new Error('原任务未能从正文检查点恢复。')
+        response = {
+          action: 'started' as const,
+          sourceJobId,
+          incompleteBefore: knownIncomplete,
+          job: resumedJob,
+          message: 'The original task resumed from its body checkpoint.',
+        }
       } catch (error) {
         const apiError = error as Error & { code?: string; status?: number }
         if (apiError.status === 404) {
           const refreshedJob = await api.job(sourceJobId)
-          if (['queued', 'running'].includes(refreshedJob.status)) {
+          if (['queued', 'resuming', 'running'].includes(refreshedJob.status)) {
             response = {
               action: 'attached' as const,
               sourceJobId,
@@ -2398,7 +2874,7 @@ function App() {
               message: 'The source task is still running.',
             }
           } else {
-            const resumedJob = await resumeJob(refreshedJob, true, session)
+            const resumedJob = await resumeJob(refreshedJob, 'body_completion', session)
             if (!resumedJob) {
               const fallbackError = new Error('当前版本未找到可复用的正文检查点。') as Error & { code?: string }
               fallbackError.code = 'RESUME_CHECKPOINTS_MISSING'
@@ -2425,25 +2901,20 @@ function App() {
           } finally {
             setRestoringAi(false)
           }
-          response = await api.completeMissing(sourceJobId, session.id)
+          const resumedJob = await resumeJob(activeJob, 'body_completion', session)
+          if (!resumedJob) throw new Error('原任务未能从正文检查点恢复。')
+          response = {
+            action: 'started' as const,
+            sourceJobId,
+            incompleteBefore: knownIncomplete,
+            job: resumedJob,
+            message: 'The original task resumed after reconnecting AI.',
+          }
         }
       }
 
-      if (response.action === 'already_complete') {
-        await loadResults(response.job.id, 0)
-        setCompletionFlow({
-          stage: 'complete',
-          sourceJobId,
-          jobId: response.job.id,
-          incompleteBefore: 0,
-          message: `核对完成，当前没有未完整${noun}。`,
-        })
-        setNotice(`所有${noun}均已完整，无需重复运行。`)
-        return
-      }
-
       setActiveJob(response.job)
-      setJobs((current) => [response.job, ...current.filter((item) => item.id !== response.job.id)])
+      setJobs((current) => replaceJobInPlace(current, response.job))
       connectJob(response.job)
       setCompletionFlow({
         stage: 'running',
@@ -2451,10 +2922,10 @@ function App() {
         jobId: response.job.id,
         incompleteBefore: response.incompleteBefore ?? knownIncomplete,
         message: response.action === 'attached'
-          ? '已接管正在运行的任务，页面会持续显示实时进度。'
-          : `已创建补全任务，仅处理 ${response.incompleteBefore ?? knownIncomplete ?? 0} 条缺失记录。`,
+          ? '原任务正在运行，页面会持续显示实时进度。'
+          : `已恢复原任务，仅处理 ${response.incompleteBefore ?? knownIncomplete ?? 0} 条缺失记录。`,
       })
-      setNotice(response.action === 'attached' ? '已接管正在运行的补全流程。' : '补全任务已启动，完成后会自动刷新结果。')
+      setNotice(response.action === 'attached' ? '原任务正在继续补全。' : '已从原任务检查点继续，完成后会自动刷新结果。')
     } catch (error) {
       const apiError = error as Error & { code?: string }
       const message = apiError.code === 'RESUME_CHECKPOINTS_MISSING'
@@ -2482,9 +2953,28 @@ function App() {
   }
 
   const selectJob = (job: Job) => {
-    setActiveJob(job)
+    disconnectJobStream()
+    const targetMode = jobAnalysisMode(job)
+    const scopedJobs = jobs.filter((candidate) => jobAnalysisMode(candidate) === targetMode)
+    const sourceJob = audienceSourceJobFor(scopedJobs, job)
+    const nextAudienceTask = targetMode === 'general'
+      ? (isAudienceOnlyJob(job) ? job : audienceTaskForSource(scopedJobs, sourceJob?.id || null))
+      : null
+    if (sourceJob?.id !== activeJob?.id) {
+      setAudienceResults(null)
+      setAudienceActionMessage(null)
+      setAudienceOffset(0)
+      setAudiencePostId('')
+      setAudienceQuery('')
+    }
+    setActiveJob(sourceJob)
+    setAudienceTask(nextAudienceTask)
     setLogs([])
-    if (job.status === 'running' || job.status === 'queued') connectJob(job)
+    if (isAudienceOnlyJob(job)) switchGeneralResultModule('audience', job.id)
+    const liveJob = nextAudienceTask && ['running', 'resuming', 'queued'].includes(nextAudienceTask.status)
+      ? nextAudienceTask
+      : sourceJob
+    if (liveJob && ['running', 'resuming', 'queued'].includes(liveJob.status)) connectJob(liveJob)
   }
 
   const openHistoryJob = (job: Job) => {
@@ -2572,21 +3062,23 @@ function App() {
   const remainingCount = Math.max(0, discoveredCount - bodyProcessedCount)
   const progressLabel = activeJob?.progressLabel || (({
     queued: '任务已排队，等待启动',
+    resuming: '正在恢复原任务',
     running: '正在等待下一条实时进度',
     completed: '任务已完成',
     incomplete: `未完成：当前检查点已分析，可继续补全剩余${workspaceMode === 'general' ? '内容' : '岗位'}`,
     interrupted: '未完成：任务已中断，检查点已保留',
+    blocked: '任务已暂停，等待人工处理',
     failed: '执行失败：请查看失败原因',
     cancelled: '未完成：任务已取消',
   } as Record<string, string>)[activeJob?.status || ''] ?? '尚未开始')
   const progressAge = progressUpdateAge(activeJob?.progressUpdatedAt, clock)
-  const runningCount = workspaceJobs.filter((job) => job.status === 'running' || job.status === 'queued').length
+  const runningCount = workspaceJobs.filter((job) => ['queued', 'resuming', 'running'].includes(job.status)).length
   const completedCount = workspaceJobs.filter((job) => job.status === 'completed').length
   const failedCount = workspaceJobs.filter((job) => job.status === 'failed').length
-  const incompleteCount = workspaceJobs.filter((job) => ['incomplete', 'cancelled', 'interrupted'].includes(job.status)).length
+  const incompleteCount = workspaceJobs.filter((job) => ['incomplete', 'cancelled', 'interrupted', 'blocked'].includes(job.status)).length
   const activeOutcome = activeJob?.status === 'failed'
     ? 'failed'
-    : activeJob?.status === 'incomplete' || activeJob?.status === 'cancelled' || activeJob?.status === 'interrupted'
+    : activeJob?.status === 'incomplete' || activeJob?.status === 'cancelled' || activeJob?.status === 'interrupted' || activeJob?.status === 'blocked'
       ? 'incomplete'
       : activeJob?.status || 'idle'
   const currentArtifacts = artifacts.length ? artifacts : activeJob?.artifacts || []
@@ -2606,7 +3098,7 @@ function App() {
   const partialAnalysis = workflowSummary.analysisMode === 'security_timeout_partial'
   const securityVerification = (workflowSummary.securityVerification || {}) as Record<string, unknown>
   const securityStatus = activeJob?.securityRestriction?.status || String(securityVerification.status || '')
-  const securityJobRunning = Boolean(activeJob && ['queued', 'running'].includes(activeJob.status))
+  const securityJobRunning = Boolean(activeJob && ['queued', 'resuming', 'running'].includes(activeJob.status))
   const securityReportedWaiting = securityStatus === 'waiting'
   const securityWaiting = securityReportedWaiting && securityJobRunning
   const securityTimedOut = securityStatus === 'timed_out' || (
@@ -2617,10 +3109,12 @@ function App() {
   const securityTimeoutSeconds = Number(activeJob?.securityRestriction?.timeoutSeconds || securityVerification.timeoutSeconds || activeJob?.config?.securityVerificationTimeoutSeconds || 600)
   const securityTimeoutLabel = securityTimeoutSeconds % 60 === 0 ? `${securityTimeoutSeconds / 60} 分钟` : `${securityTimeoutSeconds} 秒`
   const workflowRateLimit = (workflowSummary.rateLimit || {}) as Record<string, unknown>
-  const rateLimitDetected = Boolean(activeJob?.rateLimit?.detected)
-    || activeJob?.progressPhase === 'rate_limited'
-    || workflowSummary.analysisMode === 'rate_limited_partial'
-    || workflowRateLimit.status === 'stopped'
+  const rateLimitStatus = activeJob?.rateLimit?.status || String(workflowRateLimit.status || '')
+  const rateLimitRecovering = rateLimitStatus === 'waiting'
+  const rateLimitDetected = rateLimitStatus
+    ? rateLimitStatus !== 'cleared'
+    : activeJob?.progressPhase === 'rate_limited'
+      || workflowSummary.analysisMode === 'rate_limited_partial'
   const rateLimitDetectedAt = activeJob?.rateLimit?.detectedAt || String(workflowRateLimit.detectedAt || '')
   const rateLimitReadyToResume = Boolean(activeJob?.resumeAvailable && !securityNeedsAttention)
   const codexRuntime = results?.codexRuntime || (workflowSummary.codexRuntime as Record<string, unknown> | undefined)
@@ -3107,7 +3601,7 @@ function App() {
                     <span><strong>全量发现，发现多少采集多少</strong><small>搜索页发现的每一条内容都会进入候选区和正文队列</small></span>
                     <em>不截断</em>
                   </div>
-                  <small className="field-help">持续滚动至最多 {request.maxScrolls} 轮或连续 {request.stableRounds} 轮没有新结果；中断后从未裁剪的发现清单续跑。</small>
+                  <small className="field-help">全量模式会执行完整 {request.maxScrolls} 轮；连续 {request.stableRounds} 轮没有新增时触发深度加载探测，但不会提前结束。中断后从未裁剪的发现清单续跑。</small>
                 </div>
 
                 <div className="form-row connection">
@@ -3203,16 +3697,16 @@ function App() {
               {activeJob ? (
                 <>
                   <div className="mission-title"><span>关键词</span><strong>{activeJob.keyword}</strong><small>#{activeJob.id.slice(0, 8)}</small></div>
-                  <div className="scope-stamp"><Target size={15} /><span><strong>{activeAllMode ? '全量模式' : '历史限定任务'}</strong><small>{activeAllMode ? `最新优先 · 不限时间 · 发现多少采集多少 · 连续 ${activeJob.config?.stableRounds ?? '-'} 轮稳定后停止` : '历史任务按原检查点展示'}</small></span></div>
+                  <div className="scope-stamp"><Target size={15} /><span><strong>{activeAllMode ? '全量模式' : '历史限定任务'}</strong><small>{activeAllMode ? `最新优先 · 不限时间 · 完整执行 ${activeJob.config?.maxScrolls ?? '-'} 轮发现 · 单路节流采正文` : '历史任务按原检查点展示'}</small></span></div>
                   <div className={`progress-block outcome-${activeOutcome}`} aria-live="polite">
                     <div className="progress-heading">
-                      <span className={activeJob.status === 'running' ? 'live-progress-title active' : 'live-progress-title'}><i />实时进度<small>{progressAge}</small></span>
+                      <span className={['resuming', 'running'].includes(activeJob.status) ? 'live-progress-title active' : 'live-progress-title'}><i />实时进度<small>{progressAge}</small></span>
                       <strong>{Math.round(progress)}%</strong>
                     </div>
                     <div className="progress-track"><i style={{ width: `${Math.min(100, progress)}%` }} /></div>
                     <div className="live-progress-status">
                       <Activity size={16} />
-                      <span><b>{progressLabel}</b><small>{activeJob.status === 'running' ? 'SSE 实时推送中' : activeOutcome === 'failed' ? '错误终止 · 查看失败原因' : activeOutcome === 'incomplete' ? '流程未走完 · 可从检查点继续' : '任务状态快照'}</small></span>
+                      <span><b>{progressLabel}</b><small>{['resuming', 'running'].includes(activeJob.status) ? 'SSE 实时推送中' : activeOutcome === 'failed' ? '错误终止 · 查看失败原因' : activeOutcome === 'incomplete' ? '流程未走完 · 可从检查点继续' : '任务状态快照'}</small></span>
                       {progressTotal > 0 && <em>{Math.min(progressCurrent, progressTotal)} / {progressTotal}</em>}
                     </div>
                     <div className="live-progress-counts">
@@ -3250,21 +3744,21 @@ function App() {
                       <div className="security-recovery-heading">
                         <BellRing size={20} />
                         <span>
-                          <strong>检测到平台限流，需要人工确认</strong>
-                          <small>新增访问已停止，已完成岗位和检查点均已保留。请勿立即反复重试。</small>
+                          <strong>{rateLimitRecovering ? '检测到平台限流，正在自动恢复' : '平台限流自动恢复重试已耗尽'}</strong>
+                          <small>{rateLimitRecovering ? `系统正在冷却并进行第 ${activeJob.rateLimit?.retryAttempt || 1} / ${activeJob.rateLimit?.maxRetries || 5} 次恢复探测，检查点持续保存。` : '已完成内容和检查点均已保留，平台恢复后可从未完成位置继续。'}</small>
                         </span>
-                        <em>人工处理</em>
+                        <em>{rateLimitRecovering ? '自动处理' : '等待恢复'}</em>
                       </div>
                       <ol className="security-recovery-steps rate-limit-recovery-steps">
-                        <li className="done"><span><Check size={13} /></span><div><strong>系统停止访问</strong><small>采集 worker 已退出，不再继续请求新页面</small></div></li>
-                        <li className="current"><span>2</span><div><strong>手动确认恢复</strong><small>打开小红书，确认搜索和笔记页面可以正常访问</small></div></li>
-                        <li className={rateLimitReadyToResume ? 'current' : ''}><span>3</span><div><strong>检查点续跑</strong><small>{rateLimitReadyToResume ? '确认恢复后点击下方按钮，跳过已完成岗位' : '正在整理并保存当前检查点，请稍候'}</small></div></li>
+                        <li className="done"><span><Check size={13} /></span><div><strong>保存检查点</strong><small>帖子、评论与用户结果已落盘，不会重复丢失</small></div></li>
+                        <li className={rateLimitRecovering ? 'current' : 'done'}><span>{rateLimitRecovering ? '2' : <Check size={13} />}</span><div><strong>递增冷却</strong><small>{rateLimitRecovering ? `剩余约 ${activeJob.rateLimit?.retryAfterSeconds || 0} 秒后探测页面恢复` : '有限次数的自动冷却和恢复探测已执行'}</small></div></li>
+                        <li className={!rateLimitRecovering && rateLimitReadyToResume ? 'current' : ''}><span>3</span><div><strong>{rateLimitRecovering ? '自动续采' : '稍后续跑'}</strong><small>{rateLimitRecovering ? '页面恢复后自动从当前帖子继续' : rateLimitReadyToResume ? '平台恢复后点击续跑，优先处理未检查帖子' : '正在整理并保存当前检查点，请稍候'}</small></div></li>
                       </ol>
-                      <div className="security-recovery-actions">
+                      {!rateLimitRecovering && <div className="security-recovery-actions">
                         <button type="button" onClick={() => void openRelayLogin()} disabled={relayLoginOpening}><ExternalLink size={15} />{relayLoginOpening ? '正在打开' : '打开小红书检查页'}</button>
                         <button type="button" className="primary-button" onClick={() => void resumeJob(activeJob)} disabled={submitting || !rateLimitReadyToResume} title={rateLimitReadyToResume ? '仅在确认页面访问恢复后续跑' : '检查点尚未准备完成'}><Play size={15} fill="currentColor" />{rateLimitReadyToResume ? '我已确认恢复，续跑' : '等待检查点完成'}</button>
-                      </div>
-                      <p><Clock3 size={14} />{rateLimitDetectedAt ? `限流触发时间：${formatTime(rateLimitDetectedAt)}。` : ''}恢复前先等待一段时间，并以小红书页面可正常访问为准。</p>
+                      </div>}
+                      <p><Clock3 size={14} />{rateLimitDetectedAt ? `限流触发时间：${formatTime(rateLimitDetectedAt)}。` : ''}{rateLimitRecovering ? '系统不会高频刷新，冷却结束后仅进行一次恢复探测。' : '恢复前先等待一段时间，并以小红书页面可正常访问为准。'}</p>
                     </div>
                   )}
                   {activeOutcome === 'failed' && !rateLimitDetected && <div className="task-outcome-callout failed"><CircleAlert size={18} /><span><strong>执行失败</strong><small>{activeJob.message || (activeJob.resumeAvailable ? '任务因错误终止，检查点仍可用于重试。' : '任务因错误终止，请查看运行日志定位原因。')}</small></span></div>}
@@ -3278,7 +3772,7 @@ function App() {
                     })}
                   </ol>
                   <div className="mission-meta"><div><span>开始时间（北京时间）</span><strong>{formatTime(activeJob.startedAt || activeJob.createdAt)}</strong></div><div><span>运行时长</span><strong>{elapsed(activeJob)}</strong></div></div>
-                  {(activeJob.status === 'running' || activeJob.status === 'queued') && <button className="cancel-button" onClick={cancel}><Pause size={16} />终止任务</button>}
+                  {['queued', 'resuming', 'running'].includes(activeJob.status) && <button className="cancel-button" onClick={cancel}><Pause size={16} />终止任务</button>}
                   {activeJob.resumeAvailable && !rateLimitDetected && (
                     <div className="resume-strip">
                       <span><RotateCcw size={18} /><span><strong>{activeJob.status === 'failed' ? '失败检查点已保留' : '未完成检查点已保留'}</strong><small>已采集 {activeJob.scrapedCount ?? 0} / {activeJob.discoveredCount ?? 0} 篇，{activeJob.status === 'failed' ? '重试' : '续跑'}会跳过已完成正文。</small></span></span>
@@ -3318,7 +3812,7 @@ function App() {
 
           <section className="panel results-panel" id="results" aria-label={audienceModuleActive ? '受众及用户界面结果' : activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
             <div className="panel-heading compact">
-              <div><span className="step-label">{audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? results?.presentation?.eyebrow || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? results?.presentation?.title || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
+              <div><span className="step-label">{audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
               <div className="result-heading-meta">
                 <span className={`runtime-badge ${audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{audienceModuleActive ? `全量评论流 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · ${String(codexRuntime?.status || '等待结果')}`}</span>
                 <span className="count-badge">{audienceModuleActive ? audienceResults?.total ?? 0 : results?.total ?? activeJob?.applicationCount ?? 0}</span>
@@ -3331,6 +3825,8 @@ function App() {
             {audienceModuleActive ? <AudienceWorkspace
               results={audienceResults}
               loading={audienceLoading}
+              task={trackedAudienceTask}
+              actionMessage={audienceActionMessage}
               kind={audienceKind}
               postId={audiencePostId}
               query={audienceQuery}
@@ -3338,7 +3834,11 @@ function App() {
               onKind={(value) => { setAudienceKind(value); setAudienceOffset(0) }}
               onPost={(value) => { setAudiencePostId(value); setAudienceOffset(0) }}
               onQuery={(value) => { setAudienceQuery(value); setAudienceOffset(0) }}
-              onPage={(offset) => activeJob && void loadAudienceResults(activeJob.id, offset)}
+              onPage={(offset) => audienceReadJobId && void loadAudienceResults(audienceReadJobId, offset, {
+                preserveExisting: audienceReadJobId !== audienceSourceJobId,
+                fallbackJobId: audienceSourceJobId,
+                sourceJobId: audienceSourceJobId,
+              })}
               onResume={() => void resumeAudienceCollection()}
             /> : <>{completionFlow && <MissingCompletionFlowPanel
               flow={completionFlow}
@@ -3347,7 +3847,7 @@ function App() {
               onDismiss={() => setCompletionFlow(null)}
             />}
             {!results?.available ? (
-              <div className="result-empty">{activeAnalysisMode === 'general' ? <BookOpenCheck size={28} /> : <UserRoundSearch size={28} />}<strong>{resultsLoading ? '正在读取分析结果' : activeJob?.status === 'running' ? activeAnalysisMode === 'general' ? '发现内容后将自动采集正文、图片并生成 AI 模块' : '发现岗位后将自动解析到这里' : '当前任务还没有结构化分析结果'}</strong></div>
+              <div className="result-empty">{activeAnalysisMode === 'general' ? <BookOpenCheck size={28} /> : <UserRoundSearch size={28} />}<strong>{resultsLoading ? '正在读取分析结果' : ['resuming', 'running'].includes(activeJob?.status || '') ? activeAnalysisMode === 'general' ? '发现内容后将自动采集正文、图片并生成 AI 模块' : '发现岗位后将自动解析到这里' : '当前任务还没有结构化分析结果'}</strong></div>
             ) : activeAnalysisMode === 'general' ? (
               <GeneralResultsWorkspace
                 results={results}
@@ -3380,7 +3880,7 @@ function App() {
                   <label><ArrowUpDown size={15} /><span>排序</span><select aria-label="岗位卡时间排序" value={resultSort} disabled={resultsLoading} onChange={(event) => { setResultOffset(0); setResultSort(event.target.value as typeof resultSort) }}><option value="newest">最新发布优先</option><option value="oldest">最早发布优先</option></select></label>
                   <label><CalendarClock size={15} /><span>时间</span><select aria-label="岗位卡时间筛选" value={resultTimeRange} disabled={resultsLoading} onChange={(event) => { setResultOffset(0); setResultTimeRange(event.target.value as typeof resultTimeRange) }}><option value="all">全部时间</option><option value="1">近 24 小时</option><option value="3">近 3 天</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option><option value="unknown">日期待确认</option></select></label>
                   {(resultSort !== 'newest' || resultTimeRange !== 'all') && <button className="reset-result-filter" type="button" disabled={resultsLoading} onClick={() => { setResultOffset(0); setResultSort('newest'); setResultTimeRange('all') }} title="恢复最新发布优先并显示全部时间"><RotateCcw size={15} />重置筛选</button>}
-                  <button className="complete-missing-button" type="button" disabled={!resultFilterStats(results).incomplete || completingMissing || submitting || restoringAi || resultsLoading} onClick={() => void completeMissingResults()} title={aiSession ? '自动核对缺失项，并创建或接管补全任务' : '自动恢复已保存的 AI 配置并补全缺失项'}>{restoringAi || completingMissing ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{restoringAi ? '正在恢复 AI' : completingMissing ? '正在核对任务' : activeJob?.status === 'running' || activeJob?.status === 'queued' ? '查看补全进度' : '一键智能补全'}</button>
+                <button className="complete-missing-button" type="button" disabled={!resultFilterStats(results).incomplete || completingMissing || submitting || restoringAi || resultsLoading} onClick={() => void completeMissingResults()} title={aiSession ? '自动核对缺失项，并从原任务检查点继续' : '自动恢复已保存的 AI 配置并补全缺失项'}>{restoringAi || completingMissing ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{restoringAi ? '正在恢复 AI' : completingMissing ? '正在核对任务' : ['running', 'resuming', 'queued'].includes(activeJob?.status || '') ? '查看补全进度' : '一键智能补全'}</button>
                 </div>
               </div>
               <div className="results-workspace">
@@ -3428,14 +3928,14 @@ function App() {
                     {selectedResultIncomplete && (
                       <div className="completion-callout">
                         <span><WandSparkles size={18} /><span><strong>该岗位信息尚未完整</strong><small>将从已保存检查点继续采集缺失正文，并重新执行图片理解、岗位卡整理和投递文案生成。</small></span></span>
-                        <button type="button" disabled={completingMissing || submitting || restoringAi} title={aiSession ? '自动核对缺失项，并创建或接管补全任务' : '自动恢复已保存的 AI 配置并补全缺失项'} onClick={() => void completeMissingResults()}>{restoringAi ? '正在恢复 AI…' : completingMissing ? '正在核对任务…' : activeJob?.status === 'running' || activeJob?.status === 'queued' ? '查看补全进度' : '一键补全全部缺失岗位'}</button>
+                        <button type="button" disabled={completingMissing || submitting || restoringAi} title={aiSession ? '自动核对缺失项，并从原任务检查点继续' : '自动恢复已保存的 AI 配置并补全缺失项'} onClick={() => void completeMissingResults()}>{restoringAi ? '正在恢复 AI…' : completingMissing ? '正在核对任务…' : ['running', 'resuming', 'queued'].includes(activeJob?.status || '') ? '查看补全进度' : '一键补全全部缺失岗位'}</button>
                       </div>
                     )}
                     {Boolean(selectedResult.media?.images?.length) && (
                       <section className="result-media" aria-label="岗位图片与理解结果">
                         <div className="result-media-heading"><span><Images size={16} /><strong>采集图片</strong><small>{selectedResult.media?.images.length} 张</small></span><i>{selectedResult.media?.analysis?.source === 'vision_model' ? 'AI 已看图' : selectedResult.media?.analysis?.source === 'image_alt_text' ? '基于图片文字' : '等待图片理解'}</i></div>
                         <div className="result-media-grid">
-                          {selectedResult.media?.images.map((image, index) => <button key={`${image.url}-${index}`} type="button" onClick={() => openImagePreview(selectedResult.title || '未命名岗位', selectedResult.media?.images || [], index)} title={image.alt || `查看第 ${index + 1} 张岗位图片`}><img src={image.url} alt={image.alt || `${selectedResult.title || '岗位'}图片 ${index + 1}`} loading="lazy" referrerPolicy="no-referrer" /><small>{imageSourceLabel(image.source)}</small><span><Maximize2 size={13} /></span></button>)}
+                          {selectedResult.media?.images.map((image, index) => <button key={`${image.url}-${index}`} type="button" onClick={() => openImagePreview(selectedResult.title || '未命名岗位', selectedResult.media?.images || [], index)} title={image.alt || `查看第 ${index + 1} 张岗位图片`}><RetryingImage image={image} alt={image.alt || `${selectedResult.title || '岗位'}图片 ${index + 1}`} loading="lazy" /><small>{imageSourceLabel(image.source)}</small><span><Maximize2 size={13} /></span></button>)}
                         </div>
                         <div className="image-analysis">
                           <strong>图片信息理解</strong>

@@ -1,4 +1,36 @@
-export type JobStatus = 'queued' | 'running' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | 'interrupted'
+export type JobStatus = 'queued' | 'resuming' | 'running' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | 'interrupted' | 'blocked'
+
+export type ResumeScope = 'full' | 'discovery' | 'body_completion' | 'analysis' | 'audience' | 'artifacts'
+
+export type JobAttempt = {
+  attemptId: string
+  sequence: number
+  kind: 'initial' | 'resume' | 'recovery_after_restart' | string
+  status: string
+  entryStatus: string
+  exitStatus: string | null
+  resumeScope: ResumeScope
+  requestedBy?: string
+  idempotencyKey?: string | null
+  startedAt?: string | null
+  finishedAt?: string | null
+  pid?: number | null
+  exitCode?: number | null
+  stopReason?: string | null
+  errorCode?: string | null
+  errorMessage?: string | null
+  logPath?: string
+  checkpointRevisionAtStart?: number
+  checkpointRevisionAtEnd?: number | null
+  processedCountAtStart?: number
+  processedCount: number
+}
+
+export type ResumeJobOptions = {
+  scope: ResumeScope
+  aiSessionId?: string | null
+  idempotencyKey: string
+}
 
 export type SecurityRestriction = {
   detected: boolean
@@ -12,9 +44,14 @@ export type SecurityRestriction = {
 
 export type RateLimitState = {
   detected: boolean
-  status: 'stopped'
+  status: 'waiting' | 'cleared' | 'stopped'
   detectedAt?: string | null
-  recoveryAction?: 'wait_then_resume' | null
+  clearedAt?: string | null
+  exhaustedAt?: string | null
+  retryAttempt?: number
+  maxRetries?: number
+  retryAfterSeconds?: number
+  recoveryAction?: 'automatic_backoff' | 'wait_then_resume' | null
 }
 
 export type Artifact = {
@@ -28,12 +65,15 @@ export type Artifact = {
 
 export type Job = {
   id: string
+  schemaVersion?: number
   keyword: string
   status: JobStatus
   createdAt: string
+  updatedAt?: string
   startedAt?: string
   finishedAt?: string
   exitCode?: number | null
+  pid?: number | null
   progress?: number
   message?: string
   outputDir?: string
@@ -55,6 +95,15 @@ export type Job = {
   securityRestriction?: SecurityRestriction | null
   rateLimit?: RateLimitState | null
   resumeAvailable?: boolean
+  currentAttemptId?: string | null
+  activeAttemptId?: string | null
+  attemptId?: string
+  resumeCount?: number
+  lastResumedAt?: string | null
+  revision?: number
+  stages?: Record<string, unknown>
+  attempts?: JobAttempt[]
+  legacyResumeLineage?: Record<string, unknown> | null
 }
 
 export type MissingCompletionResponse = {
@@ -346,6 +395,7 @@ export type AudiencePublicProfile = {
   avatar_url: string
   xhs_id: string
   bio: string
+  ip_location?: string
   location: string
   following_count: number | null
   follower_count: number | null
@@ -367,6 +417,7 @@ export type AudienceComment = {
   text: string
   likes: number
   publish_time: string
+  ip_location?: string
   location: string
   source_url: string
   user: AudiencePublicProfile
@@ -384,6 +435,7 @@ export type AudiencePost = {
   reply_count?: number
   unique_user_count?: number
   status?: AudienceStatus
+  collectionStatus?: 'uncollected' | 'partial' | 'complete'
   completion_basis?: string
   failure_reason?: string
   last_collected_at?: string
@@ -394,14 +446,18 @@ export type AudienceSummary = {
   status: AudienceStatus
   postsTotal: number
   postsComplete: number
+  postsPending: number
   postsPartial: number
   postsFailed: number
+  postsAttempted: number
+  postsWithComments: number
   commentsCollected: number
   topLevelComments: number
   repliesCollected: number
   usersDiscovered: number
   profilesComplete: number
   postCoveragePercent: number
+  postAttemptPercent: number
   profileCoveragePercent: number
   stopReason: string
   generatedAt: string
@@ -423,8 +479,10 @@ export type AudienceResultsResponse =
   | (AudienceResultsBase & { kind: 'users'; items: AudiencePublicProfile[] })
 
 export type AudienceResumeResponse = {
-  action: 'started' | 'attached' | 'already_complete'
+  action: 'started' | 'queued' | 'attached' | 'already_complete'
   sourceJobId: string
+  checkpointJobId?: string
+  readThroughJobIds?: string[]
   job: Job
   message: string
 }
@@ -470,8 +528,10 @@ export type DeliveryState = {
 
 export type ApplicationMedia = {
   cover_url?: string
+  cover_original_url?: string
   images: Array<{
     url: string
+    original_url?: string
     alt?: string
     source: 'detail' | 'card' | 'cover' | string
   }>
@@ -479,6 +539,9 @@ export type ApplicationMedia = {
     status: 'analyzed' | 'alt_text_only' | 'alt_text_available' | 'pending_ai' | 'no_images' | 'unavailable'
     summary?: string
     visible_text?: string
+    visual_summary?: string
+    visual_signals?: string[]
+    analysis_version?: number
     job_signals?: string[]
     source?: 'vision_model' | 'image_alt_text' | 'model_error' | 'none' | string
     reason?: string
@@ -518,6 +581,37 @@ export type ContentAnalysis = {
   entities: string[]
   image_insights: string[]
   modules: ContentAnalysisModule[]
+  source_character_count?: number
+  grounded_evidence_count?: number
+}
+
+export type ContentInsightEvidence = {
+  noteId: string
+  title: string
+  quote: string
+}
+
+export type ContentInsightFinding = {
+  label: string
+  count: number
+  evidence: ContentInsightEvidence[]
+}
+
+export type ContentInsights = {
+  sampleSize: number
+  sourceReady: number
+  groundedRecords: number
+  coverageRate: number
+  methodNote: string
+  topTopics: Array<ContentInsightFinding & { share: number }>
+  modules: Array<{
+    id: string
+    title: string
+    question: string
+    recordCount: number
+    coverageRate: number
+    findings: ContentInsightFinding[]
+  }>
 }
 
 export type ApplicationResult = {
@@ -592,6 +686,7 @@ export type ApplicationResultsResponse = {
   keyword: string
   research: ContentResearchContext | null
   presentation: ContentPresentation | null
+  insights: ContentInsights | null
   total: number
   offset: number
   limit: number
