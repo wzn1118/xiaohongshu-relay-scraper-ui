@@ -21,7 +21,8 @@ export function isIncompleteApplicationRecord(record) {
 export function isIncompleteGeneralRecord(record) {
   const analysis = record?.content_analysis;
   const modules = Array.isArray(analysis?.modules) ? analysis.modules : [];
-  const hasAnalysis = ['completed', 'fallback'].includes(String(analysis?.status || ''))
+  const hasAnalysis = String(analysis?.status || '') === 'completed'
+    && Number(analysis?.grounded_evidence_count || 0) > 0
     && Boolean(String(analysis?.overview || '').trim())
     && modules.some((module) => String(module?.summary || '').trim() || module?.items?.length);
   const media = record?.media;

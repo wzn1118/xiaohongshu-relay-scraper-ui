@@ -5,8 +5,89 @@ import { PassThrough } from 'node:stream';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { JobManager, publicJob } from './job-manager.mjs';
+import { JobManager, publicJob, updateProgressFromLog } from './job-manager.mjs';
 import { validateRunRequest } from './lib/contracts.mjs';
+
+function createFakeChild(pid) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+  return child;
+}
+
+function waitForJob(manager, id, predicate, timeoutMs = 3000) {
+  const current = manager.get(id);
+  if (current && predicate(current)) return Promise.resolve(current);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      reject(new Error(`Timed out waiting for job ${id}; current status: ${manager.get(id)?.status || 'missing'}`));
+    }, timeoutMs);
+    const unsubscribe = manager.subscribe(id, (event) => {
+      if (event.type !== 'state' || !predicate(event.data)) return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(event.data);
+    });
+  });
+}
+
+function waitForEnd(manager, id, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      reject(new Error(`Timed out waiting for job ${id} to end`));
+    }, timeoutMs);
+    const unsubscribe = manager.subscribe(id, (event) => {
+      if (event.type !== 'end') return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(event.data);
+    });
+  });
+}
+
+test('audience partial completion keeps attempted coverage separate from strict completion', () => {
+  const job = { progress: 0 };
+
+  const changed = updateProgressFromLog(
+    job,
+    'AUDIENCE_COMPLETE posts=0/80 comments=34 users=84 profiles=2/84 status=partial attempted=7 with_comments=4',
+  );
+
+  assert.equal(changed, true);
+  assert.equal(job.progressCurrent, 7);
+  assert.equal(job.progressTotal, 80);
+  assert.match(job.progressLabel, /7 \/ 80/);
+  assert.match(job.progressLabel, /4/);
+  assert.doesNotMatch(job.progressLabel, /84 \/ 80/);
+});
+
+test('audience rate limits expose automatic backoff, recovery, and exhaustion states', () => {
+  const job = { progress: 0 };
+
+  assert.equal(updateProgressFromLog(job, 'AUDIENCE_RATE_LIMIT retry=2/5 wait=30s; checkpoint preserved'), true);
+  assert.equal(job.progressPhase, 'rate_limit_backoff');
+  assert.equal(job.rateLimit.status, 'waiting');
+  assert.equal(job.rateLimit.retryAttempt, 2);
+  assert.equal(job.rateLimit.maxRetries, 5);
+  assert.equal(job.rateLimit.retryAfterSeconds, 30);
+
+  assert.equal(updateProgressFromLog(job, 'AUDIENCE_RATE_LIMIT waiting attempt=2/5 remaining=10s'), true);
+  assert.equal(job.rateLimit.retryAfterSeconds, 10);
+  assert.match(job.progressLabel, /剩余 10 秒/);
+
+  assert.equal(updateProgressFromLog(job, 'AUDIENCE_RATE_LIMIT cleared retry=2/5; resuming'), true);
+  assert.equal(job.rateLimit.status, 'cleared');
+  assert.equal(job.progressPhase, 'audience_comments');
+
+  assert.equal(updateProgressFromLog(job, 'AUDIENCE_RATE_LIMIT exhausted retries=5; checkpoint preserved'), true);
+  assert.equal(job.rateLimit.status, 'stopped');
+  assert.equal(job.progressPhase, 'rate_limited');
+  assert.equal(job.rateLimit.recoveryAction, 'wait_then_resume');
+});
 
 test('JobManager persists history and enforces a single active task', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-manager-'));
@@ -99,9 +180,97 @@ test('JobManager persists history and enforces a single active task', async () =
     const cancellation = await manager.cancel(job.id);
     assert.equal(cancellation.changed, true);
     await ended;
+    const finalJob = manager.get(job.id);
+    assert.equal(finalJob.attempts.length, 1);
+    assert.equal(finalJob.attempts[0].status, 'cancelled');
+    assert.match(
+      await readFile(finalJob.attempts[0].logPath, 'utf8'),
+      new RegExp(finalJob.attempts[0].attemptId),
+    );
     const history = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
     assert.equal(history[0].id, job.id);
     assert.equal(history[0].status, 'cancelled');
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('legacy resume requests never queue a child Job while the original Job is active', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-queue-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  await writeFile(fakeRunner, '', 'utf8');
+  const child = createFakeChild(31001);
+  let spawnCount = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => {
+      spawnCount += 1;
+      return child;
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const active = await manager.start(validateRunRequest({ checkOnly: true, keyword: 'active' }));
+    await waitForJob(manager, active.id, (job) => job.status === 'running');
+
+    await assert.rejects(
+      manager.start(
+        validateRunRequest({
+          checkOnly: true,
+          keyword: 'audience',
+          analysisMode: 'general',
+          mode: 'resume',
+          resumeFromJobId: active.id,
+          audienceOnly: true,
+          collectAudience: true,
+        }),
+        { queueIfBusy: true },
+      ),
+      (error) => error.code === 'JOB_ALREADY_RUNNING',
+    );
+    assert.equal(spawnCount, 1);
+    assert.equal(manager.list().length, 1);
+
+    const ended = waitForEnd(manager, active.id);
+    child.emit('close', 0, null);
+    await ended;
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('a queued task can be cancelled before it starts', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-queue-cancel-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  await writeFile(fakeRunner, '', 'utf8');
+  const child = createFakeChild(32001);
+  let spawnCount = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => {
+      spawnCount += 1;
+      return child;
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const active = await manager.start(validateRunRequest({ checkOnly: true, keyword: 'active' }));
+    await waitForJob(manager, active.id, (job) => job.status === 'running');
+    const queued = await manager.start(validateRunRequest({ checkOnly: true, keyword: 'queued' }), { queueIfBusy: true });
+
+    const cancellation = await manager.cancel(queued.id);
+    assert.equal(cancellation.changed, true);
+    assert.equal(cancellation.job.status, 'cancelled');
+    child.emit('close', 0, null);
+    await waitForJob(manager, active.id, (job) => job.status === 'completed');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(spawnCount, 1);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -186,7 +355,17 @@ test('general content checkpoints use content completeness instead of job fields
       content_analysis: {
         status: 'completed',
         overview: '这是一条城市展览内容。',
-        modules: [{ id: 'highlights', title: '展览亮点', summary: '聚焦公共空间。', items: [], evidence: [] }],
+        grounded_evidence_count: 1,
+        modules: [{ id: 'highlights', title: '展览亮点', summary: '聚焦公共空间。', items: [], evidence: ['完整正文'] }],
+      },
+    }, {
+      note_id: 'content-2',
+      body: '另一条完整正文',
+      media: { images: [], analysis: { status: 'no_images', source: 'none' } },
+      content_analysis: {
+        status: 'completed',
+        overview: '只有模型概括，没有原文证据。',
+        modules: [{ id: 'highlights', title: '展览亮点', summary: '无法复核。', items: [], evidence: [] }],
       },
     }],
   }), 'utf8');
@@ -205,8 +384,8 @@ test('general content checkpoints use content completeness instead of job fields
 
   try {
     await manager.initialize();
-    assert.equal(manager.list()[0].applicationCount, 1);
-    assert.equal(manager.list()[0].incompleteCount, 0);
+    assert.equal(manager.list()[0].applicationCount, 2);
+    assert.equal(manager.list()[0].incompleteCount, 1);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -371,6 +550,12 @@ test('JobManager cleans persisted process identity before marking a restarted jo
     assert.equal(job.incompleteCount, 3);
     assert.equal(job.progress, 48);
     assert.equal(job.resumeAvailable, true);
+    assert.equal(job.activeAttemptId, null);
+    assert.equal(job.attempts.length, 1);
+    assert.equal(job.attempts[0].status, 'interrupted');
+    assert.equal(job.attempts[0].stopReason, 'server_restart');
+    assert.equal(job.attempts[0].errorCode, 'SERVER_RESTART');
+    assert.equal(job.attempts[0].checkpointRevisionAtEnd, job.revision);
     assert.deepEqual(recovered, [{ id: 'stale-job', pid: 45678, outputDir }]);
     const history = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
     assert.equal(history[0].cleanupResult.terminated, 2);
@@ -380,7 +565,7 @@ test('JobManager cleans persisted process identity before marking a restarted jo
   }
 });
 
-test('JobManager copies card and note checkpoints into a resumed task', async () => {
+test('JobManager resumes in place with a stable Job identity and a new Attempt', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-resume-'));
   const fakeRunner = path.join(dataDir, 'runner.py');
   const sourceId = '20260729120000-deadbeef';
@@ -418,23 +603,38 @@ test('JobManager copies card and note checkpoints into a resumed task', async ()
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.kill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+  let spawnedArgs;
   const manager = new JobManager({
     dataDir,
     pythonBin: 'python',
     runnerPath: fakeRunner,
-    spawnImpl: () => child,
+    spawnImpl: (_command, args) => {
+      spawnedArgs = args;
+      return child;
+    },
     terminateImpl: async (target) => target.kill('SIGTERM'),
   });
 
   try {
     await manager.initialize();
-    assert.equal(manager.get(sourceId).resumeAvailable, true);
+    const original = manager.get(sourceId);
+    assert.equal(original.resumeAvailable, true);
+    const originalListLength = manager.list().length;
+    const originalAttemptCount = original.attempts.length;
     const started = await manager.start(validateRunRequest({
       checkOnly: true,
       mode: 'resume',
       resumeFromJobId: sourceId,
     }));
     const resumedOutputDir = manager.getInternal(started.id).outputDir;
+    assert.equal(started.id, sourceId);
+    assert.equal(started.outputDir, original.outputDir);
+    assert.equal(started.createdAt, original.createdAt);
+    assert.equal(resumedOutputDir, sourceOutputDir);
+    assert.equal(manager.list().length, originalListLength);
+    assert.equal(started.resumeCount, 1);
+    assert.equal(started.attempts.length, originalAttemptCount + 1);
+    assert.equal(started.attemptId, started.currentAttemptId);
     assert.deepEqual(
       JSON.parse(await readFile(path.join(resumedOutputDir, 'xiaohongshu_cards_discovered.json'), 'utf8')),
       cards,
@@ -486,6 +686,91 @@ test('JobManager copies card and note checkpoints into a resumed task', async ()
     });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(manager.get(started.id).status, 'running');
+    assert.equal(spawnedArgs[spawnedArgs.indexOf('--output-dir') + 1], sourceOutputDir);
+    child.emit('close', 0, null);
+    await ended;
+    const completed = manager.get(sourceId);
+    const latestAttempt = completed.attempts.at(-1);
+    assert.equal(completed.id, sourceId);
+    assert.equal(completed.outputDir, sourceOutputDir);
+    assert.equal(completed.createdAt, original.createdAt);
+    assert.equal(completed.resumeCount, 1);
+    assert.equal(latestAttempt.kind, 'recovery_after_restart');
+    assert.equal(latestAttempt.resumeScope, 'full');
+    assert.equal(latestAttempt.status, 'succeeded');
+    assert.equal(latestAttempt.entryStatus, 'interrupted');
+    assert.equal(latestAttempt.exitStatus, 'succeeded');
+    assert.ok(Number.isInteger(latestAttempt.processedCount));
+    assert.ok(latestAttempt.processedCount >= 0);
+    assert.equal(latestAttempt.pid, 78901);
+    assert.ok(latestAttempt.finishedAt);
+    assert.match(latestAttempt.logPath, new RegExp(`${sourceId}.*attempts.*run\\.log`));
+    assert.match(await readFile(latestAttempt.logPath, 'utf8'), new RegExp(latestAttempt.attemptId));
+    assert.match(await readFile(path.join(path.dirname(sourceOutputDir), 'run.log'), 'utf8'), new RegExp(latestAttempt.attemptId));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('stage-scoped resume uses stage state and clears inherited legacy mode flags', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-stage-resume-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260729120500-stage001';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(
+    path.join(outputDir, 'xiaohongshu_cards_latest.json'),
+    JSON.stringify([{ note_id: 'note-1' }]),
+    'utf8',
+  );
+  await writeFile(
+    path.join(outputDir, 'xiaohongshu_notes_latest.json'),
+    JSON.stringify([{ note_id: 'note-1', access_status: 'detail_ok' }]),
+    'utf8',
+  );
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'succeeded',
+    outputDir,
+    params: {
+      keyword: 'test',
+      analysisMode: 'general',
+      mode: 'resume',
+      resumeFromJobId: '20260728120500-parent01',
+      collectAudience: true,
+      audienceOnly: true,
+      completeMissingOnly: true,
+    },
+  }]), 'utf8');
+
+  const child = createFakeChild(78905);
+  let spawnedArgs;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: (_command, args) => {
+      spawnedArgs = args;
+      return child;
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const resumed = await manager.resume(jobId, {
+      scope: 'discovery',
+      idempotencyKey: 'stage-discovery-1',
+    });
+    assert.equal(resumed.id, jobId);
+    assert.equal(manager.list().length, 1);
+    assert.equal(resumed.attempts.at(-1).entryStatus, 'succeeded');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(Array.isArray(spawnedArgs));
+    assert.equal(spawnedArgs.includes('--audience-only'), false);
+    assert.equal(spawnedArgs.includes('--complete-missing-only'), false);
+    assert.equal(spawnedArgs[spawnedArgs.indexOf('--resume-scope') + 1], 'discovery');
+    const ended = waitForEnd(manager, jobId);
     child.emit('close', 0, null);
     await ended;
   } finally {
@@ -493,7 +778,86 @@ test('JobManager copies card and note checkpoints into a resumed task', async ()
   }
 });
 
-test('JobManager rediscovers latest cards instead of copying a legacy comprehensive checkpoint', async () => {
+test('resume is revision-guarded and idempotent for concurrent retries', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-resume-idempotent-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260729121000-idempotent';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(
+    path.join(outputDir, 'xiaohongshu_cards_latest.json'),
+    JSON.stringify([{ note_id: 'note-1' }]),
+    'utf8',
+  );
+  await writeFile(
+    path.join(outputDir, 'xiaohongshu_notes_latest.json'),
+    JSON.stringify([{ note_id: 'note-1', access_status: 'detail_ok' }]),
+    'utf8',
+  );
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'incomplete',
+    outputDir,
+    params: { keyword: 'test' },
+  }]), 'utf8');
+
+  const child = createFakeChild(78911);
+  let spawnCount = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => {
+      spawnCount += 1;
+      return child;
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const revision = manager.get(jobId).revision;
+    const params = validateRunRequest({ checkOnly: true });
+    await assert.rejects(
+      manager.resume(jobId, {
+        scope: 'body_completion',
+        params,
+        expectedRevision: revision + 1,
+      }),
+      (error) => error.code === 'WORKFLOW_REVISION_CONFLICT'
+        && error.expectedRevision === revision + 1
+        && error.actualRevision === revision,
+    );
+    assert.equal(manager.get(jobId).attempts.length, 1);
+    assert.equal(spawnCount, 0);
+
+    const options = {
+      scope: 'body_completion',
+      params,
+      idempotencyKey: 'retry-key-1',
+      expectedRevision: revision,
+    };
+    const [first, second] = await Promise.all([
+      manager.resume(jobId, options),
+      manager.resume(jobId, options),
+    ]);
+    assert.equal(first.id, jobId);
+    assert.equal(second.id, jobId);
+    assert.equal(first.attemptId, second.attemptId);
+    assert.equal(manager.list().length, 1);
+    assert.equal(manager.get(jobId).resumeCount, 1);
+    assert.equal(manager.get(jobId).attempts.length, 2);
+    assert.equal(spawnCount, 1);
+
+    const ended = waitForEnd(manager, jobId);
+    child.emit('close', 0, null);
+    await ended;
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager rejects resume without a checkpoint and does not create a child Job', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-latest-rediscovery-'));
   const fakeRunner = path.join(dataDir, 'runner.py');
   const sourceId = '20260729120000-cafefeed';
@@ -514,6 +878,58 @@ test('JobManager rediscovers latest cards instead of copying a legacy comprehens
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.kill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
+  let spawnCount = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => {
+      spawnCount += 1;
+      return child;
+    },
+    terminateImpl: async (target) => target.kill('SIGTERM'),
+  });
+
+  try {
+    await manager.initialize();
+    const original = manager.get(sourceId);
+    await assert.rejects(
+      manager.start(validateRunRequest({
+        checkOnly: true,
+        mode: 'resume',
+        resumeFromJobId: sourceId,
+        completeMissingOnly: true,
+      })),
+      (error) => error.code === 'RESUME_CHECKPOINTS_MISSING',
+    );
+    assert.equal(spawnCount, 0);
+    assert.equal(manager.list().length, 1);
+    assert.equal(manager.get(sourceId).id, original.id);
+    assert.equal(manager.get(sourceId).outputDir, original.outputDir);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('a completed content Job can resume the unfinished audience stage in place', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-checkpoint-copy-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const sourceId = '20260729130000-deadbeef';
+  const sourceOutputDir = path.join(dataDir, 'jobs', sourceId, 'artifacts');
+  const cards = [{ note_id: 'saved-post', note_url: 'https://example.test/explore/saved-post' }];
+  const notes = [{ note_id: 'saved-post', note_url: 'https://example.test/explore/saved-post', title: 'Saved post' }];
+  await mkdir(sourceOutputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(cards), 'utf8');
+  await writeFile(path.join(sourceOutputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(notes), 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: sourceId,
+    status: 'succeeded',
+    outputDir: sourceOutputDir,
+    params: { analysisMode: 'general', keyword: 'old-search', searchSort: 'comprehensive' },
+  }]), 'utf8');
+
+  const child = createFakeChild(78903);
   const manager = new JobManager({
     dataDir,
     pythonBin: 'python',
@@ -524,30 +940,155 @@ test('JobManager rediscovers latest cards instead of copying a legacy comprehens
 
   try {
     await manager.initialize();
+    const original = manager.get(sourceId);
+    const originalListLength = manager.list().length;
     const started = await manager.start(validateRunRequest({
+      analysisMode: 'general',
+      keyword: 'old-search',
       checkOnly: true,
       mode: 'resume',
       resumeFromJobId: sourceId,
-      completeMissingOnly: true,
+      audienceOnly: true,
     }));
     const resumed = manager.getInternal(started.id);
-    assert.equal(resumed.params.searchSort, 'latest');
-    assert.equal(resumed.params.completeMissingOnly, false);
-    await assert.rejects(
-      readFile(path.join(resumed.outputDir, 'xiaohongshu_cards_latest.json'), 'utf8'),
-      (error) => error.code === 'ENOENT',
+    assert.equal(started.id, sourceId);
+    assert.equal(started.outputDir, original.outputDir);
+    assert.equal(started.createdAt, original.createdAt);
+    assert.equal(manager.list().length, originalListLength);
+    assert.equal(started.resumeCount, 1);
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(resumed.outputDir, 'xiaohongshu_cards_latest.json'), 'utf8')),
+      cards,
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(resumed.outputDir, 'xiaohongshu_notes_latest.json'), 'utf8')),
+      notes,
     );
 
-    const ended = new Promise((resolve) => {
-      const unsubscribe = manager.subscribe(started.id, (event) => {
-        if (event.type === 'end') {
-          unsubscribe();
-          resolve();
-        }
-      });
-    });
+    const ended = waitForEnd(manager, started.id);
     await new Promise((resolve) => setImmediate(resolve));
     child.emit('close', 0, null);
+    await ended;
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager does not merge legacy sibling artifacts into the selected state owner', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-sibling-merge-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const rootId = '20260729130000-11111111';
+  const firstId = '20260729140000-22222222';
+  const secondId = '20260729150000-33333333';
+  const rootOutputDir = path.join(dataDir, 'jobs', rootId, 'artifacts');
+  const firstOutputDir = path.join(dataDir, 'jobs', firstId, 'artifacts');
+  const secondOutputDir = path.join(dataDir, 'jobs', secondId, 'artifacts');
+  const outputDirs = [rootOutputDir, firstOutputDir, secondOutputDir];
+  const cards = [
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1' },
+    { note_id: 'post-2', note_url: 'https://example.test/explore/post-2' },
+  ];
+  const notes = [
+    { ...cards[0], title: 'First saved post' },
+    { ...cards[1], title: 'Second saved post' },
+  ];
+  await Promise.all(outputDirs.map((outputDir) => mkdir(outputDir, { recursive: true })));
+  await writeFile(fakeRunner, '', 'utf8');
+  await Promise.all(outputDirs.flatMap((outputDir) => [
+    writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(cards), 'utf8'),
+    writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(notes), 'utf8'),
+  ]));
+  await Promise.all([
+    writeFile(path.join(firstOutputDir, 'audience-posts.json'), JSON.stringify([
+      { post_id: 'post-1', note_url: cards[0].note_url, status: 'complete', collected_comment_count: 1 },
+    ]), 'utf8'),
+    writeFile(path.join(firstOutputDir, 'audience-comments.json'), JSON.stringify([
+      { comment_id: 'comment-1', post_id: 'post-1', text: 'First sibling comment', user: { user_id: 'user-1' } },
+    ]), 'utf8'),
+    writeFile(path.join(firstOutputDir, 'audience-users.json'), JSON.stringify([
+      { user_id: 'user-1', display_name: 'First sibling user', enrichment_status: 'complete', post_ids: ['post-1'] },
+    ]), 'utf8'),
+    writeFile(path.join(secondOutputDir, 'audience-posts.json'), JSON.stringify([
+      { post_id: 'post-2', note_url: cards[1].note_url, status: 'complete', collected_comment_count: 1 },
+    ]), 'utf8'),
+    writeFile(path.join(secondOutputDir, 'audience-comments.json'), JSON.stringify([
+      { comment_id: 'comment-2', post_id: 'post-2', text: 'Second sibling comment', user: { user_id: 'user-2' } },
+    ]), 'utf8'),
+    writeFile(path.join(secondOutputDir, 'audience-users.json'), JSON.stringify([
+      { user_id: 'user-2', display_name: 'Second sibling user', enrichment_status: 'complete', post_ids: ['post-2'] },
+    ]), 'utf8'),
+  ]);
+  const rootParams = { analysisMode: 'general', keyword: 'saved-content' };
+  const audienceParams = (resumeFromJobId) => ({
+    ...rootParams,
+    mode: 'resume',
+    resumeFromJobId,
+    audienceOnly: true,
+    collectAudience: true,
+  });
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([
+    { id: secondId, status: 'incomplete', outputDir: secondOutputDir, params: audienceParams(rootId) },
+    { id: firstId, status: 'incomplete', outputDir: firstOutputDir, params: audienceParams(rootId) },
+    { id: rootId, status: 'incomplete', outputDir: rootOutputDir, params: rootParams },
+  ]), 'utf8');
+
+  const audienceChild = createFakeChild(78905);
+  let spawnCount = 0;
+  let spawnedArgs = [];
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: (_python, args) => {
+      spawnCount += 1;
+      spawnedArgs = args;
+      return audienceChild;
+    },
+    terminateImpl: async (target) => target.kill('SIGTERM'),
+  });
+
+  try {
+    await manager.initialize();
+    const rootBefore = manager.get(rootId);
+    const listLength = manager.list().length;
+    const started = await manager.resume(rootId, {
+      scope: 'audience',
+      params: validateRunRequest({
+        ...audienceParams(rootId),
+        checkOnly: true,
+      }),
+      resumeCheckpointJobIds: [rootId, firstId, secondId],
+    });
+    assert.equal(started.id, rootId);
+    assert.equal(started.outputDir, rootBefore.outputDir);
+    assert.equal(started.createdAt, rootBefore.createdAt);
+    assert.equal(manager.list().length, listLength);
+    assert.equal(spawnCount, 1);
+    assert.deepEqual(
+      spawnedArgs.flatMap((value, index) => value === '--resume-checkpoint-dir' ? [spawnedArgs[index + 1]] : []),
+      [firstOutputDir, secondOutputDir],
+    );
+    const resumedOutputDir = manager.getInternal(started.id).outputDir;
+    const resumedNotes = JSON.parse(await readFile(
+      path.join(resumedOutputDir, 'xiaohongshu_notes_latest.json'),
+      'utf8',
+    ));
+    assert.deepEqual(resumedNotes, notes);
+    await assert.rejects(
+      readFile(path.join(resumedOutputDir, 'audience-comments.json'), 'utf8'),
+      (error) => error.code === 'ENOENT',
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(firstOutputDir, 'audience-comments.json'), 'utf8')),
+      [{ comment_id: 'comment-1', post_id: 'post-1', text: 'First sibling comment', user: { user_id: 'user-1' } }],
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(path.join(secondOutputDir, 'audience-comments.json'), 'utf8')),
+      [{ comment_id: 'comment-2', post_id: 'post-2', text: 'Second sibling comment', user: { user_id: 'user-2' } }],
+    );
+
+    const ended = waitForEnd(manager, started.id);
+    audienceChild.emit('close', 0, null);
     await ended;
   } finally {
     await rm(dataDir, { recursive: true, force: true });

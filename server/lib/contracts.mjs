@@ -35,6 +35,8 @@ const ALLOWED_KEYS = new Set([
 ]);
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
+const RESUME_SCOPES = new Set(['full', 'discovery', 'body_completion', 'analysis', 'audience', 'artifacts']);
+const ATTEMPT_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 
 export class ValidationError extends Error {
   constructor(message, details = []) {
@@ -186,10 +188,10 @@ function boundedCandidateString(value, field, defaultValue, max) {
   return normalized;
 }
 
-export function buildRunnerArgs(params, outputDir) {
+export function buildRunnerArgs(params, outputDir, execution = null) {
   const args = [
     '--analysis-mode', params.analysisMode,
-    '--keyword', params.keyword,
+    '--keyword', params.audienceOnly ? '' : params.keyword,
     '--content-preset', params.contentPreset,
     '--content-goal', params.contentGoal,
     '--output-dir', outputDir,
@@ -219,7 +221,61 @@ export function buildRunnerArgs(params, outputDir) {
   if (params.skipPostprocess) args.push('--skip-postprocess');
   if (params.noAutoAttach) args.push('--no-auto-attach');
   if (params.checkOnly) args.push('--check-only');
+  if (execution !== null && execution !== undefined) {
+    appendWorkflowStateArgs(args, execution);
+  }
   return args;
+}
+
+function appendWorkflowStateArgs(args, execution) {
+  if (!isPlainObject(execution)) throw new ValidationError('Runner execution context must be an object.');
+  const required = ['resumeScope', 'attemptId', 'statePath', 'expectedStateRevision'];
+  const missing = required.filter((key) => execution[key] === undefined || execution[key] === null || execution[key] === '');
+  if (missing.length) {
+    throw new ValidationError(
+      'Runner execution context is incomplete.',
+      missing.map((field) => ({ field, reason: 'required' })),
+    );
+  }
+  if (!RESUME_SCOPES.has(execution.resumeScope)) throw fieldError('resumeScope', 'unsupported_resume_scope');
+  if (typeof execution.attemptId !== 'string' || !ATTEMPT_ID.test(execution.attemptId)) {
+    throw fieldError('attemptId', 'invalid_format');
+  }
+  if (
+    typeof execution.statePath !== 'string'
+    || !execution.statePath.trim()
+    || execution.statePath.length > 1024
+    || /\p{Cc}/u.test(execution.statePath)
+  ) {
+    throw fieldError('statePath', 'invalid_path');
+  }
+  if (!Number.isInteger(execution.expectedStateRevision) || execution.expectedStateRevision < 1) {
+    throw fieldError('expectedStateRevision', 'positive_integer_required');
+  }
+  const checkpointDirs = execution.resumeCheckpointDirs ?? [];
+  if (!Array.isArray(checkpointDirs) || checkpointDirs.length > 128) {
+    throw fieldError('resumeCheckpointDirs', 'invalid_checkpoint_directories');
+  }
+  const normalizedCheckpointDirs = [...new Set(checkpointDirs.map((directory) => {
+    if (
+      typeof directory !== 'string'
+      || !directory.trim()
+      || directory.length > 1024
+      || /\p{Cc}/u.test(directory)
+    ) {
+      throw fieldError('resumeCheckpointDirs', 'invalid_checkpoint_directory');
+    }
+    return directory;
+  }))];
+  args.push(
+    '--resume-scope', execution.resumeScope,
+    '--attempt-id', execution.attemptId,
+    '--state-path', execution.statePath,
+    '--expected-state-revision', String(execution.expectedStateRevision),
+  );
+  for (const directory of normalizedCheckpointDirs) {
+    args.push('--resume-checkpoint-dir', directory);
+  }
 }
 
 function isPlainObject(value) {

@@ -33,6 +33,7 @@ test('general content completeness depends on AI modules and vision rather than 
     },
     content_analysis: {
       status: 'completed',
+      grounded_evidence_count: 2,
       overview: '该内容介绍一场城市摄影展。',
       modules: [{ id: 'schedule', title: '时间与地点', summary: '8月1日举办。', items: [], evidence: [] }],
     },
@@ -63,6 +64,7 @@ test('application results expose general presentation and use general completene
     media: { images: [], analysis: { status: 'no_images', source: 'none', visible_text: '' } },
     content_analysis: {
       status: 'completed',
+      grounded_evidence_count: 1,
       overview: '该内容介绍一场城市摄影展。',
       content_type: '展览推荐',
       relevance_score: 95,
@@ -87,6 +89,15 @@ test('application results expose general presentation and use general completene
       title: '城市展览内容观察',
       description: '整理正文与图片中的展览信息。',
       modules: [{ id: 'highlights', title: '展览亮点', question: '有哪些亮点？' }],
+    },
+    content_insights: {
+      sampleSize: 1,
+      sourceReady: 1,
+      groundedRecords: 1,
+      coverageRate: 100,
+      methodNote: '只统计可回溯证据。',
+      topTopics: [],
+      modules: [],
     },
     records: [record],
   }), 'utf8');
@@ -116,6 +127,7 @@ test('application results expose general presentation and use general completene
       goal: '整理适合周末到访的展览、时间与地点。',
     });
     assert.equal(response.presentation.title, '城市展览内容观察');
+    assert.equal(response.insights.groundedRecords, 1);
     assert.equal(response.filters.stats.incomplete, 0);
     assert.equal(response.items[0].content_analysis.modules[0].title, '展览亮点');
 
@@ -199,12 +211,11 @@ test('legacy results can be viewed as content and remain pending until AI struct
   }
 });
 
-test('one-click completion starts one managed task and repeated clicks attach to it', async () => {
+test('one-click completion resumes the original task in place and repeated clicks attach to it', async () => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-managed-completion-'));
   const outputDir = path.join(fixture, 'artifacts');
   await mkdir(outputDir, { recursive: true });
   const sourceId = '20260730140200-abcdef12';
-  const childId = '20260730140300-bcdef123';
   const sourceParams = {
     analysisMode: 'job',
     keyword: '数据分析实习',
@@ -228,23 +239,19 @@ test('one-click completion starts one managed task and repeated clicks attach to
     outputDir,
   };
   const jobs = [sourceJob];
-  const starts = [];
+  const resumes = [];
   const manager = {
     active: null,
     list: () => [...jobs],
     get: (jobId) => jobs.find((job) => job.id === jobId) || null,
     getInternal: (jobId) => jobId === sourceId ? internal : null,
-    start: async (params) => {
-      starts.push(params);
-      const child = {
-        id: childId,
-        keyword: params.keyword,
-        status: 'queued',
-        createdAt: new Date().toISOString(),
-        config: params,
-      };
-      jobs.unshift(child);
-      return child;
+    resume: async (jobId, options) => {
+      resumes.push([jobId, options]);
+      sourceJob.status = 'resuming';
+      sourceJob.resumeCount = 1;
+      sourceJob.attempts = [{ attemptId: 'attempt-2', resumeScope: options.scope }];
+      internal.status = 'resuming';
+      return { ...sourceJob, attemptId: 'attempt-2' };
     },
   };
   await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
@@ -284,13 +291,17 @@ test('one-click completion starts one managed task and repeated clicks attach to
     const first = await firstResponse.json();
     assert.equal(first.action, 'started');
     assert.equal(first.incompleteBefore, 1);
-    assert.equal(first.job.id, childId);
-    assert.equal(starts.length, 1);
-    assert.equal(starts[0].mode, 'resume');
-    assert.equal(starts[0].resumeFromJobId, sourceId);
-    assert.equal(starts[0].completeMissingOnly, true);
-    assert.equal(starts[0].searchSort, 'latest');
-    assert.equal(starts[0].aiSessionId, '11111111-1111-4111-8111-111111111111');
+    assert.equal(first.job.id, sourceId);
+    assert.equal(first.job.createdAt, sourceJob.createdAt);
+    assert.equal(jobs.length, 1);
+    assert.equal(resumes.length, 1);
+    assert.equal(resumes[0][0], sourceId);
+    assert.equal(resumes[0][1].scope, 'body_completion');
+    assert.equal(resumes[0][1].params.mode, 'resume');
+    assert.equal(resumes[0][1].params.resumeFromJobId, sourceId);
+    assert.equal(resumes[0][1].params.completeMissingOnly, true);
+    assert.equal(resumes[0][1].params.searchSort, 'latest');
+    assert.equal(resumes[0][1].aiSessionId, '11111111-1111-4111-8111-111111111111');
 
     const secondResponse = await fetch(`${origin}/api/jobs/${sourceId}/complete-missing`, {
       method: 'POST',
@@ -300,8 +311,9 @@ test('one-click completion starts one managed task and repeated clicks attach to
     assert.equal(secondResponse.status, 200);
     const second = await secondResponse.json();
     assert.equal(second.action, 'attached');
-    assert.equal(second.job.id, childId);
-    assert.equal(starts.length, 1);
+    assert.equal(second.job.id, sourceId);
+    assert.equal(jobs.length, 1);
+    assert.equal(resumes.length, 1);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(fixture, { recursive: true, force: true });
@@ -396,6 +408,73 @@ test('application results hydrate images and filter the full result set by publi
     }), 'utf8');
     const live = await fetch(`${origin}/api/jobs/${id}/results`).then((response) => response.json());
     assert.deepEqual(live.items.map((item) => item.note_id), ['live-checkpoint']);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('application results proxy Xiaohongshu images through a persistent per-task cache', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-media-cache-'));
+  const outputDir = path.join(fixture, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  const id = '20260731180000-abcdef12';
+  const sourceUrl = 'https://sns-webpic-qc.xhscdn.com/202607311800/test.webp';
+  await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
+    records: [{
+      note_id: 'cached-image',
+      title: 'cached image',
+      note_url: 'https://www.xiaohongshu.com/explore/cached-image',
+      body: 'complete body',
+      publish_time: { value: new Date().toISOString() },
+      media: {
+        cover_url: sourceUrl,
+        images: [{ url: sourceUrl, alt: 'poster', source: 'detail' }],
+        analysis: { status: 'analyzed', source: 'vision_model' },
+      },
+      application_info: { contacts: [], application_routes: [], responsibilities: [], requirements: [] },
+      outreach: { runtime_status: 'completed' },
+    }],
+  }), 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), '[]', 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), '[]', 'utf8');
+  const internal = { id, outputDir, config: {} };
+  const manager = {
+    active: null,
+    list: () => [],
+    get: (jobId) => jobId === id ? internal : null,
+    getInternal: (jobId) => jobId === id ? internal : null,
+  };
+  let fetchCount = 0;
+  const server = http.createServer(createApp({
+    manager,
+    config: { host: '127.0.0.1', port: 0, maxBodyBytes: 4096, runnerAvailable: true },
+    mediaFetcher: async () => {
+      fetchCount += 1;
+      return new Response(Buffer.from('cached-image-body'), {
+        status: 200,
+        headers: { 'content-type': 'image/webp' },
+      });
+    },
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const results = await fetch(`${origin}/api/jobs/${id}/results`).then((response) => response.json());
+    const image = results.items[0].media.images[0];
+    assert.equal(image.original_url, sourceUrl);
+    assert.match(image.url, new RegExp(`^/api/jobs/${id}/media\\?url=`));
+    assert.equal(results.items[0].media.cover_original_url, sourceUrl);
+
+    const first = await fetch(`${origin}${image.url}`);
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get('content-type'), 'image/webp');
+    assert.equal(await first.text(), 'cached-image-body');
+    const second = await fetch(`${origin}${image.url}`);
+    assert.equal(second.status, 200);
+    assert.equal(await second.text(), 'cached-image-body');
+    assert.equal(fetchCount, 1);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(fixture, { recursive: true, force: true });

@@ -63,12 +63,21 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     logPath: path.join(fixture, 'run.log'),
     params: { keyword: job.keyword, candidateProfile: { email: 'candidate@example.com' } },
   };
+  const startCalls = [];
+  const resumeCalls = [];
   const manager = {
     active: null,
     list: () => [],
     get: (id) => id === job.id ? job : null,
     getInternal: (id) => id === job.id ? internal : null,
-    start: async () => job,
+    start: async (...args) => {
+      startCalls.push(args);
+      return job;
+    },
+    resume: async (...args) => {
+      resumeCalls.push(args);
+      return { ...job, status: 'resuming', attemptId: 'attempt-2' };
+    },
     cancel: async () => ({ found: true, job: { ...job, status: 'cancelled' }, changed: true }),
   };
   const config = {
@@ -380,6 +389,14 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(audience.items[0].post_title, '内容运营实习');
     assert.equal(audience.items[0].user.display_name, '公开用户');
 
+    const audienceResume = await fetch(`${origin}/api/jobs/${job.id}/audience/resume`, { method: 'POST' });
+    assert.equal(audienceResume.status, 200);
+    const audienceResumePayload = await audienceResume.json();
+    assert.equal(audienceResumePayload.action, 'attached');
+    assert.equal(audienceResumePayload.sourceJobId, job.id);
+    assert.equal(audienceResumePayload.job.id, job.id);
+    assert.equal(resumeCalls.length, 0);
+
     const savedDraft = await fetch(`${origin}/api/jobs/${job.id}/draft`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -448,5 +465,391 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   } finally {
     await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('audience supplements read through queued checkpoints and resume from the latest terminal checkpoint', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-chain-'));
+  const rootOutputDir = path.join(fixture, 'root-artifacts');
+  const childOutputDir = path.join(fixture, 'child-artifacts');
+  await Promise.all([
+    mkdir(rootOutputDir, { recursive: true }),
+    mkdir(childOutputDir, { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(rootOutputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+      { note_id: 'post-1', note_url: 'https://example.test/explore/post-1', title: 'First saved post' },
+      { note_id: 'post-2', note_url: 'https://example.test/explore/post-2', title: 'Second saved post' },
+    ]), 'utf8'),
+    writeFile(path.join(rootOutputDir, 'audience-posts.json'), JSON.stringify([
+      { post_id: 'post-1', note_url: 'https://example.test/explore/post-1', title: 'First saved post', status: 'complete', collected_comment_count: 1 },
+    ]), 'utf8'),
+    writeFile(path.join(rootOutputDir, 'audience-comments.json'), JSON.stringify([
+      { comment_id: 'comment-1', post_id: 'post-1', text: 'Previously collected', user: { user_id: 'user-1' } },
+    ]), 'utf8'),
+    writeFile(path.join(rootOutputDir, 'audience-users.json'), JSON.stringify([
+      { user_id: 'user-1', display_name: 'Saved user', enrichment_status: 'complete', post_ids: ['post-1'] },
+    ]), 'utf8'),
+  ]);
+
+  const rootId = '20260730080000-aaaa1111';
+  const childId = '20260730090000-bbbb2222';
+  const rootParams = {
+    analysisMode: 'general',
+    keyword: 'original-content-query',
+    collectAudience: false,
+  };
+  const childParams = {
+    ...rootParams,
+    mode: 'resume',
+    resumeFromJobId: rootId,
+    collectAudience: true,
+    audienceOnly: true,
+  };
+  const rootJob = { id: rootId, status: 'incomplete', config: rootParams };
+  const childJob = { id: childId, status: 'queued', config: childParams };
+  const rootInternal = { ...rootJob, params: rootParams, outputDir: rootOutputDir };
+  const childInternal = {
+    ...childJob,
+    params: childParams,
+    outputDir: childOutputDir,
+    resumeCheckpointsPending: true,
+  };
+  const jobs = new Map([[rootId, rootJob], [childId, childJob]]);
+  const internals = new Map([[rootId, rootInternal], [childId, childInternal]]);
+  const resumeCalls = [];
+  const manager = {
+    active: null,
+    list: () => [childJob, rootJob],
+    get: (id) => jobs.get(id) || null,
+    getInternal: (id) => internals.get(id) || null,
+    resume: async (...args) => {
+      resumeCalls.push(args);
+      return { ...jobs.get(args[0]), status: 'resuming', attemptId: 'attempt-audience-2' };
+    },
+  };
+  const server = http.createServer(createApp({
+    manager,
+    config: {
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 4096,
+      staticDir: null,
+      runnerAvailable: true,
+    },
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const queuedSnapshot = await fetch(`${origin}/api/jobs/${childId}/audience?limit=20`).then((response) => response.json());
+    assert.equal(queuedSnapshot.sourceJobId, rootId);
+    assert.equal(queuedSnapshot.checkpointJobId, childId);
+    assert.deepEqual(queuedSnapshot.readThroughJobIds, [childId, rootId]);
+    assert.equal(queuedSnapshot.total, 1);
+    assert.equal(queuedSnapshot.items[0].comment_id, 'comment-1');
+    assert.deepEqual(
+      queuedSnapshot.posts.map((post) => post.collectionStatus),
+      ['complete', 'uncollected'],
+    );
+    rootJob.status = 'queued';
+    rootInternal.status = 'queued';
+    const attachedResponse = await fetch(`${origin}/api/jobs/${rootId}/audience/resume`, { method: 'POST' });
+    assert.equal(attachedResponse.status, 200);
+    const attached = await attachedResponse.json();
+    assert.equal(attached.action, 'attached');
+    assert.equal(attached.checkpointJobId, rootId);
+    assert.equal(attached.stateOwnerJobId, childId);
+    assert.equal(attached.job.id, rootId);
+    assert.equal(resumeCalls.length, 0);
+    rootJob.status = 'incomplete';
+    rootInternal.status = 'incomplete';
+
+    await Promise.all([
+      writeFile(path.join(childOutputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([
+        { note_id: 'post-1', note_url: 'https://example.test/explore/post-1' },
+        { note_id: 'post-2', note_url: 'https://example.test/explore/post-2' },
+      ]), 'utf8'),
+      writeFile(path.join(childOutputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+        { note_id: 'post-1', note_url: 'https://example.test/explore/post-1', title: 'First saved post' },
+        { note_id: 'post-2', note_url: 'https://example.test/explore/post-2', title: 'Second saved post' },
+      ]), 'utf8'),
+      writeFile(path.join(childOutputDir, 'audience-posts.json'), JSON.stringify([
+        { post_id: 'post-2', note_url: 'https://example.test/explore/post-2', title: 'Second saved post', status: 'partial', collected_comment_count: 1 },
+      ]), 'utf8'),
+      writeFile(path.join(childOutputDir, 'audience-comments.json'), JSON.stringify([
+        { comment_id: 'comment-2', post_id: 'post-2', text: 'Newly collected', user: { user_id: 'user-2' } },
+      ]), 'utf8'),
+      writeFile(path.join(childOutputDir, 'audience-users.json'), JSON.stringify([
+        { user_id: 'user-2', display_name: 'New user', enrichment_status: 'partial', post_ids: ['post-2'] },
+      ]), 'utf8'),
+    ]);
+    childJob.status = 'incomplete';
+    childInternal.status = 'incomplete';
+    childInternal.resumeCheckpointsPending = false;
+
+    const mergedSnapshot = await fetch(`${origin}/api/jobs/${childId}/audience?limit=20`).then((response) => response.json());
+    assert.deepEqual(mergedSnapshot.items.map((comment) => comment.comment_id), ['comment-1', 'comment-2']);
+    assert.deepEqual(
+      mergedSnapshot.posts.map((post) => post.collectionStatus),
+      ['complete', 'partial'],
+    );
+
+    const canonicalResume = await fetch(`${origin}/api/jobs/${rootId}/resume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'audience', idempotencyKey: 'legacy-audience-owner' }),
+    });
+    assert.equal(canonicalResume.status, 202);
+    assert.equal((await canonicalResume.json()).id, rootId);
+    assert.equal(resumeCalls[0][0], rootId);
+    assert.equal(resumeCalls[0][1].scope, 'audience');
+    assert.deepEqual(resumeCalls[0][1].resumeCheckpointJobIds, [rootId, childId]);
+
+    const resumed = await fetch(`${origin}/api/jobs/${rootId}/audience/resume`, { method: 'POST' });
+    assert.equal(resumed.status, 202);
+    const payload = await resumed.json();
+    assert.equal(payload.action, 'started');
+    assert.equal(payload.sourceJobId, rootId);
+    assert.equal(payload.checkpointJobId, rootId);
+    assert.equal(payload.stateOwnerJobId, childId);
+    assert.equal(payload.job.id, rootId);
+    assert.equal(resumeCalls[1][0], rootId);
+    assert.equal(resumeCalls[1][1].scope, 'audience');
+    assert.equal(resumeCalls[1][1].params.resumeFromJobId, rootId);
+    assert.equal(resumeCalls[1][1].params.keyword, 'original-content-query');
+    assert.deepEqual(resumeCalls[1][1].resumeCheckpointJobIds, [rootId, childId]);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('audience history keeps richer sibling checkpoints when the latest sibling failed empty', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-siblings-'));
+  const rootOutputDir = path.join(fixture, 'root-artifacts');
+  const earlierOutputDir = path.join(fixture, 'earlier-audience-artifacts');
+  const latestOutputDir = path.join(fixture, 'latest-empty-artifacts');
+  const outputDirs = [rootOutputDir, earlierOutputDir, latestOutputDir];
+  await Promise.all(outputDirs.map((outputDir) => mkdir(outputDir, { recursive: true })));
+
+  const cards = [{ note_id: 'post-1', note_url: 'https://example.test/explore/post-1' }];
+  const notes = [{ note_id: 'post-1', note_url: 'https://example.test/explore/post-1', title: 'Saved post' }];
+  await Promise.all(outputDirs.flatMap((outputDir) => [
+    writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(cards), 'utf8'),
+    writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(notes), 'utf8'),
+  ]));
+
+  const comments = Array.from({ length: 34 }, (_, index) => ({
+    comment_id: `comment-${index + 1}`,
+    post_id: 'post-1',
+    text: `Saved comment ${index + 1}`,
+    user: { user_id: `user-${index + 1}` },
+  }));
+  const users = Array.from({ length: 84 }, (_, index) => ({
+    user_id: `user-${index + 1}`,
+    display_name: `Saved user ${index + 1}`,
+    enrichment_status: 'complete',
+    post_ids: ['post-1'],
+  }));
+  await Promise.all([
+    writeFile(path.join(earlierOutputDir, 'audience-posts.json'), JSON.stringify([
+      { post_id: 'post-1', note_url: notes[0].note_url, title: 'Saved post', status: 'partial', collected_comment_count: 34 },
+    ]), 'utf8'),
+    writeFile(path.join(earlierOutputDir, 'audience-comments.json'), JSON.stringify(comments), 'utf8'),
+    writeFile(path.join(earlierOutputDir, 'audience-users.json'), JSON.stringify(users), 'utf8'),
+    writeFile(path.join(earlierOutputDir, 'audience-summary.json'), JSON.stringify({
+      status: 'partial',
+      postsTotal: 1,
+      postsComplete: 0,
+      postsPartial: 1,
+      commentsCollected: 34,
+      usersDiscovered: 84,
+      profilesComplete: 84,
+    }), 'utf8'),
+  ]);
+
+  const rootId = '20260730080000-aaaa1111';
+  const earlierId = '20260730090000-bbbb2222';
+  const latestId = '20260730100000-cccc3333';
+  const rootParams = {
+    analysisMode: 'general',
+    keyword: 'original-content-query',
+    collectAudience: false,
+  };
+  const earlierParams = {
+    ...rootParams,
+    mode: 'resume',
+    resumeFromJobId: rootId,
+    collectAudience: true,
+    audienceOnly: true,
+  };
+  const latestParams = { ...earlierParams };
+  const rootJob = { id: rootId, status: 'incomplete', config: rootParams };
+  const earlierJob = { id: earlierId, status: 'incomplete', config: earlierParams };
+  const latestJob = { id: latestId, status: 'failed', config: latestParams };
+  const jobs = new Map([[rootId, rootJob], [earlierId, earlierJob], [latestId, latestJob]]);
+  const internals = new Map([
+    [rootId, { ...rootJob, params: rootParams, outputDir: rootOutputDir }],
+    [earlierId, { ...earlierJob, params: earlierParams, outputDir: earlierOutputDir, resumeCheckpointsPending: false }],
+    [latestId, { ...latestJob, params: latestParams, outputDir: latestOutputDir, resumeCheckpointsPending: false }],
+  ]);
+  const resumeCalls = [];
+  const manager = {
+    active: null,
+    list: () => [latestJob, earlierJob, rootJob],
+    get: (id) => jobs.get(id) || null,
+    getInternal: (id) => internals.get(id) || null,
+    resume: async (...args) => {
+      resumeCalls.push(args);
+      return { ...jobs.get(args[0]), status: 'resuming', attemptId: 'attempt-audience-3' };
+    },
+  };
+  const server = http.createServer(createApp({
+    manager,
+    config: {
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 4096,
+      staticDir: null,
+      runnerAvailable: true,
+    },
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const fromRoot = await fetch(`${origin}/api/jobs/${rootId}/audience?kind=comments&limit=100`).then((response) => response.json());
+    assert.equal(fromRoot.sourceJobId, rootId);
+    assert.equal(fromRoot.checkpointJobId, rootId);
+    assert.deepEqual(fromRoot.mergedCheckpointJobIds, [rootId, earlierId, latestId]);
+    assert.equal(fromRoot.total, 34);
+    assert.equal(fromRoot.totals.users, 84);
+
+    const fromLatest = await fetch(`${origin}/api/jobs/${latestId}/audience?kind=users&limit=100`).then((response) => response.json());
+    assert.equal(fromLatest.sourceJobId, rootId);
+    assert.equal(fromLatest.checkpointJobId, latestId);
+    assert.deepEqual(fromLatest.mergedCheckpointJobIds, [rootId, earlierId, latestId]);
+    assert.equal(fromLatest.total, 84);
+    assert.equal(fromLatest.totals.comments, 34);
+
+    const canonicalResume = await fetch(`${origin}/api/jobs/${latestId}/resume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'audience', idempotencyKey: 'richer-audience-owner' }),
+    });
+    assert.equal(canonicalResume.status, 202);
+    assert.equal((await canonicalResume.json()).id, latestId);
+    assert.equal(resumeCalls[0][0], latestId);
+    assert.equal(resumeCalls[0][1].scope, 'audience');
+    assert.deepEqual(resumeCalls[0][1].resumeCheckpointJobIds, [rootId, earlierId, latestId]);
+
+    const resumed = await fetch(`${origin}/api/jobs/${latestId}/audience/resume`, { method: 'POST' });
+    assert.equal(resumed.status, 202);
+    const payload = await resumed.json();
+    assert.equal(payload.action, 'started');
+    assert.equal(payload.sourceJobId, rootId);
+    assert.equal(payload.checkpointJobId, latestId);
+    assert.equal(payload.stateOwnerJobId, earlierId);
+    assert.equal(payload.job.id, latestId);
+    assert.equal(resumeCalls[1][0], latestId);
+    assert.equal(resumeCalls[1][1].scope, 'audience');
+    assert.equal(resumeCalls[1][1].params.resumeFromJobId, rootId);
+    assert.deepEqual(resumeCalls[1][1].resumeCheckpointJobIds, [rootId, earlierId, latestId]);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('resume endpoint keeps the original job identity and forwards scope and idempotency', async () => {
+  const id = '20260731123000-acde1234';
+  const createdAt = '2026-07-31T04:30:00.000Z';
+  const job = {
+    id,
+    keyword: '原地续跑',
+    status: 'interrupted',
+    createdAt,
+    outputDir: 'C:\\jobs\\original\\artifacts',
+    resumeCount: 0,
+    attempts: [{ attemptId: 'attempt-1', sequence: 1, kind: 'initial' }],
+  };
+  const resumeCalls = [];
+  const manager = {
+    active: null,
+    list: () => [job],
+    get: (jobId) => jobId === id ? job : null,
+    getInternal: (jobId) => jobId === id ? job : null,
+    resume: async (jobId, options) => {
+      resumeCalls.push([jobId, options]);
+      return {
+        ...job,
+        status: 'resuming',
+        resumeCount: 1,
+        attemptId: 'attempt-2',
+        attempts: [...job.attempts, { attemptId: 'attempt-2', sequence: 2, kind: 'resume', resumeScope: options.scope }],
+      };
+    },
+  };
+  const server = http.createServer(createApp({
+    manager,
+    config: { host: '127.0.0.1', port: 0, maxBodyBytes: 4096, staticDir: null, runnerAvailable: true },
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const response = await fetch(`${origin}/api/jobs/${id}/resume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        scope: 'body_completion',
+        aiSessionId: '11111111-1111-4111-8111-111111111111',
+        idempotencyKey: 'resume-click-1',
+      }),
+    });
+    assert.equal(response.status, 202);
+    const resumed = await response.json();
+    assert.equal(resumed.id, id);
+    assert.equal(resumed.createdAt, createdAt);
+    assert.equal(resumed.outputDir, job.outputDir);
+    assert.equal(resumed.resumeCount, 1);
+    assert.equal(resumed.attemptId, 'attempt-2');
+    assert.equal(resumeCalls.length, 1);
+    assert.equal(resumeCalls[0][0], id);
+    assert.deepEqual(resumeCalls[0][1], {
+      scope: 'body_completion',
+      aiSessionId: '11111111-1111-4111-8111-111111111111',
+      idempotencyKey: 'resume-click-1',
+      requestedBy: 'resume_api',
+    });
+    const listed = await fetch(`${origin}/api/jobs`).then((item) => item.json());
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].id, id);
+
+    const audienceResponse = await fetch(`${origin}/api/jobs/${id}/resume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'audience', idempotencyKey: 'resume-audience-1' }),
+    });
+    assert.equal(audienceResponse.status, 202);
+    assert.equal((await audienceResponse.json()).id, id);
+    assert.equal(resumeCalls.length, 2);
+    assert.deepEqual(resumeCalls[1], [id, {
+      scope: 'audience',
+      idempotencyKey: 'resume-audience-1',
+      requestedBy: 'resume_api',
+      resumeCheckpointJobIds: [id],
+    }]);
+
+    const invalid = await fetch(`${origin}/api/jobs/${id}/resume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: 'unknown', idempotencyKey: 'invalid-scope' }),
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal((await invalid.json()).error.code, 'RESUME_SCOPE_INVALID');
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }
 });

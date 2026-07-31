@@ -2,12 +2,24 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createWriteStream } from 'node:fs';
-import { copyFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { buildRunnerArgs } from './lib/contracts.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
+import {
+  WORKFLOW_STATE_SCHEMA_VERSION,
+  emptyWorkflowStages,
+  initializeWorkflowState,
+  readWorkflowState,
+  updateWorkflowState,
+  workflowStatePath,
+  writeJsonAtomically,
+} from './lib/workflow-state.mjs';
 
-const TERMINAL = new Set(['succeeded', 'incomplete', 'failed', 'cancelled', 'interrupted']);
+const TERMINAL = new Set(['succeeded', 'incomplete', 'failed', 'cancelled', 'interrupted', 'blocked']);
+const ACTIVE_ATTEMPT_STATUSES = new Set(['queued', 'resuming', 'running']);
+const RESUMABLE_JOB_STATUSES = new Set(['incomplete', 'interrupted', 'failed', 'cancelled', 'blocked']);
+const RESUME_SCOPES = new Set(['full', 'discovery', 'body_completion', 'analysis', 'audience', 'artifacts']);
 
 export class JobManager {
   constructor({
@@ -42,6 +54,7 @@ export class JobManager {
     this.runtimeContexts = new Map();
     this.liveCheckpointAnalyses = new Map();
     this.recoveryBlockers = [];
+    this.jobLocks = new Map();
   }
 
   async initialize() {
@@ -55,7 +68,13 @@ export class JobManager {
     const now = new Date().toISOString();
     let changed = false;
     for (const job of this.jobs) {
-      const wasInFlight = job.status === 'queued' || job.status === 'running';
+      changed = migrateLegacyJob(job, this.dataDir, now) || changed;
+      const state = await initializeWorkflowState(job.statePath, workflowStateFromJob(job));
+      changed = applyWorkflowStateToJob(job, state) || changed;
+      const activeAttempt = currentActiveAttempt(job);
+      const wasInFlight = ['queued', 'resuming', 'running'].includes(job.status)
+        || Boolean(state.activeAttemptId)
+        || Boolean(activeAttempt);
       const needsLegacyRecovery = job.status === 'interrupted'
         && String(job.error || '').startsWith('Server restarted before the task finished.')
         && !job.cleanupConfirmedAt;
@@ -84,11 +103,25 @@ export class JobManager {
       if (wasInFlight) {
         job.status = 'interrupted';
         job.finishedAt = now;
+        job.updatedAt = now;
         job.error = 'Server restarted before the task finished. Checkpoint preserved; resume is available.';
         if (!cleanupConfirmed) {
           job.error += ` Orphan cleanup failed: ${job.cleanupError}`;
         }
         if (cleanupConfirmed) job.pid = null;
+        finishAttempt(activeAttempt, {
+          status: 'interrupted',
+          finishedAt: now,
+          stopReason: 'server_restart',
+          errorCode: cleanupConfirmed ? 'SERVER_RESTART' : 'ORPHAN_CLEANUP_FAILED',
+          errorMessage: job.error,
+          exitCode: null,
+          processedCount: attemptProcessedCount(activeAttempt, job),
+          checkpointRevisionAtEnd: Number(state.revision || job.revision || 0) + 1,
+        });
+        job.activeAttemptId = null;
+        const nextState = await this.#commitWorkflowState(job);
+        applyWorkflowStateToJob(job, nextState);
         changed = true;
       } else if (TERMINAL.has(job.status) && job.pid != null && cleanupConfirmed) {
         job.pid = null;
@@ -122,17 +155,29 @@ export class JobManager {
     return this.jobs.find((item) => item.id === id) || null;
   }
 
-  async start(params) {
+  async start(params, options = {}) {
+    if (params?.resumeFromJobId) {
+      return this.resume(params.resumeFromJobId, {
+        scope: inferResumeScope(params),
+        params,
+        aiSessionId: params.aiSessionId,
+        requestedBy: options.requestedBy || 'legacy_api',
+        idempotencyKey: options.idempotencyKey,
+        resumeCheckpointJobIds: options.resumeCheckpointJobIds,
+      });
+    }
+    const { queueIfBusy = false } = options;
     if (this.recoveryBlockers.length > 0) {
       const error = new Error('A previous scrape process could not be cleaned up after restart. Restart cleanup must succeed before a new task can start.');
       error.code = 'JOB_RECOVERY_INCOMPLETE';
       error.jobs = this.recoveryBlockers.map((item) => item.id);
       throw error;
     }
-    if (this.active) {
+    const queuedBehind = this.active;
+    if (queuedBehind && !queueIfBusy) {
       const error = new Error('A scrape task is already running.');
       error.code = 'JOB_BUSY';
-      error.activeJob = publicJob(this.active);
+      error.activeJob = publicJob(queuedBehind);
       throw error;
     }
     const id = `${timestampId()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -147,32 +192,27 @@ export class JobManager {
     const logPath = path.join(jobDir, 'run.log');
     await mkdir(outputDir, { recursive: true });
     const runtimeProfilePath = await createRuntimeProfile(profilePath, params.candidateProfile, jobDir);
-    let effectiveParams = params;
-    if (params.resumeFromJobId) {
-      const source = this.getInternal(params.resumeFromJobId);
-      if (!source) {
-        const error = new Error('Resume source task was not found.');
-        error.code = 'RESUME_SOURCE_NOT_FOUND';
-        throw error;
-      }
-      if (source.params?.searchSort === 'comprehensive') {
-        // Legacy comprehensive checkpoints cannot prove latest-first discovery.
-        // Preserve the resume relation, but rediscover cards from the live page.
-        effectiveParams = Object.freeze({
-          ...params,
-          searchSort: 'latest',
-          completeMissingOnly: false,
-        });
-      } else {
-        await copyResumeCheckpoints(source.outputDir, outputDir);
-      }
-    }
     const now = new Date().toISOString();
+    const attempt = createAttempt({
+      jobId: id,
+      jobDir,
+      sequence: 1,
+      kind: 'initial',
+      resumeScope: 'full',
+      requestedBy: options.requestedBy || 'user',
+      idempotencyKey: options.idempotencyKey || null,
+      checkpointRevisionAtStart: 0,
+      entryStatus: 'queued',
+      processedCountAtStart: 0,
+    });
+    await mkdir(path.dirname(attempt.logPath), { recursive: true });
     const job = {
       id,
+      schemaVersion: WORKFLOW_STATE_SCHEMA_VERSION,
       status: 'queued',
-      params: effectiveParams,
+      params,
       createdAt: now,
+      updatedAt: now,
       startedAt: null,
       finishedAt: null,
       exitCode: null,
@@ -190,13 +230,165 @@ export class JobManager {
       progressTotal: 0,
       progressUpdatedAt: now,
       workflowSummary: null,
+      queuedBehindJobId: queuedBehind?.id || null,
+      currentAttemptId: attempt.attemptId,
+      activeAttemptId: attempt.attemptId,
+      resumeCount: 0,
+      lastResumedAt: null,
+      revision: 0,
+      stages: emptyWorkflowStages(),
+      attempts: [attempt],
+      statePath: workflowStatePath(outputDir),
+      artifactCount: 0,
     };
+    if (queuedBehind) job.progressLabel = '任务已排队，当前任务结束后将自动启动';
+    const state = await initializeWorkflowState(job.statePath, workflowStateFromJob(job));
+    applyWorkflowStateToJob(job, state);
     this.jobs.unshift(job);
-    this.active = job;
-    this.runtimeContexts.set(id, { ai, profilePath: runtimeProfilePath });
+    this.runtimeContexts.set(id, {
+      ai,
+      profilePath: runtimeProfilePath,
+      runnerParams: params,
+      attemptId: attempt.attemptId,
+    });
+    if (!queuedBehind) {
+      this.active = job;
+      await this.#markAttemptRunning(job);
+    }
     await this.persist();
-    queueMicrotask(() => this.#run(job));
+    if (!queuedBehind) queueMicrotask(() => this.#run(job));
     return publicJob(job);
+  }
+
+  async resume(jobId, options = {}) {
+    return this.#withJobLock(jobId, async () => {
+      const job = this.getInternal(jobId);
+      if (!job) throw jobError('RESUME_SOURCE_NOT_FOUND', 'Resume source task was not found.');
+      const scope = normalizeResumeScope(options.scope);
+      const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
+      const duplicate = idempotencyKey
+        ? job.attempts?.find((attempt) => (
+            attempt.kind !== 'initial'
+            && attempt.resumeScope === scope
+            && attempt.idempotencyKey === idempotencyKey
+          ))
+        : null;
+      if (duplicate) return { ...publicJob(job), attemptId: duplicate.attemptId };
+
+      if (this.recoveryBlockers.length > 0) {
+        const error = jobError(
+          'JOB_RECOVERY_INCOMPLETE',
+          'A previous scrape process could not be cleaned up after restart. Restart cleanup must succeed before a task can resume.',
+        );
+        error.jobs = this.recoveryBlockers.map((item) => item.id);
+        throw error;
+      }
+      if (this.active) {
+        if (this.active.id === job.id) {
+          const error = jobError('JOB_ALREADY_RUNNING', 'The task already has an active attempt.');
+          error.activeJob = publicJob(job);
+          throw error;
+        }
+        const error = jobError('JOB_BUSY', 'Another scrape task is already running.');
+        error.activeJob = publicJob(this.active);
+        throw error;
+      }
+      const activeAttempt = currentActiveAttempt(job);
+      if (activeAttempt) {
+        const error = jobError('JOB_ATTEMPT_ACTIVE', 'The task already has an active attempt.');
+        error.attemptId = activeAttempt.attemptId;
+        error.activeJob = publicJob(job);
+        throw error;
+      }
+
+      await reconcileJobCheckpoint(job);
+      const state = await readWorkflowState(job.statePath);
+      applyWorkflowStateToJob(job, state);
+      if (options.expectedRevision !== undefined && Number(options.expectedRevision) !== state.revision) {
+        const error = jobError(
+          'WORKFLOW_REVISION_CONFLICT',
+          `Workflow state revision conflict: expected ${options.expectedRevision}, found ${state.revision}.`,
+        );
+        error.expectedRevision = Number(options.expectedRevision);
+        error.actualRevision = state.revision;
+        throw error;
+      }
+      const exposed = publicJob(job);
+      if (job.status === 'succeeded' && resumeScopeIsComplete(state, exposed, scope)) {
+        throw jobError('JOB_ALREADY_COMPLETED', 'The task is already complete.');
+      }
+      if (!RESUMABLE_JOB_STATUSES.has(job.status) && job.status !== 'succeeded') {
+        throw jobError('JOB_NOT_RESUMABLE', `Task status ${job.status} cannot be resumed.`);
+      }
+      if (!hasRecoverableCheckpoint(job, state, scope)) {
+        throw jobError('RESUME_CHECKPOINTS_MISSING', 'The task does not have a recoverable checkpoint.');
+      }
+      try {
+        await readdir(job.outputDir);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        throw jobError('RESUME_OUTPUT_MISSING', 'The original task output directory is missing.');
+      }
+
+      const runnerParams = resumeRunnerParams(job.params, options.params, scope);
+      const resumeCheckpointJobIds = normalizeInPlaceCheckpointJobIds(
+        job.id,
+        options.resumeCheckpointJobIds,
+      );
+      const resumeCheckpointDirs = await this.#prepareInPlaceResume(
+        job,
+        runnerParams,
+        resumeCheckpointJobIds,
+      );
+      const runtime = await this.#resolveResumeRuntime(job, runnerParams, options);
+      const now = new Date().toISOString();
+      const sequence = nextAttemptSequence(job.attempts);
+      const attempt = createAttempt({
+        jobId: job.id,
+        jobDir: path.dirname(job.outputDir),
+        sequence,
+        kind: isRestartInterruption(job) ? 'recovery_after_restart' : 'resume',
+        resumeScope: scope,
+        requestedBy: options.requestedBy || 'user',
+        idempotencyKey,
+        checkpointRevisionAtStart: state.revision,
+        entryStatus: job.status,
+        processedCountAtStart: processedCountForJob(job),
+      });
+      await mkdir(path.dirname(attempt.logPath), { recursive: true });
+      backfillLatestAttemptOutcome(job);
+      job.status = 'resuming';
+      job.updatedAt = now;
+      job.finishedAt = null;
+      job.exitCode = null;
+      job.error = null;
+      job.pid = null;
+      job.cancelRequested = false;
+      job.interruptRequested = false;
+      job.progressPhase = 'resuming';
+      job.progressLabel = '正在恢复原任务';
+      job.progressUpdatedAt = now;
+      job.currentAttemptId = attempt.attemptId;
+      job.activeAttemptId = attempt.attemptId;
+      job.resumeCount = Number(job.resumeCount || 0) + 1;
+      job.lastResumedAt = now;
+      job.attempts.push(attempt);
+      const nextState = await this.#commitWorkflowState(job, { expectedRevision: state.revision });
+      applyWorkflowStateToJob(job, nextState);
+      this.runtimeContexts.set(job.id, {
+        ...runtime,
+        runnerParams,
+        attemptId: attempt.attemptId,
+        resumeScope: scope,
+        resumeCheckpointDirs,
+      });
+      this.active = job;
+      await this.#markAttemptRunning(job);
+      await this.persist();
+      this.#emit(job.id, 'state', publicJob(job));
+      queueMicrotask(() => this.#run(job));
+      return { ...publicJob(job), attemptId: attempt.attemptId };
+    });
   }
 
   async cancel(id) {
@@ -205,6 +397,29 @@ export class JobManager {
     if (TERMINAL.has(job.status)) return { found: true, job: publicJob(job), changed: false };
     job.cancelRequested = true;
     const child = this.processes.get(id);
+    if (job.status === 'queued' && !child && this.active?.id !== job.id) {
+      job.status = 'cancelled';
+      job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
+      job.progressLabel = '排队任务已取消';
+      job.progressUpdatedAt = job.finishedAt;
+      finishAttempt(currentAttempt(job), {
+        status: 'cancelled',
+        finishedAt: job.finishedAt,
+        stopReason: 'user_cancelled',
+        processedCount: 0,
+        checkpointRevisionAtEnd: Number(job.revision || 0) + 1,
+      });
+      job.activeAttemptId = null;
+      const state = await this.#commitWorkflowState(job, { expectedRevision: job.revision });
+      applyWorkflowStateToJob(job, state);
+      this.runtimeContexts.delete(id);
+      this.#emit(id, 'state', publicJob(job));
+      this.#emit(id, 'end', { status: job.status, exitCode: job.exitCode });
+      await this.persist();
+      if (!this.active) queueMicrotask(() => this.#startNextQueued());
+      return { found: true, job: publicJob(job), changed: true };
+    }
     if (child) await this.terminateImpl(child);
     this.#emit(id, 'state', publicJob(job));
     await this.persist();
@@ -240,7 +455,20 @@ export class JobManager {
       job.status = 'interrupted';
       job.error = 'Server shutdown interrupted the task; resume is available from its checkpoint.';
       job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
       job.pid = null;
+      finishAttempt(currentAttempt(job), {
+        status: 'interrupted',
+        finishedAt: job.finishedAt,
+        stopReason: 'server_shutdown',
+        errorCode: 'SERVER_SHUTDOWN',
+        errorMessage: job.error,
+        processedCount: attemptProcessedCount(currentAttempt(job), job),
+        checkpointRevisionAtEnd: Number(job.revision || 0) + 1,
+      });
+      job.activeAttemptId = null;
+      const state = await this.#commitWorkflowState(job, { expectedRevision: job.revision });
+      applyWorkflowStateToJob(job, state);
       if (this.active?.id === job.id) this.active = null;
       await this.persist();
     }
@@ -253,12 +481,115 @@ export class JobManager {
     return () => this.events.off(event, listener);
   }
 
+  async #prepareInPlaceResume(job, params, checkpointJobIds = []) {
+    if (checkpointJobIds.length < 1 || (!params?.audienceOnly && !params?.collectAudience)) return [];
+    const outputDir = path.resolve(job.outputDir);
+    const checkpointDirs = [];
+    const seen = new Set();
+    for (const id of checkpointJobIds) {
+      const checkpoint = this.getInternal(id);
+      if (!checkpoint) {
+        throw jobError('RESUME_SOURCE_NOT_FOUND', `Resume checkpoint task ${id} was not found.`);
+      }
+      const checkpointDir = path.resolve(checkpoint.outputDir);
+      if (checkpointDir === outputDir || seen.has(checkpointDir)) continue;
+      seen.add(checkpointDir);
+      checkpointDirs.push(checkpointDir);
+    }
+    return checkpointDirs;
+  }
+
+  async #resolveResumeRuntime(job, params, options) {
+    const aiSessionId = options.aiSessionId || params.aiSessionId;
+    let ai = { provider: 'codex', apiKey: '', baseUrl: '', model: '', wireApi: 'responses' };
+    if (aiSessionId) {
+      try {
+        ai = this.aiSessions.resolve(aiSessionId);
+      } catch (error) {
+        const unavailable = jobError('AI_SESSION_UNAVAILABLE', 'The AI session required by this task is unavailable.');
+        unavailable.cause = error;
+        throw unavailable;
+      }
+    }
+    let profilePath;
+    try {
+      profilePath = params.profileId
+        ? await this.profileStore.resolvePath(params.profileId)
+        : await resolveCheckpointProfilePath(job, this.legacyProfilePath);
+      profilePath = await createRuntimeProfile(
+        profilePath,
+        params.candidateProfile,
+        path.dirname(job.outputDir),
+      );
+    } catch (error) {
+      const unavailable = jobError('PROFILE_UNAVAILABLE', 'The profile required by this task is unavailable.');
+      unavailable.cause = error;
+      throw unavailable;
+    }
+    return { ai, profilePath };
+  }
+
+  #withJobLock(jobId, operation) {
+    const key = String(jobId);
+    const previous = this.jobLocks.get(key) || Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    this.jobLocks.set(key, current);
+    return current.finally(() => {
+      if (this.jobLocks.get(key) === current) this.jobLocks.delete(key);
+    });
+  }
+
+  async #commitWorkflowState(job, { expectedRevision } = {}) {
+    return updateWorkflowState(job.statePath, (draft) => {
+      draft.status = job.status;
+      draft.createdAt = job.createdAt;
+      draft.outputDir = job.outputDir;
+      draft.activeAttemptId = job.activeAttemptId || null;
+      draft.currentAttemptId = job.currentAttemptId || null;
+      draft.resumeCount = Number(job.resumeCount || 0);
+      draft.lastResumedAt = job.lastResumedAt || null;
+      draft.stages = structuredClone(job.stages || draft.stages || emptyWorkflowStages());
+      draft.attempts = mergeAttempts(draft.attempts, job.attempts);
+      draft.workflowSummary = job.workflowSummary || null;
+      draft.artifactCount = Number(job.artifactCount || 0);
+      return draft;
+    }, { expectedRevision });
+  }
+
+  async #markAttemptRunning(job) {
+    const now = new Date().toISOString();
+    const attempt = currentAttempt(job);
+    job.status = 'running';
+    job.progress = Math.max(10, Number(job.progress || 0));
+    job.startedAt ||= now;
+    job.updatedAt = now;
+    job.progressPhase = 'starting';
+    job.progressLabel = '正在启动采集器并连接 Relay';
+    job.progressCurrent = 0;
+    job.progressTotal = 0;
+    job.progressUpdatedAt = now;
+    if (attempt) {
+      attempt.status = 'running';
+      attempt.startedAt ||= now;
+      attempt.checkpointRevisionAtStart ||= Number(job.revision || 0);
+    }
+    const state = await this.#commitWorkflowState(job, { expectedRevision: job.revision });
+    applyWorkflowStateToJob(job, state);
+    return state;
+  }
+
   async #run(job) {
+    let attempt = currentAttempt(job);
+    let executionPid = attempt?.pid || null;
     const log = createWriteStream(job.logPath, { flags: 'a', encoding: 'utf8' });
+    const attemptLog = attempt?.logPath
+      ? createWriteStream(attempt.logPath, { flags: 'a', encoding: 'utf8' })
+      : null;
     const progressBuffers = new Map();
     const append = (stream, chunk) => {
       const message = String(chunk);
       log.write(message);
+      attemptLog?.write(message);
       this.#emit(job.id, 'log', { stream, message, at: new Date().toISOString() });
       const buffered = `${progressBuffers.get(stream) || ''}${message}`;
       const lines = buffered.split(/\r?\n/);
@@ -285,17 +616,17 @@ export class JobManager {
         append('system', `Task ${job.id} was cancelled before it started.\n`);
         return;
       }
-      job.status = 'running';
-      job.progress = 10;
-      job.startedAt = new Date().toISOString();
-      job.progressPhase = 'starting';
-      job.progressLabel = '正在启动采集器并连接 Relay';
-      job.progressCurrent = 0;
-      job.progressTotal = 0;
-      job.progressUpdatedAt = job.startedAt;
-      const args = [this.runnerPath, ...buildRunnerArgs(job.params, job.outputDir)];
       const runtime = this.runtimeContexts.get(job.id) || {};
-      append('system', `Starting scrape task ${job.id}\n`);
+      const runnerParams = runtime.runnerParams || job.params;
+      const runnerState = {
+        resumeScope: runtime.resumeScope || attempt?.resumeScope || 'full',
+        attemptId: attempt?.attemptId || runtime.attemptId,
+        statePath: job.statePath,
+        expectedStateRevision: job.revision,
+        resumeCheckpointDirs: runtime.resumeCheckpointDirs || [],
+      };
+      const args = [this.runnerPath, ...buildRunnerArgs(runnerParams, job.outputDir, runnerState)];
+      append('system', `Starting ${attempt?.attemptId || 'attempt'} for task ${job.id}\n`);
       const child = this.spawnImpl(this.pythonBin, args, {
         cwd: path.dirname(this.runnerPath),
         env: {
@@ -314,7 +645,9 @@ export class JobManager {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
-      job.pid = child.pid || null;
+      executionPid = child.pid || null;
+      job.pid = executionPid;
+      if (attempt) attempt.pid = job.pid;
       this.processes.set(job.id, child);
       child.stdout?.on('data', (chunk) => append('stdout', chunk));
       child.stderr?.on('data', (chunk) => append('stderr', chunk));
@@ -339,9 +672,13 @@ export class JobManager {
         job.progressUpdatedAt = new Date().toISOString();
       } else if (result.code === 3) {
         job.status = 'incomplete';
-        job.error = '质量门禁发现未完整岗位；当前岗位卡与投递文案已生成，可从检查点续跑。';
+        job.error = job.params?.analysisMode === 'general'
+          ? '质量门禁发现内容正文或证据分析未完整；当前结果已保存，可从检查点续跑。'
+          : '质量门禁发现未完整岗位；当前岗位卡与投递文案已生成，可从检查点续跑。';
         job.progressPhase = 'incomplete';
-        job.progressLabel = '当前检查点已完成分析，仍有岗位正文待补全';
+        job.progressLabel = job.params?.analysisMode === 'general'
+          ? '当前检查点已完成分析，仍有内容正文或可回溯证据待补全'
+          : '当前检查点已完成分析，仍有岗位正文待补全';
         job.progressUpdatedAt = new Date().toISOString();
       } else {
         job.status = 'failed';
@@ -360,6 +697,7 @@ export class JobManager {
         this.#emit(job.id, 'state', publicJob(job));
       }
       job.finishedAt = new Date().toISOString();
+      job.updatedAt = job.finishedAt;
       job.pid = null;
       this.processes.delete(job.id);
       if (this.active?.id === job.id) this.active = null;
@@ -382,11 +720,57 @@ export class JobManager {
       this.runtimeContexts.delete(job.id);
       job.workflowSummary = await readWorkflowSummary(job.outputDir);
       job.artifactCount = await countArtifactFiles(job.outputDir);
+      let latestState;
+      try {
+        latestState = await readWorkflowState(job.statePath);
+        applyWorkflowStateToJob(job, latestState, { preserveStatus: true });
+        attempt = currentAttempt(job);
+      } catch (error) {
+        job.status = 'failed';
+        job.error = String(error?.message || error);
+        append('system', `${job.error}\n`);
+      }
+      finishAttempt(attempt, {
+        status: job.status,
+        finishedAt: job.finishedAt,
+        pid: executionPid,
+        exitCode: job.exitCode,
+        stopReason: stopReasonForJob(job),
+        errorCode: errorCodeForJob(job),
+        errorMessage: job.error || null,
+        processedCount: attemptProcessedCount(attempt, job),
+        checkpointRevisionAtEnd: Number(latestState?.revision || job.revision || 0) + 1,
+      });
+      job.activeAttemptId = null;
+      try {
+        const finalState = await this.#commitWorkflowState(job, {
+          expectedRevision: latestState?.revision ?? job.revision,
+        });
+        applyWorkflowStateToJob(job, finalState);
+      } catch (error) {
+        job.status = 'failed';
+        job.error = String(error?.message || error);
+        append('system', `${job.error}\n`);
+      }
       await this.persist();
       this.#emit(job.id, 'state', publicJob(job));
+      await Promise.all([closeWriteStream(log), closeWriteStream(attemptLog)]);
       this.#emit(job.id, 'end', { status: job.status, exitCode: job.exitCode });
-      log.end();
+      queueMicrotask(() => this.#startNextQueued());
     }
+  }
+
+  async #startNextQueued() {
+    if (this.active) return;
+    const next = [...this.jobs].reverse().find((job) => job.status === 'queued' && !job.cancelRequested);
+    if (!next) return;
+    this.active = next;
+    next.queuedBehindJobId = null;
+    next.progressLabel = '排队结束，正在启动任务';
+    next.progressUpdatedAt = new Date().toISOString();
+    await this.#markAttemptRunning(next);
+    await this.persist();
+    queueMicrotask(() => this.#run(next));
   }
 
   async #materializeCheckpointApplications(job, append = () => {}) {
@@ -458,13 +842,393 @@ export class JobManager {
 
   persist() {
     const snapshot = JSON.stringify(this.jobs, null, 2);
-    this.writeQueue = this.writeQueue.then(async () => {
-      const temporary = `${this.historyPath}.${process.pid}.tmp`;
-      await writeFile(temporary, snapshot, 'utf8');
-      await rename(temporary, this.historyPath);
-    });
+    this.writeQueue = this.writeQueue
+      .catch(() => {})
+      .then(() => writeJsonAtomically(this.historyPath, JSON.parse(snapshot)));
     return this.writeQueue;
   }
+}
+
+function jobError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function normalizeResumeScope(value) {
+  const scope = String(value || 'full').trim().toLowerCase();
+  if (!RESUME_SCOPES.has(scope)) {
+    const error = jobError('RESUME_SCOPE_INVALID', `Unsupported resume scope: ${scope || '(empty)'}.`);
+    error.scope = scope;
+    throw error;
+  }
+  return scope;
+}
+
+function inferResumeScope(params) {
+  if (params?.audienceOnly) return 'audience';
+  if (params?.completeMissingOnly) return 'body_completion';
+  if (params?.analysisOnly) return 'analysis';
+  if (params?.artifactOnly) return 'artifacts';
+  return 'full';
+}
+
+function normalizeIdempotencyKey(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const key = String(value).trim();
+  if (!key || key.length > 200 || /[\u0000-\u001f\u007f]/u.test(key)) {
+    throw jobError('IDEMPOTENCY_KEY_INVALID', 'The idempotency key is invalid.');
+  }
+  return key;
+}
+
+function resumeRunnerParams(original, override, scope) {
+  const params = {
+    ...(original && typeof original === 'object' ? original : {}),
+    ...(override && typeof override === 'object' ? override : {}),
+    mode: 'resume',
+  };
+  delete params.resumeFromJobId;
+  params.completeMissingOnly = false;
+  params.audienceOnly = false;
+  if (scope === 'body_completion') params.completeMissingOnly = true;
+  if (scope === 'audience') {
+    params.audienceOnly = true;
+    params.collectAudience = true;
+  }
+  return params;
+}
+
+function normalizeInPlaceCheckpointJobIds(jobId, checkpointJobIds) {
+  return [...new Set([
+    jobId,
+    ...(Array.isArray(checkpointJobIds) ? checkpointJobIds : []),
+  ].map((id) => String(id || '').trim()).filter(Boolean))];
+}
+
+function createAttempt({
+  jobId,
+  jobDir,
+  sequence,
+  kind,
+  resumeScope,
+  requestedBy,
+  idempotencyKey,
+  checkpointRevisionAtStart,
+  entryStatus,
+  processedCountAtStart,
+  attemptId,
+  status,
+}) {
+  const id = attemptId || `${jobId}-attempt-${String(sequence).padStart(4, '0')}-${crypto.randomBytes(3).toString('hex')}`;
+  return {
+    attemptId: id,
+    sequence,
+    kind,
+    resumeScope,
+    startedAt: null,
+    finishedAt: null,
+    status: status || (kind === 'initial' ? 'queued' : 'resuming'),
+    entryStatus: entryStatus || status || (kind === 'initial' ? 'queued' : 'incomplete'),
+    exitStatus: null,
+    pid: null,
+    exitCode: null,
+    stopReason: null,
+    errorCode: null,
+    errorMessage: null,
+    logPath: path.join(jobDir, 'attempts', id, 'run.log'),
+    checkpointRevisionAtStart: Number(checkpointRevisionAtStart || 0),
+    checkpointRevisionAtEnd: null,
+    processedCountAtStart: Math.max(0, Number(processedCountAtStart || 0)),
+    processedCount: 0,
+    requestedBy: requestedBy || 'user',
+    idempotencyKey: idempotencyKey || null,
+  };
+}
+
+function nextAttemptSequence(attempts) {
+  return Math.max(0, ...(Array.isArray(attempts) ? attempts : []).map((item) => Number(item.sequence || 0))) + 1;
+}
+
+function currentAttempt(job) {
+  if (!Array.isArray(job?.attempts)) return null;
+  return job.attempts.find((attempt) => attempt.attemptId === job.currentAttemptId)
+    || job.attempts.at(-1)
+    || null;
+}
+
+function currentActiveAttempt(job) {
+  if (!Array.isArray(job?.attempts)) return null;
+  const identified = job.attempts.find((attempt) => attempt.attemptId === job.activeAttemptId);
+  if (identified && ACTIVE_ATTEMPT_STATUSES.has(identified.status)) return identified;
+  return job.attempts.find((attempt) => ACTIVE_ATTEMPT_STATUSES.has(attempt.status)) || null;
+}
+
+function finishAttempt(attempt, values = {}) {
+  if (!attempt) return;
+  Object.assign(attempt, {
+    status: values.status || attempt.status,
+    exitStatus: values.exitStatus || values.status || attempt.exitStatus || null,
+    finishedAt: values.finishedAt || attempt.finishedAt || new Date().toISOString(),
+    pid: values.pid ?? attempt.pid ?? null,
+    exitCode: values.exitCode ?? attempt.exitCode ?? null,
+    stopReason: values.stopReason ?? attempt.stopReason ?? null,
+    errorCode: values.errorCode ?? attempt.errorCode ?? null,
+    errorMessage: values.errorMessage ?? attempt.errorMessage ?? null,
+    checkpointRevisionAtEnd: values.checkpointRevisionAtEnd ?? attempt.checkpointRevisionAtEnd ?? null,
+    processedCount: Math.max(0, Number(values.processedCount ?? attempt.processedCount ?? 0)),
+  });
+}
+
+function processedCountForJob(job) {
+  const audience = job?.workflowSummary?.audience || {};
+  return Math.max(
+    0,
+    Number(job?.bodyProcessedCount || 0),
+    Number(job?.scrapedCount || 0),
+    Number(job?.workflowSummary?.bodyAttempted || 0),
+    Number(audience.postsAttempted || 0),
+    Number(audience.commentsCollected || 0),
+    Number(audience.usersDiscovered || 0),
+  );
+}
+
+function attemptProcessedCount(attempt, job) {
+  return Math.max(
+    0,
+    processedCountForJob(job) - Math.max(0, Number(attempt?.processedCountAtStart || 0)),
+  );
+}
+
+function backfillLatestAttemptOutcome(job) {
+  const previous = currentAttempt(job);
+  if (!previous || !ACTIVE_ATTEMPT_STATUSES.has(previous.status)) return;
+  finishAttempt(previous, {
+    status: job.status,
+    finishedAt: job.finishedAt || job.updatedAt,
+    exitCode: job.exitCode,
+    stopReason: stopReasonForJob(job),
+    errorCode: errorCodeForJob(job),
+    errorMessage: job.error || null,
+    processedCount: attemptProcessedCount(previous, job),
+    checkpointRevisionAtEnd: job.revision || null,
+  });
+}
+
+function isRestartInterruption(job) {
+  const previous = currentAttempt(job);
+  return previous?.stopReason === 'server_restart'
+    || /server restarted|server restart/i.test(String(job?.error || ''));
+}
+
+function hasRecoverableCheckpoint(job, state, scope) {
+  if (job.checkpointAvailable || Number(job.artifactCount || 0) > 0) return true;
+  if (job.securityRestriction?.status === 'timed_out' || job.rateLimit?.status === 'stopped') return true;
+  const stages = state?.stages || {};
+  const relevant = scope === 'full'
+    ? Object.values(stages)
+    : [stages[stageKeyForScope(scope)]];
+  return relevant.filter(Boolean).some((stage) => {
+    if (stage.status && stage.status !== 'not_started') return true;
+    return Object.entries(stage).some(([key, value]) => (
+      key !== 'status'
+      && value != null
+      && (
+        typeof value === 'object'
+          ? Object.keys(value).length > 0
+          : typeof value === 'number'
+            ? value > 0
+            : typeof value === 'boolean'
+              ? value
+              : String(value).trim().length > 0
+      )
+    ));
+  });
+}
+
+function hasRecoverableStageState(stages) {
+  return Object.values(stages || {}).some((stage) => (
+    stage && typeof stage === 'object' && stage.status && stage.status !== 'not_started'
+  ));
+}
+
+function stageKeyForScope(scope) {
+  return {
+    discovery: 'discovery',
+    body_completion: 'bodyCompletion',
+    analysis: 'analysis',
+    audience: 'audience',
+    artifacts: 'artifacts',
+  }[scope] || 'discovery';
+}
+
+function resumeScopeIsComplete(state, exposedJob, scope) {
+  const stages = state?.stages || {};
+  const selected = {
+    discovery: ['discovery'],
+    body_completion: ['bodyCompletion', 'analysis', 'artifacts'],
+    analysis: ['analysis', 'artifacts'],
+    audience: ['audience', 'artifacts'],
+    artifacts: ['artifacts'],
+  }[scope] || [
+    'discovery',
+    'bodyCompletion',
+    'analysis',
+    ...(exposedJob.config?.analysisMode === 'general' && exposedJob.config?.collectAudience
+      ? ['audience']
+      : []),
+    'artifacts',
+  ];
+  return selected.every((stageName) => stages[stageName]?.status === 'completed');
+}
+
+function migrateLegacyJob(job, dataDir, now) {
+  let changed = false;
+  const assign = (key, value) => {
+    if (job[key] !== undefined && job[key] !== null) return;
+    job[key] = value;
+    changed = true;
+  };
+  if (job.status === 'completed') {
+    job.status = 'succeeded';
+    changed = true;
+  }
+  assign('schemaVersion', WORKFLOW_STATE_SCHEMA_VERSION);
+  assign('params', {});
+  assign('createdAt', job.startedAt || now);
+  assign('updatedAt', job.finishedAt || job.startedAt || job.createdAt || now);
+  assign('outputDir', path.join(dataDir, job.id, 'artifacts'));
+  assign('logPath', path.join(path.dirname(job.outputDir), 'run.log'));
+  assign('statePath', workflowStatePath(job.outputDir));
+  assign('resumeCount', 0);
+  assign('lastResumedAt', null);
+  assign('revision', 0);
+  assign('stages', emptyWorkflowStages());
+  assign('artifactCount', 0);
+  if (job.params?.resumeFromJobId && !job.legacyResumeLineage) {
+    job.legacyResumeLineage = {
+      sourceJobId: job.params.resumeFromJobId,
+      mode: 'legacy_child',
+      detectedAt: now,
+    };
+    changed = true;
+  }
+  if (!Array.isArray(job.attempts) || job.attempts.length === 0) {
+    const kind = job.params?.resumeFromJobId ? 'resume' : 'initial';
+    const attempt = createAttempt({
+      jobId: job.id,
+      jobDir: path.dirname(job.outputDir),
+      sequence: 1,
+      kind,
+      resumeScope: inferResumeScope(job.params),
+      requestedBy: 'legacy_migration',
+      idempotencyKey: null,
+      checkpointRevisionAtStart: 0,
+      attemptId: `${job.id}-attempt-0001`,
+      status: job.status || 'interrupted',
+      entryStatus: job.status || 'interrupted',
+      processedCountAtStart: 0,
+    });
+    attempt.startedAt = job.startedAt || job.createdAt;
+    if (!ACTIVE_ATTEMPT_STATUSES.has(attempt.status)) {
+      finishAttempt(attempt, {
+        status: attempt.status,
+        finishedAt: job.finishedAt || job.updatedAt,
+        exitCode: job.exitCode,
+        stopReason: stopReasonForJob(job),
+        errorCode: errorCodeForJob(job),
+        errorMessage: job.error || null,
+        processedCount: processedCountForJob(job),
+      });
+    }
+    job.attempts = [attempt];
+    job.currentAttemptId = attempt.attemptId;
+    job.activeAttemptId = ACTIVE_ATTEMPT_STATUSES.has(attempt.status) ? attempt.attemptId : null;
+    changed = true;
+  } else {
+    assign('currentAttemptId', job.attempts.at(-1)?.attemptId || null);
+    assign('activeAttemptId', currentActiveAttempt(job)?.attemptId || null);
+  }
+  return changed;
+}
+
+function workflowStateFromJob(job) {
+  return {
+    schemaVersion: WORKFLOW_STATE_SCHEMA_VERSION,
+    jobId: job.id,
+    revision: Math.max(1, Number(job.revision || 1)),
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    outputDir: job.outputDir,
+    activeAttemptId: job.activeAttemptId || null,
+    currentAttemptId: job.currentAttemptId || null,
+    resumeCount: Number(job.resumeCount || 0),
+    lastResumedAt: job.lastResumedAt || null,
+    stages: structuredClone(job.stages || emptyWorkflowStages()),
+    attempts: structuredClone(job.attempts || []),
+    workflowSummary: job.workflowSummary || null,
+    artifactCount: Number(job.artifactCount || 0),
+  };
+}
+
+function applyWorkflowStateToJob(job, state, { preserveStatus = false } = {}) {
+  if (state.jobId !== job.id) {
+    throw jobError('WORKFLOW_STATE_INVALID', `Workflow state belongs to ${state.jobId}, not ${job.id}.`);
+  }
+  let changed = false;
+  const apply = (key, value) => {
+    if (JSON.stringify(job[key]) === JSON.stringify(value)) return;
+    job[key] = structuredClone(value);
+    changed = true;
+  };
+  apply('schemaVersion', state.schemaVersion);
+  apply('revision', state.revision);
+  if (!preserveStatus && state.status) apply('status', state.status);
+  apply('activeAttemptId', state.activeAttemptId || null);
+  apply('currentAttemptId', state.currentAttemptId || job.currentAttemptId || null);
+  apply('resumeCount', Number(state.resumeCount || 0));
+  apply('lastResumedAt', state.lastResumedAt || null);
+  apply('stages', state.stages || emptyWorkflowStages());
+  apply('attempts', state.attempts || []);
+  if (state.workflowSummary) apply('workflowSummary', state.workflowSummary);
+  if (state.artifactCount !== undefined) apply('artifactCount', Number(state.artifactCount || 0));
+  if (state.updatedAt) apply('updatedAt', state.updatedAt);
+  return changed;
+}
+
+function mergeAttempts(existing, incoming) {
+  const byId = new Map();
+  for (const attempt of Array.isArray(existing) ? existing : []) {
+    if (attempt?.attemptId) byId.set(attempt.attemptId, structuredClone(attempt));
+  }
+  for (const attempt of Array.isArray(incoming) ? incoming : []) {
+    if (!attempt?.attemptId) continue;
+    byId.set(attempt.attemptId, { ...(byId.get(attempt.attemptId) || {}), ...structuredClone(attempt) });
+  }
+  return [...byId.values()].sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0));
+}
+
+function stopReasonForJob(job) {
+  if (job.interruptRequested) return 'server_shutdown';
+  if (job.cancelRequested || job.status === 'cancelled') return 'user_cancelled';
+  if (job.securityRestriction?.status === 'timed_out') return 'security_verification';
+  if (job.rateLimit?.status === 'stopped') return 'rate_limit';
+  if (job.status === 'incomplete') return 'quality_gate';
+  if (job.status === 'succeeded') return 'completed';
+  if (job.status === 'failed') return 'runner_failed';
+  if (job.status === 'interrupted') return 'server_restart';
+  return null;
+}
+
+function errorCodeForJob(job) {
+  if (job.status === 'succeeded' || job.status === 'cancelled') return null;
+  if (job.securityRestriction?.status === 'timed_out') return 'SECURITY_VERIFICATION_TIMEOUT';
+  if (job.rateLimit?.status === 'stopped') return 'RATE_LIMITED';
+  if (job.status === 'incomplete') return 'QUALITY_GATE_INCOMPLETE';
+  if (job.status === 'interrupted') return job.cleanupError ? 'ORPHAN_CLEANUP_FAILED' : 'SERVER_RESTART';
+  if (job.status === 'failed') return 'RUNNER_FAILED';
+  return null;
 }
 
 export function publicJob(job) {
@@ -482,7 +1246,7 @@ export function publicJob(job) {
   const incompleteCount = Number.isFinite(job.checkpointIncompleteCount)
     ? Number(job.checkpointIncompleteCount)
     : Math.max(0, discoveredCount - scrapedCount);
-  const resumableStatus = ['incomplete', 'interrupted', 'cancelled', 'failed'].includes(job.status)
+  const resumableStatus = ['incomplete', 'interrupted', 'cancelled', 'failed', 'blocked'].includes(job.status)
     || (job.status === 'succeeded' && incompleteCount > 0);
   const summarySecurity = job.workflowSummary?.securityVerification;
   const securityRestriction = job.securityRestriction || (
@@ -511,18 +1275,30 @@ export function publicJob(job) {
     Boolean(job.checkpointAvailable)
     || securityRestriction?.status === 'timed_out'
     || rateLimit?.status === 'stopped'
+    || hasRecoverableStageState(job.stages)
   );
   return {
     id: job.id,
-    keyword: job.params.keyword,
+    schemaVersion: Number(job.schemaVersion || 1),
+    keyword: job.params?.keyword,
     status,
     createdAt: job.createdAt,
+    updatedAt: job.updatedAt || null,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
     exitCode: job.exitCode,
     message: job.error,
     pid: job.pid,
     config: job.params,
+    outputDir: job.outputDir,
+    currentAttemptId: job.currentAttemptId || null,
+    activeAttemptId: job.activeAttemptId || null,
+    resumeCount: Number(job.resumeCount || 0),
+    lastResumedAt: job.lastResumedAt || null,
+    revision: Number(job.revision || 0),
+    stages: structuredClone(job.stages || emptyWorkflowStages()),
+    attempts: structuredClone(job.attempts || []),
+    legacyResumeLineage: job.legacyResumeLineage || null,
     artifactCount: job.artifactCount || 0,
     applicationCount: Number(job.checkpointAnalysisCount || job.workflowSummary?.applicationCopyGenerated || 0),
     progress: job.progress || 0,
@@ -542,7 +1318,7 @@ export function publicJob(job) {
   };
 }
 
-function updateProgressFromLog(job, message) {
+export function updateProgressFromLog(job, message) {
   let changed = false;
   const update = (values) => {
     for (const [key, value] of Object.entries(values)) {
@@ -553,6 +1329,66 @@ function updateProgressFromLog(job, message) {
     }
   };
   const setProgress = (next) => update({ progress: Math.max(job.progress || 0, next) });
+
+  for (const match of message.matchAll(/AUDIENCE_RATE_LIMIT retry=(\d+)\/(\d+) wait=([\d.]+)s/gi)) {
+    const now = new Date().toISOString();
+    update({
+      progressPhase: 'rate_limit_backoff',
+      progressLabel: `平台访问频率受限，自动冷却 ${match[3]} 秒后进行第 ${match[1]} / ${match[2]} 次恢复探测`,
+      rateLimit: {
+        detected: true,
+        status: 'waiting',
+        detectedAt: job.rateLimit?.detectedAt || now,
+        retryAttempt: Number(match[1]),
+        maxRetries: Number(match[2]),
+        retryAfterSeconds: Number(match[3]),
+        recoveryAction: 'automatic_backoff',
+      },
+    });
+  }
+  for (const match of message.matchAll(/AUDIENCE_RATE_LIMIT waiting attempt=(\d+)\/(\d+) remaining=([\d.]+)s/gi)) {
+    update({
+      progressPhase: 'rate_limit_backoff',
+      progressLabel: `平台限流自动冷却中，剩余 ${match[3]} 秒，第 ${match[1]} / ${match[2]} 次恢复探测`,
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'waiting',
+        retryAttempt: Number(match[1]),
+        maxRetries: Number(match[2]),
+        retryAfterSeconds: Number(match[3]),
+        recoveryAction: 'automatic_backoff',
+      },
+    });
+  }
+  if (/AUDIENCE_RATE_LIMIT cleared/gi.test(message)) {
+    update({
+      progressPhase: 'audience_comments',
+      progressLabel: '平台限流已解除，正在从检查点自动继续采集',
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'cleared',
+        clearedAt: new Date().toISOString(),
+        retryAfterSeconds: 0,
+        recoveryAction: null,
+      },
+    });
+  }
+  if (/AUDIENCE_RATE_LIMIT exhausted/gi.test(message)) {
+    update({
+      progressPhase: 'rate_limited',
+      progressLabel: '平台限流自动恢复重试已耗尽，检查点已保存，可稍后续跑',
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'stopped',
+        exhaustedAt: new Date().toISOString(),
+        retryAfterSeconds: 0,
+        recoveryAction: 'wait_then_resume',
+      },
+    });
+  }
 
   if (/RATE_LIMIT detected/gi.test(message)) {
     update({
@@ -574,20 +1410,22 @@ function updateProgressFromLog(job, message) {
     update({
       progressPhase: phase === 'comments' ? 'audience_comments' : 'audience_profiles',
       progressLabel: phase === 'comments'
-        ? `正在全量采集评论与回复，已处理 ${match[1]} / ${match[2]} 篇，收集 ${match[3]} 条评论`
+        ? `正在全量采集评论与回复，已检查 ${match[1]} / ${match[2]} 篇，收集 ${match[3]} 条评论`
         : `正在补全评论者公开资料，已处理 ${match[5]} / ${match[6]} 位`,
       progressCurrent: current,
       progressTotal: total,
     });
     setProgress(Math.min(98, 88 + Math.round((current / Math.max(1, total)) * 10)));
   }
-  for (const match of message.matchAll(/AUDIENCE_COMPLETE posts=(\d+)\/(\d+) comments=(\d+) users=(\d+) profiles=(\d+)\/(\d+) status=(\w+)/gi)) {
+  for (const match of message.matchAll(/AUDIENCE_COMPLETE posts=(\d+)\/(\d+) comments=(\d+) users=(\d+) profiles=(\d+)\/(\d+) status=(\w+)(?: attempted=(\d+) with_comments=(\d+))?/gi)) {
+    const attempted = Number(match[8] || match[1]);
+    const withComments = Number(match[9] || 0);
     update({
       progressPhase: match[7] === 'complete' ? 'audience_complete' : 'audience_partial',
       progressLabel: match[7] === 'complete'
         ? `评论与用户公开资料采集完成：${match[3]} 条评论，${match[4]} 位用户`
-        : `评论与用户采集已保存检查点：${match[3]} 条评论，仍可续跑`,
-      progressCurrent: Number(match[1]),
+        : `受众检查点已保存：已检查 ${attempted} / ${match[2]} 篇，${withComments} 篇有评论结果，共 ${match[3]} 条评论`,
+      progressCurrent: attempted,
       progressTotal: Number(match[2]),
     });
     setProgress(match[7] === 'complete' ? 99 : 96);
@@ -879,6 +1717,14 @@ function waitForChild(child) {
   });
 }
 
+function closeWriteStream(stream) {
+  if (!stream) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    stream.once('error', reject);
+    stream.end(resolve);
+  });
+}
+
 async function reconcileJobCheckpoint(job) {
   if (!job?.outputDir) return false;
   const [cards, notes, applications] = await Promise.all([
@@ -1128,39 +1974,6 @@ async function countArtifactFiles(root) {
     return entries.filter((entry) => entry.isFile()).length;
   } catch (error) {
     if (error.code === 'ENOENT') return 0;
-    throw error;
-  }
-}
-
-async function copyResumeCheckpoints(sourceDir, destinationDir) {
-  const names = [
-    'xiaohongshu_cards_discovered.json',
-    'xiaohongshu_cards_latest.json',
-    'xiaohongshu_notes_latest.json',
-    'xiaohongshu_notes_latest.csv',
-    'application_intelligence.json',
-    'application_intelligence.checkpoint.json',
-    'workflow-summary.json',
-    'artifact-manifest.json',
-    'audience-comments.json',
-    'audience-users.json',
-    'audience-posts.json',
-    'audience-summary.json',
-    'audience-failures.json',
-  ];
-  const required = new Set(['xiaohongshu_cards_latest.json', 'xiaohongshu_notes_latest.json']);
-  let requiredCopied = 0;
-  for (const name of names) {
-    try {
-      await copyFile(path.join(sourceDir, name), path.join(destinationDir, name));
-      if (required.has(name)) requiredCopied += 1;
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-  }
-  if (requiredCopied < required.size) {
-    const error = new Error('Resume source does not contain both card and note checkpoints.');
-    error.code = 'RESUME_CHECKPOINTS_MISSING';
     throw error;
   }
 }

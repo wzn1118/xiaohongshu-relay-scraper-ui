@@ -160,6 +160,7 @@ test('buildRunnerArgs only emits the normalized whitelist', () => {
 test('buildRunnerArgs emits the isolated audience resume mode', () => {
   const params = validateRunRequest({
     analysisMode: 'general',
+    keyword: 'must-not-open-a-new-search',
     mode: 'resume',
     resumeFromJobId: '20260728034820-6b942873',
     audienceOnly: true,
@@ -168,6 +169,58 @@ test('buildRunnerArgs emits the isolated audience resume mode', () => {
   assert.ok(args.includes('--collect-audience'));
   assert.ok(args.includes('--audience-only'));
   assert.equal(args.includes('--no-collect-audience'), false);
+  assert.equal(args[args.indexOf('--keyword') + 1], '');
+});
+
+test('buildRunnerArgs emits the complete workflow-state execution context', () => {
+  const params = validateRunRequest({});
+  const statePath = path.resolve('data', 'jobs', 'job-1', 'workflow-state.json');
+  const checkpointDirs = [
+    path.resolve('data', 'jobs', 'legacy-a', 'artifacts'),
+    path.resolve('data', 'jobs', 'legacy-b', 'artifacts'),
+  ];
+  const args = buildRunnerArgs(params, path.resolve('output'), {
+    resumeScope: 'body_completion',
+    attemptId: 'attempt-2',
+    statePath,
+    expectedStateRevision: 17,
+    resumeCheckpointDirs: [...checkpointDirs, checkpointDirs[0]],
+  });
+  assert.equal(args[args.indexOf('--resume-scope') + 1], 'body_completion');
+  assert.equal(args[args.indexOf('--attempt-id') + 1], 'attempt-2');
+  assert.equal(args[args.indexOf('--state-path') + 1], statePath);
+  assert.equal(args[args.indexOf('--expected-state-revision') + 1], '17');
+  assert.deepEqual(
+    args.flatMap((value, index) => value === '--resume-checkpoint-dir' ? [args[index + 1]] : []),
+    checkpointDirs,
+  );
+});
+
+test('buildRunnerArgs rejects partial or invalid workflow-state execution context', () => {
+  const params = validateRunRequest({});
+  assert.throws(
+    () => buildRunnerArgs(params, path.resolve('output'), { resumeScope: 'full' }),
+    ValidationError,
+  );
+  assert.throws(
+    () => buildRunnerArgs(params, path.resolve('output'), {
+      resumeScope: 'unknown',
+      attemptId: 'attempt-2',
+      statePath: path.resolve('workflow-state.json'),
+      expectedStateRevision: 1,
+    }),
+    ValidationError,
+  );
+  assert.throws(
+    () => buildRunnerArgs(params, path.resolve('output'), {
+      resumeScope: 'full',
+      attemptId: 'attempt-2',
+      statePath: path.resolve('workflow-state.json'),
+      expectedStateRevision: 1,
+      resumeCheckpointDirs: ['valid', 'bad\npath'],
+    }),
+    ValidationError,
+  );
 });
 
 test('artifact ids round-trip safe nested paths', () => {

@@ -1,7 +1,7 @@
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
 import { ValidationError, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
@@ -15,8 +15,12 @@ import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 export { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
+const RESUME_SCOPES = new Set(['full', 'discovery', 'body_completion', 'analysis', 'audience', 'artifacts']);
+const ACTIVE_JOB_STATUSES = new Set(['queued', 'resuming', 'running']);
 const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
+const MEDIA_CACHE_MAX_BYTES = 15 * 1024 * 1024;
+const MEDIA_CACHE_TIMEOUT_MS = 15_000;
 const CONTENT_RESEARCH_LABELS = Object.freeze({
   auto: 'AI 自动识别',
   experience: '经验攻略',
@@ -27,8 +31,9 @@ const CONTENT_RESEARCH_LABELS = Object.freeze({
   custom: '自定义研究',
 });
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, mediaFetcher = globalThis.fetch }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
+  const mediaDownloads = new Map();
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
     configure: () => ({ configured: false, from: '' }),
@@ -224,7 +229,25 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (req.method === 'GET' && url.pathname === '/api/jobs') return json(res, 200, manager.list());
       if (req.method === 'POST' && url.pathname === '/api/jobs') {
         const body = await readJsonBody(req, config.maxBodyBytes);
-        const job = await manager.start(validateRunRequest(body));
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          throw new ValidationError('Request body must be a JSON object.');
+        }
+        const { idempotencyKey, ...runBody } = body;
+        const params = validateRunRequest(runBody);
+        const resumeScope = legacyResumeScope(params);
+        const resumeCheckpointJobIds = params.resumeFromJobId && ['audience', 'full'].includes(resumeScope)
+          ? (await resolveAudienceResumeOwner(manager, params.resumeFromJobId)).readThroughJobIds
+          : [];
+        const job = params.resumeFromJobId
+          ? await manager.resume(params.resumeFromJobId, {
+              scope: resumeScope,
+              params,
+              aiSessionId: params.aiSessionId,
+              idempotencyKey,
+              requestedBy: 'legacy_jobs_api',
+              ...(resumeCheckpointJobIds.length ? { resumeCheckpointJobIds } : {}),
+            })
+          : await manager.start(params);
         return json(res, 202, job);
       }
       if (parts[0] === 'api' && parts[1] === 'jobs' && parts[2]) {
@@ -233,38 +256,36 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         const internal = manager.getInternal(id);
         if (!internal) return json(res, 404, errorBody('NOT_FOUND', 'Task not found.'));
         if (req.method === 'GET' && parts.length === 3) return json(res, 200, manager.get(id));
+        if (req.method === 'POST' && parts[3] === 'resume' && parts.length === 4) {
+          const options = validateResumeRequest(await readJsonBody(req, config.maxBodyBytes));
+          const resumeCheckpointJobIds = ['audience', 'full'].includes(options.scope)
+            ? (await resolveAudienceResumeOwner(manager, id)).readThroughJobIds
+            : [];
+          const job = await manager.resume(id, {
+            ...options,
+            requestedBy: options.requestedBy || 'resume_api',
+            ...(resumeCheckpointJobIds.length ? { resumeCheckpointJobIds } : {}),
+          });
+          return json(res, 202, job);
+        }
         if (req.method === 'POST' && parts[3] === 'complete-missing' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           if (!body || typeof body !== 'object' || Array.isArray(body)) {
             throw new ValidationError('Request body must be a JSON object.');
           }
-          const unsupported = Object.keys(body).filter((key) => key !== 'aiSessionId');
+          const unsupported = Object.keys(body).filter((key) => !['aiSessionId', 'idempotencyKey'].includes(key));
           if (unsupported.length) {
             throw new ValidationError('Unsupported completion parameters.', unsupported.map((field) => ({ field, reason: 'not_allowed' })));
           }
 
           const sourceJob = manager.get(id);
-          const allJobs = manager.list();
-          const activeCompletion = allJobs.find((job) => (
-            ['queued', 'running'].includes(job.status)
-            && isCompletionDescendant(job, id, allJobs)
-          ));
-          if (activeCompletion) {
-            return json(res, 200, {
-              action: 'attached',
-              sourceJobId: id,
-              incompleteBefore: null,
-              job: activeCompletion,
-              message: 'An existing completion task is already running.',
-            });
-          }
-          if (sourceJob && ['queued', 'running'].includes(sourceJob.status)) {
+          if (sourceJob && ACTIVE_JOB_STATUSES.has(sourceJob.status)) {
             return json(res, 200, {
               action: 'attached',
               sourceJobId: id,
               incompleteBefore: null,
               job: sourceJob,
-              message: 'The source task is still collecting and will fill incomplete records automatically.',
+              message: 'The original task is already running.',
             });
           }
 
@@ -303,7 +324,13 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             checkOnly: false,
             ...(Object.hasOwn(body, 'aiSessionId') ? { aiSessionId: body.aiSessionId } : {}),
           });
-          const job = await manager.start(params);
+          const job = await manager.resume(id, {
+            scope: 'body_completion',
+            params,
+            aiSessionId: Object.hasOwn(body, 'aiSessionId') ? body.aiSessionId : undefined,
+            idempotencyKey: body.idempotencyKey,
+            requestedBy: 'complete_missing_api',
+          });
           return json(res, 202, {
             action: 'started',
             sourceJobId: id,
@@ -330,42 +357,59 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (req.method === 'GET' && parts[3] === 'results' && parts.length === 4) {
           return json(res, 200, await readApplicationResults(internal.outputDir, url.searchParams, internal));
         }
+        if (req.method === 'GET' && parts[3] === 'media' && parts.length === 4) {
+          return serveCachedMedia(res, {
+            outputDir: internal.outputDir,
+            sourceUrl: url.searchParams.get('url'),
+            mediaFetcher,
+            mediaDownloads,
+          });
+        }
         if (req.method === 'GET' && parts[3] === 'audience' && parts.length === 4) {
-          return json(res, 200, await readAudienceResults(internal.outputDir, url.searchParams));
+          return json(res, 200, await readAudienceSnapshot(manager, id, url.searchParams));
         }
         if (req.method === 'POST' && parts[3] === 'audience' && parts[4] === 'resume' && parts.length === 5) {
-          const sourceJob = manager.get(id);
-          const current = await readAudienceResults(internal.outputDir, new URLSearchParams({ limit: '1' }));
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const resumeOptions = validateResumeRequest({ ...body, scope: 'audience' }, { fixedScope: 'audience' });
+          const {
+            sourceJobId,
+            stateOwnerJobId,
+            readThroughJobIds: resumeCheckpointJobIds,
+          } = await resolveAudienceResumeOwner(manager, id);
+          const sourceInternal = manager.getInternal(sourceJobId);
+          const sourceJob = manager.get(sourceJobId);
+          const requestedJob = manager.get(id);
+          if (!sourceInternal || !sourceJob || !requestedJob) {
+            const error = new Error('Audience collection source task was not found.');
+            error.code = 'RESUME_SOURCE_NOT_FOUND';
+            throw error;
+          }
+          if (ACTIVE_JOB_STATUSES.has(requestedJob.status)) {
+            return json(res, 200, {
+              action: 'attached',
+              sourceJobId,
+              checkpointJobId: id,
+              stateOwnerJobId,
+              job: requestedJob,
+              message: 'The original task is already running.',
+            });
+          }
+          const current = await readAudienceSnapshot(
+            manager,
+            id,
+            new URLSearchParams({ limit: '1' }),
+          );
           if (current.summary.status === 'complete') {
             return json(res, 200, {
               action: 'already_complete',
-              sourceJobId: id,
-              job: sourceJob,
+              sourceJobId,
+              checkpointJobId: id,
+              stateOwnerJobId,
+              job: requestedJob,
               message: 'All comments and public audience profiles are already complete.',
             });
           }
-          const activeAudience = manager.list().find((job) => (
-            ['queued', 'running'].includes(job.status)
-            && job.config?.audienceOnly
-            && job.config?.resumeFromJobId === id
-          ));
-          if (activeAudience) {
-            return json(res, 200, {
-              action: 'attached',
-              sourceJobId: id,
-              job: activeAudience,
-              message: 'An audience collection task is already running.',
-            });
-          }
-          if (sourceJob && ['queued', 'running'].includes(sourceJob.status) && sourceJob.config?.collectAudience) {
-            return json(res, 200, {
-              action: 'attached',
-              sourceJobId: id,
-              job: sourceJob,
-              message: 'The source task is already collecting audience data.',
-            });
-          }
-          const sourceParams = internal.params || internal.config || sourceJob?.config || {};
+          const sourceParams = sourceInternal.params || sourceInternal.config || sourceJob.config || {};
           const params = validateRunRequest({
             ...sourceParams,
             analysisMode: 'general',
@@ -373,7 +417,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             maxAgeDays: 0,
             limit: 0,
             mode: 'resume',
-            resumeFromJobId: id,
+            resumeFromJobId: sourceJobId,
             completeMissingOnly: false,
             collectAudience: true,
             audienceOnly: true,
@@ -381,12 +425,20 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             aiSessionId: null,
             profileId: null,
           });
-          const job = await manager.start(params);
+          const job = await manager.resume(id, {
+            ...resumeOptions,
+            params,
+            requestedBy: resumeOptions.requestedBy || 'audience_resume_api',
+            resumeCheckpointJobIds,
+          });
           return json(res, 202, {
             action: 'started',
-            sourceJobId: id,
+            sourceJobId,
+            checkpointJobId: id,
+            stateOwnerJobId,
+            readThroughJobIds: resumeCheckpointJobIds,
             job,
-            message: 'Audience collection resumed from the saved checkpoint.',
+            message: 'Audience collection resumed in the original task from the saved checkpoint.',
           });
         }
         if (req.method === 'POST' && parts[3] === 'delivery' && parts.length === 4) {
@@ -421,10 +473,32 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     } catch (error) {
       if (error instanceof ValidationError) return json(res, 400, errorBody('VALIDATION_ERROR', error.message, error.details));
       if (error.code === 'JOB_BUSY') return json(res, 409, { ...errorBody('JOB_BUSY', error.message), activeJob: error.activeJob });
-      if (error.code === 'RESUME_SOURCE_NOT_FOUND' || error.code === 'RESUME_CHECKPOINTS_MISSING') {
+      if (error.code === 'JOB_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
+      if ([
+        'JOB_ALREADY_RUNNING',
+        'JOB_ALREADY_COMPLETED',
+        'JOB_ATTEMPT_ACTIVE',
+        'JOB_NOT_RESUMABLE',
+        'RESUME_CONTEXT_UNAVAILABLE',
+        'RESUME_OUTPUT_MISSING',
+        'WORKFLOW_STATE_INVALID',
+        'WORKFLOW_REVISION_CONFLICT',
+        'JOB_RECOVERY_INCOMPLETE',
+        'AI_SESSION_UNAVAILABLE',
+        'PROFILE_UNAVAILABLE',
+      ].includes(error.code)) {
+        return json(res, 409, {
+          ...errorBody(error.code, error.message),
+          ...(error.activeJob ? { activeJob: error.activeJob } : {}),
+          ...(error.attemptId ? { attemptId: error.attemptId } : {}),
+        });
+      }
+      if (error.code === 'RESUME_SOURCE_NOT_FOUND' || error.code === 'RESUME_CHECKPOINTS_MISSING' || error.code === 'RESUME_SCOPE_INVALID' || error.code === 'IDEMPOTENCY_KEY_INVALID') {
         return json(res, 400, errorBody(error.code, error.message));
       }
       if (error.code === 'COMPLETION_SOURCE_UNAVAILABLE') return json(res, 409, errorBody(error.code, error.message));
+      if (error.code === 'MEDIA_SOURCE_INVALID') return json(res, 400, errorBody(error.code, error.message));
+      if (error.code === 'MEDIA_SOURCE_UNAVAILABLE') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'BODY_TOO_LARGE') return json(res, 413, errorBody('BODY_TOO_LARGE', 'Request body is too large.'));
       if (['AI_VALIDATION', 'AI_SESSION_EXPIRED', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'AI_MODEL_DISCOVERY_FAILED') return json(res, 502, errorBody(error.code, error.message));
@@ -446,18 +520,40 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
   };
 }
 
-function isCompletionDescendant(job, sourceJobId, jobs) {
-  const byId = new Map(jobs.map((item) => [item.id, item]));
-  const visited = new Set();
-  let current = job;
-  while (current && !visited.has(current.id)) {
-    visited.add(current.id);
-    const parentId = current.config?.completeMissingOnly ? current.config?.resumeFromJobId : null;
-    if (!parentId) return false;
-    if (parentId === sourceJobId) return true;
-    current = byId.get(parentId);
+function legacyResumeScope(params) {
+  if (params.audienceOnly) return 'audience';
+  if (params.completeMissingOnly) return 'body_completion';
+  return 'full';
+}
+
+function validateResumeRequest(body, { fixedScope } = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ValidationError('Request body must be a JSON object.');
   }
-  return false;
+  const allowed = new Set(['scope', 'aiSessionId', 'idempotencyKey']);
+  const unsupported = Object.keys(body).filter((key) => !allowed.has(key));
+  if (unsupported.length) {
+    throw new ValidationError('Unsupported resume parameters.', unsupported.map((field) => ({ field, reason: 'not_allowed' })));
+  }
+  const scope = fixedScope || body.scope || 'full';
+  if (typeof scope !== 'string' || !RESUME_SCOPES.has(scope)) {
+    const error = new Error(`Unsupported resume scope: ${String(scope)}`);
+    error.code = 'RESUME_SCOPE_INVALID';
+    throw error;
+  }
+  if (Object.hasOwn(body, 'aiSessionId') && body.aiSessionId !== null && typeof body.aiSessionId !== 'string') {
+    throw new ValidationError('aiSessionId must be a string or null.', [{ field: 'aiSessionId', reason: 'invalid_type' }]);
+  }
+  if (Object.hasOwn(body, 'idempotencyKey')) {
+    if (typeof body.idempotencyKey !== 'string' || !body.idempotencyKey.trim() || body.idempotencyKey.length > 200) {
+      throw new ValidationError('idempotencyKey must be a non-empty string of at most 200 characters.', [{ field: 'idempotencyKey', reason: 'invalid' }]);
+    }
+  }
+  return {
+    scope,
+    ...(Object.hasOwn(body, 'aiSessionId') ? { aiSessionId: body.aiSessionId } : {}),
+    ...(Object.hasOwn(body, 'idempotencyKey') ? { idempotencyKey: body.idempotencyKey.trim() } : {}),
+  };
 }
 
 function toGeneralContentRecord(record) {
@@ -489,6 +585,175 @@ function contentResearchContext(payload, task) {
   };
 }
 
+async function readAudienceSnapshot(manager, jobId, searchParams) {
+  const lineage = audienceJobLineage(manager, jobId);
+  const current = manager.getInternal(jobId);
+  if (!current) {
+    const error = new Error('Audience checkpoint task was not found.');
+    error.code = 'RESUME_SOURCE_NOT_FOUND';
+    throw error;
+  }
+  const sourceJobId = lineage.at(-1) || jobId;
+  const readableCheckpoints = audienceHistoryJobIds(manager, sourceJobId, jobId)
+    .map((id) => ({ id, outputDir: manager.getInternal(id)?.outputDir }))
+    .filter((item) => item.outputDir);
+  const primary = readableCheckpoints.at(-1) || { id: jobId, outputDir: current.outputDir };
+  const fallbackOutputDirs = readableCheckpoints
+    .slice(0, -1)
+    .map((item) => item.outputDir);
+  const result = await readAudienceResults(primary.outputDir, searchParams, { fallbackOutputDirs });
+  return {
+    ...result,
+    sourceJobId,
+    checkpointJobId: jobId,
+    readThroughJobIds: lineage,
+    mergedCheckpointJobIds: readableCheckpoints.map((item) => item.id),
+  };
+}
+
+async function bestAudienceCheckpointJobId(manager, sourceJobId) {
+  const allCandidates = audienceHistoryJobIds(manager, sourceJobId)
+    .map((id) => ({ id, job: manager.get(id), internal: manager.getInternal(id) }))
+    .filter(({ internal }) => Boolean(internal));
+  const activeCandidate = allCandidates
+    .filter(({ job }) => ACTIVE_JOB_STATUSES.has(job?.status))
+    .at(-1);
+  if (activeCandidate) return activeCandidate.id;
+  const candidates = allCandidates
+    .filter(({ id, internal }) => (
+      internal
+      && !internal.resumeCheckpointsPending
+      && (id === sourceJobId || !ACTIVE_JOB_STATUSES.has(internal.status))
+    ));
+  const inspected = await Promise.all(candidates.map(async (candidate, order) => ({
+    ...candidate,
+    order,
+    progress: await inspectAudienceCheckpoint(candidate.internal.outputDir),
+  })));
+  const eligible = inspected.filter(({ id, progress }) => (
+    progress.hasResumeBase
+    && (id === sourceJobId || progress.hasAudienceData)
+  ));
+  let best = eligible.find((candidate) => candidate.id === sourceJobId) || null;
+  for (const candidate of eligible) {
+    if (!best || compareAudienceProgress(candidate, best) >= 0) best = candidate;
+  }
+  return best?.id || sourceJobId;
+}
+
+async function resolveAudienceResumeOwner(manager, requestedJobId) {
+  const sourceJobId = audienceContentSourceJobId(manager, requestedJobId);
+  const stateOwnerJobId = await bestAudienceCheckpointJobId(manager, sourceJobId);
+  return {
+    sourceJobId,
+    stateOwnerJobId,
+    readThroughJobIds: audienceHistoryJobIds(manager, sourceJobId, requestedJobId),
+  };
+}
+
+function audienceHistoryJobIds(manager, sourceJobId, requestedJobId = sourceJobId) {
+  const ordered = [sourceJobId];
+  const seen = new Set(ordered);
+  const oldestFirst = [...manager.list()].reverse();
+  for (const job of oldestFirst) {
+    if (!job.config?.audienceOnly) continue;
+    if (audienceContentSourceJobId(manager, job.id) !== sourceJobId) continue;
+    if (seen.has(job.id)) continue;
+    seen.add(job.id);
+    ordered.push(job.id);
+  }
+  for (const id of audienceJobLineage(manager, requestedJobId).reverse()) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ordered.push(id);
+  }
+  return ordered;
+}
+
+async function inspectAudienceCheckpoint(outputDir) {
+  const [cards, notes, posts, comments, users, summary] = await Promise.all([
+    readCheckpointJson(path.join(outputDir, 'xiaohongshu_cards_latest.json'), []),
+    readCheckpointJson(path.join(outputDir, 'xiaohongshu_notes_latest.json'), []),
+    readCheckpointJson(path.join(outputDir, 'audience-posts.json'), []),
+    readCheckpointJson(path.join(outputDir, 'audience-comments.json'), []),
+    readCheckpointJson(path.join(outputDir, 'audience-users.json'), []),
+    readCheckpointJson(path.join(outputDir, 'audience-summary.json'), {}),
+  ]);
+  const postItems = Array.isArray(posts.value) ? posts.value.filter(isRecord) : [];
+  const commentItems = Array.isArray(comments.value) ? comments.value.filter(isRecord) : [];
+  const userItems = Array.isArray(users.value) ? users.value.filter(isRecord) : [];
+  const completePosts = postItems.filter((post) => post.status === 'complete').length;
+  const partialPosts = postItems.filter((post) => (
+    ['partial', 'failed'].includes(post.status)
+    || Number(post.collected_comment_count || 0) > 0
+    || Boolean(post.last_collected_at || post.failure_reason)
+  )).length;
+  const summaryValue = isRecord(summary.value) ? summary.value : {};
+  const reportedComments = nonNegativeCount(summaryValue.commentsCollected);
+  const reportedUsers = nonNegativeCount(summaryValue.usersDiscovered);
+  const reportedCompletePosts = nonNegativeCount(summaryValue.postsComplete);
+  const reportedPartialPosts = nonNegativeCount(summaryValue.postsPartial);
+  const reportedPosts = nonNegativeCount(summaryValue.postsTotal);
+  return {
+    hasResumeBase: cards.exists && notes.exists && Array.isArray(cards.value) && Array.isArray(notes.value),
+    hasAudienceData: postItems.length > 0 || commentItems.length > 0 || userItems.length > 0,
+    score: [
+      commentItems.length + userItems.length,
+      commentItems.length,
+      userItems.length,
+      (completePosts * 2) + partialPosts,
+      postItems.length,
+      reportedComments + reportedUsers,
+      (reportedCompletePosts * 2) + reportedPartialPosts,
+      reportedPosts,
+    ],
+  };
+}
+
+function compareAudienceProgress(left, right) {
+  for (let index = 0; index < left.progress.score.length; index += 1) {
+    const difference = left.progress.score[index] - right.progress.score[index];
+    if (difference !== 0) return difference;
+  }
+  return left.order - right.order;
+}
+
+async function readCheckpointJson(filePath, fallback) {
+  try {
+    return { exists: true, value: JSON.parse(await readFile(filePath, 'utf8')) };
+  } catch (error) {
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) return { exists: false, value: fallback };
+    throw error;
+  }
+}
+
+function isRecord(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function nonNegativeCount(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+function audienceContentSourceJobId(manager, jobId) {
+  return audienceJobLineage(manager, jobId).at(-1) || jobId;
+}
+
+function audienceJobLineage(manager, jobId) {
+  const lineage = [];
+  const visited = new Set();
+  let currentId = jobId;
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    lineage.push(currentId);
+    const current = manager.getInternal(currentId);
+    if (!current?.params?.audienceOnly || !current.params.resumeFromJobId) break;
+    currentId = current.params.resumeFromJobId;
+  }
+  return lineage;
+}
+
 async function readApplicationResults(outputDir, searchParams, task = {}) {
   const offset = boundedInteger(searchParams.get('offset'), 0, 0, 1000000);
   const limit = boundedInteger(searchParams.get('limit'), 50, 1, 100);
@@ -510,7 +775,7 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
       ? payload.records.map((record) => mergeApplicationState(
         hydrateApplicationMedia(record, legacyMedia.get(record.note_id)),
         delivery[record.note_id],
-      ))
+      )).map((record) => localizeApplicationMedia(record, task.id))
       : [];
     const source = analysisMode === 'general'
       ? hydratedSource.map(toGeneralContentRecord)
@@ -551,6 +816,7 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
       keyword: String(payload.keyword || task.params?.keyword || task.config?.keyword || ''),
       research: analysisMode === 'general' ? contentResearchContext(payload, task) : null,
       presentation: analysisMode === 'general' && payload.content_presentation ? payload.content_presentation : null,
+      insights: analysisMode === 'general' && payload.content_insights ? payload.content_insights : null,
       total: records.length,
       offset,
       limit,
@@ -566,6 +832,7 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
       keyword: '',
       research: null,
       presentation: null,
+      insights: null,
       total: 0,
       offset,
       limit,
@@ -670,6 +937,173 @@ function isContentImageUrl(value) {
   const lowered = String(value || '').toLowerCase();
   return /^https?:\/\//i.test(lowered)
     && !['sns-avatar', '/avatar/', 'avatar_'].some((marker) => lowered.includes(marker));
+}
+
+function localizeApplicationMedia(record, jobId) {
+  const media = record?.media && typeof record.media === 'object' ? record.media : null;
+  if (!media || !jobId) return record;
+  const proxy = (value) => {
+    const sourceUrl = String(value || '').trim();
+    if (!isCacheableMediaUrl(sourceUrl)) return sourceUrl;
+    return `/api/jobs/${encodeURIComponent(jobId)}/media?url=${encodeURIComponent(sourceUrl)}`;
+  };
+  const images = Array.isArray(media.images)
+    ? media.images.map((image) => {
+      const sourceUrl = String(image?.url || '').trim();
+      return isCacheableMediaUrl(sourceUrl)
+        ? { ...image, url: proxy(sourceUrl), original_url: sourceUrl }
+        : image;
+    })
+    : [];
+  const coverUrl = String(media.cover_url || '').trim();
+  return {
+    ...record,
+    media: {
+      ...media,
+      images,
+      ...(coverUrl ? {
+        cover_url: proxy(coverUrl),
+        ...(isCacheableMediaUrl(coverUrl) ? { cover_original_url: coverUrl } : {}),
+      } : {}),
+    },
+  };
+}
+
+async function serveCachedMedia(res, { outputDir, sourceUrl, mediaFetcher, mediaDownloads }) {
+  const source = validatedMediaUrl(sourceUrl);
+  if (typeof mediaFetcher !== 'function') {
+    const error = new Error('The media fetch runtime is unavailable.');
+    error.code = 'MEDIA_SOURCE_UNAVAILABLE';
+    throw error;
+  }
+  const key = createHash('sha256').update(source.href).digest('hex');
+  let pending = mediaDownloads.get(key);
+  if (!pending) {
+    pending = loadOrCacheMedia(outputDir, key, source, mediaFetcher);
+    mediaDownloads.set(key, pending);
+    pending.finally(() => mediaDownloads.delete(key)).catch(() => {});
+  }
+  const file = await pending;
+  res.writeHead(200, {
+    'Content-Type': file.contentType,
+    'Content-Length': file.size,
+    'Cache-Control': 'public, max-age=31536000, immutable',
+  });
+  createReadStream(file.absolute).pipe(res);
+}
+
+async function loadOrCacheMedia(outputDir, key, source, mediaFetcher) {
+  const cacheDir = path.join(outputDir, '.media-cache');
+  const dataPath = path.join(cacheDir, `${key}.image`);
+  const metadataPath = path.join(cacheDir, `${key}.json`);
+  try {
+    const [info, metadata] = await Promise.all([
+      stat(dataPath),
+      readFile(metadataPath, 'utf8').then(JSON.parse),
+    ]);
+    if (info.isFile() && /^image\//i.test(metadata.contentType || '')) {
+      return { absolute: dataPath, size: info.size, contentType: metadata.contentType };
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+  }
+
+  const response = await fetchMedia(source, mediaFetcher);
+  const contentType = String(response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  const contentLength = Number(response.headers.get('content-length') || 0);
+  if (!response.ok || !/^image\//.test(contentType) || contentLength > MEDIA_CACHE_MAX_BYTES) {
+    const error = new Error(`The source image could not be refreshed (HTTP ${response.status}).`);
+    error.code = 'MEDIA_SOURCE_UNAVAILABLE';
+    throw error;
+  }
+  const body = await readLimitedMediaBody(response, MEDIA_CACHE_MAX_BYTES);
+  await mkdir(cacheDir, { recursive: true });
+  const tempPath = `${dataPath}.${randomUUID()}.tmp`;
+  await writeFile(tempPath, body);
+  await rename(tempPath, dataPath);
+  await writeFile(metadataPath, JSON.stringify({ sourceUrl: source.href, contentType }), 'utf8');
+  return { absolute: dataPath, size: body.length, contentType };
+}
+
+async function fetchMedia(initialUrl, mediaFetcher) {
+  let current = initialUrl;
+  for (let redirect = 0; redirect <= 3; redirect += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), MEDIA_CACHE_TIMEOUT_MS);
+    let response;
+    try {
+      response = await mediaFetcher(current, {
+        redirect: 'manual',
+        signal: controller.signal,
+        headers: {
+          Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+          Referer: 'https://www.xiaohongshu.com/',
+        },
+      });
+    } catch (cause) {
+      const error = new Error('The source image request failed.', { cause });
+      error.code = 'MEDIA_SOURCE_UNAVAILABLE';
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    const location = response.headers.get('location');
+    if (!location || redirect === 3) break;
+    current = validatedMediaUrl(new URL(location, current).href);
+  }
+  const error = new Error('The source image redirected too many times.');
+  error.code = 'MEDIA_SOURCE_UNAVAILABLE';
+  throw error;
+}
+
+async function readLimitedMediaBody(response, maxBytes) {
+  if (!response.body?.getReader) {
+    const body = Buffer.from(await response.arrayBuffer());
+    if (body.length <= maxBytes) return body;
+  } else {
+    const chunks = [];
+    let size = 0;
+    const reader = response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return Buffer.concat(chunks, size);
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel();
+        break;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  }
+  const error = new Error('The source image is too large to cache.');
+  error.code = 'MEDIA_SOURCE_UNAVAILABLE';
+  throw error;
+}
+
+function validatedMediaUrl(value) {
+  let url;
+  try {
+    url = new URL(String(value || '').trim());
+  } catch {
+    url = null;
+  }
+  if (!url || url.protocol !== 'https:' || !isCacheableMediaUrl(url.href)) {
+    const error = new Error('Only Xiaohongshu CDN image URLs can be cached.');
+    error.code = 'MEDIA_SOURCE_INVALID';
+    throw error;
+  }
+  return url;
+}
+
+function isCacheableMediaUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    const hostname = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && (hostname === 'xhscdn.com' || hostname.endsWith('.xhscdn.com'));
+  } catch {
+    return false;
+  }
 }
 
 function applicationTimestamp(record) {
