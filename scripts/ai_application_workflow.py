@@ -18,6 +18,7 @@ from application_intelligence_agents import (
     build_job_card,
 )
 from artifact_io import atomic_write_json
+from evidence_claim_validator import validate_generated_claims
 
 
 GUIDE_RULES = [
@@ -1327,6 +1328,52 @@ def _mark_model_failure(record: dict[str, Any], error: Exception, provider: AIPr
     }
 
 
+def _apply_claim_validation(
+    record: dict[str, Any],
+    profile: dict[str, Any],
+    candidate_profile: dict[str, str],
+) -> dict[str, Any]:
+    validation = validate_generated_claims(record, profile, candidate_profile)
+    record["claim_validation"] = validation
+    record["claims"] = validation["claims"]
+    evaluation = record.get("cover_letter_evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+        record["cover_letter_evaluation"] = evaluation
+    evaluation["modelPassed"] = bool(evaluation.get("passed"))
+    evaluation["claimValidationStatus"] = validation["status"]
+    if validation["hardFactsPassed"]:
+        return validation
+
+    failed_claims = [
+        item["text"]
+        for item in validation["claims"]
+        if item["validationStatus"] != "valid"
+    ]
+    detail = "、".join(failed_claims[:3]) or "存在无法绑定到当前原始证据的事实"
+    problem = (
+        f"生成事实校验需要人工复核：{detail}"
+        if validation["status"] == "needsHumanReview"
+        else f"生成事实未通过原始证据片段校验：{detail}"
+    )
+    evaluation["passed"] = False
+    evaluation["problems"] = _merge_feedback(list(evaluation.get("problems", [])), [problem])
+    evaluation["rewrite_instructions"] = _merge_feedback(
+        list(evaluation.get("rewrite_instructions", [])),
+        [problem],
+    )
+    outreach = record.get("outreach")
+    if isinstance(outreach, dict):
+        outreach["status"] = "needs_review"
+        if evaluation["modelPassed"]:
+            outreach["runtime_status"] = (
+                "fact_validation_needs_human_review"
+                if validation["status"] == "needsHumanReview"
+                else "fact_validation_failed"
+            )
+    return validation
+
+
 def record_needs_completion(record: dict[str, Any]) -> bool:
     media = record.get("media") if isinstance(record.get("media"), dict) else {}
     analysis = media.get("analysis") if isinstance(media.get("analysis"), dict) else {}
@@ -1480,6 +1527,7 @@ def enrich_payload(
                 ],
                 "rewrite_instructions": [],
             }
+            _apply_claim_validation(record, fallback_profile, candidate_profile)
             if progress_callback:
                 progress_callback(index, total_records, "needs_review", record)
             continue
@@ -1488,6 +1536,7 @@ def enrich_payload(
         except (AIProviderError, ValueError, TypeError, KeyError) as error:
             _mark_model_failure(record, error, provider)
             record["cover_letter_evaluation"]["threshold"] = threshold
+            _apply_claim_validation(record, fallback_profile, candidate_profile)
             if progress_callback:
                 progress_callback(index, total_records, "needs_review", record)
             continue
@@ -1572,6 +1621,7 @@ def enrich_payload(
             if not draft:
                 _mark_model_failure(record, error, provider)
                 record["cover_letter_evaluation"]["threshold"] = threshold
+                _apply_claim_validation(record, fallback_profile, candidate_profile)
                 if progress_callback:
                     progress_callback(index, total_records, "needs_review", record)
                 continue
@@ -1632,8 +1682,19 @@ def enrich_payload(
             "application_signal_detected": application_signal_detected,
         }
         record["cover_letter_evaluation"] = {**final_evaluation, "passed": ready, "attempts": final_evaluation.get("attempt", 0)}
+        _apply_claim_validation(record, fallback_profile, candidate_profile)
         if progress_callback:
-            progress_callback(index, total_records, "passed" if ready else "needs_review", record)
+            progress_callback(
+                index,
+                total_records,
+                "passed" if record["cover_letter_evaluation"]["passed"] else "needs_review",
+                record,
+            )
+    passed = sum(
+        1
+        for record in target_records
+        if bool((record.get("cover_letter_evaluation") or {}).get("passed"))
+    )
     job_cards_generated = sum(1 for record in records if isinstance(record.get("job_card"), dict))
     application_copy_generated = sum(
         1
@@ -1655,12 +1716,45 @@ def enrich_payload(
         "generationCoveragePercent": round((application_copy_generated / all_records_count) * 100, 2) if all_records_count else 100.0,
     }
     payload["codex_runtime"] = {**payload["ai_workflow"], "status": "completed" if processed == passed else "quality_failed"}
+    target_note_keys = {
+        str(record.get("note_id") or record.get("id") or f"record-{index}")
+        for index, record in enumerate(target_records, start=1)
+    }
+    prior_claim_map = payload.get("claim_evidence_map")
+    if not isinstance(prior_claim_map, list):
+        prior_claim_map = []
+    existing_claim_map = [
+        item
+        for item in prior_claim_map
+        if isinstance(item, dict) and str(item.get("noteId") or "") not in target_note_keys
+    ]
+    claim_evidence_map = [
+        {
+            "noteId": str(record.get("note_id") or record.get("id") or f"record-{index}"),
+            "schemaVersion": record["claim_validation"]["schemaVersion"],
+            "sourceSetHash": record["claim_validation"]["sourceSetHash"],
+            "status": record["claim_validation"]["status"],
+            "claims": record["claim_validation"]["claims"],
+        }
+        for index, record in enumerate(target_records, start=1)
+        if isinstance(record.get("claim_validation"), dict)
+    ]
+    payload["claim_evidence_schema_version"] = 1
+    payload["claim_evidence_map"] = existing_claim_map + claim_evidence_map
     gate = payload.get("quality_gate") or {}
     gate["cover_letter_quality_passed"] = processed == passed and processed > 0
     checks = gate.setdefault("checks", {})
     checks["all_scraped_jobs_have_job_cards"] = job_cards_generated == all_records_count
     checks["all_scraped_jobs_have_application_copy"] = application_copy_generated == all_records_count
     checks["all_cover_letters_score_at_least_threshold"] = gate["cover_letter_quality_passed"]
+    checks["all_generated_claims_evidence_valid"] = bool(
+        processed > 0
+        and all(
+            isinstance(record.get("claim_validation"), dict)
+            and record["claim_validation"].get("hardFactsPassed") is True
+            for record in target_records
+        )
+    )
     gate["job_cards_generated"] = job_cards_generated
     gate["application_copy_generated"] = application_copy_generated
     gate["generation_coverage_rate"] = (application_copy_generated / all_records_count) if all_records_count else 1.0
@@ -1669,11 +1763,13 @@ def enrich_payload(
         and checks["all_scraped_jobs_have_job_cards"]
         and checks["all_scraped_jobs_have_application_copy"]
         and gate["cover_letter_quality_passed"]
+        and checks["all_generated_claims_evidence_valid"]
     )
     managed_checks = {
         "all_scraped_jobs_have_job_cards",
         "all_scraped_jobs_have_application_copy",
         "all_cover_letters_score_at_least_threshold",
+        "all_generated_claims_evidence_valid",
     }
     gate["issues"] = [
         issue
@@ -1691,6 +1787,18 @@ def enrich_payload(
             "check": "all_scraped_jobs_have_application_copy",
             "code": "APPLICATION_COPY_GENERATION_INCOMPLETE",
             "message": f"{all_records_count - application_copy_generated} scraped jobs have no editable application copy",
+        })
+    if not checks["all_generated_claims_evidence_valid"]:
+        invalid_claim_records = sum(
+            1
+            for record in target_records
+            if not isinstance(record.get("claim_validation"), dict)
+            or record["claim_validation"].get("hardFactsPassed") is not True
+        )
+        gate["issues"].append({
+            "check": "all_generated_claims_evidence_valid",
+            "code": "GENERATED_CLAIM_EVIDENCE_INVALID",
+            "message": f"{invalid_claim_records} drafts contain unsupported or review-required generated facts",
         })
     if processed != passed:
         gate["issues"].append({

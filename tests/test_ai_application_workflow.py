@@ -595,6 +595,7 @@ class AiApplicationWorkflowTests(unittest.TestCase):
     def test_low_quality_first_draft_is_rewritten_until_threshold(self) -> None:
         payload = {
             "quality_gate": {"passed": True, "checks": {}, "issues": []},
+            "claim_evidence_map": {"legacy": "unexpected-shape"},
             "records": [{"title": "增长运营实习", "body": "负责增长分析与协作推进。"}],
         }
         profile = {
@@ -621,6 +622,11 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertEqual(provider.writer_calls, 2)
         self.assertEqual(record["cover_letter_evaluation"]["score"], 94)
         self.assertEqual(record["cover_letter_evaluation"]["attempts"], 2)
+        self.assertTrue(record["cover_letter_evaluation"]["modelPassed"])
+        self.assertEqual(record["claim_validation"]["schemaVersion"], 1)
+        self.assertEqual(record["claim_validation"]["status"], "passed")
+        self.assertEqual(payload["claim_evidence_schema_version"], 1)
+        self.assertEqual(payload["claim_evidence_map"][0]["noteId"], "record-1")
         self.assertEqual(record["application_info"]["application_routes"][0]["channel"], "email")
         self.assertEqual(record["application_info"]["application_routes"][0]["confidence"], 100)
         self.assertIn("简历随信附上", record["outreach"]["cover_letter"])
@@ -631,6 +637,7 @@ class AiApplicationWorkflowTests(unittest.TestCase):
                 self.assertIn("offset_start", item)
                 self.assertIn("offset_end", item)
         self.assertTrue(payload["quality_gate"]["checks"]["all_cover_letters_score_at_least_threshold"])
+        self.assertTrue(payload["quality_gate"]["checks"]["all_generated_claims_evidence_valid"])
 
     def test_image_only_record_still_gets_image_enriched_job_card(self) -> None:
         payload = {

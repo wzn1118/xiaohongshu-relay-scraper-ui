@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any, Callable
+
+from ai_application_workflow import (
+    AIProvider,
+    _deterministic_problems,
+    _evaluate,
+    _merge_feedback,
+    _rubric_for_score,
+)
+from evidence_claim_validator import validate_generated_claims
+
+
+MAX_INPUT_BYTES = 2 * 1024 * 1024
+TEXT_FIELDS = ("greeting", "email_subject", "email_body", "cover_letter")
+RUBRIC_FIELDS = (
+    "role_relevance",
+    "evidence",
+    "first_person",
+    "concision",
+    "credibility",
+    "action_readiness",
+)
+
+
+def _object(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _object_list(value: Any) -> list[dict[str, Any]]:
+    return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [text for item in value if (text := str(item or "").strip())]
+
+
+def _threshold(payload: dict[str, Any], record: dict[str, Any]) -> int:
+    evaluation = _object(record.get("cover_letter_evaluation"))
+    raw = payload.get("threshold", evaluation.get("threshold", 90))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 90
+    return max(90, value)
+
+
+def _role_from_record(record: dict[str, Any]) -> dict[str, Any]:
+    application = _object(record.get("application_info"))
+    job_card = _object(record.get("job_card"))
+    media = _object(record.get("media"))
+    media_analysis = _object(media.get("analysis"))
+    return {
+        "role_name": str(job_card.get("role_name") or record.get("title") or "").strip(),
+        "responsibilities": _object_list(application.get("responsibilities")),
+        "requirements": _object_list(application.get("requirements")),
+        "application_routes": _object_list(application.get("application_routes")),
+        "capabilities": _object_list(record.get("job_capabilities")),
+        "image_analysis": media_analysis,
+    }
+
+
+def _candidate_profile(payload: dict[str, Any], record: dict[str, Any]) -> dict[str, str]:
+    source = _object(payload.get("candidateProfile"))
+    if not source:
+        source = _object(record.get("candidateProfile"))
+    if not source:
+        source = _object(record.get("candidate_application"))
+    return {str(key): str(value or "").strip() for key, value in source.items()}
+
+
+def _draft_with_grounding(record: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
+    grounded = dict(_object(record.get("outreach")))
+    for field in TEXT_FIELDS:
+        grounded[field] = str(draft.get(field) or "").strip()
+    for field in ("used_evidence_ids", "capability_matches"):
+        if field in draft:
+            grounded[field] = list(draft.get(field) or [])
+    return grounded
+
+
+def evaluate_payload(
+    payload: dict[str, Any],
+    provider_factory: Callable[[], AIProvider] = AIProvider,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Input must be a JSON object")
+    record = payload.get("record")
+    draft = payload.get("draft")
+    if not isinstance(record, dict) or not isinstance(draft, dict):
+        raise ValueError("record and draft must be JSON objects")
+
+    role = _role_from_record(record)
+    evidence = _object_list(record.get("fit_evidence"))
+    candidate_profile = _candidate_profile(payload, record)
+    checked_draft = _draft_with_grounding(record, draft)
+    threshold = _threshold(payload, record)
+    evaluation = _object(_evaluate(
+        provider_factory(),
+        role,
+        evidence,
+        checked_draft,
+        candidate_profile,
+    ))
+    deterministic = _deterministic_problems(
+        checked_draft,
+        role,
+        evidence,
+        candidate_profile,
+        record,
+    )
+
+    try:
+        score = min(100, max(0, int(evaluation.get("score", 0))))
+    except (TypeError, ValueError):
+        score = 0
+    problems = _text_list(evaluation.get("problems"))
+    instructions = _text_list(evaluation.get("rewrite_instructions"))
+    if deterministic:
+        score = min(score, 89)
+        problems = _merge_feedback(problems, deterministic)
+        instructions = _merge_feedback(instructions, deterministic)
+
+    rubric = _object(evaluation.get("rubric"))
+    try:
+        rubric_values = {field: int(rubric.get(field, 0)) for field in RUBRIC_FIELDS}
+    except (TypeError, ValueError):
+        rubric_values = {}
+    if set(rubric_values) != set(RUBRIC_FIELDS) or sum(rubric_values.values()) != score:
+        rubric_values = _rubric_for_score(score)
+    if deterministic:
+        rubric_values = _rubric_for_score(score)
+
+    claim_validation = validate_generated_claims(
+        record,
+        candidate_profile={**_object(record.get("candidate_application")), **candidate_profile},
+        draft=checked_draft,
+    )
+    model_passed = score >= threshold
+    if not claim_validation["hardFactsPassed"]:
+        invalid_claims = [
+            item["text"]
+            for item in claim_validation["claims"]
+            if item["validationStatus"] != "valid"
+        ]
+        detail = "、".join(invalid_claims[:3]) or "存在无法绑定到当前原始证据的事实"
+        claim_problem = (
+            f"生成事实校验需要人工复核：{detail}"
+            if claim_validation["status"] == "needsHumanReview"
+            else f"生成事实未通过原始证据片段校验：{detail}"
+        )
+        problems = _merge_feedback(problems, [claim_problem])
+        instructions = _merge_feedback(instructions, [claim_problem])
+
+    return {
+        "score": score,
+        "rubric": rubric_values,
+        "strengths": _text_list(evaluation.get("strengths")),
+        "problems": problems,
+        "rewrite_instructions": instructions,
+        "threshold": threshold,
+        "modelPassed": model_passed,
+        "passed": model_passed and claim_validation["hardFactsPassed"],
+        "attempt": 1,
+        "attempts": 1,
+        "claim_validation": claim_validation,
+        "claims": claim_validation["claims"],
+    }
+
+
+def main() -> int:
+    raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    if len(raw) > MAX_INPUT_BYTES:
+        raise ValueError("Input exceeds the maximum allowed size")
+    if not raw.strip():
+        raise ValueError("Input is required")
+    payload = json.loads(raw.decode("utf-8"))
+    result = evaluate_payload(payload)
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        sys.stderr.write(f"Draft quality check failed: {error}\n")
+        raise SystemExit(2) from error
