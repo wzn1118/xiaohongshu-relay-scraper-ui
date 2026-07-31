@@ -402,6 +402,16 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(audienceResumePayload.job.id, job.id);
     assert.equal(resumeCalls.length, 0);
 
+    const restoredEmailConfig = await fetch(`${origin}/api/email/config`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'custom', host: 'smtp.example.com', port: 465, secure: true, requireTls: false,
+        auth: 'login', user: 'sender@example.com', from: 'sender@example.com', password: 'replacement',
+      }),
+    });
+    assert.equal(restoredEmailConfig.status, 200);
+
     const savedDraft = await fetch(`${origin}/api/jobs/${job.id}/draft`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -418,6 +428,16 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(savedDraft.status, 200);
     assert.equal((await savedDraft.json()).delivery.action, 'draft_saved');
 
+    const blockedBeforeVerification = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ noteId: 'n1', to: 'jobs@example.com' }),
+    });
+    assert.equal(blockedBeforeVerification.status, 409);
+    assert.equal((await blockedBeforeVerification.json()).error.code, 'SMTP_NOT_VERIFIED');
+    assert.equal(sentMessages.length, 0);
+    assert.equal((await fetch(`${origin}/api/email/test`, { method: 'POST' })).status, 200);
+
     const resultsWithDraft = await fetch(`${origin}/api/jobs/${job.id}/results?limit=20`).then((response) => response.json());
     assert.equal(resultsWithDraft.items[0].outreach.email_subject, '应聘内容运营实习｜示例用户');
 
@@ -427,15 +447,53 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       body: JSON.stringify({
         noteId: 'n1',
         to: 'jobs@example.com',
+        idempotencyKey: 'send-n1-v1',
         outreach: resultsWithDraft.items[0].outreach,
       }),
     });
     assert.equal(sentEmail.status, 200);
-    assert.equal((await sentEmail.json()).delivery.action, 'email_sent');
+    const sentEmailBody = await sentEmail.json();
+    assert.equal(sentEmailBody.delivery.action, 'email_sent');
+    assert.match(sentEmailBody.sendIdempotencyKey, /^[a-f0-9]{64}$/);
     assert.equal(sentMessages.length, 1);
     assert.equal(sentMessages[0].to, 'jobs@example.com');
     assert.equal(sentMessages[0].replyTo, 'candidate@example.com');
     assert.equal(sentMessages[0].subject, '应聘内容运营实习｜示例用户');
+
+    const duplicateEmail = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        noteId: 'n1', to: 'jobs@example.com', idempotencyKey: 'send-n1-v1', outreach: resultsWithDraft.items[0].outreach,
+      }),
+    });
+    assert.equal(duplicateEmail.status, 200);
+    const duplicateBody = await duplicateEmail.json();
+    assert.equal(duplicateBody.duplicate, true);
+    assert.equal(duplicateBody.code, 'EMAIL_DUPLICATE_SEND');
+    assert.equal(sentMessages.length, 1);
+    assert.match(duplicateBody.delivery.sendAudit[0].recipient, /^j\*\*\*@example\.com$/);
+    assert.equal('body' in duplicateBody.delivery.sendAudit[0], false);
+
+    const resetDelivery = await fetch(`${origin}/api/jobs/${job.id}/delivery`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ noteId: 'n1', action: 'reset' }),
+    });
+    assert.equal(resetDelivery.status, 200);
+    const concurrentPayload = JSON.stringify({
+      noteId: 'n1', to: 'jobs@example.com', outreach: resultsWithDraft.items[0].outreach,
+    });
+    const concurrentResponses = await Promise.all([1, 2].map(() => fetch(`${origin}/api/jobs/${job.id}/send-email`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: concurrentPayload,
+    })));
+    assert.deepEqual(concurrentResponses.map((response) => response.status), [200, 200]);
+    const concurrentBodies = await Promise.all(concurrentResponses.map((response) => response.json()));
+    assert.equal(concurrentBodies.filter((body) => body.duplicate).length, 1);
+    assert.equal(concurrentBodies.filter((body) => !body.duplicate).length, 1);
+    assert.equal(sentMessages.length, 2);
 
     const rejectedLowQualityEdit = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',
@@ -451,7 +509,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       }),
     });
     assert.equal(rejectedLowQualityEdit.status, 400);
-    assert.equal(sentMessages.length, 1);
+    assert.equal(sentMessages.length, 2);
 
     const invalidRecipient = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',

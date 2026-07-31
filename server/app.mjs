@@ -45,6 +45,12 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     getRelayConfig,
   });
   const mediaDownloads = new Map();
+  let smtpOperationTail = Promise.resolve();
+  const withSmtpOperationLock = (operation) => {
+    const current = smtpOperationTail.catch(() => {}).then(operation);
+    smtpOperationTail = current.catch(() => {});
+    return current;
+  };
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
     configure: () => ({ configured: false, from: '' }),
@@ -95,22 +101,34 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           return json(res, 503, errorBody('SMTP_CONFIG_UNAVAILABLE', 'SMTP configuration storage is unavailable.'));
         }
         const body = await readJsonBody(req, config.maxBodyBytes);
-        await smtpConfig.update(body);
-        deliveryMailer.configure(smtpConfig.getForMailer());
-        return json(res, 200, publicSmtpConfig(smtpConfig, deliveryMailer));
+        return json(res, 200, await withSmtpOperationLock(async () => {
+          await smtpConfig.update(body);
+          deliveryMailer.configure(smtpConfig.getForMailer());
+          return publicSmtpConfig(smtpConfig, deliveryMailer);
+        }));
       }
       if (req.method === 'DELETE' && url.pathname === '/api/email/config') {
         if (!smtpConfig?.clear || !smtpConfig?.getForMailer) {
           return json(res, 503, errorBody('SMTP_CONFIG_UNAVAILABLE', 'SMTP configuration storage is unavailable.'));
         }
-        await smtpConfig.clear();
-        deliveryMailer.configure(smtpConfig.getForMailer());
-        return json(res, 200, publicSmtpConfig(smtpConfig, deliveryMailer));
+        return json(res, 200, await withSmtpOperationLock(async () => {
+          await smtpConfig.clear();
+          deliveryMailer.configure(smtpConfig.getForMailer());
+          return publicSmtpConfig(smtpConfig, deliveryMailer);
+        }));
       }
       if (req.method === 'POST' && url.pathname === '/api/email/test') {
-        const status = await deliveryMailer.verify();
-        const saved = await smtpConfig?.markVerified?.();
-        return json(res, 200, { ok: true, ...status, lastVerifiedAt: saved?.lastVerifiedAt || new Date().toISOString() });
+        return json(res, 200, await withSmtpOperationLock(async () => {
+          const snapshot = smtpConfig?.getVerificationSnapshot?.();
+          try {
+            const status = await deliveryMailer.verify();
+            const saved = await smtpConfig?.markVerified?.(snapshot);
+            return { ok: true, ...status, lastVerifiedAt: saved?.lastVerifiedAt || new Date().toISOString() };
+          } catch (error) {
+            await smtpConfig?.markVerificationFailed?.(snapshot, error.code).catch(() => {});
+            throw error;
+          }
+        }));
       }
       if (req.method === 'GET' && url.pathname === '/api/relay/status') {
         const configured = getRelayConfig();
@@ -506,7 +524,13 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (req.method === 'POST' && parts[3] === 'send-email' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           const replyTo = String(internal.params?.candidateProfile?.email || '').trim();
-          return json(res, 200, await sendApplicationEmail(internal.outputDir, body, deliveryMailer, replyTo));
+          return json(res, 200, await withSmtpOperationLock(() => sendApplicationEmail(
+            internal.outputDir,
+            body,
+            deliveryMailer,
+            replyTo,
+            smtpConfig,
+          )));
         }
         if (req.method === 'GET' && parts[3] === 'artifacts' && parts.length === 4) {
           return json(res, 200, await enumerateArtifacts(internal.outputDir));
@@ -569,9 +593,15 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'LOCAL_MODEL_RUNTIME_UNAVAILABLE') return json(res, 503, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_IMPORT_FAILED') return json(res, 422, errorBody(error.code, error.message));
-      if (error.code === 'MAIL_NOT_CONFIGURED') return json(res, 503, errorBody(error.code, error.message));
-      if (error.code === 'MAIL_CONNECTION_FAILED') return json(res, 502, errorBody(error.code, error.message));
-      if (error.code === 'MAIL_SEND_FAILED') return json(res, 502, errorBody(error.code, error.message));
+      if (['MAIL_NOT_CONFIGURED', 'SMTP_NOT_CONFIGURED'].includes(error.code)) return json(res, 503, errorBody(error.code, error.message));
+      if (['SMTP_NOT_VERIFIED', 'SMTP_VERIFICATION_EXPIRED', 'SMTP_CONFIG_CONFLICT', 'EMAIL_SEND_STATUS_UNKNOWN', 'EMAIL_IDEMPOTENCY_CONFLICT'].includes(error.code)) {
+        return json(res, 409, errorBody(error.code, error.message));
+      }
+      if (error.code === 'SMTP_RATE_LIMITED') return json(res, 429, errorBody(error.code, error.message));
+      if (['SMTP_SENDER_REJECTED', 'SMTP_RECIPIENT_REJECTED'].includes(error.code)) return json(res, 422, errorBody(error.code, error.message));
+      if (['MAIL_CONNECTION_FAILED', 'MAIL_SEND_FAILED', 'SMTP_AUTH_FAILED', 'SMTP_DNS_FAILED', 'SMTP_CONNECTION_TIMEOUT', 'SMTP_TLS_FAILED', 'SMTP_VERIFICATION_FAILED', 'SMTP_SEND_FAILED'].includes(error.code)) {
+        return json(res, 502, errorBody(error.code, error.message));
+      }
       if (error instanceof SyntaxError) return json(res, 400, errorBody('INVALID_JSON', 'Request body must contain valid JSON.'));
       if (error.code === 'ENOENT' || /artifact/i.test(error.message) || /Path escapes/.test(error.message)) {
         return json(res, 404, errorBody('ARTIFACT_NOT_FOUND', 'Artifact not found.'));
@@ -1224,7 +1254,7 @@ async function updateApplicationDraft(outputDir, value) {
   return { noteId, outreach: draft, delivery: publicDeliveryState(state[noteId]) };
 }
 
-async function sendApplicationEmail(outputDir, value, mailer, replyTo) {
+async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfig) {
   const noteId = String(value?.noteId || '').trim();
   if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
   const record = await readApplicationRecord(outputDir, noteId);
@@ -1237,41 +1267,194 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo) {
   const to = extracted.find((item) => item.toLowerCase() === requested) || (!requested ? extracted[0] : '');
   if (!to) throw new ValidationError('Recipient must be an email extracted from this application record.');
 
+  let smtpState = assertSmtpVerified(mailer, smtpConfig);
   const state = await readDeliveryState(outputDir);
   const draft = normalizeDraft(value?.outreach || state[noteId]?.draft || record.outreach);
   if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
   validateDeliveryDraft(draft, record);
-  state[noteId] = { ...state[noteId], draft, updatedAt: new Date().toISOString() };
+  const existing = state[noteId] || {};
+  const requestKey = normalizeEmailIdempotencyKey(value?.idempotencyKey);
+  const draftId = String(value?.draftId || existing.draftId || `legacy:${noteId}`);
+  const draftVersion = Number(value?.version || value?.draftVersion || existing.draftVersion?.version || existing.draftVersion || 1);
+  const contentHash = createHash('sha256').update(JSON.stringify(draft)).digest('hex');
+  const idempotencyKey = createHash('sha256').update(JSON.stringify({
+    configHash: smtpState.configHash || '',
+    credentialRevision: smtpState.credentialRevision ?? null,
+    draftId,
+    draftVersion,
+    contentHash,
+    recipient: to.toLowerCase(),
+  })).digest('hex');
+  const priorAudits = Array.isArray(existing.sendAudit) ? existing.sendAudit : [];
+  const requestKeyAudit = requestKey ? priorAudits.find((audit) => audit.requestKey === requestKey) : null;
+  if (requestKeyAudit && requestKeyAudit.idempotencyKey !== idempotencyKey) {
+    throw emailDeliveryError('EMAIL_IDEMPOTENCY_CONFLICT', 'The email idempotency key was already used for different content.');
+  }
+  const completed = priorAudits.find((audit) => audit.idempotencyKey === idempotencyKey && audit.status === 'sent');
+  if (completed) {
+    const duplicateAt = new Date().toISOString();
+    const duplicateAudit = buildSendAudit({
+      status: 'duplicate', draftId, draftVersion, contentHash, idempotencyKey,
+      requestKey, recipient: to, timestamp: duplicateAt, smtpState, errorCode: 'EMAIL_DUPLICATE_SEND',
+    });
+    state[noteId] = {
+      ...existing,
+      sendAudit: [...priorAudits, duplicateAudit],
+      updatedAt: duplicateAt,
+    };
+    await writeDeliveryState(outputDir, state);
+    return {
+      noteId,
+      outreach: draft,
+      delivery: publicDeliveryState(state[noteId]),
+      duplicate: true,
+      code: 'EMAIL_DUPLICATE_SEND',
+      sendIdempotencyKey: idempotencyKey,
+    };
+  }
+  if (existing.pendingSend) {
+    throw emailDeliveryError('EMAIL_SEND_STATUS_UNKNOWN', 'A previous persisted send intent has no final delivery result.');
+  }
+  const verificationSnapshot = smtpConfig?.getVerificationSnapshot?.() || smtpState;
+  try {
+    await mailer.verify();
+  } catch (error) {
+    await smtpConfig?.markVerificationFailed?.(verificationSnapshot, error.code).catch(() => {});
+    const failedAt = new Date().toISOString();
+    const audit = buildSendAudit({
+      status: 'failed', draftId, draftVersion, contentHash, idempotencyKey,
+      requestKey, recipient: to, timestamp: failedAt, smtpState, errorCode: error.code || 'SMTP_VERIFICATION_FAILED',
+    });
+    state[noteId] = {
+      ...existing,
+      draft,
+      action: 'email_failed',
+      updatedAt: failedAt,
+      email: { status: 'failed', to, failedAt, errorCode: error.code || 'SMTP_VERIFICATION_FAILED' },
+      sendAudit: [...priorAudits, audit],
+    };
+    await writeDeliveryState(outputDir, state);
+    throw error;
+  }
+  const refreshedVerification = await smtpConfig?.markVerified?.(verificationSnapshot);
+  if (refreshedVerification) {
+    smtpState = {
+      ...smtpState,
+      configHash: refreshedVerification.configHash || smtpState.configHash,
+      credentialRevision: refreshedVerification.credentialRevision ?? smtpState.credentialRevision,
+      verificationStatus: refreshedVerification.verificationStatus || 'verified',
+    };
+  }
+  const pendingAt = new Date().toISOString();
+  state[noteId] = {
+    ...existing,
+    draft,
+    updatedAt: pendingAt,
+    pendingSend: { idempotencyKey, draftId, draftVersion, contentHash, recipient: maskEmail(to), createdAt: pendingAt },
+  };
+  await writeDeliveryState(outputDir, state);
   try {
     const sent = await mailer.send({
       to,
       subject: draft.email_subject,
       text: draft.email_body,
       replyTo: EMAIL.test(replyTo) ? replyTo : '',
+      ...(Array.isArray(value?.attachments) ? { attachments: value.attachments } : {}),
+    });
+    const sentAt = new Date().toISOString();
+    const audit = buildSendAudit({
+      status: 'sent', draftId, draftVersion, contentHash, idempotencyKey,
+      requestKey, recipient: to, timestamp: sentAt, smtpState,
     });
     state[noteId] = {
       ...state[noteId],
       action: 'email_sent',
-      updatedAt: new Date().toISOString(),
+      updatedAt: sentAt,
       email: {
         status: 'sent',
         to,
-        sentAt: new Date().toISOString(),
+        sentAt,
         messageId: sent.messageId || '',
       },
+      sendAudit: [...priorAudits, audit],
     };
+    delete state[noteId].pendingSend;
     await writeDeliveryState(outputDir, state);
-    return { noteId, outreach: draft, delivery: publicDeliveryState(state[noteId]) };
+    return {
+      noteId,
+      outreach: draft,
+      delivery: publicDeliveryState(state[noteId]),
+      duplicate: false,
+      sendIdempotencyKey: idempotencyKey,
+    };
   } catch (error) {
+    const failedAt = new Date().toISOString();
+    const status = error.deliveryStatus === 'unknown' ? 'unknown' : 'failed';
+    const audit = buildSendAudit({
+      status, draftId, draftVersion, contentHash, idempotencyKey,
+      requestKey, recipient: to, timestamp: failedAt, smtpState, errorCode: error.code || 'SMTP_SEND_FAILED',
+    });
     state[noteId] = {
       ...state[noteId],
       action: 'email_failed',
-      updatedAt: new Date().toISOString(),
-      email: { status: 'failed', to, failedAt: new Date().toISOString() },
+      updatedAt: failedAt,
+      email: { status, to, failedAt, errorCode: error.code || 'SMTP_SEND_FAILED' },
+      sendAudit: [...priorAudits, audit],
     };
+    if (status !== 'unknown') delete state[noteId].pendingSend;
     await writeDeliveryState(outputDir, state);
     throw error;
   }
+}
+
+function assertSmtpVerified(mailer, smtpConfig) {
+  if (smtpConfig?.assertReadyForSend) return smtpConfig.assertReadyForSend();
+  const configured = mailer.status?.().configured;
+  const saved = smtpConfig?.getPublic?.() || {};
+  if (!configured) throw emailDeliveryError('SMTP_NOT_CONFIGURED', '请先配置 SMTP 邮件发送。');
+  if (!(saved.verified ?? Boolean(saved.lastVerifiedAt))) {
+    throw emailDeliveryError('SMTP_NOT_VERIFIED', '当前 SMTP 配置尚未通过连接验证。');
+  }
+  return {
+    configHash: saved.configHash || '',
+    credentialRevision: saved.credentialRevision ?? null,
+    verificationStatus: 'verified',
+  };
+}
+
+function normalizeEmailIdempotencyKey(value) {
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value !== 'string' || !value.trim() || value.length > 200) {
+    throw new ValidationError('idempotencyKey must be a non-empty string of at most 200 characters.');
+  }
+  return value.trim();
+}
+
+function buildSendAudit({ status, draftId, draftVersion, contentHash, idempotencyKey, requestKey, recipient, timestamp, smtpState, errorCode = '' }) {
+  return {
+    status,
+    recipient: maskEmail(recipient),
+    draftId,
+    draftVersion,
+    contentHash,
+    idempotencyKey,
+    requestKey,
+    timestamp,
+    configHash: smtpState.configHash || '',
+    credentialRevision: smtpState.credentialRevision ?? null,
+    errorCode,
+  };
+}
+
+function maskEmail(value) {
+  const match = String(value || '').match(/^(.)([^@]*)(@.+)$/);
+  return match ? `${match[1]}***${match[3]}` : '';
+}
+
+function emailDeliveryError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 function normalizeDraft(value) {
@@ -1357,7 +1540,13 @@ function publicSmtpConfig(smtpConfig, mailer) {
     hasPassword: false,
   };
   const status = mailer.status();
-  return { ...saved, configured: status.configured, verified: Boolean(saved.lastVerifiedAt), maskedFrom: status.from, authMode: status.authMode };
+  return {
+    ...saved,
+    configured: status.configured,
+    verified: saved.verified ?? Boolean(saved.lastVerifiedAt),
+    maskedFrom: status.from,
+    authMode: status.authMode,
+  };
 }
 
 function boundedInteger(raw, fallback, min, max) {

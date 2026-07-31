@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 
 export const SMTP_PROVIDER_PRESETS = Object.freeze({
@@ -26,19 +27,62 @@ const SMTP_EMAIL_DOMAIN_PRESETS = Object.freeze({
 const PROVIDERS = new Set(Object.keys(SMTP_PROVIDER_PRESETS));
 const AUTH_MODES = new Set(['login', 'oauth2', 'none']);
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
+const DEFAULT_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 
 export class SmtpConfigStore {
-  constructor({ filePath, defaults = {} }) {
+  constructor({ filePath, defaults = {}, verificationTtlMs = DEFAULT_VERIFICATION_TTL_MS, clock = () => Date.now() }) {
     this.filePath = filePath;
     this.defaults = normalizeSmtpConfig(defaults, { allowEmpty: true });
-    this.value = { ...this.defaults, oauth: { ...this.defaults.oauth } };
+    this.value = cloneConfig(this.defaults);
+    this.clock = clock;
+    this.verificationTtlMs = Math.max(1, Number(verificationTtlMs) || DEFAULT_VERIFICATION_TTL_MS);
+    this.revision = 0;
+    this.credentialRevision = hasRuntimeCredential(this.value) ? 1 : 0;
+    this.configHash = smtpConfigHash(this.value);
+    this.verifiedConfigHash = '';
+    this.verifiedCredentialRevision = null;
+    this.verifiedAt = '';
+    this.verificationStatus = 'unverified';
+    this.verificationFailureCode = '';
+    this.configurationUpdatedAt = '';
+    this.mutationQueue = Promise.resolve();
   }
 
   async initialize() {
     await mkdir(path.dirname(this.filePath), { recursive: true });
     try {
       const saved = JSON.parse(await readFile(this.filePath, 'utf8'));
-      this.value = normalizeSmtpConfig({ ...this.defaults, ...saved, oauth: { ...this.defaults.oauth, ...saved.oauth } });
+      const legacySecrets = extractSecrets(saved);
+      const defaultsSecrets = extractSecrets(this.defaults);
+      const runtimeSecrets = hasRuntimeCredential(legacySecrets) ? legacySecrets : defaultsSecrets;
+      this.value = normalizeSmtpConfig({
+        ...this.defaults,
+        ...saved,
+        pass: runtimeSecrets.pass,
+        oauth: {
+          ...this.defaults.oauth,
+          ...saved.oauth,
+          clientSecret: runtimeSecrets.oauth.clientSecret,
+          refreshToken: runtimeSecrets.oauth.refreshToken,
+        },
+      }, { allowEmpty: true });
+      this.revision = normalizeRevision(saved.revision, 1);
+      this.credentialRevision = normalizeRevision(saved.credentialRevision, 0)
+        + (hasRuntimeCredential(runtimeSecrets) ? 1 : 0);
+      this.configHash = smtpConfigHash(this.value);
+      this.configurationUpdatedAt = normalizeTimestamp(saved.configurationUpdatedAt);
+
+      const canRestoreVerification = !hasRuntimeCredential(runtimeSecrets)
+        && saved.configHash === this.configHash
+        && saved.verifiedConfigHash === this.configHash
+        && Number(saved.verifiedCredentialRevision) === this.credentialRevision;
+      this.verifiedConfigHash = canRestoreVerification ? String(saved.verifiedConfigHash) : '';
+      this.verifiedCredentialRevision = canRestoreVerification ? this.credentialRevision : null;
+      this.verifiedAt = canRestoreVerification ? normalizeTimestamp(saved.verifiedAt || saved.lastVerifiedAt) : '';
+      this.verificationStatus = canRestoreVerification && this.verifiedAt ? 'verified' : 'unverified';
+      this.verificationFailureCode = canRestoreVerification ? String(saved.verificationFailureCode || '') : '';
+
+      if (containsPersistedSecret(saved) || Number(saved.schemaVersion) !== 2) await this.persist();
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
@@ -46,13 +90,84 @@ export class SmtpConfigStore {
   }
 
   getForMailer() {
-    return { ...this.value, oauth: { ...this.value.oauth } };
+    return cloneConfig(this.value);
+  }
+
+  getVerificationSnapshot() {
+    return {
+      revision: this.revision,
+      configHash: this.configHash,
+      fingerprint: this.configHash,
+      credentialRevision: this.credentialRevision,
+    };
+  }
+
+  getVerificationState() {
+    const configured = isRuntimeConfigured(this.value);
+    let status = this.verificationStatus;
+    let failureCode = this.verificationFailureCode;
+    if (!configured) {
+      status = 'unverified';
+      failureCode = 'SMTP_NOT_CONFIGURED';
+    } else if (this.verificationStatus === 'failed') {
+      status = 'failed';
+      failureCode ||= 'SMTP_VERIFICATION_FAILED';
+    } else if (
+      this.verifiedConfigHash !== this.configHash
+      || this.verifiedCredentialRevision !== this.credentialRevision
+    ) {
+      status = 'unverified';
+      failureCode = 'SMTP_NOT_VERIFIED';
+    } else if (!this.verifiedAt) {
+      status = this.verificationStatus === 'failed' ? 'failed' : 'unverified';
+      failureCode ||= 'SMTP_NOT_VERIFIED';
+    } else if (this.clock() - Date.parse(this.verifiedAt) > this.verificationTtlMs) {
+      status = 'expired';
+      failureCode = 'SMTP_VERIFICATION_EXPIRED';
+    }
+    return {
+      configured,
+      configHash: this.configHash,
+      verifiedConfigHash: this.verifiedConfigHash,
+      credentialRevision: this.credentialRevision,
+      verifiedCredentialRevision: this.verifiedCredentialRevision,
+      verifiedAt: this.verifiedAt,
+      verificationStatus: status,
+      verificationFailureCode: failureCode,
+    };
+  }
+
+  isVerified() {
+    return this.getVerificationState().verificationStatus === 'verified';
+  }
+
+  assertReadyForSend() {
+    const state = this.getVerificationState();
+    if (!state.configured) throw smtpStateError('SMTP_NOT_CONFIGURED', '请先配置 SMTP 邮件发送。');
+    if (state.verificationStatus === 'expired') {
+      throw smtpStateError('SMTP_VERIFICATION_EXPIRED', 'SMTP 验证已过期，请重新测试连接后再发送。');
+    }
+    if (state.verificationStatus !== 'verified') {
+      throw smtpStateError('SMTP_NOT_VERIFIED', '当前 SMTP 配置尚未通过连接验证。');
+    }
+    return state;
   }
 
   getPublic() {
-    const { pass, oauth, ...value } = this.value;
+    const { pass, oauth, lastVerifiedAt: _lastVerifiedAt, ...value } = this.value;
+    const verification = this.getVerificationState();
     return {
       ...value,
+      revision: this.revision,
+      configHash: this.configHash,
+      verifiedConfigHash: this.verifiedConfigHash,
+      verifiedAt: this.verifiedAt,
+      lastVerifiedAt: this.verifiedAt,
+      verificationStatus: verification.verificationStatus,
+      verificationFailureCode: verification.verificationFailureCode,
+      configurationUpdatedAt: this.configurationUpdatedAt,
+      credentialRevision: this.credentialRevision,
+      verified: verification.verificationStatus === 'verified',
       hasPassword: Boolean(pass),
       oauth: {
         tenant: oauth.tenant,
@@ -65,54 +180,190 @@ export class SmtpConfigStore {
   }
 
   async update(input = {}) {
-    const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-    const oauth = mergeOAuth(this.value.oauth, source.oauth);
-    const autoConfigure = source.autoConfigure === true;
-    const automatic = autoConfigure ? detectSmtpSettings(source.from || source.user) : null;
-    if (autoConfigure && !automatic) {
-      throw validation('暂不支持自动识别这个邮箱，请展开高级设置并填写服务商提供的 SMTP 参数。');
-    }
-    const next = {
-      ...this.value,
-      ...source,
-      ...(automatic ? {
-        ...automatic,
-        auth: 'login',
-        user: String(source.from || source.user || '').trim(),
-        from: String(source.from || source.user || '').trim(),
-      } : {}),
-      pass: source.clearPassword ? '' : Object.hasOwn(source, 'password') && source.password !== ''
-        ? String(source.password)
-        : this.value.pass,
-      oauth,
-      lastVerifiedAt: '',
-    };
-    delete next.password;
-    delete next.clearPassword;
-    delete next.autoConfigure;
-    this.value = normalizeSmtpConfig(next);
-    await this.persist();
-    return this.getPublic();
+    return this.enqueueMutation(async () => {
+      const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+      const oauth = mergeOAuth(this.value.oauth, source.oauth);
+      const autoConfigure = source.autoConfigure === true;
+      const automatic = autoConfigure ? detectSmtpSettings(source.from || source.user) : null;
+      if (autoConfigure && !automatic) {
+        throw validation('暂不支持自动识别这个邮箱，请展开高级设置并填写服务商提供的 SMTP 参数。');
+      }
+      const next = {
+        ...this.value,
+        ...source,
+        ...(automatic ? {
+          ...automatic,
+          auth: 'login',
+          user: String(source.from || source.user || '').trim(),
+          from: String(source.from || source.user || '').trim(),
+        } : {}),
+        pass: source.clearPassword ? '' : Object.hasOwn(source, 'password') && source.password !== ''
+          ? String(source.password)
+          : this.value.pass,
+        oauth,
+      };
+      delete next.password;
+      delete next.clearPassword;
+      delete next.autoConfigure;
+      const value = normalizeSmtpConfig(next);
+      const nextHash = smtpConfigHash(value);
+      const credentialChanged = credentialsDiffer(this.value, value);
+      const configChanged = nextHash !== this.configHash;
+      const changed = credentialChanged || configChanged;
+      await this.commit({
+        value,
+        revision: changed ? this.revision + 1 : this.revision,
+        credentialRevision: credentialChanged ? this.credentialRevision + 1 : this.credentialRevision,
+        configurationUpdatedAt: changed ? new Date(this.clock()).toISOString() : this.configurationUpdatedAt,
+        invalidateVerification: changed,
+      });
+      return this.getPublic();
+    });
   }
 
   async clear() {
-    this.value = normalizeSmtpConfig({}, { allowEmpty: true });
-    await this.persist();
-    return this.getPublic();
+    return this.enqueueMutation(async () => {
+      await this.commit({
+        value: normalizeSmtpConfig({}, { allowEmpty: true }),
+        revision: this.revision + 1,
+        credentialRevision: this.credentialRevision + 1,
+        configurationUpdatedAt: new Date(this.clock()).toISOString(),
+        invalidateVerification: true,
+      });
+      return this.getPublic();
+    });
   }
 
-  async markVerified() {
-    this.value = { ...this.value, lastVerifiedAt: new Date().toISOString() };
-    await this.persist();
-    return this.getPublic();
+  async markVerified(expected = this.getVerificationSnapshot()) {
+    return this.enqueueMutation(async () => {
+      const snapshot = normalizeExpectedSnapshot(expected, this.credentialRevision);
+      if (snapshot.configHash !== this.configHash || snapshot.credentialRevision !== this.credentialRevision) {
+        throw conflict(this.revision);
+      }
+      const verifiedAt = new Date(this.clock()).toISOString();
+      await this.commit({
+        value: this.value,
+        revision: this.revision,
+        credentialRevision: this.credentialRevision,
+        configurationUpdatedAt: this.configurationUpdatedAt,
+        verification: {
+          verifiedConfigHash: this.configHash,
+          verifiedCredentialRevision: this.credentialRevision,
+          verifiedAt,
+          verificationStatus: 'verified',
+          verificationFailureCode: '',
+        },
+      });
+      return this.getPublic();
+    });
+  }
+
+  async markVerificationFailed(expected, failureCode = 'SMTP_VERIFICATION_FAILED') {
+    return this.enqueueMutation(async () => {
+      const snapshot = normalizeExpectedSnapshot(expected, this.credentialRevision);
+      if (snapshot.configHash !== this.configHash || snapshot.credentialRevision !== this.credentialRevision) {
+        throw conflict(this.revision);
+      }
+      await this.commit({
+        value: this.value,
+        revision: this.revision,
+        credentialRevision: this.credentialRevision,
+        configurationUpdatedAt: this.configurationUpdatedAt,
+        verification: {
+          verifiedConfigHash: '',
+          verifiedCredentialRevision: null,
+          verifiedAt: '',
+          verificationStatus: 'failed',
+          verificationFailureCode: String(failureCode || 'SMTP_VERIFICATION_FAILED'),
+        },
+      });
+      return this.getPublic();
+    });
+  }
+
+  enqueueMutation(operation) {
+    const result = this.mutationQueue.then(operation, operation);
+    this.mutationQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  async commit({ value, revision, credentialRevision, configurationUpdatedAt, invalidateVerification = false, verification }) {
+    const previous = this.snapshotState();
+    this.value = cloneConfig(value);
+    this.revision = revision;
+    this.credentialRevision = credentialRevision;
+    this.configHash = smtpConfigHash(value);
+    this.configurationUpdatedAt = configurationUpdatedAt;
+    if (invalidateVerification) {
+      this.verifiedConfigHash = '';
+      this.verifiedCredentialRevision = null;
+      this.verifiedAt = '';
+      this.verificationStatus = 'unverified';
+      this.verificationFailureCode = '';
+    }
+    if (verification) Object.assign(this, verification);
+    try {
+      await this.persist();
+    } catch (error) {
+      Object.assign(this, previous);
+      throw error;
+    }
+  }
+
+  snapshotState() {
+    return {
+      value: this.value,
+      revision: this.revision,
+      credentialRevision: this.credentialRevision,
+      configHash: this.configHash,
+      verifiedConfigHash: this.verifiedConfigHash,
+      verifiedCredentialRevision: this.verifiedCredentialRevision,
+      verifiedAt: this.verifiedAt,
+      verificationStatus: this.verificationStatus,
+      verificationFailureCode: this.verificationFailureCode,
+      configurationUpdatedAt: this.configurationUpdatedAt,
+    };
   }
 
   async persist() {
     const temporary = `${this.filePath}.${process.pid}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(this.value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    const saved = persistentSmtpConfig(this.value, {
+      revision: this.revision,
+      credentialRevision: this.credentialRevision,
+      configHash: this.configHash,
+      verifiedConfigHash: this.verifiedConfigHash,
+      verifiedCredentialRevision: this.verifiedCredentialRevision,
+      verifiedAt: this.verifiedAt,
+      verificationStatus: this.verificationStatus,
+      verificationFailureCode: this.verificationFailureCode,
+      configurationUpdatedAt: this.configurationUpdatedAt,
+    });
+    await writeFile(temporary, `${JSON.stringify(saved, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     await rename(temporary, this.filePath);
   }
 }
+
+export function smtpConfigHash(value = {}) {
+  const normalized = normalizeSmtpConfig(value, { allowEmpty: true });
+  const canonical = {
+    provider: normalized.provider,
+    host: normalized.host.toLowerCase(),
+    port: normalized.port,
+    secure: normalized.secure,
+    requireTls: normalized.requireTls,
+    auth: normalized.auth,
+    user: normalized.user,
+    from: normalized.from,
+    oauth: {
+      tenant: normalized.oauth.tenant,
+      clientId: normalized.oauth.clientId,
+      scope: normalized.oauth.scope,
+    },
+  };
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+}
+
+export const smtpConfigFingerprint = smtpConfigHash;
 
 export function normalizeSmtpConfig(value = {}, { allowEmpty = false } = {}) {
   const host = String(value.host || '').trim();
@@ -128,17 +379,16 @@ export function normalizeSmtpConfig(value = {}, { allowEmpty = false } = {}) {
   const secure = typeof value.secure === 'boolean' ? value.secure : port === 465;
   const requireTls = typeof value.requireTls === 'boolean' ? value.requireTls : port === 587;
   const oauth = normalizeOAuth(value.oauth);
-  const lastVerifiedAt = /^\d{4}-\d{2}-\d{2}T/.test(String(value.lastVerifiedAt || '')) ? String(value.lastVerifiedAt) : '';
 
-  if (allowEmpty) return { provider, host, port, secure, requireTls, auth, user, pass, from, oauth, lastVerifiedAt };
-  if (!/^[A-Za-z0-9.-]+$/.test(host) || !host.includes('.')) throw validation('SMTP 主机格式无效。');
+  if (allowEmpty) return { provider, host, port, secure, requireTls, auth, user, pass, from, oauth, lastVerifiedAt: '' };
+  if (!isValidSmtpHost(host)) throw validation('SMTP 主机格式无效。');
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw validation('SMTP 端口必须在 1 到 65535 之间。');
   if (!EMAIL.test(from)) throw validation('发件邮箱格式无效。');
   if (auth === 'login' && !user) throw validation('SMTP 用户名不能为空。');
   if (auth === 'login' && !pass) throw validation('请填写客户端授权密码或 SMTP 密码。');
   if (auth === 'oauth2' && !(user && oauth.clientId && oauth.refreshToken)) throw validation('Outlook OAuth2 配置不完整。');
   if (pass.length > 2048) throw validation('SMTP 密码长度无效。');
-  return { provider, host, port, secure, requireTls, auth, user, pass, from, oauth, lastVerifiedAt };
+  return { provider, host, port, secure, requireTls, auth, user, pass, from, oauth, lastVerifiedAt: '' };
 }
 
 export function detectSmtpSettings(email) {
@@ -147,6 +397,66 @@ export function detectSmtpSettings(email) {
   const domain = normalized.slice(normalized.lastIndexOf('@') + 1);
   const preset = SMTP_EMAIL_DOMAIN_PRESETS[domain];
   return preset ? { ...preset } : null;
+}
+
+function persistentSmtpConfig(value, metadata) {
+  return {
+    schemaVersion: 2,
+    provider: value.provider,
+    host: value.host,
+    port: value.port,
+    secure: value.secure,
+    requireTls: value.requireTls,
+    auth: value.auth,
+    user: value.user,
+    from: value.from,
+    oauth: {
+      tenant: value.oauth.tenant,
+      clientId: value.oauth.clientId,
+      scope: value.oauth.scope,
+    },
+    ...metadata,
+  };
+}
+
+function extractSecrets(value = {}) {
+  return {
+    pass: String(value.pass || value.password || ''),
+    oauth: {
+      clientSecret: String(value.oauth?.clientSecret || ''),
+      refreshToken: String(value.oauth?.refreshToken || ''),
+    },
+  };
+}
+
+function containsPersistedSecret(value = {}) {
+  return Boolean(value.pass || value.password || value.oauth?.clientSecret || value.oauth?.refreshToken);
+}
+
+function credentialsDiffer(first, second) {
+  return first.pass !== second.pass
+    || first.oauth.clientSecret !== second.oauth.clientSecret
+    || first.oauth.refreshToken !== second.oauth.refreshToken;
+}
+
+function hasRuntimeCredential(value = {}) {
+  return Boolean(value.pass || value.oauth?.clientSecret || value.oauth?.refreshToken);
+}
+
+function isRuntimeConfigured(value) {
+  if (!(value.host && EMAIL.test(value.from))) return false;
+  if (value.auth === 'login') return Boolean(value.user && value.pass);
+  if (value.auth === 'oauth2') return Boolean(value.user && value.oauth.clientId && value.oauth.refreshToken);
+  return value.auth === 'none';
+}
+
+function cloneConfig(value) {
+  return { ...value, oauth: { ...value.oauth } };
+}
+
+function isValidSmtpHost(host) {
+  if (!host || !/^[A-Za-z0-9.:-]+$/.test(host)) return false;
+  return host === 'localhost' || host.includes('.') || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.includes(':');
 }
 
 function providerForHost(host) {
@@ -190,8 +500,36 @@ function mergeOAuth(current, input) {
   return next;
 }
 
-function validation(message) {
+function normalizeExpectedSnapshot(value, credentialRevision) {
+  if (typeof value === 'string') return { configHash: value, credentialRevision };
+  return {
+    configHash: String(value?.configHash || value?.fingerprint || ''),
+    credentialRevision: Number(value?.credentialRevision),
+  };
+}
+
+function normalizeRevision(value, fallback) {
+  const revision = Number(value);
+  return Number.isInteger(revision) && revision >= 0 ? revision : fallback;
+}
+
+function normalizeTimestamp(value) {
+  const text = String(value || '');
+  return /^\d{4}-\d{2}-\d{2}T/.test(text) && Number.isFinite(Date.parse(text)) ? text : '';
+}
+
+function smtpStateError(code, message) {
   const error = new Error(message);
-  error.code = 'SMTP_CONFIG_VALIDATION';
+  error.code = code;
   return error;
+}
+
+function conflict(revision) {
+  const error = smtpStateError('SMTP_CONFIG_CONFLICT', 'SMTP 配置已变化，请重新测试当前配置。');
+  error.currentRevision = revision;
+  return error;
+}
+
+function validation(message) {
+  return smtpStateError('SMTP_CONFIG_VALIDATION', message);
 }
