@@ -11,6 +11,7 @@ import { recoverRelay } from './lib/relay-recovery.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 import { readAudienceResults } from './lib/audience-results.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
+import { createPreflightService } from './preflight-service.mjs';
 
 export { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 
@@ -31,8 +32,18 @@ const CONTENT_RESEARCH_LABELS = Object.freeze({
   custom: '自定义研究',
 });
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, mediaFetcher = globalThis.fetch }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, preflightService, mediaFetcher = globalThis.fetch }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
+  const readiness = preflightService || createPreflightService({
+    config,
+    aiSessions,
+    profileStore,
+    smtpConfig,
+    relayRuntime: {
+      probe: ({ port }) => probeRelay({ port, openClawConfigPath: config.openClawConfigPath }),
+    },
+    getRelayConfig,
+  });
   const mediaDownloads = new Map();
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
@@ -227,6 +238,15 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         return json(res, 201, await profileStore.create(body, session));
       }
       if (req.method === 'GET' && url.pathname === '/api/jobs') return json(res, 200, manager.list());
+      if (req.method === 'POST' && url.pathname === '/api/preflight') {
+        const body = await readJsonBody(req, config.maxBodyBytes);
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          throw new ValidationError('Request body must be a JSON object.');
+        }
+        const { idempotencyKey: _ignoredIdempotencyKey, ...runBody } = body;
+        const params = validateRunRequest({ ...runBody, checkOnly: true });
+        return json(res, 200, await readiness.run(params));
+      }
       if (req.method === 'POST' && url.pathname === '/api/jobs') {
         const body = await readJsonBody(req, config.maxBodyBytes);
         if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -234,10 +254,22 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         }
         const { idempotencyKey, ...runBody } = body;
         const params = validateRunRequest(runBody);
+        if (params.checkOnly) return json(res, 200, await readiness.run(params));
         const resumeScope = legacyResumeScope(params);
         const resumeCheckpointJobIds = params.resumeFromJobId && ['audience', 'full'].includes(resumeScope)
           ? (await resolveAudienceResumeOwner(manager, params.resumeFromJobId)).readThroughJobIds
           : [];
+        if (!params.resumeFromJobId) {
+          const preflight = await readiness.run(params);
+          if (!preflight.ready) {
+            const expiredAiSession = preflight.checks.find((item) => item.code === 'AI_PROVIDER' && item.details?.errorCode === 'AI_SESSION_EXPIRED');
+            const code = expiredAiSession ? 'AI_SESSION_EXPIRED' : 'PREFLIGHT_BLOCKED';
+            const message = expiredAiSession
+              ? 'AI session is missing or expired. Configure the provider again.'
+              : 'Formal job creation was blocked by preflight checks.';
+            return json(res, 409, { ...errorBody(code, message), preflight });
+          }
+        }
         const job = params.resumeFromJobId
           ? await manager.resume(params.resumeFromJobId, {
               scope: resumeScope,

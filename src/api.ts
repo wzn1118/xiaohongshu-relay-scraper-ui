@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -56,6 +56,8 @@ export const api = {
   }),
   jobs: () => request<Job[]>('/api/jobs'),
   job: (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`),
+  preflight: (payload: JobRequest) =>
+    request<PreflightReport>('/api/preflight', { method: 'POST', body: JSON.stringify(payload) }),
   createJob: (payload: JobRequest) =>
     request<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
   resumeJob: (id: string, options: ResumeJobOptions) =>

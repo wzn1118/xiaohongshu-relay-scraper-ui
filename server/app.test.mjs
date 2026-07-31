@@ -6,6 +6,10 @@ import path from 'node:path';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { createApp } from './app.mjs';
 
+function readyPreflightReport() {
+  return { schemaVersion: 1, kind: 'preflight', status: 'ready', ready: true, checkedAt: new Date().toISOString(), durationMs: 0, checks: [] };
+}
+
 test('HTTP contract exposes direct frontend-compatible responses', async () => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-app-'));
   const staticDir = path.join(fixture, 'dist');
@@ -102,6 +106,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   const server = http.createServer(createApp({
     manager,
     config,
+    preflightService: { run: async () => readyPreflightReport() },
     aiSessions: {
       providers: () => [{ id: 'openai', models: ['gpt-4.1-mini'] }],
       discoverModels: async (value) => {

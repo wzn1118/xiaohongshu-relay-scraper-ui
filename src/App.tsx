@@ -2578,7 +2578,7 @@ function App() {
     setSubmitting(true)
     setNotice(null)
     setCoverage(null)
-    setLogs([`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 正在创建任务...`])
+    setLogs([`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${payload.checkOnly ? '正在执行启动前检查...' : '正在创建任务...'}`])
     try {
       const latestPayload: JobRequest = {
         ...payload,
@@ -2586,6 +2586,16 @@ function App() {
         maxAgeDays: 0,
         limit: 0,
         aiSessionId: sessionHint?.id || payload.aiSessionId || null,
+      }
+      if (payload.checkOnly) {
+        const report = await api.preflight(latestPayload)
+        const statusLabel = { passed: '通过', warning: '提醒', blocked: '阻断' } as const
+        setLogs(report.checks.map((check) => (
+          `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] [${statusLabel[check.status]}] ${check.message}${check.action ? `；处理：${check.action}` : ''}`
+        )))
+        const blockedCount = report.checks.filter((check) => check.status === 'blocked').length
+        setNotice(report.ready ? '启动前检查已通过，可以创建正式任务。' : `启动前检查发现 ${blockedCount} 项阻断，尚未创建正式任务。`)
+        return null
       }
       let effectivePayload = latestPayload
       let job: Job

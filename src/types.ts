@@ -386,6 +386,28 @@ export type JobRequest = {
   coverLetterMaxAttempts: number
 }
 
+export type PreflightCheckStatus = 'passed' | 'warning' | 'blocked'
+
+export type PreflightCheck = {
+  code: string
+  status: PreflightCheckStatus
+  blocking: boolean
+  message: string
+  action: string
+  details: Record<string, string | number | boolean | null>
+  durationMs: number
+}
+
+export type PreflightReport = {
+  schemaVersion: 1
+  kind: 'preflight'
+  status: 'ready' | 'blocked'
+  ready: boolean
+  checkedAt: string
+  durationMs: number
+  checks: PreflightCheck[]
+}
+
 export type AudienceStatus = 'complete' | 'partial' | 'pending' | 'failed'
 
 export type AudiencePublicProfile = {
