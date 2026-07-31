@@ -31,6 +31,17 @@ def make_record(status: str, **overrides):
     return SCRAPER.NoteRecord(**values)
 
 
+def test_wrapper_accepts_repeatable_resume_checkpoint_directories() -> None:
+    options, remaining = WORKFLOW.parse_wrapper_args([
+        "--resume-scope", "audience",
+        "--resume-checkpoint-dir", "C:/jobs/legacy-1",
+        "--resume-checkpoint-dir=C:/jobs/legacy-2",
+    ])
+
+    assert options.resume_checkpoint_dir == ["C:/jobs/legacy-1", "C:/jobs/legacy-2"]
+    assert remaining == []
+
+
 def test_resume_retries_failed_detail_records() -> None:
     assert SCRAPER.is_complete_resume_record(make_record("detail_ok", body="完整正文"))
     assert not SCRAPER.is_complete_resume_record(
@@ -93,13 +104,18 @@ def test_failed_discovery_retries_body_checkpoint_when_cards_are_available(tmp_p
         relay_port=18800,
         goto_timeout_ms=15000,
         security_verification_timeout_seconds=600,
+        speed_mode="random",
+        note_delay_seconds=1.2,
+        random_delay_min_seconds=0.8,
+        random_delay_max_seconds=2.4,
         upstream_scraper=SCRIPT,
     )
 
     assert summary["collectionStatus"] == "partial"
     assert calls["output_dir"] == tmp_path
-    assert calls["kwargs"]["workers"] == 2
+    assert calls["kwargs"]["workers"] == 1
     assert calls["kwargs"]["attempts"] == 3
+    assert calls["kwargs"]["speed_mode"] == "random"
 
 
 def test_security_restriction_target_detection() -> None:
@@ -453,3 +469,38 @@ def test_search_security_timeout_returns_discovered_cards_and_checkpoint(monkeyp
     assert timed_out
     assert cards == [{"note_id": "n1", "note_url": "https://example.test/n1"}]
     assert checkpoints == [cards]
+
+
+def test_full_discovery_does_not_stop_on_stable_rounds(monkeypatch) -> None:
+    page = FakeRestrictionPage("")
+    extract_calls = 0
+    scrolls: list[int] = []
+
+    def extract_cards(_page):
+        nonlocal extract_calls
+        extract_calls += 1
+        return [{"note_id": "n1", "note_url": "https://example.test/n1"}]
+
+    monkeypatch.setattr(SCRAPER, "wait_for_search_security_clearance", lambda *_args: True)
+    monkeypatch.setattr(SCRAPER, "dismiss_common_popups", lambda _page: None)
+    monkeypatch.setattr(SCRAPER, "extract_cards", extract_cards)
+    monkeypatch.setattr(SCRAPER, "search_security_restriction", lambda _page: "")
+    monkeypatch.setattr(SCRAPER, "scroll_search_results", lambda _page, delta: scrolls.append(delta) or True)
+    monkeypatch.setattr(SCRAPER, "next_collection_delay", lambda *_args: 0)
+
+    cards, timed_out = SCRAPER.collect_note_links(
+        page,
+        max_scrolls=5,
+        stable_rounds=2,
+        speed_mode="steady",
+        note_delay_seconds=0,
+        random_delay_min_seconds=0,
+        random_delay_max_seconds=0,
+        security_verification_timeout_seconds=60,
+        full_discovery=True,
+    )
+
+    assert not timed_out
+    assert extract_calls == 5
+    assert cards == [{"note_id": "n1", "note_url": "https://example.test/n1"}]
+    assert -900 in scrolls

@@ -1021,6 +1021,7 @@ def collect_note_links(
     random_delay_min_seconds: float,
     random_delay_max_seconds: float,
     security_verification_timeout_seconds: int,
+    full_discovery: bool = False,
     checkpoint: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     all_cards: dict[str, dict[str, Any]] = {}
@@ -1064,7 +1065,23 @@ def collect_note_links(
             unchanged_rounds = 0
 
         if unchanged_rounds >= stable_rounds:
-            break
+            if not full_discovery:
+                break
+            log(
+                "discovery plateau reached; full-discovery mode keeps scrolling "
+                f"through {max_scrolls} rounds"
+            )
+            unchanged_rounds = 0
+            # A short upward probe helps wake virtualized result feeds before
+            # returning to the downward full-discovery pass.
+            scroll_search_results(page, -900)
+            try:
+                page.wait_for_timeout(700)
+            except Error as exc:
+                if is_navigation_context_error(exc):
+                    wait_for_search_page_to_settle(page)
+                    continue
+                raise
 
         scrolled = scroll_search_results(page, 2600)
         if not scrolled:
@@ -1629,6 +1646,7 @@ def main() -> int:
                 random_delay_min_seconds=args.random_delay_min_seconds,
                 random_delay_max_seconds=args.random_delay_max_seconds,
                 security_verification_timeout_seconds=args.security_verification_timeout_seconds,
+                full_discovery=args.limit <= 0,
                 checkpoint=lambda discovered: (
                     write_json_payload(discovered, discovered_cards_json),
                     write_json_payload(discovered, latest_cards_json),

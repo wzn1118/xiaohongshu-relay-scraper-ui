@@ -6,13 +6,16 @@ import importlib.util
 import json
 import os
 import queue
+import random
 import sys
 import threading
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from workflow_state import open_workflow_state_from_args
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -178,7 +181,12 @@ def complete_bodies(
     checkpoint_every: int = 10,
     page_recycle_every: int = 20,
     security_verification_timeout_seconds: int = 600,
+    speed_mode: str = "random",
+    note_delay_seconds: float = 1.2,
+    random_delay_min_seconds: float = 0.8,
+    random_delay_max_seconds: float = 2.4,
     upstream_scraper: Path = DEFAULT_UPSTREAM_SCRAPER,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     cards_path = output_dir / "xiaohongshu_cards_latest.json"
@@ -218,6 +226,14 @@ def complete_bodies(
     security_owner_id: int | None = None
     rate_limit_detected_at = ""
     stop_reason = ""
+    checkpoint_error: BaseException | None = None
+
+    def next_body_delay() -> float:
+        if str(speed_mode).strip().casefold() == "steady":
+            return max(0.0, float(note_delay_seconds))
+        lower = max(0.0, float(random_delay_min_seconds))
+        upper = max(lower, float(random_delay_max_seconds))
+        return random.uniform(lower, upper)
 
     source_search_url = next(
         (str(record.get("source_search_url")) for record in existing if record.get("source_search_url")),
@@ -228,12 +244,27 @@ def complete_bodies(
         return [complete_by_key[key] for key in card_keys if key in complete_by_key]
 
     def checkpoint(force: bool = False) -> None:
-        nonlocal successful_since_checkpoint
+        nonlocal successful_since_checkpoint, checkpoint_error
         if not force and successful_since_checkpoint < checkpoint_every:
             return
         records = ordered_complete()
         atomic_json(notes_path, records)
         successful_since_checkpoint = 0
+        if progress_callback is not None:
+            try:
+                progress_callback({
+                    "cards": [dict(item) for item in cards],
+                    "completeRecords": [dict(item) for item in records],
+                    "failures": [dict(item) for item in last_failures.values()],
+                    "attemptedIds": sorted(attempted_keys),
+                    "status": "running",
+                    "lastCheckpointAt": utc_now(),
+                })
+            except BaseException as error:
+                checkpoint_error = error
+                stop_event.set()
+                security_gate.set()
+                raise
         print(f"PARALLEL_BODY {len(records)}/{len(cards)} checkpoint", flush=True)
 
     def scrape_with_url_fallback(page: Any, card: dict[str, Any]) -> dict[str, Any]:
@@ -431,6 +462,9 @@ def complete_bodies(
                         work.task_done()
                         if stop_event.is_set():
                             break
+                        delay = next_body_delay()
+                        if delay > 0 and stop_event.wait(delay):
+                            break
                 finally:
                     page.close()
         except Exception as error:  # noqa: BLE001
@@ -468,6 +502,8 @@ def complete_bodies(
             time.sleep(0.75)
         for thread in threads:
             thread.join()
+        if checkpoint_error is not None:
+            raise checkpoint_error
         checkpoint(force=True)
         if stop_event.is_set():
             break
@@ -492,6 +528,12 @@ def complete_bodies(
         "completeBodies": len(records),
         "missingBodies": len(missing),
         "workers": workers,
+        "pacing": {
+            "mode": speed_mode,
+            "noteDelaySeconds": note_delay_seconds,
+            "randomDelayMinSeconds": random_delay_min_seconds,
+            "randomDelayMaxSeconds": random_delay_max_seconds,
+        },
         "attempts": attempts,
         "failureStatuses": status_counts,
         "collectionStatus": "partial" if missing else "completed",
@@ -516,6 +558,16 @@ def complete_bodies(
         "passed": not missing,
     }
     atomic_json(summary_path, summary)
+    if progress_callback is not None:
+        progress_callback({
+            "cards": [dict(item) for item in cards],
+            "completeRecords": [dict(item) for item in records],
+            "failures": [dict(item) for item in failure_payload],
+            "attemptedIds": sorted(attempted_keys),
+            "status": "completed" if not missing else "blocked" if stop_reason else "partial",
+            "summary": summary,
+            "lastCheckpointAt": utc_now(),
+        })
     print(
         f"PARALLEL_COMPLETE cards={len(cards)} bodies={len(records)} missing={len(missing)}",
         flush=True,
@@ -533,23 +585,75 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=10)
     parser.add_argument("--page-recycle-every", type=int, default=20)
     parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
+    parser.add_argument("--speed-mode", choices=("steady", "random"), default="random")
+    parser.add_argument("--note-delay-seconds", type=float, default=1.2)
+    parser.add_argument("--random-delay-min-seconds", type=float, default=0.8)
+    parser.add_argument("--random-delay-max-seconds", type=float, default=2.4)
     parser.add_argument("--upstream-scraper", default=str(DEFAULT_UPSTREAM_SCRAPER))
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume-scope", choices=("full", "body_completion"))
+    parser.add_argument("--attempt-id")
+    parser.add_argument("--state-path")
+    parser.add_argument("--expected-state-revision", type=int)
     return parser.parse_args(arguments)
 
 
 def main(arguments: list[str] | None = None) -> int:
     args = parse_args(arguments)
-    summary = complete_bodies(
-        Path(args.output_dir),
-        relay_port=args.relay_port,
-        workers=args.workers,
-        attempts=args.attempts,
-        goto_timeout_ms=args.goto_timeout_ms,
-        checkpoint_every=args.checkpoint_every,
-        page_recycle_every=max(1, args.page_recycle_every),
-        security_verification_timeout_seconds=args.security_verification_timeout_seconds,
-        upstream_scraper=Path(args.upstream_scraper),
-    )
+    output_dir = Path(args.output_dir).resolve()
+    state = open_workflow_state_from_args(args, output_dir)
+    if state is not None:
+        if not state.should_run("bodyCompletion"):
+            summary_path = output_dir / "parallel-body-summary.json"
+            try:
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                summary = {}
+            return 0 if summary.get("passed", True) else 3
+        state.start_stage("bodyCompletion")
+
+    def update_state(progress: dict[str, Any]) -> None:
+        if state is None:
+            return
+        state.checkpoint_body(
+            cards=progress["cards"],
+            complete_records=progress["completeRecords"],
+            failures=progress["failures"],
+            attempted_ids=set(progress["attemptedIds"]),
+            summary=progress.get("summary"),
+            status=str(progress.get("status") or "running"),
+        )
+
+    try:
+        summary = complete_bodies(
+            output_dir,
+            relay_port=args.relay_port,
+            workers=args.workers,
+            attempts=args.attempts,
+            goto_timeout_ms=args.goto_timeout_ms,
+            checkpoint_every=args.checkpoint_every,
+            page_recycle_every=max(1, args.page_recycle_every),
+            security_verification_timeout_seconds=args.security_verification_timeout_seconds,
+            speed_mode=args.speed_mode,
+            note_delay_seconds=args.note_delay_seconds,
+            random_delay_min_seconds=args.random_delay_min_seconds,
+            random_delay_max_seconds=args.random_delay_max_seconds,
+            upstream_scraper=Path(args.upstream_scraper),
+            progress_callback=update_state,
+        )
+    except BaseException as error:
+        if state is not None:
+            try:
+                state.finish_stage("bodyCompletion", "failed", {
+                    "failureCode": type(error).__name__,
+                    "failureMessage": str(error)[:1000],
+                })
+            except BaseException:
+                pass
+        raise
+    if state is not None:
+        status = "completed" if summary["passed"] else "blocked" if summary.get("stopReason") else "partial"
+        state.finish_stage("bodyCompletion", status, {"stopReason": summary.get("stopReason") or ""})
     return 0 if summary["passed"] else 3
 
 

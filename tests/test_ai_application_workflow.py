@@ -120,9 +120,13 @@ class GeneralContentProvider:
     def generate_json(self, system, user, schema, image_urls=None):
         required = set(schema.get("required", []))
         self.last_request_used_images = bool(image_urls)
-        if required == {"visible_text"}:
+        if required == {"visible_text", "visual_summary", "visual_signals"}:
             self.calls.append("vision")
-            return {"visible_text": "展览时间：8月1日\n地点：城市美术馆"}
+            return {
+                "visible_text": "展览时间：8月1日\n地点：城市美术馆",
+                "visual_summary": "海报以城市建筑摄影为主画面。",
+                "visual_signals": ["黑白建筑照片", "展览日期排版"],
+            }
         if "eyebrow" in required:
             self.calls.append("presentation")
             return {
@@ -327,9 +331,68 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertIn("展览时间", record["media"]["analysis"]["visible_text"])
         self.assertEqual(record["content_analysis"]["content_type"], "展览推荐")
         self.assertEqual(len(record["content_analysis"]["modules"]), 2)
+        self.assertGreater(record["content_analysis"]["grounded_evidence_count"], 0)
         self.assertFalse(record_needs_content_completion(record))
         self.assertEqual(provider.calls, ["presentation", "vision", "analysis"])
+        self.assertEqual(payload["content_insights"]["groundedRecords"], 1)
+        self.assertGreater(payload["content_insights"]["coverageRate"], 0)
         self.assertTrue(payload["quality_gate"]["passed"])
+
+    def test_general_mode_does_not_analyze_short_title_only_source(self) -> None:
+        payload = {
+            "quality_gate": {"passed": True, "discovered_count": 1, "record_count": 1, "checks": {}, "issues": []},
+            "records": [{
+                "note_id": "short-1",
+                "title": "南韩第一亚比 1小时前",
+                "body": "南韩第一亚比",
+                "source_card_text": "",
+                "media": {"images": []},
+            }],
+        }
+        provider = GeneralContentProvider()
+
+        report = enrich_general_payload(payload, "亚比女", provider=provider, content_preset="auto")
+
+        self.assertEqual(payload["content_research"]["preset"], "people")
+        self.assertEqual(report.passed, 0)
+        self.assertEqual(payload["records"][0]["content_analysis"]["status"], "insufficient_source")
+        self.assertEqual(payload["records"][0]["content_analysis"]["relevance_score"], 0)
+        self.assertEqual(provider.calls, ["presentation"])
+        self.assertFalse(payload["quality_gate"]["passed"])
+
+    def test_general_mode_rejects_evidence_not_found_in_source(self) -> None:
+        class UngroundedProvider(GeneralContentProvider):
+            def generate_json(self, system, user, schema, image_urls=None):
+                result = super().generate_json(system, user, schema, image_urls)
+                if "overview" in set(schema.get("required", [])):
+                    result["modules"] = [{
+                        "id": "schedule",
+                        "title": "时间与地点",
+                        "summary": "虚构地点举办。",
+                        "items": ["虚构地点"],
+                        "evidence": ["原文中不存在的句子"],
+                    }]
+                return result
+
+        payload = {
+            "quality_gate": {"passed": True, "discovered_count": 1, "record_count": 1, "checks": {}, "issues": []},
+            "records": [{
+                "note_id": "ungrounded-1",
+                "title": "城市摄影展",
+                "body": "本周城市摄影展将展出多位创作者的作品，并介绍现场策展思路。",
+                "source_card_text": "城市摄影展览推荐",
+                "media": {"images": []},
+            }],
+        }
+
+        report = enrich_general_payload(payload, "城市展览", provider=UngroundedProvider(), content_preset="place")
+
+        analysis = payload["records"][0]["content_analysis"]
+        self.assertEqual(report.passed, 0)
+        self.assertEqual(analysis["status"], "ungrounded")
+        self.assertEqual(analysis["grounded_evidence_count"], 0)
+        self.assertEqual(analysis["relevance_score"], 0)
+        self.assertTrue(record_needs_content_completion(payload["records"][0]))
 
     def test_poster_first_line_replaces_noisy_search_title_with_formal_role_name(self) -> None:
         role = _deterministic_ocr_role(

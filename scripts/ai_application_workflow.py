@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -129,6 +130,19 @@ def image_ocr_schema() -> dict[str, Any]:
         "additionalProperties": False,
         "required": ["visible_text"],
         "properties": {"visible_text": {"type": "string"}},
+    }
+
+
+def content_image_analysis_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["visible_text", "visual_summary", "visual_signals"],
+        "properties": {
+            "visible_text": {"type": "string"},
+            "visual_summary": {"type": "string"},
+            "visual_signals": {"type": "array", "items": {"type": "string"}},
+        },
     }
 
 
@@ -1715,12 +1729,14 @@ CONTENT_RESEARCH_PRESETS: dict[str, dict[str, Any]] = {
     },
     "people": {
         "label": "人群与风格",
-        "description": "理解人物特征、审美表达、需求偏好与讨论语境。",
+        "description": "从可复核图文证据理解视觉符号、身份表达、内容母题、受众语言与争议边界。",
         "modules": [
-            ("traits", "特征表现", "内容呈现了哪些外观、风格或行为特征？"),
-            ("preferences", "偏好与需求", "目标人群表达了哪些偏好、顾虑或期待？"),
-            ("language", "表达与语境", "常见描述、评价方式和讨论语境是什么？"),
-            ("evidence", "图文证据", "哪些正文或图片信息直接支持这些判断？"),
+            ("visual-codes", "视觉符号", "妆发、服饰、配色、配饰、姿态与画面风格出现了哪些可见特征？"),
+            ("identity-context", "身份与自我呈现", "作者如何命名、认同、区分或表演这种风格？"),
+            ("content-motifs", "内容母题与场景", "反复出现的生活场景、关系、情绪与叙事母题是什么？"),
+            ("audience-language", "受众语言与评价", "帖子用哪些词描述该人群，表达欣赏、模仿、疑问或排斥？"),
+            ("tensions", "争议与边界", "样本中出现了哪些定义分歧、刻板印象或审美边界？"),
+            ("evidence", "图文证据", "哪些原文或客观视觉观察直接支持上述判断？"),
         ],
     },
     "trend": {
@@ -1766,8 +1782,21 @@ CONTENT_RESEARCH_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
-def _content_research_context(content_preset: str, content_goal: str) -> dict[str, str]:
+def _infer_auto_content_preset(keyword: str) -> str:
+    value = str(keyword or "").strip().casefold()
+    if any(token in value for token in ("女", "男", "人群", "女生", "男生", "发型", "穿搭", "妆容", "风格")):
+        return "people"
+    if any(token in value for token in ("攻略", "经验", "教程", "怎么", "避坑")):
+        return "experience"
+    if any(token in value for token in ("趋势", "流行", "热度", "变化")):
+        return "trend"
+    return "auto"
+
+
+def _content_research_context(content_preset: str, content_goal: str, keyword: str = "") -> dict[str, str]:
     preset = content_preset if content_preset in CONTENT_RESEARCH_PRESETS else "auto"
+    if preset == "auto":
+        preset = _infer_auto_content_preset(keyword)
     definition = CONTENT_RESEARCH_PRESETS[preset]
     return {
         "preset": preset,
@@ -1777,7 +1806,7 @@ def _content_research_context(content_preset: str, content_goal: str) -> dict[st
 
 
 def _fallback_content_presentation(keyword: str, content_preset: str = "auto", content_goal: str = "") -> dict[str, Any]:
-    research = _content_research_context(content_preset, content_goal)
+    research = _content_research_context(content_preset, content_goal, keyword)
     definition = CONTENT_RESEARCH_PRESETS[research["preset"]]
     goal_suffix = f"；重点回答：{research['goal']}" if research["goal"] else ""
     return {
@@ -1822,13 +1851,27 @@ def _normalize_content_presentation(
     }
 
 
-def _general_image_text(provider: AIProvider, record: dict[str, Any]) -> tuple[str, bool]:
+_EMPTY_EXTRACTED_TEXT = {"", "无", "未识别", "none", "null", "undefined", "n/a", "no_think"}
+
+
+def _usable_extracted_text(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if text.casefold() in _EMPTY_EXTRACTED_TEXT else text
+
+
+def _general_image_text(
+    provider: AIProvider,
+    record: dict[str, Any],
+    keyword: str,
+    research: dict[str, str],
+) -> tuple[str, bool]:
     media = record.get("media") if isinstance(record.get("media"), dict) else {}
     images = media.get("images") if isinstance(media.get("images"), list) else []
     existing = media.get("analysis") if isinstance(media.get("analysis"), dict) else {}
-    cached_text = str(existing.get("visible_text") or "").strip()
-    if cached_text and existing.get("source") == "vision_model":
-        return cached_text, True
+    cached_text = _usable_extracted_text(existing.get("visible_text"))
+    cached_visual = _usable_extracted_text(existing.get("visual_summary"))
+    if existing.get("source") == "vision_model" and int(existing.get("analysis_version") or 0) >= 2 and (cached_text or cached_visual):
+        return "\n".join(part for part in (cached_text, cached_visual) if part), True
     image_urls = [
         str(item.get("url") or "").strip()
         for item in images[:4]
@@ -1851,25 +1894,90 @@ def _general_image_text(provider: AIProvider, record: dict[str, Any]) -> tuple[s
         return "", True
     try:
         result = provider.generate_json(
-            "你是通用图片 OCR。逐字转录图片中肉眼可见的文字，保留关键换行；不要假定图片与招聘有关，不解释、不补写被遮挡内容。",
-            "请转录这些采集图片中的全部可见文字。若多张图片有重复内容，只保留一份。",
-            image_ocr_schema(),
+            "你是严谨的非岗位内容视觉研究员。逐字转录图片中的可见文字，并客观描述可见的妆发、服饰、配色、配饰、姿态、场景和画面构图。不得猜测人物身份、性格、职业或未显示的信息；不得把搜索关键词当作图片事实。",
+            json.dumps({
+                "keyword": keyword,
+                "research": research,
+                "instruction": "合并重复文字；视觉观察必须是图片中可直接复核的具体特征。",
+            }, ensure_ascii=False),
+            content_image_analysis_schema(),
             image_urls=image_urls,
         )
-        visible_text = str(result.get("visible_text") or "").strip()
+        visible_text = _usable_extracted_text(result.get("visible_text"))
+        visual_summary = _usable_extracted_text(result.get("visual_summary"))
+        visual_signals = [
+            _usable_extracted_text(item)[:160]
+            for item in result.get("visual_signals", [])
+            if _usable_extracted_text(item)
+        ][:10]
     except (AIProviderError, ValueError, TypeError, KeyError):
         visible_text = ""
-    vision_used = bool(getattr(provider, "last_request_used_images", False) and visible_text)
-    usable_text = visible_text if vision_used else alt_text
+        visual_summary = ""
+        visual_signals = []
+    vision_used = bool(getattr(provider, "last_request_used_images", False) and (visible_text or visual_summary or visual_signals))
+    observed_text = "\n".join(part for part in (visible_text, visual_summary, *visual_signals) if part)
+    usable_text = observed_text if vision_used else alt_text
     media["analysis"] = {
         **existing,
+        "analysis_version": 2,
         "status": "analyzed" if vision_used else "alt_text_only" if alt_text else "unavailable",
         "source": "vision_model" if vision_used else "image_alt_text" if alt_text else "model_error",
-        "summary": "AI 已读取图片文字并纳入内容分析。" if vision_used else "仅获得图片说明文字，原图内容仍需复核。" if alt_text else "当前模型未能读取图片内容。",
-        "visible_text": usable_text,
+        "summary": visual_summary if vision_used and visual_summary else "AI 已读取图片文字并纳入内容分析。" if vision_used else "仅获得图片说明文字，原图内容仍需复核。" if alt_text else "当前模型未能读取图片内容。",
+        "visible_text": visible_text if vision_used else usable_text,
+        "visual_summary": visual_summary if vision_used else "",
+        "visual_signals": visual_signals if vision_used else [],
     }
     record["media"] = media
     return usable_text, vision_used
+
+
+def _normalized_evidence_text(value: Any) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def _source_character_count(value: Any) -> int:
+    return len(_normalized_evidence_text(value))
+
+
+def _is_grounded_text(value: Any, source_text: str) -> bool:
+    candidate = _normalized_evidence_text(value)
+    return len(candidate) >= 4 and candidate in _normalized_evidence_text(source_text)
+
+
+def _record_general_source_text(record: dict[str, Any]) -> str:
+    media = record.get("media") if isinstance(record.get("media"), dict) else {}
+    image_analysis = media.get("analysis") if isinstance(media.get("analysis"), dict) else {}
+    image_parts = [
+        _usable_extracted_text(image_analysis.get("visible_text")),
+        _usable_extracted_text(image_analysis.get("visual_summary")),
+        *[
+            _usable_extracted_text(item)
+            for item in image_analysis.get("visual_signals", [])
+            if _usable_extracted_text(item)
+        ],
+    ]
+    return "\n\n".join(part for part in (
+        str(record.get("body") or "").strip(),
+        str(record.get("source_card_text") or "").strip(),
+        "\n".join(part for part in image_parts if part),
+    ) if part).strip()
+
+
+def _representative_content_samples(records: list[dict[str, Any]], limit: int = 24) -> list[dict[str, str]]:
+    if not records:
+        return []
+    if len(records) <= limit:
+        selected = records
+    else:
+        indices = sorted({round(index * (len(records) - 1) / (limit - 1)) for index in range(limit)})
+        selected = [records[index] for index in indices]
+    return [
+        {
+            "title": str(record.get("title") or "")[:120],
+            "text": str(record.get("body") or record.get("source_card_text") or "")[:700],
+        }
+        for record in selected
+    ]
 
 
 def record_needs_content_completion(record: dict[str, Any]) -> bool:
@@ -1880,7 +1988,8 @@ def record_needs_content_completion(record: dict[str, Any]) -> bool:
     image_analysis = media.get("analysis") if isinstance(media.get("analysis"), dict) else {}
     images_ready = not images or image_analysis.get("source") == "vision_model"
     return not (
-        analysis.get("status") in {"completed", "fallback"}
+        analysis.get("status") == "completed"
+        and int(analysis.get("grounded_evidence_count") or 0) > 0
         and str(analysis.get("overview") or "").strip()
         and modules
         and images_ready
@@ -1888,31 +1997,165 @@ def record_needs_content_completion(record: dict[str, Any]) -> bool:
 
 
 def _fallback_content_analysis(record: dict[str, Any], presentation: dict[str, Any], source_text: str) -> dict[str, Any]:
-    sentences = [
-        item.strip()
-        for item in re.split(r"[\n。！？!?；;]+", source_text)
-        if item.strip()
-    ]
-    evidence = sentences[:4]
-    overview = "；".join(evidence[:2])[:280] or "当前记录没有可供分析的正文或图片文字。"
     modules = []
     for index, definition in enumerate(presentation.get("modules", []), start=1):
         modules.append({
             "id": _content_module_id(definition.get("id"), index),
             "title": str(definition.get("title") or f"分析模块 {index}"),
-            "summary": overview,
-            "items": evidence[:3],
-            "evidence": evidence[:2],
+            "summary": "模型未返回可验证结论，保留原始图文等待重试。",
+            "items": [],
+            "evidence": [],
         })
     return {
-        "status": "fallback",
-        "overview": overview,
+        "status": "model_error",
+        "overview": "本条分析未完成，当前不形成内容结论。",
         "content_type": "待进一步判断",
         "relevance_score": 0,
-        "relevance_reason": "模型分析失败，当前仅展示采集原文的确定性摘要。",
+        "relevance_reason": "模型分析失败，需从检查点重试。",
         "topics": [],
         "entities": [],
         "image_insights": [],
+        "modules": modules,
+        "source_character_count": _source_character_count(source_text),
+        "grounded_evidence_count": 0,
+    }
+
+
+def _normalize_grounded_content_analysis(
+    result: dict[str, Any],
+    presentation: dict[str, Any],
+    source_text: str,
+) -> dict[str, Any]:
+    generated_modules = [
+        item for item in result.get("modules", [])
+        if isinstance(item, dict)
+    ] if isinstance(result.get("modules"), list) else []
+    generated_by_id = {
+        _content_module_id(item.get("id"), index): item
+        for index, item in enumerate(generated_modules, start=1)
+    }
+    normalized_modules = []
+    grounded_count = 0
+    for index, definition in enumerate(presentation.get("modules", []), start=1):
+        module_id = _content_module_id(definition.get("id"), index)
+        generated = generated_by_id.get(module_id)
+        if generated is None and index <= len(generated_modules):
+            generated = generated_modules[index - 1]
+        generated = generated or {}
+        evidence = [
+            str(item).strip()[:300]
+            for item in generated.get("evidence", [])
+            if str(item).strip() and _is_grounded_text(item, source_text)
+        ][:6]
+        items = [
+            str(item).strip()[:300]
+            for item in generated.get("items", [])
+            if str(item).strip() and _is_grounded_text(item, source_text)
+        ][:8]
+        grounded_count += len(evidence)
+        normalized_modules.append({
+            "id": module_id,
+            "title": str(definition.get("title") or generated.get("title") or f"分析模块 {index}").strip()[:60],
+            "summary": str(generated.get("summary") or "").strip()[:800] if evidence else "该条原文没有提供可复核信息。",
+            "items": items if evidence else [],
+            "evidence": evidence,
+        })
+    status = "completed" if grounded_count > 0 else "ungrounded"
+    return {
+        "status": status,
+        "overview": str(result.get("overview") or "").strip()[:1000] if grounded_count else "模型没有返回可在原始图文中复核的证据，本条暂不形成结论。",
+        "content_type": str(result.get("content_type") or "").strip()[:80] if grounded_count else "证据不足",
+        "relevance_score": max(0, min(100, int(result.get("relevance_score") or 0))) if grounded_count else 0,
+        "relevance_reason": str(result.get("relevance_reason") or "").strip()[:400] if grounded_count else "所有引用均未通过原文逐字匹配。",
+        "topics": [str(item).strip()[:80] for item in result.get("topics", []) if str(item).strip() and _is_grounded_text(item, source_text)][:12],
+        "entities": [str(item).strip()[:100] for item in result.get("entities", []) if str(item).strip() and _is_grounded_text(item, source_text)][:12],
+        "image_insights": [str(item).strip()[:300] for item in result.get("image_insights", []) if str(item).strip() and _is_grounded_text(item, source_text)][:8],
+        "modules": normalized_modules,
+        "source_character_count": _source_character_count(source_text),
+        "grounded_evidence_count": grounded_count,
+    }
+
+
+def _content_evidence_reference(record: dict[str, Any], quote: str) -> dict[str, str]:
+    return {
+        "noteId": str(record.get("note_id") or ""),
+        "title": str(record.get("title") or "未命名内容")[:100],
+        "quote": str(quote or "")[:220],
+    }
+
+
+def _build_content_insights(records: list[dict[str, Any]], presentation: dict[str, Any]) -> dict[str, Any]:
+    source_ready = sum(1 for record in records if _source_character_count(_record_general_source_text(record)) >= 24)
+    grounded_records = [
+        record for record in records
+        if (record.get("content_analysis") or {}).get("status") == "completed"
+        and int((record.get("content_analysis") or {}).get("grounded_evidence_count") or 0) > 0
+    ]
+    topic_counter: Counter[str] = Counter()
+    topic_evidence: dict[str, list[dict[str, str]]] = defaultdict(list)
+    module_items: dict[str, Counter[str]] = defaultdict(Counter)
+    module_evidence: dict[str, dict[str, list[dict[str, str]]]] = defaultdict(lambda: defaultdict(list))
+    module_records: Counter[str] = Counter()
+    for record in grounded_records:
+        analysis = record.get("content_analysis") or {}
+        first_quote = next((
+            str(quote)
+            for module in analysis.get("modules", [])
+            for quote in module.get("evidence", [])
+            if str(quote).strip()
+        ), "")
+        for topic in set(str(item).strip() for item in analysis.get("topics", []) if str(item).strip()):
+            topic_counter[topic] += 1
+            if first_quote and len(topic_evidence[topic]) < 3:
+                topic_evidence[topic].append(_content_evidence_reference(record, first_quote))
+        for module in analysis.get("modules", []):
+            module_id = str(module.get("id") or "")
+            evidence = [str(item).strip() for item in module.get("evidence", []) if str(item).strip()]
+            if not module_id or not evidence:
+                continue
+            module_records[module_id] += 1
+            labels = [str(item).strip() for item in module.get("items", []) if str(item).strip()] or evidence[:1]
+            for label in set(labels):
+                module_items[module_id][label] += 1
+                if len(module_evidence[module_id][label]) < 3:
+                    module_evidence[module_id][label].append(_content_evidence_reference(record, evidence[0]))
+    denominator = len(grounded_records) or 1
+    top_topics = [
+        {
+            "label": label,
+            "count": count,
+            "share": round(count * 100 / denominator, 1),
+            "evidence": topic_evidence[label],
+        }
+        for label, count in topic_counter.most_common(10)
+    ]
+    modules = []
+    for index, definition in enumerate(presentation.get("modules", []), start=1):
+        module_id = _content_module_id(definition.get("id"), index)
+        findings = [
+            {
+                "label": label,
+                "count": count,
+                "evidence": module_evidence[module_id][label],
+            }
+            for label, count in module_items[module_id].most_common(8)
+        ]
+        count = module_records[module_id]
+        modules.append({
+            "id": module_id,
+            "title": str(definition.get("title") or f"研究模块 {index}"),
+            "question": str(definition.get("question") or ""),
+            "recordCount": count,
+            "coverageRate": round(count * 100 / (len(records) or 1), 1),
+            "findings": findings,
+        })
+    return {
+        "sampleSize": len(records),
+        "sourceReady": source_ready,
+        "groundedRecords": len(grounded_records),
+        "coverageRate": round(len(grounded_records) * 100 / (len(records) or 1), 1),
+        "methodNote": "只统计正文、卡片文字或图片视觉观察中可逐字回溯的证据；低覆盖率时不将频次外推为总体结论。",
+        "topTopics": top_topics,
         "modules": modules,
     }
 
@@ -1927,22 +2170,17 @@ def enrich_general_payload(
     content_goal: str = "",
 ) -> WorkflowReport:
     provider = provider or AIProvider()
-    research = _content_research_context(content_preset, content_goal)
+    research = _content_research_context(content_preset, content_goal, keyword)
     records = [record for record in payload.get("records", []) if isinstance(record, dict)]
-    samples = [
-        {
-            "title": str(record.get("title") or "")[:120],
-            "text": str(record.get("body") or record.get("source_card_text") or "")[:500],
-        }
-        for record in records[:12]
-    ]
+    samples = _representative_content_samples(records)
     existing_presentation = payload.get("content_presentation")
-    if only_incomplete and isinstance(existing_presentation, dict):
+    analysis_version = int(payload.get("content_analysis_version") or 0)
+    if only_incomplete and analysis_version >= 2 and isinstance(existing_presentation, dict):
         presentation = _normalize_content_presentation(existing_presentation, keyword, research["preset"], research["goal"])
     else:
         try:
             generated = provider.generate_json(
-                "你是非岗位内容研究产品设计师。根据用户选择的研究场景、研究目标、搜索关键词与真实样本，设计本次专属分析工作台。栏目必须直接服务于研究目标，避免固定套用岗位、投递、候选人等概念；保留可由正文或图片验证的证据栏目。",
+                "你是非岗位内容研究产品设计师。根据研究场景、目标、关键词与分布抽样样本，设计中立的研究问题。只设计问题，不定义关键词、不预设人群属性、不从样本直接下总体结论。栏目必须覆盖可见特征、语境、母题、受众表达和反例，并能由正文或图片观察验证。",
                 json.dumps({"keyword": keyword, "research": research, "samples": samples}, ensure_ascii=False),
                 content_presentation_schema(),
             )
@@ -1953,21 +2191,53 @@ def enrich_general_payload(
     payload["keyword"] = keyword
     payload["content_research"] = research
     payload["content_presentation"] = presentation
+    payload["content_analysis_version"] = 2
 
     targets = [record for record in records if not only_incomplete or record_needs_content_completion(record)]
     passed = failed = attempts = 0
     for index, record in enumerate(targets, start=1):
-        image_text, _image_ready = _general_image_text(provider, record)
+        image_text, _image_ready = _general_image_text(provider, record, keyword, research)
         body = str(record.get("body") or "").strip()
         card_text = str(record.get("source_card_text") or "").strip()
         source_text = "\n\n".join(part for part in (body, card_text, image_text) if part).strip()
+        if _source_character_count(source_text) < 24:
+            record["content_analysis"] = {
+                "status": "insufficient_source",
+                "overview": "正文、卡片文字与图片可读信息不足，暂不形成结论。",
+                "content_type": "证据不足",
+                "relevance_score": 0,
+                "relevance_reason": "有效原始信息少于 24 个字符。",
+                "topics": [],
+                "entities": [],
+                "image_insights": [],
+                "modules": [{
+                    "id": _content_module_id(definition.get("id"), module_index),
+                    "title": str(definition.get("title") or f"分析模块 {module_index}"),
+                    "summary": "该条原文没有提供可复核信息。",
+                    "items": [],
+                    "evidence": [],
+                } for module_index, definition in enumerate(presentation.get("modules", []), start=1)],
+                "source_character_count": _source_character_count(source_text),
+                "grounded_evidence_count": 0,
+            }
+            failed += 1
+            attempts += 1
+            if progress_callback:
+                progress_callback(index, len(targets), "insufficient_source", record)
+            continue
         try:
             result = provider.generate_json(
-                "你是严谨的小红书非岗位内容研究员。只依据提供的正文、卡片文字和图片 OCR，围绕指定研究场景、研究目标与关键词生成分析；不得把内容默认解释成岗位招聘。严格按给定栏目逐项回答，没有证据时明确写信息不足。",
+                "你是严谨的小红书非岗位内容研究员。只能依据提供的正文、卡片文字、图片 OCR 与客观视觉观察回答研究问题。每个有结论的栏目必须在 evidence 中逐字引用输入中的原文片段；不得把栏目问题、搜索关键词或常识当作事实，不得定义作者身份，不得补写输入中没有的审美特征。证据不足时保持空数组并明确写信息不足。",
                 json.dumps({
                     "keyword": keyword,
                     "research": research,
-                    "presentation": presentation,
+                    "research_questions": [
+                        {
+                            "id": module.get("id"),
+                            "question": module.get("question"),
+                        }
+                        for module in presentation.get("modules", [])
+                    ],
                     "record": {
                         "title": record.get("title"),
                         "body": body,
@@ -1977,40 +2247,23 @@ def enrich_general_payload(
                 }, ensure_ascii=False),
                 content_analysis_schema(),
             )
-            normalized_modules = []
-            for module_index, module in enumerate(result.get("modules", []) if isinstance(result.get("modules"), list) else [], start=1):
-                if not isinstance(module, dict):
-                    continue
-                normalized_modules.append({
-                    "id": _content_module_id(module.get("id"), module_index),
-                    "title": str(module.get("title") or f"分析模块 {module_index}").strip()[:60],
-                    "summary": str(module.get("summary") or "").strip()[:800],
-                    "items": [str(item).strip()[:300] for item in module.get("items", []) if str(item).strip()][:8],
-                    "evidence": [str(item).strip()[:300] for item in module.get("evidence", []) if str(item).strip()][:6],
-                })
-            record["content_analysis"] = {
-                "status": "completed",
-                "overview": str(result.get("overview") or "").strip()[:1000],
-                "content_type": str(result.get("content_type") or "").strip()[:80],
-                "relevance_score": max(0, min(100, int(result.get("relevance_score") or 0))),
-                "relevance_reason": str(result.get("relevance_reason") or "").strip()[:400],
-                "topics": [str(item).strip()[:80] for item in result.get("topics", []) if str(item).strip()][:12],
-                "entities": [str(item).strip()[:100] for item in result.get("entities", []) if str(item).strip()][:12],
-                "image_insights": [str(item).strip()[:300] for item in result.get("image_insights", []) if str(item).strip()][:8],
-                "modules": normalized_modules,
-            }
-            if not record["content_analysis"]["overview"] or not normalized_modules:
+            record["content_analysis"] = _normalize_grounded_content_analysis(result, presentation, source_text)
+            if not record["content_analysis"]["overview"] or not record["content_analysis"]["modules"]:
                 raise ValueError("content analysis is missing overview or modules")
-            passed += 1
-            status = "completed"
+            status = str(record["content_analysis"]["status"])
+            if status == "completed":
+                passed += 1
+            else:
+                failed += 1
         except (AIProviderError, ValueError, TypeError, KeyError):
             record["content_analysis"] = _fallback_content_analysis(record, presentation, source_text)
             failed += 1
-            status = "fallback"
+            status = "model_error"
         attempts += 1
         if progress_callback:
             progress_callback(index, len(targets), status, record)
 
+    payload["content_insights"] = _build_content_insights(records, presentation)
     analyzed = sum(1 for record in records if not record_needs_content_completion(record))
     with_images = sum(1 for record in records if (record.get("media") or {}).get("images"))
     understood_images = sum(
@@ -2029,19 +2282,17 @@ def enrich_general_payload(
         "contentAnalyzed": analyzed,
         "imageRecords": with_images,
         "imageRecordsUnderstood": understood_images,
+        "grounded": analyzed,
+        "insufficientSource": sum(1 for record in records if (record.get("content_analysis") or {}).get("status") == "insufficient_source"),
     }
     payload["codex_runtime"] = payload["ai_workflow"]
     base_gate = payload.get("quality_gate") if isinstance(payload.get("quality_gate"), dict) else {}
-    source_ready = sum(
-        1 for record in records
-        if str(record.get("body") or record.get("source_card_text") or "").strip()
-        or str((((record.get("media") or {}).get("analysis") or {}).get("visible_text") or "")).strip()
-    )
+    source_ready = sum(1 for record in records if _source_character_count(_record_general_source_text(record)) >= 24)
     checks = {
         "all_discovered_records_materialized": int(base_gate.get("record_count") or len(records)) == int(base_gate.get("discovered_count") or len(records)),
         "all_records_have_source_content": source_ready == len(records),
         "all_image_records_understood": understood_images == len(records),
-        "all_records_have_content_analysis": analyzed == len(records),
+        "all_records_have_grounded_analysis": analyzed == len(records),
     }
     issues = []
     if source_ready != len(records):
@@ -2049,7 +2300,7 @@ def enrich_general_payload(
     if understood_images != len(records):
         issues.append({"check": "all_image_records_understood", "code": "IMAGE_ANALYSIS_INCOMPLETE", "message": f"{len(records) - understood_images} records still have unread images"})
     if analyzed != len(records):
-        issues.append({"check": "all_records_have_content_analysis", "code": "CONTENT_ANALYSIS_INCOMPLETE", "message": f"{len(records) - analyzed} records have no complete content analysis"})
+        issues.append({"check": "all_records_have_grounded_analysis", "code": "GROUNDED_CONTENT_ANALYSIS_INCOMPLETE", "message": f"{len(records) - analyzed} records have no source-grounded content analysis"})
     payload["quality_gate"] = {
         **base_gate,
         "checks": checks,

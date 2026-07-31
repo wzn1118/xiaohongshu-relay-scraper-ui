@@ -6,11 +6,22 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+try:
+    from workflow_state import open_workflow_state_from_args
+except ModuleNotFoundError:
+    from scripts.workflow_state import open_workflow_state_from_args
+
+try:
+    from artifact_io import atomic_write_json
+except ModuleNotFoundError:
+    from scripts.artifact_io import atomic_write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +30,15 @@ COMMENT_RESPONSE_MARKERS = ("comment/page", "comment/sub", "comment/list", "/com
 SECURITY_MARKERS = ("安全验证", "请完成验证", "拖动滑块", "滑块验证", "captcha")
 RATE_LIMIT_MARKERS = ("访问频繁", "请稍后再试", "error_code=300013")
 MORE_REPLY_PATTERN = re.compile(r"(?:展开|查看|更多|显示).{0,12}(?:回复|评论)|(?:回复|评论).{0,12}(?:更多|全部)")
+RESUMABLE_AUDIENCE_POST_STATUSES = frozenset({"pending", "partial", "failed"})
+AUDIENCE_CHECKPOINT_FILENAMES = (
+    "xiaohongshu_notes_latest.json",
+    "audience-posts.json",
+    "audience-comments.json",
+    "audience-users.json",
+    "audience-failures.json",
+    "audience-summary.json",
+)
 
 
 def utc_now() -> str:
@@ -26,9 +46,7 @@ def utc_now() -> str:
 
 
 def atomic_json(path: Path, payload: Any) -> None:
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(path, payload)
 
 
 def load_json(path: Path, fallback: Any) -> Any:
@@ -36,6 +54,212 @@ def load_json(path: Path, fallback: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return fallback
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalized_checkpoint_dirs(
+    output_dir: Path,
+    checkpoint_dirs: Iterable[str | Path],
+) -> list[Path]:
+    normalized: list[Path] = []
+    seen = {output_dir.resolve()}
+    for raw_path in checkpoint_dirs:
+        checkpoint_dir = Path(raw_path).resolve()
+        if checkpoint_dir in seen:
+            continue
+        if not checkpoint_dir.is_dir():
+            raise ValueError(f"Audience resume checkpoint directory was not found: {checkpoint_dir}")
+        seen.add(checkpoint_dir)
+        normalized.append(checkpoint_dir)
+    return normalized
+
+
+def _copy_verified(source: Path, destination: Path) -> str:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    expected_hash = _file_sha256(source)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    try:
+        with source.open("rb") as source_handle, temporary.open("wb") as destination_handle:
+            shutil.copyfileobj(source_handle, destination_handle)
+            destination_handle.flush()
+            os.fsync(destination_handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if _file_sha256(destination) != expected_hash:
+        raise OSError(f"Audience resume backup verification failed: {destination}")
+    return expected_hash
+
+
+def _verify_readthrough_sources(manifest: dict[str, Any]) -> None:
+    for entry in manifest.get("sourceFiles", []):
+        path = Path(str(entry.get("path") or ""))
+        expected_hash = str(entry.get("sha256") or "")
+        if not path.is_file() or not expected_hash or _file_sha256(path) != expected_hash:
+            raise RuntimeError(f"Audience resume checkpoint changed during read-through: {path}")
+
+
+def _prepare_readthrough_manifest(
+    output_dir: Path,
+    checkpoint_dirs: list[Path],
+    attempt_id: str,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    if not checkpoint_dirs:
+        return None, None
+    identity = attempt_id.strip() or hashlib.sha256(
+        "\n".join(str(path) for path in checkpoint_dirs).encode("utf-8")
+    ).hexdigest()[:16]
+    safe_identity = re.sub(r"[^A-Za-z0-9._-]+", "_", identity)[:96] or "readthrough"
+    # Keep recovery metadata beside the job artifacts so artifact enumeration
+    # never exposes internal attempt backups as user-facing output.
+    backup_dir = output_dir.parent / "attempts" / safe_identity / "readthrough-backup"
+    manifest_path = backup_dir / "readthrough-manifest.json"
+    existing_manifest = load_json(manifest_path, None)
+    if isinstance(existing_manifest, dict):
+        _verify_readthrough_sources(existing_manifest)
+        return manifest_path, existing_manifest
+
+    source_files: list[dict[str, str]] = []
+    for checkpoint_dir in checkpoint_dirs:
+        for filename in AUDIENCE_CHECKPOINT_FILENAMES:
+            source_path = checkpoint_dir / filename
+            if source_path.is_file():
+                source_files.append({
+                    "checkpointDir": str(checkpoint_dir),
+                    "filename": filename,
+                    "path": str(source_path),
+                    "sha256": _file_sha256(source_path),
+                })
+
+    target_backups: list[dict[str, str]] = []
+    for filename in AUDIENCE_CHECKPOINT_FILENAMES:
+        target_path = output_dir / filename
+        if not target_path.is_file():
+            continue
+        backup_path = backup_dir / "target-before-readthrough" / filename
+        target_backups.append({
+            "filename": filename,
+            "targetPath": str(target_path),
+            "backupPath": str(backup_path),
+            "sha256": _copy_verified(target_path, backup_path),
+        })
+
+    manifest: dict[str, Any] = {
+        "schemaVersion": 1,
+        "mode": "read_through",
+        "status": "prepared",
+        "attemptId": attempt_id,
+        "createdAt": utc_now(),
+        "targetOutputDir": str(output_dir),
+        "checkpointDirs": [str(path) for path in checkpoint_dirs],
+        "conflictPolicy": "target_fields_win; source_fills_missing; status_and_counts_are_monotonic",
+        "rollbackDirectory": str(backup_dir / "target-before-readthrough"),
+        "sourceFiles": source_files,
+        "targetBackups": target_backups,
+        "targetState": "prepared",
+        "sourceIntegrity": "pending",
+    }
+    atomic_json(manifest_path, manifest)
+    return manifest_path, manifest
+
+
+def _rollback_readthrough_target(
+    output_dir: Path,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    error: BaseException,
+) -> list[str]:
+    current_manifest = load_json(manifest_path, manifest)
+    if not isinstance(current_manifest, dict):
+        current_manifest = dict(manifest)
+    rollback_errors: list[str] = []
+    restored_files: list[str] = []
+    deleted_files: list[str] = []
+    backed_up_names: set[str] = set()
+
+    for entry in current_manifest.get("targetBackups", []):
+        if not isinstance(entry, dict):
+            continue
+        filename = str(entry.get("filename") or "")
+        if filename not in AUDIENCE_CHECKPOINT_FILENAMES:
+            rollback_errors.append(f"invalid backup filename: {filename}")
+            continue
+        backed_up_names.add(filename)
+        backup_path = Path(str(entry.get("backupPath") or ""))
+        expected_hash = str(entry.get("sha256") or "")
+        target_path = output_dir / filename
+        try:
+            if not backup_path.is_file() or not expected_hash:
+                raise OSError(f"rollback backup is unavailable: {backup_path}")
+            if _file_sha256(backup_path) != expected_hash:
+                raise OSError(f"rollback backup hash mismatch: {backup_path}")
+            _copy_verified(backup_path, target_path)
+            if _file_sha256(target_path) != expected_hash:
+                raise OSError(f"restored target hash mismatch: {target_path}")
+            restored_files.append(filename)
+        except OSError as rollback_error:
+            rollback_errors.append(str(rollback_error))
+
+    for filename in AUDIENCE_CHECKPOINT_FILENAMES:
+        if filename in backed_up_names:
+            continue
+        target_path = output_dir / filename
+        try:
+            if target_path.exists():
+                target_path.unlink()
+                deleted_files.append(filename)
+        except OSError as rollback_error:
+            rollback_errors.append(str(rollback_error))
+
+    source_integrity = "verified"
+    source_integrity_error = ""
+    try:
+        _verify_readthrough_sources(current_manifest)
+    except RuntimeError as integrity_error:
+        source_integrity = "failed"
+        source_integrity_error = str(integrity_error)
+
+    rolled_back_manifest = {
+        **current_manifest,
+        "status": "rollback_failed" if rollback_errors else "rolled_back",
+        "targetState": "rollback_failed" if rollback_errors else "rolled_back",
+        "rollbackReason": f"{type(error).__name__}: {str(error)[:1000]}",
+        "rolledBackAt": utc_now(),
+        "restoredFiles": restored_files,
+        "deletedFiles": deleted_files,
+        "rollbackErrors": rollback_errors,
+        "sourceIntegrity": source_integrity,
+    }
+    if source_integrity_error:
+        rolled_back_manifest["sourceIntegrityError"] = source_integrity_error
+    try:
+        atomic_json(manifest_path, rolled_back_manifest)
+    except OSError as manifest_error:
+        rollback_errors.append(str(manifest_error))
+    return rollback_errors
+
+
+def _record_key(record: dict[str, Any], *fields: str) -> str:
+    for field in fields:
+        value = clean_text(record.get(field), 2000)
+        if value:
+            return value
+    return ""
+
+
+def _enrich_current_record(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for field, value in incoming.items():
+        if merged.get(field) in (None, "", [], {}) and value not in (None, "", [], {}):
+            merged[field] = value
+    return merged
 
 
 def load_upstream(path: Path):
@@ -94,6 +318,7 @@ def normalize_user(raw: Any, *, role: str = "commenter") -> dict[str, Any]:
     avatar = clean_text(first_value(source, "image", "avatar", "avatar_url", "imageb"), 2000)
     url = clean_text(first_value(source, "profile_url", "user_url", "url"), 2000) or profile_url(user_id, token)
     stable = user_id or hashlib.sha256(f"{name}|{url}".encode("utf-8")).hexdigest()[:24]
+    ip_location = clean_text(first_value(source, "ip_location"), 200)
     return {
         "user_id": stable,
         "display_name": name or "未命名用户",
@@ -101,7 +326,8 @@ def normalize_user(raw: Any, *, role: str = "commenter") -> dict[str, Any]:
         "avatar_url": avatar,
         "xhs_id": clean_text(first_value(source, "red_id", "xhs_id", "redId"), 200),
         "bio": clean_text(first_value(source, "desc", "description", "bio"), 1000),
-        "location": clean_text(first_value(source, "ip_location", "location"), 200),
+        "ip_location": ip_location,
+        "location": ip_location or clean_text(first_value(source, "location"), 200),
         "following_count": compact_count(first_value(source, "follows", "following_count")),
         "follower_count": compact_count(first_value(source, "fans", "follower_count")),
         "liked_and_collected_count": compact_count(first_value(source, "interaction", "liked_and_collected_count")),
@@ -119,7 +345,7 @@ def merge_user(current: dict[str, Any] | None, incoming: dict[str, Any]) -> dict
         return incoming
     merged = dict(current)
     for field in (
-        "display_name", "profile_url", "avatar_url", "xhs_id", "bio", "location",
+        "display_name", "profile_url", "avatar_url", "xhs_id", "bio", "ip_location", "location",
         "following_count", "follower_count", "liked_and_collected_count",
     ):
         current_missing = merged.get(field) in (None, "", [], {})
@@ -178,6 +404,7 @@ def normalize_comment(raw: dict[str, Any], *, post_id: str, note_url: str, paren
         comment_id = hashlib.sha256(f"{post_id}|{user['user_id']}|{text}".encode("utf-8")).hexdigest()[:32]
     parent = clean_text(first_value(raw, "parent_comment_id", "parent_id", "target_comment_id"), 200) or parent_id
     create_time = first_value(raw, "create_time", "createTime", "time", "publish_time")
+    ip_location = clean_text(first_value(raw, "ip_location"), 200)
     return {
         "comment_id": comment_id,
         "post_id": post_id,
@@ -186,7 +413,8 @@ def normalize_comment(raw: dict[str, Any], *, post_id: str, note_url: str, paren
         "text": text,
         "likes": compact_count(first_value(raw, "like_count", "likes", "likeCount")) or 0,
         "publish_time": clean_text(create_time, 200),
-        "location": clean_text(first_value(raw, "ip_location", "location"), 200),
+        "ip_location": ip_location,
+        "location": ip_location,
         "source_url": note_url,
         "user": user,
         "collected_at": utc_now(),
@@ -203,7 +431,7 @@ def extract_comments_from_payload(payload: Any, *, post_id: str, note_url: str) 
 
 def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
     merged = dict(existing)
-    identity_fields = ("display_name", "avatar_url", "xhs_id", "bio", "location")
+    identity_fields = ("display_name", "avatar_url", "xhs_id", "bio", "ip_location")
     profile_verified = bool(snapshot.get("profile_loaded")) and any(
         clean_text(snapshot.get(field), 2000) for field in identity_fields
     )
@@ -216,6 +444,8 @@ def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -
         value = clean_text(snapshot.get(field), 2000 if field == "avatar_url" else 1000)
         if value:
             merged[field] = value
+    if merged.get("ip_location"):
+        merged["location"] = merged["ip_location"]
     for field in ("following_count", "follower_count", "liked_and_collected_count"):
         value = compact_count(snapshot.get(field))
         if value is not None:
@@ -224,6 +454,27 @@ def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -
     merged["access_status"] = "public_profile_ok"
     merged["last_enriched_at"] = utc_now()
     return merged
+
+
+def invalidate_legacy_profile_snapshot(user: dict[str, Any]) -> bool:
+    """Mark profiles affected by the old parent-container metric parser for refresh."""
+    if user.get("enrichment_status") != "complete":
+        return False
+    metrics = [
+        user.get("following_count"),
+        user.get("follower_count"),
+        user.get("liked_and_collected_count"),
+    ]
+    duplicated_metrics = all(value is not None for value in metrics) and len(set(metrics)) == 1
+    missing_ip_location = not clean_text(user.get("ip_location"), 200)
+    if not duplicated_metrics and not missing_ip_location:
+        return False
+    if duplicated_metrics:
+        for field in ("following_count", "follower_count", "liked_and_collected_count"):
+            user[field] = None
+    user["enrichment_status"] = "pending"
+    user["access_status"] = "profile_refresh_required"
+    return True
 
 
 def _challenge_status(text: str) -> str:
@@ -252,6 +503,63 @@ def _wait_for_manual_verification(page: Any, timeout_seconds: int) -> tuple[bool
             return True, ""
         time.sleep(min(3, max(0.1, deadline - time.monotonic())))
     return False, "security_verification_timeout"
+
+
+def _wait_for_rate_limit_recovery(
+    page: Any,
+    *,
+    max_retries: int = 5,
+    initial_delay_seconds: float = 15.0,
+    max_delay_seconds: float = 120.0,
+    reload_timeout_ms: int = 15000,
+    checkpoint_callback: Callable[[], Any] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[bool, str]:
+    """Back off after a rate limit and probe the current page before resuming."""
+    retries = max(0, int(max_retries))
+    initial_delay = max(0.0, float(initial_delay_seconds))
+    maximum_delay = max(initial_delay, float(max_delay_seconds))
+    for attempt in range(1, retries + 1):
+        delay = min(maximum_delay, initial_delay * (2 ** (attempt - 1)))
+        if checkpoint_callback is not None:
+            checkpoint_callback()
+        print(
+            f"AUDIENCE_RATE_LIMIT retry={attempt}/{retries} wait={delay:g}s; checkpoint preserved",
+            flush=True,
+        )
+        remaining = delay
+        while remaining > 0:
+            step = min(5.0, remaining)
+            sleep(step)
+            remaining = max(0.0, remaining - step)
+            if remaining > 0:
+                print(
+                    f"AUDIENCE_RATE_LIMIT waiting attempt={attempt}/{retries} remaining={remaining:g}s",
+                    flush=True,
+                )
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=reload_timeout_ms)
+            page.wait_for_timeout(1200)
+        except Exception as error:  # noqa: BLE001
+            print(
+                f"AUDIENCE_RATE_LIMIT probe_failed attempt={attempt}/{retries} error={clean_text(error, 240)}",
+                flush=True,
+            )
+            continue
+        status = _challenge_status(f"{page.url}\n{_body_text(page)}")
+        if not status:
+            print(
+                f"AUDIENCE_RATE_LIMIT cleared retry={attempt}/{retries}; resuming",
+                flush=True,
+            )
+            return True, ""
+        if status != "rate_limited":
+            return False, status
+    print(
+        f"AUDIENCE_RATE_LIMIT exhausted retries={retries}; checkpoint preserved",
+        flush=True,
+    )
+    return False, "rate_limited"
 
 
 def _dom_comments(page: Any, post_id: str, note_url: str) -> list[dict[str, Any]]:
@@ -342,10 +650,12 @@ def _profile_snapshot(page: Any) -> dict[str, Any]:
             return '';
           };
           const metric = (labels) => {
-            const nodes = [...document.querySelectorAll('[class*="data-info"], [class*="user-interactions"], [class*="count"]')];
-            for (const node of nodes) {
-              const text = node.textContent?.trim() || '';
-              if (labels.some((label) => text.includes(label))) return text.replace(/粉丝|关注|获赞与收藏|获赞和收藏/g, '').trim();
+            const rows = [...document.querySelectorAll('.user-interactions > div, [class*="user-interactions"] > div')];
+            for (const row of rows) {
+              const label = row.querySelector('.shows, [class*="shows"]')?.textContent?.trim() || '';
+              if (labels.includes(label)) {
+                return row.querySelector('.count, [class*="count"]')?.textContent?.trim() || '';
+              }
             }
             return '';
           };
@@ -355,7 +665,7 @@ def _profile_snapshot(page: Any) -> dict[str, Any]:
             avatar_url: document.querySelector('.avatar img, [class*="avatar"] img')?.src || '',
             xhs_id: (allText.match(/小红书号[：:]?\s*([^\s]+)/) || [])[1] || '',
             bio: read(['.user-desc', '[class*="user-desc"]', '[class*="desc"]']),
-            location: (allText.match(/(?:IP属地|所在地)[：:]?\s*([^\n]+)/) || [])[1] || '',
+            ip_location: (allText.match(/IP属地[：:]?\s*([^\n]+)/) || [])[1] || '',
             following_count: metric(['关注']),
             follower_count: metric(['粉丝']),
             liked_and_collected_count: metric(['获赞与收藏', '获赞和收藏']),
@@ -388,93 +698,447 @@ def _post_source(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "note_url": note_url,
             "author": author,
             "expected_comment_count": compact_count(first_value(note, "comment_count", "comments")),
+            "status": "pending",
         })
     return posts
 
 
+def normalize_audience_post_status(post: dict[str, Any], *, comment_count: int = 0) -> str:
+    """Map legacy audience checkpoints onto pending/partial/complete."""
+    status = clean_text(post.get("status"), 40).casefold()
+    if status == "complete":
+        return "complete"
+    if status in {"partial", "failed"}:
+        return "partial"
+    stored_count = compact_count(post.get("collected_comment_count")) or 0
+    attempted = bool(
+        post.get("last_attempt_at")
+        or post.get("last_collected_at")
+        or post.get("failure_reason")
+    )
+    return "partial" if comment_count > 0 or stored_count > 0 or attempted else "pending"
+
+
+def merge_audience_posts(
+    source_posts: list[dict[str, Any]],
+    existing_posts: list[dict[str, Any]],
+    comments: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge saved content links with prior audience state without dropping old posts."""
+    comments_by_post: dict[str, list[dict[str, Any]]] = {}
+    for comment in comments:
+        post_id = clean_text(comment.get("post_id"), 200)
+        if post_id:
+            comments_by_post.setdefault(post_id, []).append(comment)
+
+    existing_by_id = {
+        clean_text(post.get("post_id"), 200): post
+        for post in existing_posts
+        if clean_text(post.get("post_id"), 200)
+    }
+    merged_posts: list[dict[str, Any]] = []
+    source_ids: set[str] = set()
+
+    def merge_one(source: dict[str, Any] | None, current: dict[str, Any]) -> dict[str, Any]:
+        merged = {**(source or {}), **current}
+        post_id = clean_text(merged.get("post_id"), 200)
+        merged["post_id"] = post_id
+
+        # The content-insight checkpoint owns the navigation URL. Audience resume
+        # must never rediscover or replace it through a fresh keyword search.
+        if source and clean_text(source.get("note_url"), 2000):
+            merged["note_url"] = clean_text(source["note_url"], 2000)
+        if source and source.get("expected_comment_count") is not None:
+            merged["expected_comment_count"] = source["expected_comment_count"]
+
+        source_author = source.get("author") if source and isinstance(source.get("author"), dict) else None
+        current_author = current.get("author") if isinstance(current.get("author"), dict) else None
+        if source_author or current_author:
+            merged["author"] = merge_user(current_author, source_author or {})
+            merged["author"]["post_ids"] = list(dict.fromkeys([
+                *merged["author"].get("post_ids", []),
+                post_id,
+            ]))
+
+        post_comments = comments_by_post.get(post_id, [])
+        stored_count = compact_count(merged.get("collected_comment_count")) or 0
+        merged["collected_comment_count"] = max(stored_count, len(post_comments))
+        merged["status"] = normalize_audience_post_status(
+            merged,
+            comment_count=len(post_comments),
+        )
+        return merged
+
+    for source in source_posts:
+        post_id = clean_text(source.get("post_id"), 200)
+        if not post_id or post_id in source_ids:
+            continue
+        source_ids.add(post_id)
+        merged_posts.append(merge_one(source, existing_by_id.get(post_id, {})))
+
+    for current in existing_posts:
+        post_id = clean_text(current.get("post_id"), 200)
+        if not post_id or post_id in source_ids:
+            continue
+        source_ids.add(post_id)
+        merged_posts.append(merge_one(None, current))
+    return merged_posts
+
+
+def audience_posts_to_supplement(
+    posts: Iterable[dict[str, Any]],
+    *,
+    allowed_post_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return resumable posts, prioritizing untouched checkpoints."""
+    resumable = [
+        post
+        for post in posts
+        if (
+            clean_text(post.get("status"), 40).casefold() in RESUMABLE_AUDIENCE_POST_STATUSES
+            and (
+                allowed_post_ids is None
+                or clean_text(post.get("post_id"), 200) in allowed_post_ids
+            )
+        )
+    ]
+
+    def resume_priority(post: dict[str, Any]) -> int:
+        status = normalize_audience_post_status(post)
+        reason = clean_text(post.get("failure_reason"), 120).casefold()
+        if status == "pending":
+            return 0
+        if "rate_limit" in reason or "security_verification" in reason:
+            return 2
+        return 1
+
+    return sorted(resumable, key=resume_priority)
+
+
+def merge_comment(current: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
+    if not current:
+        return dict(incoming)
+    merged = {**incoming, **current}
+    current_user = current.get("user") if isinstance(current.get("user"), dict) else None
+    incoming_user = incoming.get("user") if isinstance(incoming.get("user"), dict) else None
+    if current_user or incoming_user:
+        merged["user"] = merge_user(current_user, incoming_user or {})
+    return merged
+
+
+def _merge_checkpoint_user(
+    current: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    if not current:
+        return dict(incoming)
+    merged = merge_user(current, incoming)
+    status_rank = {"": 0, "pending": 1, "partial": 2, "complete": 3}
+    current_status = clean_text(current.get("enrichment_status"), 40).casefold()
+    incoming_status = clean_text(incoming.get("enrichment_status"), 40).casefold()
+    if status_rank.get(incoming_status, 0) > status_rank.get(current_status, 0):
+        merged["enrichment_status"] = incoming_status
+    access_rank = {
+        "": 0,
+        "discovered": 1,
+        "profile_partial": 2,
+        "public_profile_ok": 3,
+    }
+    current_access = clean_text(current.get("access_status"), 80).casefold()
+    incoming_access = clean_text(incoming.get("access_status"), 80).casefold()
+    if access_rank.get(incoming_access, 0) > access_rank.get(current_access, 0):
+        merged["access_status"] = incoming_access
+    for field in ("last_attempt_at", "last_enriched_at"):
+        latest = max(clean_text(current.get(field), 100), clean_text(incoming.get(field), 100))
+        if latest:
+            merged[field] = latest
+    return merged
+
+
+def _merge_checkpoint_post(
+    current: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    if not current:
+        merged = dict(incoming)
+        merged["status"] = normalize_audience_post_status(merged)
+        return merged
+    merged = _enrich_current_record(current, incoming)
+    current_author = current.get("author") if isinstance(current.get("author"), dict) else None
+    incoming_author = incoming.get("author") if isinstance(incoming.get("author"), dict) else None
+    if current_author or incoming_author:
+        merged["author"] = _merge_checkpoint_user(current_author, incoming_author or {})
+
+    count_fields = (
+        "expected_comment_count",
+        "collected_comment_count",
+        "top_level_count",
+        "unique_user_count",
+    )
+    for field in count_fields:
+        current_count = compact_count(current.get(field))
+        incoming_count = compact_count(incoming.get(field))
+        if current_count is not None or incoming_count is not None:
+            merged[field] = max(current_count or 0, incoming_count or 0)
+
+    status_rank = {"pending": 0, "partial": 1, "complete": 2}
+    current_status = normalize_audience_post_status(
+        current,
+        comment_count=compact_count(current.get("collected_comment_count")) or 0,
+    )
+    incoming_status = normalize_audience_post_status(
+        incoming,
+        comment_count=compact_count(incoming.get("collected_comment_count")) or 0,
+    )
+    merged["status"] = max((current_status, incoming_status), key=status_rank.get)
+    for field in ("last_attempt_at", "last_collected_at"):
+        latest = max(clean_text(current.get(field), 100), clean_text(incoming.get(field), 100))
+        if latest:
+            merged[field] = latest
+    return merged
+
+
+def _load_audience_readthrough(
+    output_dir: Path,
+    checkpoint_dirs: list[Path],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    list[dict[str, Any]],
+    set[str],
+]:
+    notes = [item for item in load_json(output_dir / "xiaohongshu_notes_latest.json", []) if isinstance(item, dict)]
+    posts = [item for item in load_json(output_dir / "audience-posts.json", []) if isinstance(item, dict) and item.get("post_id")]
+    comments_by_id = {
+        str(item.get("comment_id")): item
+        for item in load_json(output_dir / "audience-comments.json", [])
+        if isinstance(item, dict) and item.get("comment_id")
+    }
+    users_by_id = {
+        str(item.get("user_id")): item
+        for item in load_json(output_dir / "audience-users.json", [])
+        if isinstance(item, dict) and item.get("user_id")
+    }
+    failures = [item for item in load_json(output_dir / "audience-failures.json", []) if isinstance(item, dict)]
+
+    note_positions = {
+        _record_key(item, "note_id", "id", "note_url", "search_result_url", "explore_url"): index
+        for index, item in enumerate(notes)
+        if _record_key(item, "note_id", "id", "note_url", "search_result_url", "explore_url")
+    }
+    post_positions = {
+        clean_text(item.get("post_id"), 200): index
+        for index, item in enumerate(posts)
+        if clean_text(item.get("post_id"), 200)
+    }
+    failure_keys = {
+        json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for item in failures
+    }
+    checkpoint_post_ids: set[str] = set()
+
+    for checkpoint_dir in checkpoint_dirs:
+        source_notes = [item for item in load_json(checkpoint_dir / "xiaohongshu_notes_latest.json", []) if isinstance(item, dict)]
+        for incoming in source_notes:
+            key = _record_key(incoming, "note_id", "id", "note_url", "search_result_url", "explore_url")
+            if not key:
+                continue
+            if key in note_positions:
+                notes[note_positions[key]] = _enrich_current_record(notes[note_positions[key]], incoming)
+            else:
+                note_positions[key] = len(notes)
+                notes.append(dict(incoming))
+            note_id = _record_key(incoming, "note_id", "id")
+            if note_id:
+                checkpoint_post_ids.add(note_id)
+
+        source_posts = [
+            item for item in load_json(checkpoint_dir / "audience-posts.json", [])
+            if isinstance(item, dict) and item.get("post_id")
+        ]
+        for incoming in source_posts:
+            post_id = clean_text(incoming.get("post_id"), 200)
+            if post_id in post_positions:
+                posts[post_positions[post_id]] = _merge_checkpoint_post(posts[post_positions[post_id]], incoming)
+            else:
+                post_positions[post_id] = len(posts)
+                posts.append(_merge_checkpoint_post(None, incoming))
+            if clean_text(incoming.get("note_url"), 2000):
+                checkpoint_post_ids.add(post_id)
+
+        for incoming in load_json(checkpoint_dir / "audience-comments.json", []):
+            if not isinstance(incoming, dict) or not incoming.get("comment_id"):
+                continue
+            comment_id = str(incoming["comment_id"])
+            comments_by_id[comment_id] = merge_comment(comments_by_id.get(comment_id), incoming)
+
+        for incoming in load_json(checkpoint_dir / "audience-users.json", []):
+            if not isinstance(incoming, dict) or not incoming.get("user_id"):
+                continue
+            user_id = str(incoming["user_id"])
+            users_by_id[user_id] = _merge_checkpoint_user(users_by_id.get(user_id), incoming)
+
+        for incoming in load_json(checkpoint_dir / "audience-failures.json", []):
+            if not isinstance(incoming, dict):
+                continue
+            key = json.dumps(incoming, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if key not in failure_keys:
+                failure_keys.add(key)
+                failures.append(dict(incoming))
+
+    return notes, posts, comments_by_id, users_by_id, failures, checkpoint_post_ids
+
+
 def _summary(posts: list[dict[str, Any]], comments: list[dict[str, Any]], users: list[dict[str, Any]], stop_reason: str = "") -> dict[str, Any]:
-    complete_posts = sum(1 for post in posts if post.get("status") == "complete")
+    normalized_statuses = [normalize_audience_post_status(post) for post in posts]
+    complete_posts = normalized_statuses.count("complete")
     complete_profiles = sum(1 for user in users if user.get("enrichment_status") == "complete")
-    failed_posts = sum(1 for post in posts if post.get("status") == "failed")
-    partial_posts = sum(1 for post in posts if post.get("status") == "partial")
-    status = "complete" if posts and complete_posts == len(posts) and complete_profiles == len(users) else "partial" if comments or complete_posts else "pending"
-    if failed_posts and not comments:
-        status = "failed"
+    failed_posts = sum(1 for post in posts if clean_text(post.get("status"), 40).casefold() == "failed")
+    partial_posts = normalized_statuses.count("partial")
+    pending_posts = normalized_statuses.count("pending")
+    attempted_posts = complete_posts + partial_posts
+    posts_with_comments = sum(1 for post in posts if (compact_count(post.get("collected_comment_count")) or 0) > 0)
+    status = "complete" if posts and complete_posts == len(posts) and complete_profiles == len(users) else "partial" if comments or complete_posts or partial_posts else "pending"
     return {
         "schemaVersion": 1,
         "status": status,
         "postsTotal": len(posts),
         "postsComplete": complete_posts,
+        "postsPending": pending_posts,
         "postsPartial": partial_posts,
         "postsFailed": failed_posts,
+        "postsAttempted": attempted_posts,
+        "postsWithComments": posts_with_comments,
         "commentsCollected": len(comments),
         "topLevelComments": sum(1 for item in comments if not item.get("parent_comment_id")),
         "repliesCollected": sum(1 for item in comments if item.get("parent_comment_id")),
         "usersDiscovered": len(users),
         "profilesComplete": complete_profiles,
         "postCoveragePercent": round((complete_posts / len(posts)) * 100, 2) if posts else 0,
+        "postAttemptPercent": round((attempted_posts / len(posts)) * 100, 2) if posts else 0,
         "profileCoveragePercent": round((complete_profiles / len(users)) * 100, 2) if users else 0,
         "stopReason": stop_reason,
         "generatedAt": utc_now(),
     }
 
 
-def collect_audience(
+def _collect_audience_impl(
     output_dir: Path,
     *,
+    checkpoint_dirs: Iterable[str | Path] = (),
+    attempt_id: str = "",
     relay_port: int = 18800,
     goto_timeout_ms: int = 15000,
     note_delay_seconds: float = 1.2,
     stable_rounds: int = 5,
     security_verification_timeout_seconds: int = 600,
+    rate_limit_max_retries: int = 5,
+    rate_limit_initial_delay_seconds: float = 15.0,
+    rate_limit_max_delay_seconds: float = 120.0,
     upstream_scraper: Path = DEFAULT_UPSTREAM_SCRAPER,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    _readthrough_context: tuple[
+        list[Path],
+        Path | None,
+        dict[str, Any] | None,
+    ] | None = None,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
+    if _readthrough_context is None:
+        readthrough_dirs = _normalized_checkpoint_dirs(output_dir, checkpoint_dirs)
+        manifest_path, readthrough_manifest = _prepare_readthrough_manifest(
+            output_dir,
+            readthrough_dirs,
+            attempt_id,
+        )
+    else:
+        readthrough_dirs, manifest_path, readthrough_manifest = _readthrough_context
     notes_path = output_dir / "xiaohongshu_notes_latest.json"
     comments_path = output_dir / "audience-comments.json"
     users_path = output_dir / "audience-users.json"
     posts_path = output_dir / "audience-posts.json"
     failures_path = output_dir / "audience-failures.json"
     summary_path = output_dir / "audience-summary.json"
-    notes = load_json(notes_path, [])
-    if not isinstance(notes, list) or not notes:
+    (
+        notes,
+        existing_posts,
+        comments_by_id,
+        users_by_id,
+        failures,
+        checkpoint_post_ids,
+    ) = _load_audience_readthrough(output_dir, readthrough_dirs)
+    if not notes:
         raise ValueError("Audience collection requires a non-empty note checkpoint")
 
-    source_posts = _post_source([item for item in notes if isinstance(item, dict)])
-    existing_posts = {item.get("post_id"): item for item in load_json(posts_path, []) if isinstance(item, dict) and item.get("post_id")}
-    comments_by_id = {item.get("comment_id"): item for item in load_json(comments_path, []) if isinstance(item, dict) and item.get("comment_id")}
-    users_by_id = {item.get("user_id"): item for item in load_json(users_path, []) if isinstance(item, dict) and item.get("user_id")}
-    failures = [item for item in load_json(failures_path, []) if isinstance(item, dict)]
-    posts: list[dict[str, Any]] = []
-    for source in source_posts:
-        post = {**source, **existing_posts.get(source["post_id"], {})}
-        post["author"] = merge_user(existing_posts.get(source["post_id"], {}).get("author"), source["author"])
-        post["author"]["post_ids"] = list(dict.fromkeys([*post["author"].get("post_ids", []), post["post_id"]]))
-        posts.append(post)
-        users_by_id[post["author"]["user_id"]] = merge_user(users_by_id.get(post["author"]["user_id"]), post["author"])
+    source_posts = _post_source(notes)
+    posts = merge_audience_posts(source_posts, existing_posts, comments_by_id.values())
+    for post in posts:
+        author = post.get("author") if isinstance(post.get("author"), dict) else None
+        if not author or not author.get("user_id"):
+            continue
+        users_by_id[author["user_id"]] = merge_user(users_by_id.get(author["user_id"]), author)
+
+    legacy_profile_refresh_ids = [
+        user_id
+        for user_id, user in users_by_id.items()
+        if invalidate_legacy_profile_snapshot(user)
+    ]
 
     stop_reason = ""
+    profile_stop_reason = ""
 
     def absorb(comment: dict[str, Any]) -> None:
-        comments_by_id[comment["comment_id"]] = comment
-        user = comment["user"]
+        merged_comment = merge_comment(comments_by_id.get(comment["comment_id"]), comment)
+        comments_by_id[comment["comment_id"]] = merged_comment
+        user = merged_comment["user"]
         user_id = user["user_id"]
         merged = merge_user(users_by_id.get(user_id), user)
-        merged["post_ids"] = list(dict.fromkeys([*merged.get("post_ids", []), comment["post_id"]]))
+        merged["post_ids"] = list(dict.fromkeys([*merged.get("post_ids", []), merged_comment["post_id"]]))
         users_by_id[user_id] = merged
 
     def checkpoint() -> dict[str, Any]:
         comments = sorted(comments_by_id.values(), key=lambda item: (item.get("post_id", ""), item.get("collected_at", ""), item.get("comment_id", "")))
         for user in users_by_id.values():
-            user["comment_count"] = sum(1 for item in comments if item.get("user", {}).get("user_id") == user.get("user_id"))
+            checkpoint_count = sum(1 for item in comments if item.get("user", {}).get("user_id") == user.get("user_id"))
+            user["comment_count"] = max(compact_count(user.get("comment_count")) or 0, checkpoint_count)
         users = sorted(users_by_id.values(), key=lambda item: (-int(item.get("comment_count") or 0), item.get("display_name", "")))
+        atomic_json(notes_path, notes)
         atomic_json(comments_path, comments)
         atomic_json(users_path, users)
         atomic_json(posts_path, posts)
         atomic_json(failures_path, failures[-1000:])
-        summary = _summary(posts, comments, users, stop_reason)
+        summary = _summary(posts, comments, users, stop_reason or profile_stop_reason)
         atomic_json(summary_path, summary)
+        if progress_callback is not None:
+            progress_callback({
+                "posts": [dict(item) for item in posts],
+                "users": [dict(item) for item in users],
+                "summary": dict(summary),
+                "status": "running",
+                "lastCheckpointAt": utc_now(),
+            })
         return summary
+
+    # Materialize the merged checkpoint before opening any page so existing
+    # audience data remains available throughout a supplementation run.
+    checkpoint()
+    source_post_ids = {
+        clean_text(post.get("post_id"), 200)
+        for post in source_posts
+        if clean_text(post.get("post_id"), 200)
+    }
+    source_post_ids.update(checkpoint_post_ids)
+    target_posts = audience_posts_to_supplement(
+        posts,
+        allowed_post_ids=source_post_ids,
+    )
+    print(
+        f"AUDIENCE_RESUME saved_posts={len(posts)} targets={len(target_posts)} "
+        f"preserved_comments={len(comments_by_id)} preserved_users={len(users_by_id)}",
+        flush=True,
+    )
 
     upstream = load_upstream(upstream_scraper)
     from playwright.sync_api import sync_playwright
@@ -483,6 +1147,7 @@ def collect_audience(
         browser = upstream.connect_browser(playwright, relay_port)
         context = upstream.get_or_create_context(browser)
         page = context.new_page()
+        profile_page = context.new_page()
         response_payloads: list[Any] = []
 
         def on_response(response: Any) -> None:
@@ -495,8 +1160,75 @@ def collect_audience(
 
         page.on("response", on_response)
         try:
-            for post_index, post in enumerate(posts, start=1):
-                if post.get("status") == "complete":
+            def recover_rate_limit(limited_page: Any) -> tuple[bool, str]:
+                return _wait_for_rate_limit_recovery(
+                    limited_page,
+                    max_retries=rate_limit_max_retries,
+                    initial_delay_seconds=rate_limit_initial_delay_seconds,
+                    max_delay_seconds=rate_limit_max_delay_seconds,
+                    reload_timeout_ms=goto_timeout_ms,
+                    checkpoint_callback=checkpoint,
+                )
+
+            def enrich_profile(user: dict[str, Any], *, phase: str) -> bool:
+                nonlocal profile_stop_reason
+                user["last_attempt_at"] = utc_now()
+                if not user.get("profile_url"):
+                    user["enrichment_status"] = "partial"
+                    user["access_status"] = "profile_url_missing"
+                    return False
+                try:
+                    profile_page.goto(user["profile_url"], wait_until="domcontentloaded", timeout=goto_timeout_ms)
+                    profile_page.wait_for_timeout(900)
+                    challenge = _challenge_status(f"{profile_page.url}\n{_body_text(profile_page)}")
+                    if challenge == "rate_limited":
+                        cleared, challenge = recover_rate_limit(profile_page)
+                        if cleared:
+                            challenge = ""
+                    if challenge:
+                        profile_stop_reason = challenge
+                        user["enrichment_status"] = "partial"
+                        user["access_status"] = challenge
+                        print(
+                            f"AUDIENCE_PROFILE_LIMIT reason={challenge}; comments continue and profile checkpoint preserved",
+                            flush=True,
+                        )
+                        return False
+                    users_by_id[user["user_id"]] = parse_profile_snapshot(_profile_snapshot(profile_page), user)
+                    return users_by_id[user["user_id"]].get("enrichment_status") == "complete"
+                except Exception as error:  # noqa: BLE001
+                    user["enrichment_status"] = "partial"
+                    user["access_status"] = "profile_error"
+                    user["last_enriched_at"] = utc_now()
+                    failures.append({
+                        "user_id": user["user_id"],
+                        "phase": phase,
+                        "reason": clean_text(error, 1000),
+                        "at": utc_now(),
+                    })
+                    return False
+
+            for user_id in legacy_profile_refresh_ids:
+                user = users_by_id.get(user_id)
+                if not user:
+                    continue
+                enrich_profile(user, phase="legacy_profile_refresh")
+                checkpoint()
+                if profile_stop_reason:
+                    break
+
+            for post in target_posts:
+                post["last_attempt_at"] = utc_now()
+                if not clean_text(post.get("note_url"), 2000):
+                    post["status"] = "partial"
+                    post["failure_reason"] = "checkpoint_note_url_missing"
+                    failures.append({
+                        "post_id": post["post_id"],
+                        "phase": "comments",
+                        "reason": post["failure_reason"],
+                        "at": utc_now(),
+                    })
+                    checkpoint()
                     continue
                 response_payloads.clear()
                 before = len([item for item in comments_by_id.values() if item.get("post_id") == post["post_id"]])
@@ -516,13 +1248,14 @@ def collect_audience(
                             post["failure_reason"] = reason
                             checkpoint()
                             break
-                    elif challenge:
-                        stop_reason = challenge
-                        post["status"] = "partial"
-                        post["failure_reason"] = challenge
-                        print("AUDIENCE_RATE_LIMIT detected; checkpoint preserved", flush=True)
-                        checkpoint()
-                        break
+                    elif challenge == "rate_limited":
+                        cleared, reason = recover_rate_limit(page)
+                        if not cleared:
+                            stop_reason = reason
+                            post["status"] = "partial"
+                            post["failure_reason"] = reason
+                            checkpoint()
+                            break
 
                     unchanged = 0
                     previous_count = -1
@@ -539,6 +1272,15 @@ def collect_audience(
                         page.wait_for_timeout(650)
                         body = _body_text(page)
                         challenge = _challenge_status(f"{page.url}\n{body}")
+                        if challenge == "rate_limited":
+                            cleared, reason = recover_rate_limit(page)
+                            if not cleared:
+                                stop_reason = reason
+                                break
+                            response_payloads.clear()
+                            unchanged = 0
+                            previous_count = -1
+                            continue
                         if challenge:
                             stop_reason = challenge
                             break
@@ -579,9 +1321,14 @@ def collect_audience(
                         post["failure_reason"] = f"expected_{expected}_collected_{collected}" if expected is not None else "comment_list_not_proven_complete"
                     if collected == before and post["status"] != "complete":
                         failures.append({"post_id": post["post_id"], "phase": "comments", "reason": post["failure_reason"], "at": utc_now()})
-                    checkpoint()
+                    author = post.get("author") if isinstance(post.get("author"), dict) else None
+                    if collected > 0 and author and not profile_stop_reason:
+                        current_author = users_by_id.get(author.get("user_id"), author)
+                        if current_author.get("enrichment_status") != "complete":
+                            enrich_profile(current_author, phase="author_profile")
+                    progress_summary = checkpoint()
                     print(
-                        f"AUDIENCE_PROGRESS posts={post_index}/{len(posts)} comments={len(comments_by_id)} "
+                        f"AUDIENCE_PROGRESS posts={progress_summary['postsAttempted']}/{len(posts)} comments={len(comments_by_id)} "
                         f"users={len(users_by_id)} profiles={sum(1 for item in users_by_id.values() if item.get('enrichment_status') == 'complete')}/{len(users_by_id)} phase=comments",
                         flush=True,
                     )
@@ -589,56 +1336,129 @@ def collect_audience(
                         break
                     time.sleep(max(0.0, note_delay_seconds))
                 except Exception as error:  # noqa: BLE001
-                    post["status"] = "failed"
+                    post["status"] = "partial"
                     post["failure_reason"] = clean_text(error, 1000)
                     failures.append({"post_id": post["post_id"], "phase": "comments", "reason": post["failure_reason"], "at": utc_now()})
                     checkpoint()
 
-            if not stop_reason:
-                pending_users = [item for item in users_by_id.values() if item.get("enrichment_status") != "complete"]
+            if not stop_reason and not profile_stop_reason:
+                commented_post_ids = {
+                    item.get("post_id") for item in comments_by_id.values() if item.get("post_id")
+                }
+                pending_users = sorted(
+                    [item for item in users_by_id.values() if item.get("enrichment_status") != "complete"],
+                    key=lambda item: (
+                        0 if "author" in item.get("roles", []) and commented_post_ids.intersection(item.get("post_ids", [])) else
+                        1 if "author" in item.get("roles", []) else
+                        2,
+                        item.get("display_name", ""),
+                    ),
+                )
                 for profile_index, user in enumerate(pending_users, start=1):
-                    if not user.get("profile_url"):
-                        user["enrichment_status"] = "partial"
-                        user["access_status"] = "profile_url_missing"
-                        continue
-                    try:
-                        page.goto(user["profile_url"], wait_until="domcontentloaded", timeout=goto_timeout_ms)
-                        page.wait_for_timeout(800)
-                        challenge = _challenge_status(f"{page.url}\n{_body_text(page)}")
-                        if challenge:
-                            stop_reason = challenge
-                            user["enrichment_status"] = "partial"
-                            user["access_status"] = challenge
-                            print("AUDIENCE_RATE_LIMIT detected during profile enrichment; checkpoint preserved", flush=True)
-                            checkpoint()
-                            break
-                        users_by_id[user["user_id"]] = parse_profile_snapshot(_profile_snapshot(page), user)
-                    except Exception as error:  # noqa: BLE001
-                        user["enrichment_status"] = "partial"
-                        user["access_status"] = "profile_error"
-                        user["last_enriched_at"] = utc_now()
-                        failures.append({"user_id": user["user_id"], "phase": "profile", "reason": clean_text(error, 1000), "at": utc_now()})
+                    enrich_profile(user, phase="profile")
                     checkpoint()
                     print(
                         f"AUDIENCE_PROGRESS posts={len(posts)}/{len(posts)} comments={len(comments_by_id)} "
                         f"users={len(users_by_id)} profiles={profile_index}/{len(pending_users)} phase=profiles",
                         flush=True,
                     )
+                    if profile_stop_reason:
+                        break
                     time.sleep(max(0.0, note_delay_seconds))
         finally:
-            try:
-                page.close()
-            except Exception:  # noqa: BLE001
-                pass
+            for opened_page in (profile_page, page):
+                try:
+                    opened_page.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     summary = checkpoint()
+    if manifest_path is not None and readthrough_manifest is not None:
+        _verify_readthrough_sources(readthrough_manifest)
+        readthrough_manifest = {
+            **readthrough_manifest,
+            "status": "committed",
+            "targetState": "committed",
+            "sourceIntegrity": "verified",
+            "verifiedAt": utc_now(),
+        }
+        atomic_json(manifest_path, readthrough_manifest)
+    if progress_callback is not None:
+        progress_callback({
+            "posts": [dict(item) for item in posts],
+            "users": [dict(item) for item in users_by_id.values()],
+            "summary": dict(summary),
+            "status": "completed" if summary.get("status") == "complete" else "blocked" if summary.get("stopReason") else "partial",
+            "lastCheckpointAt": utc_now(),
+        })
     print(
         f"AUDIENCE_COMPLETE posts={summary['postsComplete']}/{summary['postsTotal']} "
         f"comments={summary['commentsCollected']} users={summary['usersDiscovered']} "
-        f"profiles={summary['profilesComplete']}/{summary['usersDiscovered']} status={summary['status']}",
+        f"profiles={summary['profilesComplete']}/{summary['usersDiscovered']} status={summary['status']} "
+        f"attempted={summary['postsAttempted']} with_comments={summary['postsWithComments']}",
         flush=True,
     )
     return summary
+
+
+def collect_audience(
+    output_dir: Path,
+    *,
+    checkpoint_dirs: Iterable[str | Path] = (),
+    attempt_id: str = "",
+    relay_port: int = 18800,
+    goto_timeout_ms: int = 15000,
+    note_delay_seconds: float = 1.2,
+    stable_rounds: int = 5,
+    security_verification_timeout_seconds: int = 600,
+    rate_limit_max_retries: int = 5,
+    rate_limit_initial_delay_seconds: float = 15.0,
+    rate_limit_max_delay_seconds: float = 120.0,
+    upstream_scraper: Path = DEFAULT_UPSTREAM_SCRAPER,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    resolved_output_dir = output_dir.resolve()
+    readthrough_dirs = _normalized_checkpoint_dirs(resolved_output_dir, checkpoint_dirs)
+    manifest_path, readthrough_manifest = _prepare_readthrough_manifest(
+        resolved_output_dir,
+        readthrough_dirs,
+        attempt_id,
+    )
+    try:
+        return _collect_audience_impl(
+            resolved_output_dir,
+            checkpoint_dirs=readthrough_dirs,
+            attempt_id=attempt_id,
+            relay_port=relay_port,
+            goto_timeout_ms=goto_timeout_ms,
+            note_delay_seconds=note_delay_seconds,
+            stable_rounds=stable_rounds,
+            security_verification_timeout_seconds=security_verification_timeout_seconds,
+            rate_limit_max_retries=rate_limit_max_retries,
+            rate_limit_initial_delay_seconds=rate_limit_initial_delay_seconds,
+            rate_limit_max_delay_seconds=rate_limit_max_delay_seconds,
+            upstream_scraper=upstream_scraper,
+            progress_callback=progress_callback,
+            _readthrough_context=(
+                readthrough_dirs,
+                manifest_path,
+                readthrough_manifest,
+            ),
+        )
+    except BaseException as error:
+        if manifest_path is not None and readthrough_manifest is not None:
+            rollback_errors = _rollback_readthrough_target(
+                resolved_output_dir,
+                manifest_path,
+                readthrough_manifest,
+                error,
+            )
+            if rollback_errors:
+                raise RuntimeError(
+                    "Audience read-through failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from error
+        raise
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -649,17 +1469,64 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--note-delay-seconds", type=float, default=1.2)
     parser.add_argument("--stable-rounds", type=int, default=5)
     parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
+    parser.add_argument("--rate-limit-max-retries", type=int, default=5)
+    parser.add_argument("--rate-limit-initial-delay-seconds", type=float, default=15.0)
+    parser.add_argument("--rate-limit-max-delay-seconds", type=float, default=120.0)
     parser.add_argument("--upstream-scraper", default=str(DEFAULT_UPSTREAM_SCRAPER))
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume-scope", choices=("full", "audience"))
+    parser.add_argument("--attempt-id")
+    parser.add_argument("--resume-checkpoint-dir", action="append", default=[])
+    parser.add_argument("--state-path")
+    parser.add_argument("--expected-state-revision", type=int)
     options = parser.parse_args(arguments)
-    summary = collect_audience(
-        Path(options.output_dir),
-        relay_port=options.relay_port,
-        goto_timeout_ms=options.goto_timeout_ms,
-        note_delay_seconds=options.note_delay_seconds,
-        stable_rounds=options.stable_rounds,
-        security_verification_timeout_seconds=options.security_verification_timeout_seconds,
-        upstream_scraper=Path(options.upstream_scraper),
-    )
+    output_dir = Path(options.output_dir).resolve()
+    state = open_workflow_state_from_args(options, output_dir)
+    if state is not None:
+        if not state.should_run("audience"):
+            summary = load_json(output_dir / "audience-summary.json", {})
+            return 0 if isinstance(summary, dict) and summary.get("status") == "complete" else 3
+        state.start_stage("audience")
+
+    def update_state(progress: dict[str, Any]) -> None:
+        if state is None:
+            return
+        state.checkpoint_audience(
+            posts=progress["posts"],
+            users=progress["users"],
+            summary=progress["summary"],
+            status=str(progress.get("status") or "running"),
+        )
+
+    try:
+        summary = collect_audience(
+            output_dir,
+            checkpoint_dirs=options.resume_checkpoint_dir,
+            attempt_id=options.attempt_id or "",
+            relay_port=options.relay_port,
+            goto_timeout_ms=options.goto_timeout_ms,
+            note_delay_seconds=options.note_delay_seconds,
+            stable_rounds=options.stable_rounds,
+            security_verification_timeout_seconds=options.security_verification_timeout_seconds,
+            rate_limit_max_retries=options.rate_limit_max_retries,
+            rate_limit_initial_delay_seconds=options.rate_limit_initial_delay_seconds,
+            rate_limit_max_delay_seconds=options.rate_limit_max_delay_seconds,
+            upstream_scraper=Path(options.upstream_scraper),
+            progress_callback=update_state,
+        )
+    except BaseException as error:
+        if state is not None:
+            try:
+                state.finish_stage("audience", "failed", {
+                    "failureCode": type(error).__name__,
+                    "failureMessage": str(error)[:1000],
+                })
+            except BaseException:
+                pass
+        raise
+    if state is not None:
+        status = "completed" if summary["status"] == "complete" else "blocked" if summary.get("stopReason") else "partial"
+        state.finish_stage("audience", status, {"stopReason": summary.get("stopReason") or ""})
     return 0 if summary["status"] == "complete" else 3
 
 

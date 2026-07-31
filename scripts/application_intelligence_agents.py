@@ -1296,6 +1296,7 @@ def run_pipeline(
     codex_cli_bin: str = "",
     codex_batch_size: int = 8,
     codex_timeout_seconds: int = 300,
+    persist: bool = True,
 ) -> PipelineResult:
     cards = _load_json(output_dir / "xiaohongshu_cards_latest.json", [])
     notes = _load_json(find_notes_path(output_dir), [])
@@ -1325,7 +1326,8 @@ def run_pipeline(
         runtime_required=use_codex_runtime,
         runtime_initialization_error=runtime_error,
     ).run(cards, notes)
-    write_pipeline_artifacts(output_dir, result.payload)
+    if persist:
+        write_pipeline_artifacts(output_dir, result.payload)
     return result
 
 
@@ -1403,22 +1405,64 @@ def write_pipeline_artifacts(output_dir: Path, payload: dict[str, Any]) -> None:
             )
 
     markdown_path = output_dir / "application_intelligence_report.md"
-    lines = [
-        "# Application Intelligence Quality Report",
-        "",
-        f"- Gate: {'PASS' if summary['passed'] else 'FAIL'}",
-        f"- Discovered: {summary['discovered_count']}",
-        f"- Extracted records: {summary['record_count']}",
-        f"- Full bodies: {summary['body_count']}",
-        f"- Discovery coverage: {summary['coverage_rate']:.1%}",
-        f"- Body coverage: {summary['body_coverage_rate']:.1%}",
-        "",
-        "## Checks",
-    ]
-    lines.extend(f"- [{'x' if passed else ' '}] {name}" for name, passed in summary["checks"].items())
-    if summary["issues"]:
-        lines.extend(["", "## Issues"])
-        lines.extend(f"- {item['message']}" for item in summary["issues"])
+    if payload.get("analysis_mode") == "general":
+        insights = payload.get("content_insights") if isinstance(payload.get("content_insights"), dict) else {}
+        research = payload.get("content_research") if isinstance(payload.get("content_research"), dict) else {}
+        lines = [
+            f"# {payload.get('keyword') or '关键词'}跨样本内容洞察报告",
+            "",
+            f"- 研究场景：{research.get('label') or research.get('preset') or '非岗位内容研究'}",
+            f"- 样本总数：{int(insights.get('sampleSize') or 0)}",
+            f"- 原始图文就绪：{int(insights.get('sourceReady') or 0)}",
+            f"- 证据门禁通过：{int(insights.get('groundedRecords') or 0)}",
+            f"- 可验证分析覆盖率：{float(insights.get('coverageRate') or 0):.1f}%",
+            "",
+            f"> {insights.get('methodNote') or '结论仅来自可回溯的原始图文证据。'}",
+            "",
+            "## 高频主题",
+        ]
+        topics = insights.get("topTopics") if isinstance(insights.get("topTopics"), list) else []
+        if topics:
+            for topic in topics:
+                lines.append(f"- {topic.get('label') or '未命名主题'}：{int(topic.get('count') or 0)} 条，占证据通过样本 {float(topic.get('share') or 0):.1f}%")
+                for evidence in topic.get("evidence", [])[:3]:
+                    lines.append(f"  - 《{evidence.get('title') or '未命名内容'}》：{evidence.get('quote') or ''}")
+        else:
+            lines.append("- 当前没有通过原文证据门禁的高频主题。")
+        for module in insights.get("modules", []):
+            lines.extend([
+                "",
+                f"## {module.get('title') or '研究问题'}",
+                "",
+                f"研究问题：{module.get('question') or '未设置'}",
+                f"证据覆盖：{int(module.get('recordCount') or 0)} 条（{float(module.get('coverageRate') or 0):.1f}%）",
+                "",
+            ])
+            findings = module.get("findings") if isinstance(module.get("findings"), list) else []
+            if not findings:
+                lines.append("- 当前样本没有形成可复核结论。")
+                continue
+            for finding in findings:
+                lines.append(f"- {finding.get('label') or '未命名发现'}：{int(finding.get('count') or 0)} 条")
+                for evidence in finding.get("evidence", [])[:3]:
+                    lines.append(f"  - 《{evidence.get('title') or '未命名内容'}》：{evidence.get('quote') or ''}")
+    else:
+        lines = [
+            "# Application Intelligence Quality Report",
+            "",
+            f"- Gate: {'PASS' if summary['passed'] else 'FAIL'}",
+            f"- Discovered: {summary['discovered_count']}",
+            f"- Extracted records: {summary['record_count']}",
+            f"- Full bodies: {summary['body_count']}",
+            f"- Discovery coverage: {summary['coverage_rate']:.1%}",
+            f"- Body coverage: {summary['body_coverage_rate']:.1%}",
+            "",
+            "## Checks",
+        ]
+        lines.extend(f"- [{'x' if passed else ' '}] {name}" for name, passed in summary["checks"].items())
+        if summary["issues"]:
+            lines.extend(["", "## Issues"])
+            lines.extend(f"- {item['message']}" for item in summary["issues"])
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     _write_xlsx(output_dir / "application_intelligence.xlsx", payload)
 
