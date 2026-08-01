@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { appendFile, mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
 import { ValidationError, validateAudienceGrowthRequest, validateExpansionCancelRequest, validateExpansionResumeRequest, validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
@@ -24,6 +24,25 @@ import {
 } from './lib/draft-store.mjs';
 import { createDraftQualityChecker } from './lib/draft-quality-checker.mjs';
 import { normalizeDiagnosticRoute } from './lib/diagnostics.mjs';
+import {
+  AttachmentError,
+  attachmentLimits,
+  buildEmailPreview,
+  createApplicationAttachment,
+  deleteApplicationAttachment,
+  discardSendBundle,
+  finalizeSendBundle,
+  listApplicationAttachments,
+  prepareSendBundle,
+  readApplicationAttachmentUpload,
+  readFinalizedSendBundle,
+  resolveApplicationAttachmentDownload,
+  resolveApplicationAttachments,
+  resolveSelectedApplicationAttachments,
+  sealPreparedSendBundle,
+  updateApplicationAttachment,
+  withApplicationDeliveryLock,
+} from './lib/application-attachments.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 import { createPreflightService } from './preflight-service.mjs';
 import { AudienceAiService } from './audience-ai-service.mjs';
@@ -45,9 +64,17 @@ const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
 const MEDIA_CACHE_MAX_BYTES = 15 * 1024 * 1024;
 const MEDIA_CACHE_TIMEOUT_MS = 15_000;
+const APPLICATION_ATTACHMENT_MEDIA_TYPES = Object.freeze({
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.txt': 'text/plain',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+});
 const APPLICATION_RECORD_INDEX = Symbol('applicationRecordIndex');
 const APPLICATION_ARTIFACT_FILENAME = Symbol('applicationArtifactFilename');
-const deliveryStateLocks = new Map();
 const CONTENT_RESEARCH_LABELS = Object.freeze({
   auto: 'AI 自动识别',
   experience: '经验攻略',
@@ -86,6 +113,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     getRelayConfig,
   });
   const mediaDownloads = new Map();
+  const deliveryAttachmentLimits = attachmentLimits(config);
   const checkDraftQuality = draftQualityChecker || createDraftQualityChecker({
     pythonBin: config.pythonBin || (process.platform === 'win32' ? 'python' : 'python3'),
     scriptPath: path.join(config.projectRoot || process.cwd(), 'scripts', 'recheck_application_draft.py'),
@@ -740,6 +768,169 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             message: 'Latest-first discovery started; existing audience data will be retained and merged.',
           });
         }
+        if (parts[3] === 'application-attachments' && parts.length === 4 && req.method === 'GET') {
+          return json(res, 200, await listApplicationAttachments(
+            internal.outputDir,
+            url.searchParams.get('noteId'),
+            deliveryAttachmentLimits,
+          ));
+        }
+        if (parts[3] === 'application-attachments' && parts.length === 4 && req.method === 'POST') {
+          const upload = await readApplicationAttachmentUpload(req, deliveryAttachmentLimits);
+          const result = await mutateApplicationAttachments(
+            internal.outputDir,
+            deliveryStateWriter,
+            () => createApplicationAttachment(internal.outputDir, {
+              jobId: id,
+              noteId: String(upload.fields.noteId || ''),
+              source: 'uploaded',
+              displayName: upload.fields.displayName,
+              selected: upload.fields.selected !== 'false',
+              file: upload.file,
+            }, deliveryAttachmentLimits),
+          );
+          return json(res, result.duplicate ? 200 : 201, result);
+        }
+        if (parts[3] === 'application-attachments' && parts[4] === 'from-artifact' && parts.length === 5 && req.method === 'POST') {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const artifact = await resolveDownload(internal.outputDir, String(body?.artifactId || ''));
+          const portablePath = artifact.relative.replaceAll('\\', '/');
+          if (portablePath.startsWith('application-attachments/')) {
+            throw new AttachmentError('ATTACHMENT_PATH_INVALID', 'Application delivery internals cannot be re-imported as Job artifacts.');
+          }
+          if (artifact.size > deliveryAttachmentLimits.maxFileBytes) {
+            throw new AttachmentError(
+              'ATTACHMENT_TOO_LARGE',
+              `Attachment exceeds ${deliveryAttachmentLimits.maxFileBytes} bytes.`,
+              413,
+            );
+          }
+          const originalName = path.basename(artifact.relative);
+          const clientMediaType = applicationAttachmentMediaType(originalName);
+          const artifactBuffer = await readFile(artifact.absolute);
+          const result = await mutateApplicationAttachments(
+            internal.outputDir,
+            deliveryStateWriter,
+            () => createApplicationAttachment(internal.outputDir, {
+              jobId: id,
+              noteId: String(body?.noteId || ''),
+              source: 'job_artifact',
+              displayName: body?.displayName || originalName,
+              generatedFrom: `artifact:${String(body?.artifactId || '')}`,
+              draftId: body?.draftId,
+              draftVersion: body?.draftVersion,
+              selected: body?.selected !== false,
+              file: {
+                originalName,
+                clientMediaType,
+                buffer: artifactBuffer,
+              },
+            }, deliveryAttachmentLimits),
+          );
+          return json(res, result.duplicate ? 200 : 201, result);
+        }
+        if (parts[3] === 'application-attachments' && parts[4] === 'from-cover-letter' && parts.length === 5 && req.method === 'POST') {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const noteId = String(body?.noteId || '').trim();
+          const draftId = String(body?.draftId || '').trim();
+          const draftVersion = Number(body?.draftVersion);
+          if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+          if (!draftId || !Number.isInteger(draftVersion) || draftVersion < 1) {
+            throw applicationDraftError('DRAFT_VERSION_REQUIRED', 'A saved draft version is required to export the Cover Letter.');
+          }
+          const record = await readApplicationRecord(internal.outputDir, noteId);
+          const savedDraft = await withDeliveryStateLock(internal.outputDir, async () => {
+            const state = await readDeliveryState(internal.outputDir);
+            return resolveStoredDraftForAction(record, state[noteId] || {}, {
+              draftId,
+              version: draftVersion,
+            });
+          });
+          const content = String(savedDraft.content.cover_letter || '').trim();
+          if (!content) throw new ValidationError('The saved Cover Letter is empty.');
+          const title = String(record?.title || noteId).replace(/[\\/:*?"<>|]/gu, '-').slice(0, 80) || noteId;
+          const originalName = `${title}-Cover-Letter.txt`;
+          const result = await mutateApplicationAttachments(
+            internal.outputDir,
+            deliveryStateWriter,
+            () => createApplicationAttachment(internal.outputDir, {
+              jobId: id,
+              noteId,
+              source: 'generated_cover_letter',
+              displayName: originalName,
+              generatedFrom: `draft:${savedDraft.draftId}:v${savedDraft.version}`,
+              draftId: savedDraft.draftId,
+              draftVersion: savedDraft.version,
+              selected: body?.selected !== false,
+              file: {
+                originalName,
+                clientMediaType: 'text/plain',
+                buffer: Buffer.from(content, 'utf8'),
+              },
+            }, deliveryAttachmentLimits),
+          );
+          return json(res, result.duplicate ? 200 : 201, result);
+        }
+        if (parts[3] === 'application-attachments' && parts[4] === 'from-profile' && parts.length === 5 && req.method === 'POST') {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const profileId = String(body?.profileId || '').trim();
+          if (!profileId || profileId !== String(internal.params?.profileId || '')) {
+            throw applicationDraftError(
+              'PROFILE_SOURCE_JOB_MISMATCH',
+              'The selected candidate profile is not attached to this Job.',
+            );
+          }
+          if (typeof profileStore?.readSourceFile !== 'function') {
+            throw applicationDraftError('PROFILE_SOURCE_UNAVAILABLE', 'Candidate profile sources are unavailable.');
+          }
+          const file = await profileStore.readSourceFile(profileId, body?.sourceFile);
+          const result = await mutateApplicationAttachments(
+            internal.outputDir,
+            deliveryStateWriter,
+            () => createApplicationAttachment(internal.outputDir, {
+              jobId: id,
+              noteId: String(body?.noteId || ''),
+              source: 'candidate_profile',
+              displayName: body?.displayName || file.originalName,
+              generatedFrom: `candidate_profile:${profileId}`,
+              draftId: body?.draftId,
+              draftVersion: body?.draftVersion,
+              selected: body?.selected !== false,
+              file,
+            }, deliveryAttachmentLimits),
+          );
+          return json(res, result.duplicate ? 200 : 201, result);
+        }
+        if (parts[3] === 'application-attachments' && parts[4] && parts[5] === 'content' && parts.length === 6 && req.method === 'GET') {
+          const file = await resolveApplicationAttachmentDownload(internal.outputDir, parts[4]);
+          res.writeHead(200, {
+            'Content-Type': file.attachment.mediaType,
+            'Content-Length': file.size,
+            'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(file.attachment.displayName)}`,
+            'Cache-Control': 'private, no-store',
+          });
+          return file.stream().pipe(res);
+        }
+        if (parts[3] === 'application-attachments' && parts[4] && parts.length === 5 && req.method === 'PATCH') {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          return json(res, 200, await mutateApplicationAttachments(
+            internal.outputDir,
+            deliveryStateWriter,
+            () => updateApplicationAttachment(
+              internal.outputDir,
+              parts[4],
+              body,
+              deliveryAttachmentLimits,
+            ),
+          ));
+        }
+        if (parts[3] === 'application-attachments' && parts[4] && parts.length === 5 && req.method === 'DELETE') {
+          return json(res, 200, await mutateApplicationAttachments(
+            internal.outputDir,
+            deliveryStateWriter,
+            () => deleteApplicationAttachment(internal.outputDir, parts[4]),
+          ));
+        }
         if (req.method === 'POST' && parts[3] === 'delivery' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           return json(res, 200, await updateDeliveryState(internal.outputDir, body));
@@ -758,7 +949,21 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             ai,
             internal.params?.candidateProfile,
             deliveryStateWriter,
+            deliveryAttachmentLimits,
           ));
+        }
+        if (req.method === 'POST' && parts[3] === 'send-email' && parts[4] === 'preview' && parts.length === 5) {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const replyTo = String(internal.params?.candidateProfile?.email || '').trim();
+          return json(res, 200, await previewApplicationEmail(
+            internal.outputDir,
+            body,
+            replyTo,
+             deliveryMailer,
+             smtpConfig,
+             deliveryAttachmentLimits,
+             deliveryStateWriter,
+           ));
         }
         if (req.method === 'POST' && parts[3] === 'send-email' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
@@ -769,11 +974,12 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             deliveryMailer,
             replyTo,
             smtpConfig,
-            {
-              writeState: deliveryStateWriter,
-              appendAudit: sendAuditAppender,
-              readAudit: sendAuditReader,
-            },
+             {
+               writeState: deliveryStateWriter,
+               appendAudit: sendAuditAppender,
+               readAudit: sendAuditReader,
+               attachmentLimits: deliveryAttachmentLimits,
+             },
           )));
         }
         if (req.method === 'GET' && parts[3] === 'artifacts' && parts.length === 4) {
@@ -810,6 +1016,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           postId: error.postId || (parts[5] ? safeDecodePathSegment(parts[5]) : null),
           runId: error.runId || (parts[7] === 'runs' && parts[8] ? safeDecodePathSegment(parts[8]) : null),
         }));
+      }
+      if (error instanceof AttachmentError || String(error.code || '').startsWith('ATTACHMENT_')) {
+        return json(res, Number(error.status || 400), errorBody(error.code || 'ATTACHMENT_INVALID', error.message));
       }
       if (error instanceof ValidationError) return json(res, 400, errorBody('VALIDATION_ERROR', error.message, error.details));
       if (error.code === 'DRAFT_VERSION_CONFLICT') {
@@ -865,7 +1074,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'LOCAL_MODEL_VALIDATION') return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'LOCAL_MODEL_BUSY') return json(res, 409, { ...errorBody(error.code, error.message), install: error.install });
       if (error.code === 'LOCAL_MODEL_RUNTIME_UNAVAILABLE') return json(res, 503, errorBody(error.code, error.message));
-      if (error.code === 'PROFILE_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
+      if (['PROFILE_NOT_FOUND', 'PROFILE_SOURCE_NOT_FOUND'].includes(error.code)) return json(res, 404, errorBody(error.code, error.message));
+      if (['PROFILE_SOURCE_JOB_MISMATCH', 'PROFILE_SOURCE_UNAVAILABLE'].includes(error.code)) {
+        return json(res, 409, errorBody(error.code, error.message));
+      }
       if (error.code === 'PROFILE_IMPORT_FAILED') return json(res, 422, errorBody(error.code, error.message));
       if (['MAIL_NOT_CONFIGURED', 'SMTP_NOT_CONFIGURED'].includes(error.code)) return json(res, 503, errorBody(error.code, error.message));
       if (error.code === 'SMTP_CONFIG_CONFLICT') {
@@ -874,7 +1086,14 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           currentRevision: error.currentRevision ?? null,
         });
       }
-      if (['SMTP_NOT_VERIFIED', 'SMTP_VERIFICATION_EXPIRED', 'EMAIL_IDEMPOTENCY_CONFLICT'].includes(error.code)) {
+      if ([
+        'SMTP_NOT_VERIFIED',
+        'SMTP_VERIFICATION_EXPIRED',
+        'EMAIL_IDEMPOTENCY_CONFLICT',
+        'EMAIL_IDEMPOTENCY_REQUIRED',
+        'EMAIL_PREVIEW_REQUIRED',
+        'EMAIL_PREVIEW_STALE',
+      ].includes(error.code)) {
         return json(res, 409, errorBody(error.code, error.message));
       }
       if (error.code === 'SMTP_RATE_LIMITED') return json(res, 429, errorBody(error.code, error.message));
@@ -893,6 +1112,12 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'MAIL_SEND_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'AI_QUALITY_CHECK_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'EMAIL_SEND_STATUS_UNKNOWN') return json(res, 409, errorBody(error.code, error.message));
+      if (error.code === 'DELIVERY_STATE_REVISION_CONFLICT') {
+        return json(res, 409, errorBody(error.code, error.message));
+      }
+      if (['DELIVERY_STATE_INVALID', 'DELIVERY_AUDIT_INVALID'].includes(error.code)) {
+        return json(res, 500, errorBody(error.code, error.message));
+      }
       if (['EMAIL_DELIVERED_AUDIT_STATE_PENDING', 'EMAIL_DELIVERED_AUDIT_UNCERTAIN'].includes(error.code)) {
         return json(res, 500, errorBody(error.code, error.message));
       }
@@ -1584,20 +1809,68 @@ async function readApplicationRecord(outputDir, noteId) {
 async function readDeliveryState(outputDir) {
   try {
     const value = JSON.parse(await readFile(path.join(outputDir, 'delivery-state.json'), 'utf8'));
-    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw deliveryStateInvalid('Delivery state root must be a JSON object.');
+    }
+    return value;
   } catch (error) {
-    if (error.code === 'ENOENT' || error instanceof SyntaxError) return {};
+    if (error.code === 'ENOENT') return {};
+    if (error?.code === 'DELIVERY_STATE_INVALID') throw error;
+    if (error instanceof SyntaxError) throw deliveryStateInvalid('Delivery state JSON is malformed.', error);
     throw error;
   }
 }
 
 function withDeliveryStateLock(outputDir, operation) {
-  const key = path.resolve(outputDir, 'delivery-state.json');
-  const previous = deliveryStateLocks.get(key) || Promise.resolve();
-  const current = previous.catch(() => {}).then(operation);
-  deliveryStateLocks.set(key, current);
-  return current.finally(() => {
-    if (deliveryStateLocks.get(key) === current) deliveryStateLocks.delete(key);
+  return withApplicationDeliveryLock(outputDir, operation);
+}
+
+function deliveryStateInvalid(message, cause) {
+  const error = applicationDraftError('DELIVERY_STATE_INVALID', message);
+  if (cause) error.cause = cause;
+  return error;
+}
+
+async function mutateApplicationAttachments(outputDir, writeState, operation) {
+  return withDeliveryStateLock(outputDir, async () => {
+    const state = await readDeliveryState(outputDir);
+    const result = await operation();
+    if (!result?.attachmentBundleChanged) return result;
+
+    const noteId = String(result.noteId || result.attachment?.noteId || '').trim();
+    if (!NOTE_ID.test(noteId)) {
+      throw new AttachmentError('ATTACHMENT_PATH_INVALID', 'Attachment mutation did not identify a valid note.');
+    }
+    const record = await readApplicationRecord(outputDir, noteId);
+    const existing = state[noteId] || {};
+    const store = draftStoreFor(record, existing);
+    const current = currentDraftVersion(store);
+    if (current.qualityStatus === 'stale') return result;
+
+    const updatedAt = new Date().toISOString();
+    const updatedStore = {
+      ...store,
+      versions: store.versions.map((version) => (
+        Number(version.version) === Number(store.currentVersion)
+          ? {
+              ...version,
+              qualityStatus: 'stale',
+              qualityCheckedVersion: null,
+              qualityCheckedHash: null,
+              qualityReportRef: null,
+              updatedAt,
+            }
+          : { ...version }
+      )),
+    };
+    state[noteId] = {
+      ...existing,
+      updatedAt,
+      draft: { ...current.content },
+      draftStore: updatedStore,
+    };
+    await writeState(outputDir, state);
+    return result;
   });
 }
 
@@ -1630,7 +1903,14 @@ async function updateDeliveryState(outputDir, value) {
     }
 
     const resolved = resolveStoredDraftForAction(record, existing, value);
-    await assertQualityReportReference(outputDir, record, resolved);
+    await assertQualityReportReference(
+      outputDir,
+      record,
+      resolved,
+      null,
+      applicationPeerCorpusHash(savedPeerDrafts(state, noteId)),
+      persistedApplicationContextHash(existing),
+    );
     if (['ready_to_message', 'messaged'].includes(action) && !resolved.content.greeting) {
       throw new ValidationError('Direct-message greeting is required.');
     }
@@ -1681,32 +1961,57 @@ async function updateApplicationDraft(outputDir, value, writeState = writeDelive
     const expectedVersion = isVersionedWrite
       ? Number(suppliedVersion)
       : store.currentVersion;
-    const updatedStore = saveDraftVersion(store, {
+    const savedAt = new Date().toISOString();
+    const savedStore = saveDraftVersion(store, {
       draftId: value?.draftId || store.draftId,
       expectedVersion,
       content: draft,
-      now: new Date(),
+      now: savedAt,
     });
+    const hasApplicationContext = Object.hasOwn(value || {}, 'applicationContext');
+    const applicationContext = hasApplicationContext
+      ? normalizeApplicationContext(value.applicationContext)
+      : persistedApplicationContext(existing);
+    const applicationContextHash = applicationContext
+      ? hashApplicationContext(applicationContext)
+      : null;
+    const contextChanged = hasApplicationContext
+      && applicationContextHash !== persistedApplicationContextHash(existing);
+    const updatedStore = contextChanged
+      ? staleCurrentDraftQuality(savedStore, new Date().toISOString())
+      : savedStore;
     const updated = currentDraftVersion(updatedStore);
     state[noteId] = {
       ...existing,
       action: 'draft_saved',
-      updatedAt: updated.updatedAt,
+      updatedAt: contextChanged ? savedAt : updated.updatedAt,
       draft: { ...updated.content },
       draftStore: updatedStore,
       draftWriteProtocol: isVersionedWrite ? 'versioned' : (writeProtocol || 'legacy'),
+      ...(hasApplicationContext ? { applicationContext, applicationContextHash } : {}),
     };
     await writeState(outputDir, state);
     return {
       noteId,
-      outreach: { ...updated.content },
+      outreach: {
+        ...updated.content,
+        ...(applicationContext ? { applicationContext } : {}),
+      },
       draftVersion: draftVersionMetadata(updatedStore),
       delivery: publicDeliveryState(state[noteId]),
     };
   });
 }
 
-async function recheckApplicationDraft(outputDir, value, checker, ai, candidateProfile, writeState = writeDeliveryState) {
+async function recheckApplicationDraft(
+  outputDir,
+  value,
+  checker,
+  ai,
+  candidateProfile,
+  writeState = writeDeliveryState,
+  limits = attachmentLimits(),
+) {
   const noteId = String(value?.noteId || '').trim();
   if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
   const record = await readApplicationRecord(outputDir, noteId);
@@ -1729,11 +2034,31 @@ async function recheckApplicationDraft(outputDir, value, checker, ai, candidateP
     if (hashDraftContent(current.content) !== current.contentHash) {
       throw applicationDraftError('DRAFT_CONTENT_HASH_MISMATCH', 'Stored draft content no longer matches its content hash.');
     }
+    const attachmentBundle = await resolveSelectedApplicationAttachments(
+      outputDir,
+      noteId,
+      Object.hasOwn(value || {}, 'attachmentIds') ? value.attachmentIds : undefined,
+      limits,
+    );
+    const blockingWarning = attachmentConsistencyWarnings(current.content.email_body, attachmentBundle.snapshots)
+      .find((item) => item.blocking);
+    if (blockingWarning) throw new AttachmentError(blockingWarning.code, blockingWarning.message);
+    const peerDrafts = savedPeerDrafts(state, noteId);
+    const applicationContext = resolveApplicationContext(record, existing, value);
     return {
       draftId: store.draftId,
       version: current.version,
       contentHash: current.contentHash,
       content: { ...current.content },
+      attachmentBundleHash: attachmentBundle.attachmentBundleHash,
+      peerCorpusHash: applicationPeerCorpusHash(peerDrafts),
+      attachmentContext: normalizedAttachmentContext(
+        attachmentBundle,
+        peerDrafts,
+      ),
+      applicationContext,
+      applicationContextHash: hashApplicationContext(applicationContext),
+      persistedApplicationContextHash: persistedApplicationContextHash(existing),
     };
   });
 
@@ -1741,9 +2066,11 @@ async function recheckApplicationDraft(outputDir, value, checker, ai, candidateP
   let report;
   try {
     report = await checker({
-      record,
+      record: { ...record, applicationContext: snapshot.applicationContext },
       draft: snapshot.content,
       candidateProfile: candidateProfile || record?.candidate_profile || {},
+      attachmentContext: snapshot.attachmentContext,
+      applicationContext: snapshot.applicationContext,
       threshold,
     }, ai);
   } catch (error) {
@@ -1768,17 +2095,48 @@ async function recheckApplicationDraft(outputDir, value, checker, ai, candidateP
     ) {
       throw draftVersionConflict(snapshot.version, store.currentVersion);
     }
+    const currentAttachments = await resolveSelectedApplicationAttachments(
+      outputDir,
+      noteId,
+      Object.hasOwn(value || {}, 'attachmentIds') ? value.attachmentIds : undefined,
+      limits,
+    );
+    if (currentAttachments.attachmentBundleHash !== snapshot.attachmentBundleHash) {
+      throw new AttachmentError(
+        'ATTACHMENT_BUNDLE_CHANGED',
+        'The selected attachment bundle changed while quality checking was in progress.',
+        409,
+      );
+    }
+    if (applicationPeerCorpusHash(savedPeerDrafts(state, noteId)) !== snapshot.peerCorpusHash) {
+      throw applicationDraftError(
+        'DRAFT_PEER_CORPUS_CHANGED',
+        'Another saved application email changed while quality checking was in progress.',
+      );
+    }
+    if (persistedApplicationContextHash(existing) !== snapshot.persistedApplicationContextHash) {
+      throw applicationDraftError(
+        'DRAFT_APPLICATION_CONTEXT_CHANGED',
+        'The application context changed while quality checking was in progress.',
+      );
+    }
     const checkedAt = new Date().toISOString();
     const evaluation = normalizeDraftQualityReport(report, record?.cover_letter_evaluation);
     const qualityChecks = Array.isArray(existing.qualityChecks) ? existing.qualityChecks : [];
     const qualityCheckId = `quality_${randomUUID()}`;
     const qualityReportRef = `delivery-state.json#/${jsonPointerToken(noteId)}/qualityChecks/${qualityChecks.length}`;
     const qualityCheck = {
+      evidenceSchemaVersion: 2,
       id: qualityCheckId,
       draftId: snapshot.draftId,
       version: snapshot.version,
       contentHash: snapshot.contentHash,
       checkedAt,
+      attachmentBundleHash: snapshot.attachmentBundleHash,
+      peerCorpusHash: snapshot.peerCorpusHash,
+      attachmentContext: snapshot.attachmentContext,
+      applicationContext: snapshot.applicationContext,
+      applicationContextHash: snapshot.applicationContextHash,
       evaluation,
     };
     const updatedStore = bindDraftQuality(store, {
@@ -1796,11 +2154,13 @@ async function recheckApplicationDraft(outputDir, value, checker, ai, candidateP
       draft: { ...current.content },
       draftStore: updatedStore,
       qualityChecks: [...qualityChecks, qualityCheck],
+      applicationContext: snapshot.applicationContext,
+      applicationContextHash: snapshot.applicationContextHash,
     };
     await writeState(outputDir, state);
     return {
       noteId,
-      outreach: { ...current.content },
+      outreach: { ...current.content, applicationContext: snapshot.applicationContext },
       draftVersion: draftVersionMetadata(updatedStore),
       cover_letter_evaluation: evaluation,
       delivery: publicDeliveryState(state[noteId]),
@@ -1808,13 +2168,257 @@ async function recheckApplicationDraft(outputDir, value, checker, ai, candidateP
   });
 }
 
-async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfig, options = {}) {
+export async function previewApplicationEmail(outputDir, value, replyTo, mailer, smtpConfig, limits, writeState = writeDeliveryState) {
+  const noteId = String(value?.noteId || '').trim();
+  if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+  const record = await readApplicationRecord(outputDir, noteId);
+  const extracted = extractedEmails(record);
+  const requested = String(value?.to || '').trim().toLowerCase();
+  const recipient = extracted.find((item) => item.toLowerCase() === requested) || (!requested ? extracted[0] : '');
+  if (!recipient) throw new ValidationError('Recipient must be an email extracted from this application record.');
+  return withDeliveryStateLock(outputDir, async () => {
+    const state = await readDeliveryState(outputDir);
+    const existing = state[noteId] || {};
+    const bundle = await resolveApplicationAttachments(outputDir, noteId, value?.attachmentIds, limits);
+    const resolved = resolveStoredDraftForAction(record, existing, value);
+    const draft = { ...resolved.content };
+    if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
+    validateDeliveryDraft(draft, record);
+    const peerCorpusHash = applicationPeerCorpusHash(savedPeerDrafts(state, noteId));
+    const applicationContextHash = persistedApplicationContextHash(existing);
+    await assertQualityReportReference(
+      outputDir,
+      record,
+      resolved,
+      bundle.attachmentBundleHash,
+      peerCorpusHash,
+      applicationContextHash,
+    );
+    const quality = previewQualityResult(
+      existing,
+      resolved,
+      record,
+      bundle.attachmentBundleHash,
+      peerCorpusHash,
+      applicationContextHash,
+    );
+    const smtp = smtpConfigurationContext(mailer, smtpConfig);
+    const warnings = [
+      ...attachmentConsistencyWarnings(draft.email_body, bundle.snapshots),
+      ...smtpPreviewWarnings(smtp),
+    ];
+    const preview = buildEmailPreview({
+      noteId,
+      recipient,
+      from: smtp.from,
+      replyTo: EMAIL.test(replyTo) ? replyTo : '',
+      subject: draft.email_subject,
+      text: draft.email_body,
+      draftId: resolved.draftId,
+      draftVersion: resolved.version,
+      contentHash: resolved.contentHash,
+      quality,
+      attachmentSummary: bundle.summary,
+      attachmentBundleHash: bundle.attachmentBundleHash,
+      smtpConfigurationRevision: smtp.revision,
+      smtpConfigurationFingerprint: smtp.fingerprint,
+      smtp: {
+        configured: smtp.configured,
+        verificationStatus: smtp.verificationStatus,
+        verificationFailureCode: smtp.verificationFailureCode,
+      },
+      warnings,
+    });
+    const previewedAt = new Date().toISOString();
+    state[noteId] = {
+      ...existing,
+      ...deliveryStatusPatch(existing, preview.readiness === 'ready' ? 'preview_ready' : 'blocked', previewedAt),
+      action: 'email_previewed',
+      updatedAt: previewedAt,
+      preview: {
+        previewRevision: preview.previewRevision,
+        attachmentBundleHash: preview.attachmentBundleHash,
+        draftId: preview.draftId,
+        draftVersion: preview.draftVersion,
+        readiness: preview.readiness,
+        preparedAt: previewedAt,
+      },
+    };
+    await writeState(outputDir, state);
+    return preview;
+  });
+}
+
+function previewQualityResult(
+  existing,
+  resolved,
+  record,
+  attachmentBundleHash = null,
+  peerCorpusHash = null,
+  applicationContextHash = null,
+) {
+  const exact = [...(Array.isArray(existing?.qualityChecks) ? existing.qualityChecks : [])]
+    .reverse()
+    .find((item) => (
+      item?.draftId === resolved.draftId
+      && Number(item?.version) === Number(resolved.version)
+      && item?.contentHash === resolved.contentHash
+      && qualityAttachmentBundleMatches(item, attachmentBundleHash)
+      && qualityPeerCorpusMatches(item, peerCorpusHash)
+      && qualityApplicationContextMatches(item, applicationContextHash)
+    ));
+  const legacy = applicationContextHash === null
+    && Number(resolved.version) === 1
+    && attachmentBundleHash === emptyAttachmentBundleHash()
+    ? record?.cover_letter_evaluation
+    : null;
+  return {
+    ...draftVersionMetadata(resolved.store),
+    checkedAt: exact?.checkedAt || null,
+    evaluation: exact?.evaluation || legacy || null,
+  };
+}
+
+function qualityAttachmentBundleMatches(check, attachmentBundleHash) {
+  if (attachmentBundleHash === null) return true;
+  if (check?.attachmentBundleHash) return check.attachmentBundleHash === attachmentBundleHash;
+  return attachmentBundleHash === emptyAttachmentBundleHash();
+}
+
+function qualityPeerCorpusMatches(check, peerCorpusHash) {
+  if (peerCorpusHash === null) return true;
+  if (!check?.peerCorpusHash) return Number(check?.evidenceSchemaVersion || 0) < 2;
+  return check.peerCorpusHash === peerCorpusHash;
+}
+
+function qualityApplicationContextMatches(check, applicationContextHash) {
+  if (applicationContextHash === null) return !check?.applicationContextHash;
+  return check?.applicationContextHash === applicationContextHash;
+}
+
+function emptyAttachmentBundleHash() {
+  return createHash('sha256').update('application-attachments:v1\n[]', 'utf8').digest('hex');
+}
+
+function smtpConfigurationContext(mailer, smtpConfig) {
+  const publicConfig = smtpConfig?.getPublic?.() || {};
+  const verification = smtpConfig?.getVerificationState?.() || {};
+  const snapshot = smtpConfig?.getVerificationSnapshot?.() || {};
+  const mailerStatus = mailer?.status?.() || {};
+  const verifiedAt = String(verification.verifiedAt || publicConfig.lastVerifiedAt || publicConfig.verifiedAt || '');
+  const verificationStatus = String(
+    verification.verificationStatus
+      || publicConfig.verificationStatus
+      || (publicConfig.verified === true || (verifiedAt && Number.isFinite(Date.parse(verifiedAt))) ? 'verified' : 'unverified'),
+  );
+  const revision = Number(publicConfig.revision ?? snapshot.revision ?? 0);
+  const configHash = String(verification.configHash || publicConfig.configHash || snapshot.configHash || snapshot.fingerprint || '');
+  const credentialRevision = Number(verification.credentialRevision ?? publicConfig.credentialRevision ?? snapshot.credentialRevision ?? 0);
+  const fingerprint = createHash('sha256').update(JSON.stringify([
+    'smtp-configuration:v1',
+    revision,
+    configHash,
+    credentialRevision,
+  ])).digest('hex');
+  return {
+    configured: Boolean(verification.configured ?? mailerStatus.configured),
+    from: String(publicConfig.from || mailerStatus.from || ''),
+    revision,
+    configHash,
+    credentialRevision,
+    fingerprint,
+    verificationStatus,
+    verificationFailureCode: String(verification.verificationFailureCode || publicConfig.verificationFailureCode || ''),
+  };
+}
+
+function smtpPreviewWarnings(smtp) {
+  if (!smtp.configured) {
+    return [{ code: 'SMTP_NOT_CONFIGURED', message: 'SMTP is not configured.', blocking: true }];
+  }
+  if (smtp.verificationStatus !== 'verified') {
+    const code = smtp.verificationStatus === 'expired' ? 'SMTP_VERIFICATION_EXPIRED' : 'SMTP_NOT_VERIFIED';
+    return [{ code, message: 'SMTP configuration must be verified before sending.', blocking: true }];
+  }
+  return [];
+}
+
+function attachmentConsistencyWarnings(text, attachments) {
+  const body = String(text || '');
+  const claimsAttachment = /(?:附件|随信|附上|简历见附|resume\s+attached|attached\s+(?:my\s+)?resume)/iu.test(body);
+  const hasResume = attachments.some((item) => /(?:简历|resume|cv)/iu.test(item.filename));
+  const claimsResume = /(?:附件.{0,8}简历|附上.{0,8}简历|简历.{0,8}附件|resume\s+attached|attached\s+(?:my\s+)?resume)/iu.test(body);
+  const warnings = [];
+  if (claimsAttachment && attachments.length === 0) {
+    warnings.push({ code: 'ATTACHMENT_CLAIM_WITHOUT_FILE', message: '正文提到附件，但本次发送没有选择任何附件。', blocking: true });
+  }
+  if (claimsResume && !hasResume) {
+    warnings.push({ code: 'RESUME_CLAIM_WITHOUT_RESUME', message: '正文声称附有简历，但所选附件中没有简历。', blocking: true });
+  }
+  if (attachments.length > 0 && !claimsAttachment) {
+    warnings.push({ code: 'ATTACHMENTS_NOT_MENTIONED', message: '本次将发送附件，但正文没有说明附件内容。', blocking: false });
+  }
+  return warnings;
+}
+
+function normalizedAttachmentContext(bundle, peerDrafts = []) {
+  return {
+    schemaVersion: 1,
+    attachmentBundleHash: bundle.attachmentBundleHash,
+    count: Number(bundle.summary?.count || 0),
+    totalBytes: Number(bundle.summary?.totalBytes || 0),
+    attachments: (Array.isArray(bundle.snapshots) ? bundle.snapshots : []).map((item) => ({
+      attachmentId: String(item.attachmentId || ''),
+      filename: String(item.filename || ''),
+      mediaType: String(item.mediaType || ''),
+      size: Number(item.size || 0),
+      sha256: String(item.sha256 || ''),
+    })),
+    peerDrafts: peerDrafts.map((item) => ({ ...item })),
+  };
+}
+
+function savedPeerDrafts(state, currentNoteId) {
+  return Object.entries(state || {})
+    .flatMap(([noteId, entry]) => {
+      if (noteId === currentNoteId || !NOTE_ID.test(noteId) || !entry || typeof entry !== 'object') return [];
+      const directBody = String(entry.draft?.email_body || '').trim();
+      const currentVersion = Number(entry.draftStore?.currentVersion);
+      const version = Array.isArray(entry.draftStore?.versions)
+        ? entry.draftStore.versions.find((item) => Number(item?.version) === currentVersion)
+        : null;
+      const emailBody = directBody || String(version?.content?.email_body || '').trim();
+      return emailBody ? [{ noteId, emailBody }] : [];
+    })
+    .sort((left, right) => left.noteId.localeCompare(right.noteId));
+}
+
+function applicationPeerCorpusHash(peerDrafts) {
+  const normalized = (Array.isArray(peerDrafts) ? peerDrafts : []).map((item) => [
+    String(item?.noteId || ''),
+    createHash('sha256').update(String(item?.emailBody || ''), 'utf8').digest('hex'),
+  ]);
+  return createHash('sha256').update(JSON.stringify(['application-peer-corpus:v1', normalized]), 'utf8').digest('hex');
+}
+
+export async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfig, options = {}) {
   const writeState = options.writeState || writeDeliveryState;
   const appendAudit = options.appendAudit || appendSendAuditJournal;
   const readAudit = options.readAudit || readSendAuditJournal;
+  const limits = options.attachmentLimits || attachmentLimits();
   const noteId = String(value?.noteId || '').trim();
   if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+  const modernRequest = Object.hasOwn(value || {}, 'attachmentIds');
   const requestIdempotencyKey = normalizeSendRequestKey(value?.idempotencyKey);
+  if (modernRequest && !requestIdempotencyKey) {
+    throw applicationDraftError('EMAIL_IDEMPOTENCY_REQUIRED', 'A modern send request requires an idempotencyKey.');
+  }
+  if (modernRequest && (!value?.attachmentBundleHash || !value?.previewRevision)) {
+    throw applicationDraftError(
+      'EMAIL_PREVIEW_REQUIRED',
+      'A modern send request requires the attachment bundle hash and preview revision returned by the preview endpoint.',
+    );
+  }
   const record = await readApplicationRecord(outputDir, noteId);
   const extracted = extractedEmails(record);
   const requested = String(value?.to || '').trim().toLowerCase();
@@ -1823,17 +2427,77 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
 
   return withDeliveryStateLock(outputDir, async () => {
     const state = await readDeliveryState(outputDir);
-    const existing = state[noteId] || {};
+    let existing = state[noteId] || {};
+    const journalAudits = await readAudit(outputDir);
+    const recovered = await recoverDurableEmailDelivery({
+      outputDir,
+      noteId,
+      requestIdempotencyKey,
+      requestPreviewRevision: String(value?.previewRevision || ''),
+      state,
+      existing,
+      record,
+      recipient: to,
+      appendAudit,
+      writeState,
+      journalAudits,
+    });
+    if (recovered) return recovered;
+    existing = state[noteId] || {};
     const resolved = resolveStoredDraftForAction(record, existing, value);
-    await assertQualityReportReference(outputDir, record, resolved);
     const draft = { ...resolved.content };
     if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
     validateDeliveryDraft(draft, record);
+    const attachmentBundle = await resolveApplicationAttachments(outputDir, noteId, value?.attachmentIds, limits);
+    const peerCorpusHash = applicationPeerCorpusHash(savedPeerDrafts(state, noteId));
+    await assertQualityReportReference(
+      outputDir,
+      record,
+      resolved,
+      attachmentBundle.attachmentBundleHash,
+      peerCorpusHash,
+      persistedApplicationContextHash(existing),
+    );
+    const warnings = attachmentConsistencyWarnings(draft.email_body, attachmentBundle.snapshots);
+    const blockingWarning = warnings.find((item) => item.blocking);
+    if (blockingWarning) throw new AttachmentError(blockingWarning.code, blockingWarning.message);
+    const smtpPreview = smtpConfigurationContext(mailer, smtpConfig);
+    const preview = buildEmailPreview({
+      noteId,
+      recipient: to,
+      from: smtpPreview.from,
+      replyTo: EMAIL.test(replyTo) ? replyTo : '',
+      subject: draft.email_subject,
+      text: draft.email_body,
+      draftId: resolved.draftId,
+      draftVersion: resolved.version,
+      contentHash: resolved.contentHash,
+      quality: previewQualityResult(
+        existing,
+        resolved,
+        record,
+        attachmentBundle.attachmentBundleHash,
+        peerCorpusHash,
+        persistedApplicationContextHash(existing),
+      ),
+      attachmentSummary: attachmentBundle.summary,
+      attachmentBundleHash: attachmentBundle.attachmentBundleHash,
+      smtpConfigurationRevision: smtpPreview.revision,
+      smtpConfigurationFingerprint: smtpPreview.fingerprint,
+      warnings,
+    });
+    if (value?.attachmentBundleHash && value.attachmentBundleHash !== attachmentBundle.attachmentBundleHash) {
+      throw new AttachmentError('ATTACHMENT_BUNDLE_CHANGED', 'The selected attachment bundle changed after preview.', 409);
+    }
+    if (value?.previewRevision && value.previewRevision !== preview.previewRevision) {
+      throw applicationDraftError('EMAIL_PREVIEW_STALE', 'The email preview is stale; review the current message before sending.');
+    }
     const idempotencyKey = sendIdempotencyKey({
       draftId: resolved.draftId,
       version: resolved.version,
       contentHash: resolved.contentHash,
       recipient: to,
+      attachmentBundleHash: attachmentBundle.attachmentBundleHash,
     });
     const sendIdentity = {
       draftId: resolved.draftId,
@@ -1841,9 +2505,17 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
       contentHash: resolved.contentHash,
       recipient: to,
       recipientHash: recipientAuditHash(to),
+      attachmentBundleHash: attachmentBundle.attachmentBundleHash,
+      attachmentCount: attachmentBundle.summary.count,
       idempotencyKey,
     };
-    const journalAudits = await readAudit(outputDir);
+    const auditAttachmentDetails = {
+      attachmentBundleHash: attachmentBundle.attachmentBundleHash,
+      attachmentCount: attachmentBundle.summary.count,
+      attachmentBytes: attachmentBundle.summary.totalBytes,
+      attachments: attachmentBundle.snapshots,
+      previewRevision: preview.previewRevision,
+    };
     assertSendRequestKeyAvailable(
       [
         ...Object.values(state).flatMap((item) => Array.isArray(item?.sendAudit) ? item.sendAudit : []),
@@ -1870,6 +2542,7 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
       const reconciledAt = journalAudit.sentAt || journalAudit.timestamp || new Date().toISOString();
       const reconciled = stateWithoutPendingSend({
         ...existing,
+        ...deliveryStatusPatch(existing, 'sent', reconciledAt),
         action: 'email_sent',
         updatedAt: reconciledAt,
         draft,
@@ -1894,12 +2567,6 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
         sendIdempotencyKey: idempotencyKey,
       };
     }
-    if (existing.pendingSend) {
-      throw applicationDraftError(
-        'EMAIL_SEND_STATUS_UNKNOWN',
-        'A previous email attempt has a persisted send intent without a confirmed audit; retry is blocked to prevent duplicate delivery.',
-      );
-    }
     let smtpState = assertSmtpVerified(mailer, smtpConfig);
     const verificationSnapshot = smtpConfig?.getVerificationSnapshot?.() || {
       configHash: smtpState?.configHash || '',
@@ -1916,6 +2583,7 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
       ).catch(() => {});
       const failedAt = new Date().toISOString();
       const failureAudit = createSendAuditRecord(sendIdentity, {
+        ...auditAttachmentDetails,
         requestIdempotencyKey,
         smtpState,
         status: 'failed',
@@ -1925,6 +2593,7 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
       });
       state[noteId] = {
         ...existing,
+        ...deliveryStatusPatch(existing, 'failed', failedAt),
         action: 'email_failed',
         updatedAt: failedAt,
         draft,
@@ -1935,34 +2604,86 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
       await writeState(outputDir, state);
       throw error;
     }
+    const smtpConfiguration = smtpConfigurationContext(mailer, smtpConfig);
+    if (modernRequest && (
+      smtpConfiguration.revision !== smtpPreview.revision
+      || smtpConfiguration.fingerprint !== smtpPreview.fingerprint
+    )) {
+      throw applicationDraftError(
+        'EMAIL_PREVIEW_STALE',
+        'The SMTP configuration changed during verification; review the current message before sending.',
+      );
+    }
+    smtpState = {
+      ...smtpState,
+      smtpConfigurationRevision: smtpConfiguration.revision,
+      smtpConfigurationFingerprint: smtpConfiguration.fingerprint,
+    };
     const preparedAt = new Date().toISOString();
-    state[noteId] = {
+    const sendBundle = await prepareSendBundle(outputDir, attachmentBundle);
+    const pendingSend = {
+      ...sendIdentity,
+      ...auditAttachmentDetails,
+      noteId,
+      sendId: sendBundle.sendId,
+      requestIdempotencyKey,
+      configHash: smtpState?.configHash || '',
+      credentialRevision: Number(smtpState?.credentialRevision || 0),
+      smtpConfigurationRevision: smtpConfiguration.revision,
+      smtpConfigurationFingerprint: smtpConfiguration.fingerprint,
+      preparedAt,
+      qualityReportRef: resolved.qualityReportRef,
+    };
+    try {
+      await sealPreparedSendBundle(sendBundle, {
+        ...pendingSend,
+        recipient: to,
+        draftVersion: resolved.version,
+        attachments: attachmentBundle.attachments,
+      });
+    } catch (error) {
+      await discardSendBundle(sendBundle);
+      throw error;
+    }
+    const preparingState = {
       ...existing,
+      ...deliveryStatusPatch(existing, 'preparing', preparedAt),
+    };
+    state[noteId] = {
+      ...preparingState,
+      ...deliveryStatusPatch(preparingState, 'sending', preparedAt),
       draft,
       draftStore: resolved.store,
       updatedAt: preparedAt,
-      pendingSend: {
-        ...sendIdentity,
-        requestIdempotencyKey,
-        configHash: smtpState?.configHash || '',
-        credentialRevision: Number(smtpState?.credentialRevision || 0),
-        preparedAt,
-        qualityReportRef: resolved.qualityReportRef,
-      },
+      pendingSend,
     };
-    await writeState(outputDir, state);
+    try {
+      await writeState(outputDir, state);
+    } catch (error) {
+      await discardSendBundle(sendBundle);
+      throw error;
+    }
     let sent;
     try {
-      sent = await mailer.send({
+      const message = {
         to,
         subject: draft.email_subject,
         text: draft.email_body,
         replyTo: EMAIL.test(replyTo) ? replyTo : '',
-      });
+      };
+      if (sendBundle.mailAttachments.length > 0) message.attachments = sendBundle.mailAttachments;
+      sent = await mailer.send(message);
     } catch (error) {
       const knownNotSent = error?.safeToRetry === true || error?.deliveryStatus === 'not_sent';
       const failedAt = new Date().toISOString();
+      await finalizeSendBundle(sendBundle, {
+        status: knownNotSent ? 'failed' : 'unknown',
+        failedAt,
+        errorCode: String(error?.code || 'SMTP_SEND_FAILED'),
+      }).catch(() => {});
       const failureAudit = createSendAuditRecord(sendIdentity, {
+        ...auditAttachmentDetails,
+        sendId: sendBundle.sendId,
         requestIdempotencyKey,
         smtpState,
         status: knownNotSent ? 'failed' : 'unknown',
@@ -1972,6 +2693,7 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
       });
       const failedState = {
         ...state[noteId],
+        ...deliveryStatusPatch(state[noteId], knownNotSent ? 'failed' : 'unknown', failedAt),
         action: knownNotSent ? 'email_failed' : 'email_unknown',
         updatedAt: failedAt,
         email: { status: knownNotSent ? 'failed' : 'unknown', to, failedAt },
@@ -1982,7 +2704,28 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
       throw error;
     }
     const sentAt = new Date().toISOString();
+    try {
+      await finalizeSendBundle(sendBundle, {
+        status: 'sent',
+        sentAt,
+        messageId: sent.messageId || '',
+      });
+    } catch (error) {
+      await persistAcceptedDeliveryUnknown(outputDir, state, noteId, {
+        to,
+        unknownAt: sentAt,
+        messageId: sent.messageId || '',
+      }, writeState);
+      const uncertain = applicationDraftError(
+        'EMAIL_DELIVERED_AUDIT_UNCERTAIN',
+        'SMTP accepted the email, but its immutable send bundle could not be finalized; retry is blocked to prevent duplicate delivery.',
+      );
+      uncertain.cause = error;
+      throw uncertain;
+    }
     const audit = createSendAuditRecord(sendIdentity, {
+      ...auditAttachmentDetails,
+      sendId: sendBundle.sendId,
       requestIdempotencyKey,
       smtpState,
       status: 'sent',
@@ -1995,6 +2738,11 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
     try {
       await appendAudit(outputDir, audit);
     } catch (error) {
+      await persistAcceptedDeliveryUnknown(outputDir, state, noteId, {
+        to,
+        unknownAt: sentAt,
+        messageId: sent.messageId || '',
+      }, writeState);
       const uncertain = applicationDraftError(
         'EMAIL_DELIVERED_AUDIT_UNCERTAIN',
         'SMTP accepted the email, but its durable audit journal could not be written; retry is blocked to prevent duplicate delivery.',
@@ -2004,6 +2752,7 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
     }
     state[noteId] = stateWithoutPendingSend({
       ...state[noteId],
+      ...deliveryStatusPatch(state[noteId], 'sent', sentAt),
       action: 'email_sent',
       updatedAt: sentAt,
       email: {
@@ -2031,6 +2780,8 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
       delivery: publicDeliveryState(state[noteId]),
       duplicate: false,
       sendIdempotencyKey: idempotencyKey,
+      sendId: sendBundle.sendId,
+      attachmentBundleHash: attachmentBundle.attachmentBundleHash,
     };
   });
 }
@@ -2089,6 +2840,86 @@ function draftVersionMetadata(store) {
   return { ...metadata, version: currentVersion };
 }
 
+function normalizeApplicationContext(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const channel = ['email', 'direct_message'].includes(String(source.channel || '').trim())
+    ? String(source.channel).trim()
+    : 'email';
+  const contactStage = ['first_contact', 'follow_up'].includes(String(source.contactStage || '').trim())
+    ? String(source.contactStage).trim()
+    : 'first_contact';
+  const tone = ['formal', 'natural', 'concise'].includes(String(source.tone || '').trim())
+    ? String(source.tone).trim()
+    : 'natural';
+  return {
+    channel,
+    contactStage,
+    tone,
+    resumeAttached: source.resumeAttached === true,
+    coverLetterAttached: source.coverLetterAttached === true,
+    recipientType: String(source.recipientType || '').trim().slice(0, 80) || 'recruiter',
+  };
+}
+
+function hashApplicationContext(value) {
+  const context = normalizeApplicationContext(value);
+  const canonical = JSON.stringify([
+    ['channel', context.channel],
+    ['contactStage', context.contactStage],
+    ['tone', context.tone],
+    ['resumeAttached', context.resumeAttached],
+    ['coverLetterAttached', context.coverLetterAttached],
+    ['recipientType', context.recipientType],
+  ]);
+  return createHash('sha256').update(`application-context:v1\n${canonical}`, 'utf8').digest('hex');
+}
+
+function persistedApplicationContext(state) {
+  if (!state?.applicationContext || typeof state.applicationContext !== 'object' || Array.isArray(state.applicationContext)) {
+    return null;
+  }
+  return normalizeApplicationContext(state.applicationContext);
+}
+
+function persistedApplicationContextHash(state) {
+  const context = persistedApplicationContext(state);
+  return context ? hashApplicationContext(context) : null;
+}
+
+function resolveApplicationContext(record, state, value = {}) {
+  if (Object.hasOwn(value || {}, 'applicationContext')) {
+    return normalizeApplicationContext(value.applicationContext);
+  }
+  const persisted = persistedApplicationContext(state);
+  if (persisted) return persisted;
+  return normalizeApplicationContext(
+    record?.applicationContext
+      ?? record?.application_context
+      ?? record?.outreach?.applicationContext
+      ?? record?.outreach?.application_context,
+  );
+}
+
+function staleCurrentDraftQuality(store, updatedAt) {
+  const current = currentDraftVersion(store);
+  if (current.qualityStatus === 'stale') return store;
+  return {
+    ...store,
+    versions: store.versions.map((version) => (
+      Number(version.version) === Number(store.currentVersion)
+        ? {
+            ...version,
+            qualityStatus: 'stale',
+            qualityCheckedVersion: null,
+            qualityCheckedHash: null,
+            qualityReportRef: null,
+            updatedAt,
+          }
+        : { ...version }
+    )),
+  };
+}
+
 function resolveStoredDraftForAction(record, state, value) {
   const store = draftStoreFor(record, state);
   const requestedVersion = value?.version == null ? store.currentVersion : Number(value.version);
@@ -2112,7 +2943,14 @@ function resolveStoredDraftForAction(record, state, value) {
   return { ...resolved, store };
 }
 
-async function assertQualityReportReference(outputDir, record, resolved) {
+async function assertQualityReportReference(
+  outputDir,
+  record,
+  resolved,
+  attachmentBundleHash = null,
+  peerCorpusHash = null,
+  applicationContextHash = null,
+) {
   const reference = resolved?.qualityReportRef;
   if (typeof reference !== 'string' || !reference.trim()) {
     throw invalidQualityReportReference('The checked draft quality report reference is invalid.');
@@ -2153,9 +2991,14 @@ async function assertQualityReportReference(outputDir, record, resolved) {
   const expectedStatePrefix = `delivery-state.json#/${jsonPointerToken(noteId)}/qualityChecks/`;
   const versionBound = String(report.draftId || '') === resolved.draftId
     && Number(report.version) === resolved.version
-    && String(report.contentHash || '') === resolved.contentHash;
+    && String(report.contentHash || '') === resolved.contentHash
+    && qualityAttachmentBundleMatches(report, attachmentBundleHash)
+    && qualityPeerCorpusMatches(report, peerCorpusHash)
+    && qualityApplicationContextMatches(report, applicationContextHash);
   const legacyBound = reference === expectedLegacyRef
     && resolved.version === 1
+    && applicationContextHash === null
+    && (attachmentBundleHash === null || attachmentBundleHash === emptyAttachmentBundleHash())
     && hashDraftContent(record?.outreach) === resolved.contentHash
     && JSON.stringify(report) === JSON.stringify(record?.cover_letter_evaluation);
   if ((versionBound && !reference.startsWith(expectedStatePrefix)) || (!versionBound && !legacyBound)) {
@@ -2275,8 +3118,9 @@ function sendIdempotencyKey(value) {
     Number(value?.version || 0),
     String(value?.contentHash || ''),
     String(value?.recipient || '').trim().toLowerCase(),
+    String(value?.attachmentBundleHash || ''),
   ]);
-  return createHash('sha256').update(`application-email:v1\n${canonical}`, 'utf8').digest('hex');
+  return createHash('sha256').update(`application-email:v2\n${canonical}`, 'utf8').digest('hex');
 }
 
 function sendAuditMatches(audit, identity) {
@@ -2284,17 +3128,273 @@ function sendAuditMatches(audit, identity) {
   const recipientMatches = audit?.recipientHash
     ? audit.recipientHash === identity.recipientHash
     : String(audit?.recipient || '').toLowerCase() === String(identity.recipient || '').toLowerCase();
+  const attachmentIdentityMatches = audit?.attachmentBundleHash
+    ? audit.attachmentBundleHash === identity.attachmentBundleHash
+      && audit.idempotencyKey === identity.idempotencyKey
+    : Number(identity.attachmentCount || 0) === 0;
   return Boolean(audit)
     && status === 'sent'
     && audit.draftId === identity.draftId
     && Number(audit.version ?? audit.draftVersion) === Number(identity.version)
     && audit.contentHash === identity.contentHash
     && recipientMatches
-    && audit.idempotencyKey === identity.idempotencyKey;
+    && attachmentIdentityMatches;
 }
 
 function findSendAudit(audits, identity) {
   return Array.isArray(audits) ? audits.find((audit) => sendAuditMatches(audit, identity)) || null : null;
+}
+
+async function recoverDurableEmailDelivery({
+  outputDir,
+  noteId,
+  requestIdempotencyKey,
+  requestPreviewRevision,
+  state,
+  existing,
+  record,
+  recipient,
+  appendAudit,
+  writeState,
+  journalAudits,
+}) {
+  const stateAudits = Array.isArray(existing?.sendAudit) ? existing.sendAudit : [];
+  const requestAudit = [...stateAudits, ...journalAudits].find((audit) => (
+    String(audit?.status || 'sent').toLowerCase() === 'sent'
+    && requestIdempotencyKey
+    && String(audit?.requestIdempotencyKey || '') === requestIdempotencyKey
+  ));
+  if (requestAudit) {
+    assertRecoveredRequestMatches(requestAudit, requestPreviewRevision);
+    const journalHasAudit = journalAudits.some((audit) => sameSendEvidence(audit, requestAudit));
+    if (!journalHasAudit) {
+      await appendRecoveredSendAudit(outputDir, appendAudit, sanitizeSendAudit(requestAudit));
+    }
+    return reconcileRecoveredDelivery({
+      outputDir,
+      noteId,
+      state,
+      existing,
+      record,
+      recipient,
+      audit: sanitizeSendAudit(requestAudit),
+      writeState,
+      clearPending: true,
+    });
+  }
+
+  const pending = existing?.pendingSend;
+  if (!pending) return null;
+  const bundle = await readFinalizedSendBundle(outputDir, pending.sendId);
+  if (!durableBundleIdentityMatchesPending(bundle, pending)) {
+    throw applicationDraftError(
+      'EMAIL_SEND_STATUS_UNKNOWN',
+      'A previous email attempt has a persisted send intent without confirmed immutable delivery evidence.',
+    );
+  }
+
+  const pendingRequestKey = String(pending.requestIdempotencyKey || '');
+  const requestMatches = pendingRequestKey === requestIdempotencyKey;
+  if (requestMatches) assertRecoveredRequestMatches(pending, requestPreviewRevision);
+  const identity = {
+    draftId: String(bundle.draftId || pending.draftId || ''),
+    version: Number(bundle.draftVersion ?? pending.version ?? 0),
+    contentHash: String(bundle.contentHash || pending.contentHash || ''),
+    recipient: String(bundle.recipient || recipient || ''),
+    recipientHash: String(bundle.recipientHash || pending.recipientHash || recipientAuditHash(bundle.recipient || recipient)),
+    attachmentBundleHash: String(bundle.attachmentBundleHash || pending.attachmentBundleHash || ''),
+    attachmentCount: Number(bundle.attachmentCount ?? bundle.attachments?.length ?? pending.attachmentCount ?? 0),
+    idempotencyKey: String(bundle.idempotencyKey || pending.idempotencyKey || ''),
+  };
+  if (bundle.status === 'failed') {
+    const failedAt = String(bundle.completedAt || pending.preparedAt || new Date().toISOString());
+    const failureAudit = createSendAuditRecord(identity, {
+      sendId: bundle.sendId,
+      requestIdempotencyKey: pendingRequestKey,
+      smtpState: {
+        configHash: pending.configHash || '',
+        credentialRevision: Number(pending.credentialRevision || 0),
+        smtpConfigurationRevision: Number(bundle.smtpConfigurationRevision || pending.smtpConfigurationRevision || 0),
+        smtpConfigurationFingerprint: String(bundle.smtpConfigurationFingerprint || pending.smtpConfigurationFingerprint || ''),
+      },
+      status: 'failed',
+      errorCode: String(bundle.errorCode || 'SMTP_SEND_FAILED'),
+      timestamp: failedAt,
+      qualityReportRef: bundle.qualityReportRef || pending.qualityReportRef || null,
+      attachmentBundleHash: identity.attachmentBundleHash,
+      attachmentCount: identity.attachmentCount,
+      attachmentBytes: Number(bundle.attachmentBytes ?? pending.attachmentBytes ?? 0),
+      attachments: Array.isArray(bundle.attachments) ? bundle.attachments : pending.attachments,
+      previewRevision: String(bundle.previewRevision || pending.previewRevision || ''),
+    });
+    state[noteId] = stateWithoutPendingSend({
+      ...existing,
+      ...deliveryStatusPatch(existing, 'failed', failedAt),
+      action: 'email_failed',
+      updatedAt: failedAt,
+      email: { status: 'failed', to: identity.recipient, failedAt },
+      sendAudit: appendSendAuditEvent(existing.sendAudit, failureAudit),
+    });
+    await writeState(outputDir, state);
+    return null;
+  }
+  if (bundle.status !== 'sent') {
+    throw applicationDraftError(
+      'EMAIL_SEND_STATUS_UNKNOWN',
+      'A previous email attempt has no immutable proof that SMTP either accepted or rejected it.',
+    );
+  }
+  const sentAt = String(bundle.sentAt || pending.preparedAt || new Date().toISOString());
+  const existingDurableAudit = [...stateAudits, ...journalAudits].find((audit) => (
+    String(audit?.status || '').toLowerCase() === 'sent'
+    && String(audit?.sendId || '') === String(bundle.sendId || '')
+  ));
+  const recoveredAudit = existingDurableAudit || createSendAuditRecord(identity, {
+    sendId: bundle.sendId,
+    requestIdempotencyKey: pendingRequestKey,
+    smtpState: {
+      configHash: pending.configHash || '',
+      credentialRevision: Number(pending.credentialRevision || 0),
+      smtpConfigurationRevision: Number(bundle.smtpConfigurationRevision || pending.smtpConfigurationRevision || 0),
+      smtpConfigurationFingerprint: String(bundle.smtpConfigurationFingerprint || pending.smtpConfigurationFingerprint || ''),
+    },
+    status: 'sent',
+    errorCode: '',
+    timestamp: sentAt,
+    sentAt,
+    qualityReportRef: bundle.qualityReportRef || pending.qualityReportRef || null,
+    messageId: bundle.messageId || '',
+    attachmentBundleHash: identity.attachmentBundleHash,
+    attachmentCount: identity.attachmentCount,
+    attachmentBytes: Number(bundle.attachmentBytes ?? pending.attachmentBytes ?? 0),
+    attachments: Array.isArray(bundle.attachments) ? bundle.attachments : pending.attachments,
+    previewRevision: String(bundle.previewRevision || pending.previewRevision || ''),
+  });
+  if (!journalAudits.some((audit) => sameSendEvidence(audit, recoveredAudit))) {
+    await appendRecoveredSendAudit(outputDir, appendAudit, recoveredAudit);
+  }
+  const response = await reconcileRecoveredDelivery({
+    outputDir,
+    noteId,
+    state,
+    existing,
+    record,
+    recipient: identity.recipient,
+    audit: recoveredAudit,
+    writeState,
+    clearPending: true,
+    sendId: bundle.sendId,
+    attachmentBundleHash: identity.attachmentBundleHash,
+  });
+  if (!requestMatches) {
+    throw applicationDraftError(
+      'EMAIL_IDEMPOTENCY_CONFLICT',
+      'A different email operation was reconciled from the immutable pending send bundle; retry the new operation.',
+    );
+  }
+  return response;
+}
+
+async function reconcileRecoveredDelivery({
+  outputDir,
+  noteId,
+  state,
+  existing,
+  record,
+  recipient,
+  audit,
+  writeState,
+  clearPending,
+  sendId = '',
+  attachmentBundleHash = '',
+}) {
+  const store = draftStoreFor(record, existing);
+  const current = currentDraftVersion(store);
+  const sentAt = String(audit.sentAt || audit.timestamp || new Date().toISOString());
+  let reconciled = {
+    ...existing,
+    ...deliveryStatusPatch(existing, 'sent', sentAt),
+    action: 'email_sent',
+    updatedAt: sentAt,
+    draft: { ...current.content },
+    draftStore: store,
+    email: {
+      status: 'sent',
+      to: String(existing?.email?.to || recipient || ''),
+      sentAt,
+      messageId: String(audit.messageId || ''),
+    },
+    sendAudit: appendUniqueSendAudit(existing.sendAudit, sanitizeSendAudit(audit)),
+  };
+  if (clearPending) reconciled = stateWithoutPendingSend(reconciled);
+  const changed = JSON.stringify(existing) !== JSON.stringify(reconciled);
+  if (changed) {
+    state[noteId] = reconciled;
+    await writeState(outputDir, state);
+  }
+  return {
+    noteId,
+    outreach: { ...current.content },
+    draftVersion: draftVersionMetadata(store),
+    delivery: publicDeliveryState(reconciled),
+    duplicate: true,
+    code: 'EMAIL_DUPLICATE_SEND',
+    sendIdempotencyKey: String(audit.idempotencyKey || ''),
+    ...(sendId || audit.sendId ? { sendId: String(sendId || audit.sendId) } : {}),
+    ...(attachmentBundleHash || audit.attachmentBundleHash
+      ? { attachmentBundleHash: String(attachmentBundleHash || audit.attachmentBundleHash) }
+      : {}),
+  };
+}
+
+function assertRecoveredRequestMatches(evidence, previewRevision) {
+  const storedPreview = String(evidence?.previewRevision || '');
+  if (storedPreview && previewRevision && storedPreview !== previewRevision) {
+    throw applicationDraftError(
+      'EMAIL_IDEMPOTENCY_CONFLICT',
+      'The idempotency key is already bound to a different email preview.',
+    );
+  }
+}
+
+function sameSendEvidence(left, right) {
+  return Boolean(left && right) && (
+    (left.sendId && right.sendId && left.sendId === right.sendId)
+    || (left.idempotencyKey && right.idempotencyKey && left.idempotencyKey === right.idempotencyKey)
+  );
+}
+
+function durableBundleIdentityMatchesPending(bundle, pending) {
+  return Boolean(bundle)
+    && ['prepared', 'sent', 'failed', 'unknown'].includes(String(bundle.status || ''))
+    && bundle.sendId === pending?.sendId
+    && (!pending?.noteId || bundle.noteId === pending.noteId)
+    && bundle.draftId === pending?.draftId
+    && Number(bundle.draftVersion) === Number(pending?.version)
+    && bundle.contentHash === pending?.contentHash
+    && String(bundle.recipient || '').toLowerCase() === String(pending?.recipient || '').toLowerCase()
+    && (!bundle.recipientHash || bundle.recipientHash === pending?.recipientHash)
+    && bundle.attachmentBundleHash === pending?.attachmentBundleHash
+    && Number(bundle.attachmentCount ?? bundle.attachments?.length ?? 0) === Number(pending?.attachmentCount || 0)
+    && Number(bundle.attachmentBytes || 0) === Number(pending?.attachmentBytes || 0)
+    && Number(bundle.smtpConfigurationRevision || 0) === Number(pending?.smtpConfigurationRevision || 0)
+    && String(bundle.smtpConfigurationFingerprint || '') === String(pending?.smtpConfigurationFingerprint || '')
+    && (!bundle.idempotencyKey || bundle.idempotencyKey === pending?.idempotencyKey)
+    && (!bundle.requestIdempotencyKey || bundle.requestIdempotencyKey === String(pending?.requestIdempotencyKey || ''))
+    && (!bundle.previewRevision || bundle.previewRevision === String(pending?.previewRevision || ''));
+}
+
+async function appendRecoveredSendAudit(outputDir, appendAudit, audit) {
+  try {
+    await appendAudit(outputDir, audit);
+  } catch (cause) {
+    const error = applicationDraftError(
+      'EMAIL_DELIVERED_AUDIT_UNCERTAIN',
+      'Immutable delivery evidence exists, but the durable audit journal could not be reconciled.',
+    );
+    error.cause = cause;
+    throw error;
+  }
 }
 
 function appendUniqueSendAudit(audits, audit) {
@@ -2366,10 +3466,24 @@ function createSendAuditRecord(identity, details = {}) {
     version,
     draftVersion: version,
     contentHash: identity.contentHash,
+    sendId: String(details.sendId || ''),
+    attachmentBundleHash: String(details.attachmentBundleHash || identity.attachmentBundleHash || ''),
+    attachmentCount: Number(details.attachmentCount || 0),
+    attachmentBytes: Number(details.attachmentBytes || 0),
+    attachments: Array.isArray(details.attachments) ? details.attachments.map((item) => ({
+      attachmentId: String(item.attachmentId || ''),
+      filename: String(item.filename || ''),
+      mediaType: String(item.mediaType || ''),
+      size: Number(item.size || 0),
+      sha256: String(item.sha256 || ''),
+    })) : [],
+    previewRevision: String(details.previewRevision || ''),
     idempotencyKey: identity.idempotencyKey,
     ...(details.requestIdempotencyKey ? { requestIdempotencyKey: details.requestIdempotencyKey } : {}),
     configHash: String(details.smtpState?.configHash || ''),
     credentialRevision: Number(details.smtpState?.credentialRevision || 0),
+    smtpConfigurationRevision: Number(details.smtpState?.smtpConfigurationRevision ?? details.smtpState?.revision ?? 0),
+    smtpConfigurationFingerprint: String(details.smtpState?.smtpConfigurationFingerprint || ''),
     timestamp: String(details.timestamp || ''),
     errorCode: String(details.errorCode || ''),
     qualityReportRef: details.qualityReportRef || null,
@@ -2381,6 +3495,24 @@ function createSendAuditRecord(identity, details = {}) {
 function stateWithoutPendingSend(state) {
   const { pendingSend: _pendingSend, ...next } = state;
   return next;
+}
+
+async function persistAcceptedDeliveryUnknown(outputDir, state, noteId, details, writeState) {
+  const existing = state[noteId] || {};
+  const unknownAt = String(details?.unknownAt || new Date().toISOString());
+  state[noteId] = {
+    ...existing,
+    ...deliveryStatusPatch(existing, 'unknown', unknownAt),
+    action: 'email_unknown',
+    updatedAt: unknownAt,
+    email: {
+      status: 'unknown',
+      to: String(details?.to || ''),
+      unknownAt,
+      messageId: String(details?.messageId || ''),
+    },
+  };
+  await writeState(outputDir, state).catch(() => {});
 }
 
 function assertSmtpVerified(mailer, smtpConfig) {
@@ -2452,8 +3584,8 @@ function validateDeliveryDraft(draft, record) {
   }
   const candidateName = String(record?.candidate_profile?.name || '').trim();
   const metaScan = candidateName ? combined.replaceAll(candidateName, '') : combined;
-  if (/(?:简历|附件|原帖|岗位提到|候选人|材料显示)/.test(metaScan)) {
-    throw new ValidationError('Email contains unsupported meta wording or refers to an attachment that is not sent.');
+  if (/(?:原帖|岗位提到|候选人|材料显示)/.test(metaScan)) {
+    throw new ValidationError('Email contains unsupported meta wording.');
   }
   const roleName = String(record?.job_card?.role_name || record?.title || '').trim();
   if (roleName && !subject.includes(roleName) && !body.includes(roleName)) {
@@ -2482,15 +3614,30 @@ function mergeApplicationState(record, state, recordIndex, artifactFilename) {
   const store = draftStoreFor(record, state || {}, recordIndex, artifactFilename);
   const current = currentDraftVersion(store);
   const qualityChecks = Array.isArray(state?.qualityChecks) ? state.qualityChecks : [];
+  const recordApplicationContext = record?.outreach?.applicationContext
+    ?? record?.outreach?.application_context
+    ?? record?.applicationContext
+    ?? record?.application_context;
+  const applicationContext = persistedApplicationContext(state)
+    || (recordApplicationContext
+      ? normalizeApplicationContext(recordApplicationContext)
+      : null);
+  const applicationContextHash = persistedApplicationContextHash(state);
   const currentQuality = [...qualityChecks].reverse().find((item) => (
     item?.draftId === store.draftId
     && Number(item?.version) === current.version
     && item?.contentHash === current.contentHash
+    && qualityApplicationContextMatches(item, applicationContextHash)
   ));
   return {
     ...record,
-    outreach: { ...record.outreach, ...current.content },
-    cover_letter_evaluation: currentQuality?.evaluation || record.cover_letter_evaluation,
+    outreach: {
+      ...record.outreach,
+      ...current.content,
+      ...(applicationContext ? { applicationContext } : {}),
+    },
+    cover_letter_evaluation: currentQuality?.evaluation
+      || (applicationContextHash === null ? record.cover_letter_evaluation : null),
     draftVersion: draftVersionMetadata(store),
     delivery: publicDeliveryState(state),
   };
@@ -2505,13 +3652,26 @@ function publicDeliveryState(state) {
   return Object.keys(publicState).length ? publicState : null;
 }
 
+function deliveryStatusPatch(existing, status, at) {
+  const transitions = Array.isArray(existing?.deliveryTransitions)
+    ? existing.deliveryTransitions.filter((item) => item && typeof item === 'object')
+    : [];
+  const latest = transitions.at(-1);
+  const next = latest?.status === status
+    ? transitions
+    : [...transitions, { status, at }].slice(-64);
+  return { deliveryStatus: status, deliveryTransitions: next };
+}
+
 async function appendSendAuditJournal(outputDir, audit) {
   await mkdir(outputDir, { recursive: true });
-  await appendFile(
-    path.join(outputDir, 'delivery-send-audit.jsonl'),
-    `${JSON.stringify({ schemaVersion: 1, event: 'email_sent', ...audit })}\n`,
-    { encoding: 'utf8', flag: 'a' },
-  );
+  const handle = await open(path.join(outputDir, 'delivery-send-audit.jsonl'), 'a', 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify({ schemaVersion: 1, event: 'email_sent', ...audit })}\n`, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readSendAuditJournal(outputDir) {
@@ -2522,45 +3682,77 @@ async function readSendAuditJournal(outputDir) {
     if (error.code === 'ENOENT') return [];
     throw error;
   }
-  return content.split(/\r?\n/u).flatMap((line) => {
-    if (!line.trim()) return [];
+  const audits = [];
+  for (const [index, line] of content.split(/\r?\n/u).entries()) {
+    if (!line.trim()) continue;
     try {
       const value = JSON.parse(line);
-      return value && typeof value === 'object' && !Array.isArray(value) ? [value] : [];
-    } catch {
-      return [];
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid audit record');
+      audits.push(value);
+    } catch (cause) {
+      const error = applicationDraftError(
+        'DELIVERY_AUDIT_INVALID',
+        `Delivery audit journal contains an invalid record at line ${index + 1}.`,
+      );
+      error.cause = cause;
+      throw error;
     }
-  });
+  }
+  return audits;
 }
 
-async function writeDeliveryState(outputDir, state) {
+export async function writeDeliveryState(outputDir, state) {
+  await mkdir(outputDir, { recursive: true });
   const target = path.join(outputDir, 'delivery-state.json');
+  let current = {};
+  let previous = null;
   try {
-    const previous = await readFile(target, 'utf8');
-    let previousSchemaVersion = 0;
+    previous = await readFile(target, 'utf8');
     try {
-      previousSchemaVersion = Number(JSON.parse(previous)?._schemaVersion || 0);
-    } catch {
-      previousSchemaVersion = 0;
-    }
-    if (previousSchemaVersion < 2) {
-      try {
-        await writeFile(path.join(outputDir, 'delivery-state.v1.backup.json'), previous, { encoding: 'utf8', flag: 'wx' });
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-      }
+      current = JSON.parse(previous);
+      if (!current || typeof current !== 'object' || Array.isArray(current)) throw new Error('invalid root');
+    } catch (cause) {
+      throw deliveryStateInvalid('Delivery state JSON is malformed.', cause);
     }
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
+  const expectedRevision = Math.max(0, Number(state?._revision || 0));
+  const actualRevision = Math.max(0, Number(current?._revision || 0));
+  if (expectedRevision !== actualRevision) {
+    const error = applicationDraftError(
+      'DELIVERY_STATE_REVISION_CONFLICT',
+      `Delivery state revision conflict: expected ${expectedRevision}, found ${actualRevision}.`,
+    );
+    error.expectedRevision = expectedRevision;
+    error.currentRevision = actualRevision;
+    throw error;
+  }
+  if (previous !== null && Number(current?._schemaVersion || 0) < 2) {
+    try {
+      await writeFile(path.join(outputDir, 'delivery-state.v1.backup.json'), previous, { encoding: 'utf8', flag: 'wx' });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
   const persisted = {
     ...state,
     _schemaVersion: 2,
-    _revision: Math.max(0, Number(state?._revision || 0)) + 1,
+    _revision: actualRevision + 1,
   };
   const temporary = `${target}.${process.pid}-${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify(persisted, null, 2), 'utf8');
-  await rename(temporary, target);
+  try {
+    const handle = await open(temporary, 'wx', 0o600);
+    try {
+      await handle.writeFile(JSON.stringify(persisted, null, 2), 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(temporary, target);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => {});
+  }
   state._schemaVersion = persisted._schemaVersion;
   state._revision = persisted._revision;
 }
@@ -2580,6 +3772,12 @@ function publicSmtpConfig(smtpConfig, mailer) {
   const status = mailer.status();
   const verified = Object.hasOwn(saved, 'verified') ? saved.verified === true : Boolean(saved.lastVerifiedAt);
   return { ...saved, configured: status.configured, verified, maskedFrom: status.from, authMode: status.authMode };
+}
+
+function applicationAttachmentMediaType(filename) {
+  const mediaType = APPLICATION_ATTACHMENT_MEDIA_TYPES[path.extname(String(filename || '')).toLowerCase()];
+  if (!mediaType) throw new AttachmentError('ATTACHMENT_TYPE_NOT_ALLOWED', 'Attachment type is not allowed.');
+  return mediaType;
 }
 
 function boundedInteger(raw, fallback, min, max) {

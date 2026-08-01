@@ -15,9 +15,12 @@ import {
   Clock3,
   Download,
   ExternalLink,
+  FileImage,
   FileJson,
   FileSpreadsheet,
   FileText,
+  FileType2,
+  Eye,
   Gauge,
   Images,
   BrainCircuit,
@@ -32,6 +35,7 @@ import {
   Copy,
   Cpu,
   Pause,
+  Paperclip,
   Play,
   RefreshCw,
   RotateCcw,
@@ -64,8 +68,12 @@ import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
 import type { DraftSaveRequest } from './useUnsavedDraftGuard'
 import type {
   Artifact,
+  ApplicationAttachment,
+  ApplicationAttachmentList,
+  ApplicationContext,
   ApplicationResult,
   ApplicationResultsResponse,
+  ApplicationTone,
   AudienceComment,
   AudienceAiAnchor,
   AudienceAiStatus,
@@ -86,6 +94,7 @@ import type {
   CandidateProfile,
   CandidateApplicationProfile,
   ApplicationRoute,
+  EmailPreview,
   OutreachDraft,
   LocalModelStatus,
   SmtpAuthMode,
@@ -430,6 +439,19 @@ const jobAgentStages = [
   },
 ]
 
+const humanQualityLabels: Record<string, string> = {
+  factual_grounding: '事实依据',
+  specificity: '具体程度',
+  relevance: '岗位相关',
+  naturalness: '自然表达',
+  brevity: '简洁程度',
+  tone: '语气',
+  repetition: '避免重复',
+  attachment_consistency: '附件一致',
+  call_to_action: '下一步',
+  ai_cliche_score: '模板腔',
+}
+
 const generalAgentStages = [
   { name: '全量正文 Agent', description: '滚动到结果稳定，逐篇打开并保存正文与原图', matcher: /全量正文|body|正文|scrape/i },
   { name: '时间归一化 Agent', description: '统一相对时间、发布日期与采集时间', matcher: /时间归一化|time.?normal/i },
@@ -462,6 +484,20 @@ function formatBytes(bytes = 0) {
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`
   if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`
   return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+}
+
+function attachmentTypeIcon(attachment: ApplicationAttachment) {
+  if (/^image\//i.test(attachment.mediaType)) return <FileImage size={17} />
+  if (/\.(?:doc|docx)$/i.test(attachment.extension)) return <FileType2 size={17} />
+  return <FileText size={17} />
+}
+
+function attachmentStatusLabel(attachment: ApplicationAttachment) {
+  if (attachment.status === 'ready' && ['passed', 'valid', 'verified'].includes(attachment.validationStatus)) return '已校验'
+  if (attachment.status === 'uploading') return '上传中'
+  if (attachment.status === 'missing') return '文件缺失'
+  if (attachment.status === 'invalid') return attachment.validationError || '校验失败'
+  return attachment.validationStatus || attachment.status
 }
 
 type PreviewImage = {
@@ -642,6 +678,64 @@ function ImagePreview({ preview, onClose, onChange }: { preview: ImagePreviewSta
   )
 }
 
+function EmailSendPreview({ preview, sending, onClose, onConfirm }: { preview: EmailPreview; sending: boolean; onClose: () => void; onConfirm: () => void }) {
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !sending) onClose()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      document.body.style.overflow = previousOverflow
+    }
+  }, [onClose, sending])
+
+  const qualityEvaluation = preview.quality?.evaluation
+
+  return (
+    <div className="email-preview-backdrop" role="presentation" onMouseDown={() => { if (!sending) onClose() }}>
+      <section className="email-preview-dialog" role="dialog" aria-modal="true" aria-label="邮件发送预览" onMouseDown={(event) => event.stopPropagation()}>
+        <header>
+          <div><span className="step-label">FINAL SEND PREVIEW</span><h3>确认本次邮件投递</h3></div>
+          <button type="button" disabled={sending} onClick={onClose} title="关闭发送预览" aria-label="关闭发送预览"><X size={19} /></button>
+        </header>
+        <div className="email-preview-content">
+          <dl className="email-preview-meta">
+            <div><dt>收件人</dt><dd>{preview.recipient}</dd></div>
+            <div><dt>发件人</dt><dd>{preview.from}</dd></div>
+            <div><dt>Reply-To</dt><dd>{preview.replyTo || '-'}</dd></div>
+            <div><dt>主题</dt><dd>{preview.subject}</dd></div>
+          </dl>
+          <section>
+            <h4>完整邮件正文</h4>
+            <pre>{preview.text}</pre>
+          </section>
+          <section>
+            <h4>随信附件 <small>{preview.attachmentSummary.count} 个 · {formatBytes(preview.attachmentSummary.totalBytes)}</small></h4>
+            {preview.attachmentSummary.attachments.length ? <ul className="email-preview-attachments">{preview.attachmentSummary.attachments.map((attachment) => <li key={attachment.attachmentId}><Paperclip size={14} /><span><strong>{attachment.filename}</strong><small>{attachment.mediaType} · {formatBytes(attachment.size)}</small></span></li>)}</ul> : <p className="email-preview-empty">本次邮件没有附件。</p>}
+          </section>
+          <section className="email-preview-quality">
+            <h4>最近一次质量检查 <small>{preview.quality?.checkedAt ? formatTime(preview.quality.checkedAt) : '暂无时间'}</small></h4>
+            <p className={qualityEvaluation?.passed ? 'passed' : 'blocking'}>
+              {preview.quality && qualityEvaluation
+                ? `${qualityEvaluation.passed ? '已通过' : '未通过'}${typeof qualityEvaluation.score === 'number' ? ` · ${qualityEvaluation.score} / 100` : ''} · 草稿 v${preview.quality.version}`
+                : '当前草稿没有可用的质量检查结果'}
+            </p>
+            {!!qualityEvaluation?.problems?.length && <ul>{qualityEvaluation.problems.map((problem) => <li key={problem}>{problem}</li>)}</ul>}
+          </section>
+          {preview.warnings.length > 0 && <section className="email-preview-warnings"><h4>发送检查</h4>{preview.warnings.map((warning) => <p key={warning.code} className={warning.blocking ? 'blocking' : ''}><CircleAlert size={14} />{warning.message}</p>)}</section>}
+        </div>
+        <footer>
+          <span>草稿 v{preview.draftVersion} · 预计邮件大小 {formatBytes(preview.estimatedMessageSize)}</span>
+          <div><button type="button" disabled={sending} onClick={onClose}>返回修改</button><button className="confirm-send" type="button" disabled={sending || preview.readiness !== 'ready'} onClick={onConfirm}>{sending ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}{sending ? '正在投递' : '确认发送'}</button></div>
+        </footer>
+      </section>
+    </div>
+  )
+}
+
 type DeliveryRouteView = {
   channel: 'email' | 'direct_message' | 'link' | 'other'
   label: string
@@ -790,15 +884,22 @@ function resultCompletionStats(results: ApplicationResultsResponse) {
 }
 
 function deliveryStatusLabel(action?: string) {
-  return ({
+  const labels = {
     draft_saved: '草稿已保存',
     ready_to_apply: '等待邮件投递',
     ready_to_message: '私信文案已复制',
     applied: '已投递',
     messaged: '已私信',
-    email_sent: '邮件已发送',
-    email_failed: '邮件发送失败',
-  } as Record<string, string>)[action || ''] || '尚未处理'
+    preview_ready: '发送预览已就绪',
+    preparing: '正在准备发送',
+    sending: '发送中',
+    sent: '邮件已发送',
+    failed: '邮件发送失败',
+    unknown: '发送结果待确认',
+    blocked: '发送已阻断',
+  } as Record<string, string>
+  const normalized = action?.startsWith('email_') ? action.slice('email_'.length) : action
+  return labels[action || ''] || labels[normalized || ''] || '尚未处理'
 }
 
 function elapsed(job?: Job) {
@@ -1594,6 +1695,16 @@ function App() {
   const [coverage, setCoverage] = useState<CoverageSummary | null>(null)
   const [results, setResults] = useState<ApplicationResultsResponse | null>(null)
   const [selectedResult, setSelectedResult] = useState<ApplicationResult | null>(null)
+  const [applicationAttachments, setApplicationAttachments] = useState<ApplicationAttachmentList | null>(null)
+  const [attachmentsLoading, setAttachmentsLoading] = useState(false)
+  const [attachmentUploading, setAttachmentUploading] = useState(false)
+  const [artifactAttachmentId, setArtifactAttachmentId] = useState('')
+  const [profileAttachmentSource, setProfileAttachmentSource] = useState('')
+  const [applicationToneOverrides, setApplicationToneOverrides] = useState<Record<string, ApplicationTone>>({})
+  const [emailPreview, setEmailPreview] = useState<EmailPreview | null>(null)
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null)
+  const attachmentSourceRef = useRef<ApplicationAttachment['source']>('uploaded')
+  const replacementAttachmentRef = useRef<string | null>(null)
   const draftDirtyRef = useRef(false)
   const [emailSending, setEmailSending] = useState(false)
   const [deliveryUpdating, setDeliveryUpdating] = useState(false)
@@ -1664,6 +1775,25 @@ function App() {
   const draftSaveResponseRef = useRef(0)
   const audienceRequestRef = useRef(0)
   const audienceForegroundRequestRef = useRef(0)
+
+  useEffect(() => {
+    const jobId = activeJob?.id
+    const noteId = selectedResult?.note_id
+    let cancelled = false
+    setEmailPreview(null)
+    setArtifactAttachmentId('')
+    setApplicationAttachments(null)
+    if (!jobId || !noteId) {
+      setApplicationAttachments(null)
+      return () => { cancelled = true }
+    }
+    setAttachmentsLoading(true)
+    void api.applicationAttachments(jobId, noteId)
+      .then((response) => { if (!cancelled) setApplicationAttachments(response) })
+      .catch((error) => { if (!cancelled) setNotice((error as Error).message) })
+      .finally(() => { if (!cancelled) setAttachmentsLoading(false) })
+    return () => { cancelled = true }
+  }, [activeJob?.id, selectedResult?.note_id])
   const audienceResultsRef = useRef<{ sourceJobId: string; value: AudienceResultsResponse } | null>(null)
   const generalModuleScrollRef = useRef<Record<GeneralResultModule, number>>({ insights: 0, audience: 0, expansion: 0 })
   const relayGuideAutoOpened = useRef(false)
@@ -3803,6 +3933,10 @@ function App() {
   }, [])
   const localInstallActive = Boolean(localModelStatus?.install && ['queued', 'running'].includes(localModelStatus.install.status))
   const activeProfile = profiles.find((item) => item.id === request.profileId)
+  const profileResumeSources = (activeProfile?.sourceFiles || []).filter((name) => /\.(?:pdf|doc|docx|txt)$/i.test(name))
+  const selectedProfileAttachmentSource = profileResumeSources.includes(profileAttachmentSource)
+    ? profileAttachmentSource
+    : profileResumeSources[0] || ''
   const profileAiRouteLabel = selectedProvider?.local
     ? `${selectedProvider.label} · ${aiModel || '待选择'} · 未配置外部模型时默认`
     : `${selectedProvider?.label || providerId} · ${aiModel || '待选择'} · 严格使用当前选择`
@@ -3826,6 +3960,44 @@ function App() {
   const selectedDeliveryRoutes = selectedResult ? deliveryRoutes(selectedResult) : []
   const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email' && route.actionable)
   const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message' && route.actionable)
+  const selectedAttachments = (applicationAttachments?.attachments || []).filter((attachment) => attachment.selected && attachment.status === 'ready')
+  const selectedAttachmentIds = selectedAttachments.map((attachment) => attachment.attachmentId)
+  const selectedAttachmentBytes = selectedAttachments.reduce((total, attachment) => total + attachment.size, 0)
+  const selectedApplicationContextKey = activeJob && selectedResult ? `${activeJob.id}:${selectedResult.note_id}` : ''
+  const existingApplicationContext = selectedResult?.outreach.applicationContext
+  const selectedApplicationChannel: ApplicationContext['channel'] = selectedEmailRoute
+    ? 'email'
+    : selectedMessageRoute
+      ? 'direct_message'
+      : existingApplicationContext?.channel || 'email'
+  const hasPreviousContact = Boolean(
+    selectedResult?.delivery?.sendAudit?.some((entry) => entry.status === 'sent' || Boolean(entry.sentAt))
+    || ['applied', 'messaged', 'email_sent', 'sent'].includes(selectedResult?.delivery?.action || ''),
+  )
+  const selectedApplicationTone = applicationToneOverrides[selectedApplicationContextKey]
+    || existingApplicationContext?.tone
+    || 'natural'
+  const selectedApplicationContext: ApplicationContext = {
+    channel: selectedApplicationChannel,
+    contactStage: hasPreviousContact ? 'follow_up' : existingApplicationContext?.contactStage || 'first_contact',
+    tone: selectedApplicationTone,
+    resumeAttached: selectedAttachments.some((attachment) => (
+      ['candidate_profile', 'generated_resume'].includes(attachment.source)
+      || /(?:resume|curriculum[ _-]*vitae|\bcv\b|简历)/i.test(`${attachment.displayName} ${attachment.originalName}`)
+    )),
+    coverLetterAttached: selectedAttachments.some((attachment) => (
+      attachment.source === 'generated_cover_letter'
+      || /(?:cover[ _-]*letter|求职信|申请信)/i.test(`${attachment.displayName} ${attachment.originalName}`)
+    )),
+    recipientType: existingApplicationContext?.recipientType
+      || (selectedApplicationChannel === 'direct_message' ? 'author' : 'recruiter'),
+  }
+  const selectedRecipientTypeLabel = ({
+    recruiter: '招聘方',
+    hiring_manager: '用人经理',
+    author: '帖子作者',
+  } as Record<string, string>)[selectedApplicationContext.recipientType] || selectedApplicationContext.recipientType
+  const importableArtifacts = artifacts.filter((artifact) => /\.(pdf|docx?|txt|png|jpe?g)$/i.test(artifact.name))
   const selectedResultIncomplete = Boolean(selectedResult && isIncompleteApplicationResult(selectedResult))
   const draftOperationPending = draftSaving || emailSending || deliveryUpdating
   const selectedDraftQualityVerified = Boolean(selectedResult && !selectedResultIncomplete && hasVerifiedDraftQuality(selectedResult))
@@ -3857,6 +4029,24 @@ function App() {
   const replaceResult = (next: ApplicationResult) => {
     setSelectedResult(next)
     setResults((current) => current ? { ...current, items: current.items.map((item) => item.note_id === next.note_id ? next : item) } : current)
+  }
+
+  const invalidateAttachmentQuality = (result = selectedResult) => {
+    if (!result?.draftVersion || result.draftVersion.qualityStatus === 'stale') return
+    replaceResult({
+      ...result,
+      draftVersion: {
+        ...result.draftVersion,
+        qualityStatus: 'stale',
+      },
+    })
+  }
+
+  const changeApplicationTone = (tone: ApplicationTone) => {
+    if (!selectedApplicationContextKey || tone === selectedApplicationTone) return
+    setApplicationToneOverrides((current) => ({ ...current, [selectedApplicationContextKey]: tone }))
+    setEmailPreview(null)
+    invalidateAttachmentQuality()
   }
 
   const captureDraftView = () => ({
@@ -3894,6 +4084,7 @@ function App() {
 
   const updateDraft = (field: keyof OutreachDraft, value: string) => {
     if (!selectedResult) return
+    setEmailPreview(null)
     replaceResult({
       ...selectedResult,
       outreach: { ...selectedResult.outreach, [field]: value },
@@ -3914,13 +4105,15 @@ function App() {
     const submittedResult = selectedResult
     const submittedDraft = outreachDraft(submittedResult)
     const submittedHash = draftContentHash(submittedDraft)
+    const submittedAttachmentIds = [...selectedAttachmentIds]
+    const submittedApplicationContext = { ...selectedApplicationContext }
     if (saveRequest.contentHash !== submittedHash) return false
     const draftView = captureDraftView()
     let savedResult: ApplicationResult | null = null
     const responseIsCurrent = () => saveRequest.requestId === draftSaveResponseRef.current && draftViewIsCurrent(draftView)
     draftSaveResponseRef.current = saveRequest.requestId
     try {
-      const response = await api.saveDraft(jobId, submittedResult.note_id, submittedDraft, submittedResult.draftVersion)
+      const response = await api.saveDraft(jobId, submittedResult.note_id, submittedDraft, submittedResult.draftVersion, submittedApplicationContext)
       if (!response.draftVersion) throw new Error('服务端未返回草稿版本，请刷新后重试。')
       if (response.draftVersion.contentHash !== submittedHash) throw new Error('服务端返回的草稿内容哈希不一致，请刷新后重试。')
       savedResult = {
@@ -3932,7 +4125,7 @@ function App() {
       if (!responseIsCurrent()) return false
       replaceResultInDraftView(draftView, savedResult)
       const session = aiSession || await restoreAiSession()
-      const checked = await api.checkDraft(jobId, submittedResult.note_id, response.draftVersion, session.id)
+      const checked = await api.checkDraft(jobId, submittedResult.note_id, response.draftVersion, session.id, submittedAttachmentIds, submittedApplicationContext)
       if (!checked.draftVersion) throw new Error('服务端未返回质量检查版本，请刷新后重试。')
       if (checked.draftVersion.contentHash !== submittedHash) throw new Error('质量检查返回了过期的草稿版本，请重新检查。')
       const checkedResult: ApplicationResult = {
@@ -3988,6 +4181,155 @@ function App() {
 
   draftSaveHandlerRef.current = saveDraft
 
+  const refreshApplicationAttachments = async (jobId = activeJob?.id, noteId = selectedResult?.note_id) => {
+    if (!jobId || !noteId) return null
+    const response = await api.applicationAttachments(jobId, noteId)
+    if (activeJob?.id === jobId && selectedResult?.note_id === noteId) setApplicationAttachments(response)
+    return response
+  }
+
+  const chooseAttachmentFiles = (source: ApplicationAttachment['source'], replacementAttachmentId: string | null = null) => {
+    attachmentSourceRef.current = source
+    replacementAttachmentRef.current = replacementAttachmentId
+    attachmentInputRef.current?.click()
+  }
+
+  const uploadAttachmentFiles = async (event: FormEvent<HTMLInputElement>) => {
+    const input = event.currentTarget
+    const files = Array.from(input.files || [])
+    input.value = ''
+    if (!activeJob || !selectedResult || files.length === 0) return
+    const jobId = activeJob.id
+    const noteId = selectedResult.note_id
+    const source = attachmentSourceRef.current
+    const replacementId = replacementAttachmentRef.current
+    setAttachmentUploading(true)
+    setEmailPreview(null)
+    try {
+      let uploaded = 0
+      let bundleChanged = false
+      for (const file of replacementId ? files.slice(0, 1) : files) {
+        const response = await api.uploadApplicationAttachment(jobId, noteId, file, selectedResult.draftVersion, source)
+        uploaded += response.duplicate ? 0 : 1
+        bundleChanged ||= !response.duplicate
+        if (replacementId && response.attachment.attachmentId !== replacementId) {
+          await api.deleteApplicationAttachment(jobId, replacementId)
+          bundleChanged = true
+        }
+      }
+      await refreshApplicationAttachments(jobId, noteId)
+      if (bundleChanged) invalidateAttachmentQuality()
+      setNotice(uploaded ? `已加入 ${uploaded} 个附件` : '相同附件已存在，已保留原文件')
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      await refreshApplicationAttachments(jobId, noteId).catch(() => null)
+      replacementAttachmentRef.current = null
+      attachmentSourceRef.current = 'uploaded'
+      setAttachmentUploading(false)
+    }
+  }
+
+  const importCandidateProfileAttachment = async () => {
+    if (!activeJob || !selectedResult || !activeProfile || !selectedProfileAttachmentSource) return
+    const jobId = activeJob.id
+    const noteId = selectedResult.note_id
+    setAttachmentUploading(true)
+    setEmailPreview(null)
+    try {
+      const response = await api.importProfileApplicationAttachment(jobId, {
+        noteId,
+        profileId: activeProfile.id,
+        sourceFile: selectedProfileAttachmentSource,
+        draftVersion: selectedResult.draftVersion,
+      })
+      await refreshApplicationAttachments(jobId, noteId)
+      if (!response.duplicate) invalidateAttachmentQuality()
+      setNotice(response.duplicate ? '候选人资料中的相同简历已存在' : `已从候选人资料加入：${response.attachment.displayName}`)
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setAttachmentUploading(false)
+    }
+  }
+
+  const updateAttachmentSelection = async (attachment: ApplicationAttachment, selected: boolean) => {
+    if (!activeJob || !selectedResult) return
+    setEmailPreview(null)
+    try {
+      await api.updateApplicationAttachment(activeJob.id, attachment.attachmentId, { selected })
+      await refreshApplicationAttachments(activeJob.id, selectedResult.note_id)
+      invalidateAttachmentQuality()
+    } catch (error) {
+      setNotice((error as Error).message)
+    }
+  }
+
+  const removeApplicationAttachment = async (attachment: ApplicationAttachment) => {
+    if (!activeJob || !selectedResult) return
+    setEmailPreview(null)
+    try {
+      await api.deleteApplicationAttachment(activeJob.id, attachment.attachmentId)
+      await refreshApplicationAttachments(activeJob.id, selectedResult.note_id)
+      invalidateAttachmentQuality()
+      setNotice(`已移除附件：${attachment.displayName}`)
+    } catch (error) {
+      setNotice((error as Error).message)
+    }
+  }
+
+  const importJobArtifact = async () => {
+    if (!activeJob || !selectedResult || !artifactAttachmentId) return
+    const artifact = importableArtifacts.find((item) => item.id === artifactAttachmentId)
+    if (!artifact) return
+    const jobId = activeJob.id
+    const noteId = selectedResult.note_id
+    setAttachmentUploading(true)
+    setEmailPreview(null)
+    try {
+      const uploadResponse = await api.importJobArtifactApplicationAttachment(jobId, {
+        noteId,
+        artifactId: artifact.id,
+        displayName: artifact.name,
+        draftVersion: selectedResult.draftVersion,
+      })
+      await refreshApplicationAttachments(jobId, noteId)
+      if (!uploadResponse.duplicate) invalidateAttachmentQuality()
+      setNotice(`任务产物已加入附件：${artifact.name}`)
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setAttachmentUploading(false)
+    }
+  }
+
+  const exportCoverLetterAttachment = async () => {
+    if (!activeJob || !selectedResult) return
+    const submittedResult = selectedResult
+    const savedVersion = submittedResult.draftVersion
+    const submittedDraft = outreachDraft(submittedResult)
+    if (draftDirtyRef.current || !savedVersion || savedVersion.qualityStatus === 'stale' || draftContentHash(submittedDraft) !== savedVersion.contentHash) {
+      setNotice('请先保存 Cover Letter，再基于已保存版本导出附件')
+      return
+    }
+    const content = submittedDraft.cover_letter.trim()
+    if (!content) return
+    const jobId = activeJob.id
+    const noteId = submittedResult.note_id
+    setAttachmentUploading(true)
+    setEmailPreview(null)
+    try {
+      const response = await api.exportCoverLetterApplicationAttachment(jobId, noteId, savedVersion)
+      await refreshApplicationAttachments(jobId, noteId)
+      if (!response.duplicate && activeJob?.id === jobId && selectedResult?.note_id === noteId) invalidateAttachmentQuality()
+      setNotice('Cover Letter 已导出并加入附件')
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setAttachmentUploading(false)
+    }
+  }
+
   const prepareMessage = async () => {
     if (!activeJob || !selectedResult || !selectedMessageRoute || !selectedDraftQualityVerified || draftDirty) return
     const jobId = activeJob.id
@@ -4019,13 +4361,33 @@ function App() {
     const draftView = captureDraftView()
     setEmailSending(true)
     try {
-      const response = await api.sendEmail(jobId, submittedResult.note_id, submittedRoute.target, outreachDraft(submittedResult), submittedResult.draftVersion)
+      const preview = await api.previewEmail(jobId, submittedResult.note_id, submittedRoute.target, selectedAttachmentIds, submittedResult.draftVersion)
+      if (!draftViewIsCurrent(draftView)) return
+      setEmailPreview(preview)
+    } catch (error) {
+      if (draftViewIsCurrent(draftView)) setNotice((error as Error).message)
+    } finally {
+      setEmailSending(false)
+    }
+  }
+
+  const confirmSendEmail = async () => {
+    if (!activeJob || !selectedResult || !selectedEmailRoute || !emailPreview || emailPreview.readiness !== 'ready') return
+    const jobId = activeJob.id
+    const submittedResult = selectedResult
+    const submittedRoute = selectedEmailRoute
+    const submittedPreview = emailPreview
+    const draftView = captureDraftView()
+    setEmailSending(true)
+    try {
+      const response = await api.sendEmail(jobId, submittedResult.note_id, submittedRoute.target, outreachDraft(submittedResult), submittedPreview.attachmentSummary.attachments.map((item) => item.attachmentId), submittedPreview, submittedResult.draftVersion)
       if (replaceResultInDraftView(draftView, {
         ...submittedResult,
         outreach: { ...submittedResult.outreach, ...response.outreach },
         draftVersion: response.draftVersion ?? submittedResult.draftVersion,
         delivery: response.delivery,
       })) {
+        setEmailPreview(null)
         setNotice(`邮件已发送至 ${submittedRoute.target}`)
       }
     } catch (error) {
@@ -4847,10 +5209,39 @@ function App() {
                         <div><span className="step-label">EDITABLE APPLICATION COPY</span><h4>投递文案编辑器</h4><p>每个岗位均生成可编辑初稿；90 分以上方可发送，发送时使用当前内容。</p></div>
                         <button className={draftDirty ? 'dirty' : ''} disabled={draftOperationPending || (!draftDirty && !selectedDraftQualityRetryable)} onClick={() => void draftGuard.saveNow()}>{draftSaving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{draftSaveLabel}</button>
                       </div>
+                      <div className="draft-context-row" aria-label="投递上下文">
+                        <label><span>文案语气</span><select aria-label="投递语气" value={selectedApplicationTone} disabled={draftOperationPending} onChange={(event) => changeApplicationTone(event.target.value as ApplicationTone)}><option value="formal">正式</option><option value="natural">自然</option><option value="concise">精简</option></select></label>
+                        <p><strong>{selectedApplicationContext.channel === 'email' ? '邮件' : '私信'}</strong><span>{selectedApplicationContext.contactStage === 'follow_up' ? '跟进联系' : '首次联系'} · {selectedRecipientTypeLabel} · {selectedApplicationContext.resumeAttached ? '已附简历' : '未附简历'} · {selectedApplicationContext.coverLetterAttached ? '已附 Cover Letter' : '未附 Cover Letter'}</span></p>
+                      </div>
                       <section className="draft-editor"><div><h4><MessageSquare size={15} />私信文案</h4><button title="复制私信文案" disabled={draftOperationPending} onClick={() => copyText(outreachDraft(selectedResult).greeting)}><Copy size={15} /></button></div><textarea aria-label="私信文案" value={outreachDraft(selectedResult).greeting} disabled={draftOperationPending} onChange={(event) => updateDraft('greeting', event.target.value)} rows={4} /><small>{outreachDraft(selectedResult).greeting.length} 字</small></section>
                       <section className="draft-editor email-editor"><div><h4><Mail size={15} />邮件文案</h4><button title="复制投递邮件" disabled={draftOperationPending} onClick={() => copyText(`${outreachDraft(selectedResult).email_subject}\n\n${outreachDraft(selectedResult).email_body}`)}><Copy size={15} /></button></div><label><span>邮件主题</span><input aria-label="邮件主题" value={outreachDraft(selectedResult).email_subject} disabled={draftOperationPending} onChange={(event) => updateDraft('email_subject', event.target.value)} /></label><label><span>邮件正文（实际发送）</span><textarea aria-label="邮件正文" value={outreachDraft(selectedResult).email_body} disabled={draftOperationPending} onChange={(event) => updateDraft('email_body', event.target.value)} rows={7} /></label><small>{outreachDraft(selectedResult).email_body.length} 字</small></section>
                       <section className="draft-editor"><div><h4><FileText size={15} />专属 Cover Letter</h4><button title="复制 Cover Letter" disabled={draftOperationPending} onClick={() => copyText(outreachDraft(selectedResult).cover_letter)}><Copy size={15} /></button></div><textarea aria-label="Cover Letter" value={outreachDraft(selectedResult).cover_letter} disabled={draftOperationPending} onChange={(event) => updateDraft('cover_letter', event.target.value)} rows={10} /><small>{outreachDraft(selectedResult).cover_letter.length} 字 · 初稿可编辑，发送仍需通过 90 分门槛</small></section>
                     </div>
+                    <section className="attachment-workspace" aria-label="投递附件">
+                      <input ref={attachmentInputRef} className="attachment-file-input" type="file" multiple accept=".pdf,.doc,.docx,.txt,.png,.jpg,.jpeg" onInput={(event) => void uploadAttachmentFiles(event)} />
+                      <header>
+                        <div><span className="step-label">APPLICATION ATTACHMENTS</span><h4><Paperclip size={15} />随信附件</h4><p>附件保存在当前任务与岗位下，发送前仍会重新校验文件内容和哈希。</p></div>
+                        <strong>{selectedAttachments.length} / {applicationAttachments?.limits.maxFiles ?? 5} 个 · {formatBytes(selectedAttachmentBytes)}</strong>
+                      </header>
+                      <div className="attachment-source-actions">
+                        <button type="button" disabled={attachmentUploading} onClick={() => chooseAttachmentFiles('uploaded')}><Upload size={15} />上传文件</button>
+                        <div className="artifact-attachment-picker candidate-attachment-picker"><select aria-label="选择候选人资料附件" value={selectedProfileAttachmentSource} disabled={attachmentUploading || profileResumeSources.length === 0} onChange={(event) => setProfileAttachmentSource(event.target.value)}><option value="">{activeProfile ? '档案中没有可用简历' : '请先选择候选人档案'}</option>{profileResumeSources.map((source) => <option key={source} value={source}>{source.replace(/^\d{2}-/, '')}</option>)}</select><button type="button" disabled={attachmentUploading || !selectedProfileAttachmentSource} onClick={() => void importCandidateProfileAttachment()}><FileText size={15} />加入简历</button></div>
+                        <button type="button" disabled={attachmentUploading || draftDirty || selectedDraftQualityStale || !selectedResult.draftVersion || !outreachDraft(selectedResult).cover_letter.trim()} title={draftDirty || selectedDraftQualityStale ? '请先保存并复检 Cover Letter，再导出已保存版本' : '将已保存的 Cover Letter 导出为附件'} onClick={() => void exportCoverLetterAttachment()}><Download size={15} />导出 Cover Letter</button>
+                        {importableArtifacts.length > 0 && <div className="artifact-attachment-picker"><select aria-label="选择任务产物" value={artifactAttachmentId} onChange={(event) => setArtifactAttachmentId(event.target.value)}><option value="">选择任务产物</option>{importableArtifacts.map((artifact) => <option key={artifact.id} value={artifact.id}>{artifact.name}</option>)}</select><button type="button" disabled={attachmentUploading || !artifactAttachmentId} onClick={() => void importJobArtifact()}><Paperclip size={15} />加入</button></div>}
+                      </div>
+                      {attachmentsLoading ? <div className="attachment-empty"><LoaderCircle className="spin" size={18} />正在读取附件</div> : applicationAttachments?.attachments.length ? <ul className="attachment-list">{applicationAttachments.attachments.map((attachment) => <li key={attachment.attachmentId} className={attachment.selected ? 'selected' : ''}>
+                        <label title={attachment.selected ? '本次发送包含此附件' : '本次发送不包含此附件'}><input type="checkbox" checked={attachment.selected} disabled={attachmentUploading || attachment.status !== 'ready'} onChange={(event) => void updateAttachmentSelection(attachment, event.target.checked)} /><span /></label>
+                        <span className="attachment-file-icon">{attachmentTypeIcon(attachment)}</span>
+                        <span className="attachment-file-copy"><strong title={attachment.displayName}>{attachment.displayName}</strong><small>{formatBytes(attachment.size)} · {attachment.source === 'candidate_profile' ? '候选人资料' : attachment.source === 'job_artifact' ? '任务产物' : attachment.source === 'generated_cover_letter' ? 'Cover Letter' : attachment.source === 'generated_resume' ? '生成简历' : '本地上传'} · {attachmentStatusLabel(attachment)}</small></span>
+                        <span className="attachment-row-actions">
+                          <a href={activeJob ? api.applicationAttachmentUrl(activeJob.id, attachment.attachmentId) : '#'} target="_blank" rel="noreferrer" title="预览附件" aria-label={`预览 ${attachment.displayName}`}><Eye size={15} /></a>
+                          <a href={activeJob ? api.applicationAttachmentUrl(activeJob.id, attachment.attachmentId) : '#'} download={attachment.displayName} title="下载附件" aria-label={`下载 ${attachment.displayName}`}><Download size={15} /></a>
+                          <button type="button" disabled={attachmentUploading} onClick={() => chooseAttachmentFiles(attachment.source, attachment.attachmentId)} title="替换附件" aria-label={`替换 ${attachment.displayName}`}><RefreshCw size={15} /></button>
+                          <button type="button" disabled={attachmentUploading} onClick={() => void removeApplicationAttachment(attachment)} title="删除附件" aria-label={`删除 ${attachment.displayName}`}><Trash2 size={15} /></button>
+                        </span>
+                      </li>)}</ul> : <div className="attachment-empty"><Paperclip size={20} /><span>尚未添加附件；附件集合变化后需要重新执行质量检查。</span></div>}
+                      <footer><span>单个不超过 {formatBytes(applicationAttachments?.limits.maxFileBytes ?? 10 * 1024 * 1024)}，合计不超过 {formatBytes(applicationAttachments?.limits.maxTotalBytes ?? 20 * 1024 * 1024)}</span>{attachmentUploading && <strong><LoaderCircle className="spin" size={14} />正在校验并保存</strong>}</footer>
+                    </section>
                     <div className="evaluation-panel">
                       <div><span>用人单位评分</span><strong>{selectedDraftQualityStale ? '-' : selectedResult.cover_letter_evaluation?.score ?? '-'}<small>/ 100</small></strong></div>
                       <div><span>重写轮次</span><strong>{selectedDraftQualityStale ? '-' : selectedResult.cover_letter_evaluation?.attempts ?? '-'}</strong></div>
@@ -4863,6 +5254,9 @@ function App() {
                             : selectedResult.cover_letter_evaluation?.passed
                               ? '已通过 90 分投递门槛'
                               : (selectedResult.cover_letter_evaluation?.problems || []).join('；') || '等待评分'}</p>
+                      {!selectedDraftQualityStale && selectedResult.cover_letter_evaluation?.human_quality && <div className="human-quality-grid" aria-label="真人化质量维度">
+                        {Object.entries(selectedResult.cover_letter_evaluation.human_quality).map(([key, item]) => <span key={key} className={item.passed ? 'passed' : 'failed'} title={item.passed ? (item.evidence || []).join('；') : [...(item.problems || []), item.suggestedFix].filter(Boolean).join('；')}><small>{humanQualityLabels[key] || key}</small><strong>{item.score}</strong></span>)}
+                      </div>}
                     </div>
                     <div className="delivery-console">
                       <div className="delivery-target">
@@ -4870,13 +5264,13 @@ function App() {
                         <div><small>邮件收件人</small><strong>{selectedEmailRoute?.target || '岗位正文未提取到邮箱'}</strong><p>{health?.emailDelivery?.configured ? `${health.emailDelivery.authMode === 'oauth2' ? 'Outlook OAuth2' : 'SMTP'} 已就绪 · 发件人 ${health.emailDelivery.from}` : '发件邮箱尚未配置，可在当前页面保存并测试后立即启用'}</p></div>
                       </div>
                       <div className="delivery-actions">
-                        <button className="send-email-action" disabled={draftDirty || !selectedDraftQualityVerified || !selectedEmailRoute || !health?.emailDelivery?.configured || !smtpConfig?.verified || draftOperationPending} onClick={() => void sendEmail()} title={!selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : !smtpConfig?.verified ? '请先测试 SMTP' : '立即发送当前邮件正文'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}{emailSending ? '发送中' : '发送邮件'}</button>
+                        <button className="send-email-action" disabled={draftDirty || !selectedDraftQualityVerified || !selectedEmailRoute || !health?.emailDelivery?.configured || !smtpConfig?.verified || draftOperationPending || attachmentUploading || attachmentsLoading} onClick={() => void sendEmail()} title={!selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : !smtpConfig?.verified ? '请先测试 SMTP' : attachmentsLoading ? '正在读取当前岗位附件' : '预览收件人、完整正文与附件后发送'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Eye size={16} />}{emailSending ? '生成预览' : '预览并发送'}</button>
                         <button onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={16} />发件邮箱</button>
                         <button disabled={draftDirty || !selectedDraftQualityVerified || !selectedMessageRoute || draftOperationPending} onClick={() => void prepareMessage()}><MessageSquare size={16} />复制私信</button>
                         {selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer"><ExternalLink size={16} />打开岗位</a>}
                       </div>
                     </div>
-                    <footer><span>生成方式：<strong>{selectedResult.outreach?.generation_mode || '-'}</strong></span><span>当前状态：<strong>{deliveryStatusLabel(selectedResult.delivery?.action)}</strong></span>{selectedResult.delivery?.email?.sentAt && <span>发送时间：<strong>{formatTime(selectedResult.delivery.email.sentAt)}</strong></span>}</footer>
+                    <footer><span>生成方式：<strong>{selectedResult.outreach?.generation_mode || '-'}</strong></span><span>当前状态：<strong>{deliveryStatusLabel(selectedResult.delivery?.email?.status || selectedResult.delivery?.action)}</strong></span>{selectedResult.delivery?.email?.sentAt && <span>发送时间：<strong>{formatTime(selectedResult.delivery.email.sentAt)}</strong></span>}</footer>
                   </article>
                 ) : <div className="result-empty"><FileText size={28} /><strong>选择一个岗位查看详情</strong></div>}
               </div>
@@ -4946,6 +5340,7 @@ function App() {
         </main>
       </div>
       {imagePreview && <ImagePreview preview={imagePreview} onClose={closeImagePreview} onChange={changePreviewImage} />}
+      {emailPreview && <EmailSendPreview preview={emailPreview} sending={emailSending} onClose={() => setEmailPreview(null)} onConfirm={() => void confirmSendEmail()} />}
       {draftGuard.pendingTransition && <UnsavedDraftDialog
         reason={draftGuard.pendingTransition.reason}
         saveStatus={draftGuard.saveStatus}

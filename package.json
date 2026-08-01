@@ -26,6 +26,7 @@
     "verify:artifacts": "node scripts/verify-artifacts.mjs"
   },
   "dependencies": {
+    "busboy": "^1.6.0",
     "lucide-react": "^0.468.0",
     "nodemailer": "^9.0.3",
     "react": "^19.0.0",

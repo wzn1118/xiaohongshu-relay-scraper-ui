@@ -66,6 +66,9 @@ export const config = Object.freeze({
     process.env.OPENCLAW_CONFIG_PATH ||
     path.join(process.env.USERPROFILE || process.env.HOME || '', '.openclaw', 'openclaw.json'),
   maxBodyBytes: readInt(process.env.XHS_MAX_BODY_BYTES, 32 * 1024 * 1024, 1024, 64 * 1024 * 1024),
+  attachmentMaxFiles: readInt(process.env.XHS_ATTACHMENT_MAX_FILES, 5, 1, 20),
+  attachmentMaxFileBytes: readInt(process.env.XHS_ATTACHMENT_MAX_FILE_BYTES, 10 * 1024 * 1024, 1024, 64 * 1024 * 1024),
+  attachmentMaxTotalBytes: readInt(process.env.XHS_ATTACHMENT_MAX_TOTAL_BYTES, 20 * 1024 * 1024, 1024, 128 * 1024 * 1024),
   relayMonitorIntervalMs: readInt(process.env.XHS_RELAY_MONITOR_INTERVAL_MS, 15_000, 2_000, 300_000),
   relayFailureThreshold: readInt(process.env.XHS_RELAY_FAILURE_THRESHOLD, 2, 1, 10),
   relayRecoveryCooldownMs: readInt(process.env.XHS_RELAY_RECOVERY_COOLDOWN_MS, 60_000, 5_000, 900_000),

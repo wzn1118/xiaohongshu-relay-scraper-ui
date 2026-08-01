@@ -983,6 +983,17 @@ export type OutreachDraft = {
   cover_letter: string
 }
 
+export type ApplicationTone = 'formal' | 'natural' | 'concise'
+
+export type ApplicationContext = {
+  channel: 'email' | 'direct_message'
+  contactStage: 'first_contact' | 'follow_up'
+  tone: ApplicationTone
+  resumeAttached: boolean
+  coverLetterAttached: boolean
+  recipientType: string
+}
+
 export type DraftQualityStatus = 'pending' | 'passed' | 'failed' | 'stale'
 
 export type DraftVersionRef = {
@@ -998,26 +1009,107 @@ export type DraftVersionRef = {
   updatedAt: string
 }
 
+export type DeliveryRuntimeStatus = 'preview_ready' | 'preparing' | 'sending' | 'sent' | 'failed' | 'unknown' | 'blocked'
+
 export type DeliveryState = {
-  action: string
+  action: 'draft_saved' | 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | `email_${DeliveryRuntimeStatus}` | DeliveryRuntimeStatus | (string & {})
   updatedAt: string
   email?: {
-    status: 'sent' | 'failed'
-    to: string
+    status: DeliveryRuntimeStatus
+    to?: string
     sentAt?: string
     failedAt?: string
     messageId?: string
+    errorCode?: string
   }
   sendAudit?: Array<{
     draftId: string
     version: number
+    draftVersion?: number
     contentHash: string
     recipient: string
-    sentAt: string
+    recipientHash?: string
+    status?: DeliveryRuntimeStatus
+    sentAt?: string
+    timestamp?: string
     qualityReportRef: string | null
     idempotencyKey?: string
+    requestIdempotencyKey?: string
     messageId?: string
+    sendId?: string
+    errorCode?: string
+    attachmentBundleHash?: string
+    attachmentCount?: number
+    attachmentBytes?: number
+    attachments?: Array<{
+      attachmentId: string
+      filename: string
+      mediaType: string
+      size: number
+      sha256: string
+    }>
+    previewRevision?: string
+    configHash?: string
+    credentialRevision?: number
+    smtpConfigurationRevision?: number
+    smtpConfigurationFingerprint?: string
   }>
+}
+
+export type ApplicationAttachment = {
+  attachmentId: string
+  jobId: string
+  noteId: string
+  originalName: string
+  displayName: string
+  extension: string
+  mediaType: string
+  size: number
+  sha256: string
+  source: 'uploaded' | 'candidate_profile' | 'job_artifact' | 'generated_cover_letter' | 'generated_resume'
+  createdAt: string
+  updatedAt: string
+  status: 'uploading' | 'ready' | 'invalid' | 'missing' | 'deleted'
+  validationStatus: string
+  validationError: string
+  selected: boolean
+  generatedFrom: string
+  draftId: string
+  draftVersion: number
+}
+
+export type ApplicationAttachmentList = {
+  schemaVersion: number
+  revision: number
+  noteId: string
+  attachments: ApplicationAttachment[]
+  selectedSummary: { count: number; totalBytes: number }
+  limits: { maxFiles: number; maxFileBytes: number; maxTotalBytes: number }
+}
+
+export type EmailPreview = {
+  recipient: string
+  from: string
+  replyTo: string
+  subject: string
+  text: string
+  htmlPreview: string
+  draftId: string
+  draftVersion: number
+  quality: (DraftVersionRef & {
+    checkedAt?: string
+    evaluation: ApplicationResult['cover_letter_evaluation'] | null
+  }) | null
+  attachmentSummary: {
+    count: number
+    totalBytes: number
+    attachments: Array<{ attachmentId: string; filename: string; mediaType: string; size: number; sha256: string }>
+  }
+  attachmentBundleHash: string
+  previewRevision: string
+  warnings: Array<{ code: string; message: string; blocking: boolean }>
+  readiness: 'ready' | 'blocked'
+  estimatedMessageSize: number
 }
 
 export type ApplicationMedia = {
@@ -1153,6 +1245,7 @@ export type ApplicationResult = {
     generation_mode: string
     runtime_status: string
     status: string
+    applicationContext?: ApplicationContext
   }
   job_capabilities?: Array<{ id: string; capability: string; why_it_matters: string; priority: number }>
   cover_letter_evaluation?: {
@@ -1163,6 +1256,13 @@ export type ApplicationResult = {
     strengths: string[]
     problems: string[]
     rubric: Record<string, number>
+    human_quality?: Record<string, {
+      score: number
+      passed: boolean
+      problems: string[]
+      evidence: string[]
+      suggestedFix: string
+    }>
   }
   draftVersion?: DraftVersionRef
   delivery?: DeliveryState | null
@@ -1175,6 +1275,9 @@ export type ApplicationMutationResponse = {
   draftVersion?: DraftVersionRef
   cover_letter_evaluation?: ApplicationResult['cover_letter_evaluation']
   delivery: DeliveryState | null
+  duplicate?: boolean
+  sendId?: string
+  attachmentBundleHash?: string
 }
 
 export type ApplicationResultsResponse = {

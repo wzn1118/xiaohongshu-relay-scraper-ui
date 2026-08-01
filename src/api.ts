@@ -1,9 +1,11 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationAttachment, ApplicationAttachmentList, ApplicationContext, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, EmailPreview, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (!(init?.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   const response = await fetch(path, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    headers,
   })
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }))
@@ -148,12 +150,71 @@ export const api = {
   cancelExpansion: (id: string) => request<ExpansionActionResponse>(`/api/jobs/${encodeURIComponent(id)}/expansion/cancel`, { method: 'POST', body: '{}' }),
   setDelivery: (jobId: string, noteId: string, action: 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | 'reset', draftVersion?: DraftVersionRef) =>
     request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/delivery`, { method: 'POST', body: JSON.stringify({ noteId, action, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
-  saveDraft: (jobId: string, noteId: string, outreach: OutreachDraft, draftVersion?: DraftVersionRef) =>
-    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft`, { method: 'POST', body: JSON.stringify({ noteId, outreach, ...(draftVersion ? { draftId: draftVersion.draftId, baseVersion: draftVersion.version } : {}) }) }),
-  checkDraft: (jobId: string, noteId: string, draftVersion: DraftVersionRef, aiSessionId?: string) =>
-    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft/quality`, { method: 'POST', body: JSON.stringify({ noteId, draftId: draftVersion.draftId, version: draftVersion.version, ...(aiSessionId ? { aiSessionId } : {}) }) }),
-  sendEmail: (jobId: string, noteId: string, to: string, outreach: OutreachDraft, draftVersion?: DraftVersionRef) =>
-    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/send-email`, { method: 'POST', body: JSON.stringify({ noteId, to, outreach, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
+  saveDraft: (jobId: string, noteId: string, outreach: OutreachDraft, draftVersion?: DraftVersionRef, applicationContext?: ApplicationContext) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft`, { method: 'POST', body: JSON.stringify({ noteId, outreach, ...(applicationContext ? { applicationContext } : {}), ...(draftVersion ? { draftId: draftVersion.draftId, baseVersion: draftVersion.version } : {}) }) }),
+  checkDraft: (jobId: string, noteId: string, draftVersion: DraftVersionRef, aiSessionId?: string, attachmentIds: string[] = [], applicationContext?: ApplicationContext) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft/quality`, { method: 'POST', body: JSON.stringify({ noteId, draftId: draftVersion.draftId, version: draftVersion.version, attachmentIds, ...(applicationContext ? { applicationContext } : {}), ...(aiSessionId ? { aiSessionId } : {}) }) }),
+  applicationAttachments: (jobId: string, noteId: string) =>
+    request<ApplicationAttachmentList>(`/api/jobs/${encodeURIComponent(jobId)}/application-attachments?noteId=${encodeURIComponent(noteId)}`),
+  uploadApplicationAttachment: (jobId: string, noteId: string, file: File, draftVersion?: DraftVersionRef, source: ApplicationAttachment['source'] = 'uploaded') => {
+    const body = new FormData()
+    body.append('noteId', noteId)
+    body.append('source', source)
+    body.append('selected', 'true')
+    if (draftVersion) {
+      body.append('draftId', draftVersion.draftId)
+      body.append('draftVersion', String(draftVersion.version))
+    }
+    body.append('file', file, file.name)
+    return request<{ attachment: ApplicationAttachment; duplicate: boolean; revision: number }>(`/api/jobs/${encodeURIComponent(jobId)}/application-attachments`, { method: 'POST', body })
+  },
+  importProfileApplicationAttachment: (jobId: string, payload: { noteId: string; profileId: string; sourceFile: string; draftVersion?: DraftVersionRef }) =>
+    request<{ attachment: ApplicationAttachment; duplicate: boolean; revision: number }>(`/api/jobs/${encodeURIComponent(jobId)}/application-attachments/from-profile`, {
+      method: 'POST',
+      body: JSON.stringify({
+        noteId: payload.noteId,
+        profileId: payload.profileId,
+        sourceFile: payload.sourceFile,
+        selected: true,
+        ...(payload.draftVersion ? { draftId: payload.draftVersion.draftId, draftVersion: payload.draftVersion.version } : {}),
+      }),
+    }),
+  importJobArtifactApplicationAttachment: (jobId: string, payload: { noteId: string; artifactId: string; displayName?: string; draftVersion?: DraftVersionRef }) =>
+    request<{ attachment: ApplicationAttachment; duplicate: boolean; revision: number }>(`/api/jobs/${encodeURIComponent(jobId)}/application-attachments/from-artifact`, {
+      method: 'POST',
+      body: JSON.stringify({
+        noteId: payload.noteId,
+        artifactId: payload.artifactId,
+        selected: true,
+        ...(payload.displayName ? { displayName: payload.displayName } : {}),
+        ...(payload.draftVersion ? {
+          draftId: payload.draftVersion.draftId,
+          draftVersion: payload.draftVersion.version,
+          contentHash: payload.draftVersion.contentHash,
+        } : {}),
+      }),
+    }),
+  exportCoverLetterApplicationAttachment: (jobId: string, noteId: string, draftVersion: DraftVersionRef) =>
+    request<{ attachment: ApplicationAttachment; duplicate: boolean; revision: number }>(`/api/jobs/${encodeURIComponent(jobId)}/application-attachments/from-cover-letter`, {
+      method: 'POST',
+      body: JSON.stringify({
+        noteId,
+        draftId: draftVersion.draftId,
+        draftVersion: draftVersion.version,
+        contentHash: draftVersion.contentHash,
+        selected: true,
+      }),
+    }),
+  updateApplicationAttachment: (jobId: string, attachmentId: string, payload: { selected?: boolean; displayName?: string }) =>
+    request<{ attachment: ApplicationAttachment; revision: number }>(`/api/jobs/${encodeURIComponent(jobId)}/application-attachments/${encodeURIComponent(attachmentId)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  deleteApplicationAttachment: (jobId: string, attachmentId: string) =>
+    request<{ attachmentId: string; deleted: boolean; revision: number }>(`/api/jobs/${encodeURIComponent(jobId)}/application-attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' }),
+  applicationAttachmentUrl: (jobId: string, attachmentId: string) =>
+    `/api/jobs/${encodeURIComponent(jobId)}/application-attachments/${encodeURIComponent(attachmentId)}/content`,
+  previewEmail: (jobId: string, noteId: string, to: string, attachmentIds: string[], draftVersion?: DraftVersionRef) =>
+    request<EmailPreview>(`/api/jobs/${encodeURIComponent(jobId)}/send-email/preview`, { method: 'POST', body: JSON.stringify({ noteId, to, attachmentIds, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
+  sendEmail: (jobId: string, noteId: string, to: string, outreach: OutreachDraft, attachmentIds: string[], preview: EmailPreview, draftVersion?: DraftVersionRef) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/send-email`, { method: 'POST', body: JSON.stringify({ noteId, to, outreach, attachmentIds, previewRevision: preview.previewRevision, attachmentBundleHash: preview.attachmentBundleHash, idempotencyKey: preview.previewRevision, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
   artifactUrl: (jobId: string, artifact: Artifact) =>
     artifact.url || `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifact.id)}`,
   subscribe: (id: string, onEvent: (event: JobEvent) => void, onDisconnect: () => void) => {

@@ -1,10 +1,19 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 
 const PROFILE_ID = /^[a-f0-9]{16}$/;
 const ALLOWED = new Set(['.pdf', '.docx', '.txt', '.md', '.json', '.csv', '.rtf']);
+const MEDIA_TYPE = Object.freeze({
+  '.pdf': 'application/pdf',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.json': 'application/json',
+  '.csv': 'text/csv',
+  '.rtf': 'application/rtf',
+});
 
 export class ProfileStore {
   constructor({ root, pythonBin, scriptPath, maxFileBytes = 12 * 1024 * 1024 }) {
@@ -41,6 +50,44 @@ export class ProfileStore {
   async resolvePath(id) {
     await this.get(id);
     return path.join(this.root, id, 'profile_memory.json');
+  }
+
+  async readSourceFile(id, sourceFile) {
+    const profile = await this.get(id);
+    const name = String(sourceFile || '').normalize('NFC').trim();
+    if (
+      !name
+      || name !== path.basename(name)
+      || name !== path.win32.basename(name)
+      || /[\p{Cc}<>:"/\\|?*]/u.test(name)
+      || !Array.isArray(profile.sourceFiles)
+      || !profile.sourceFiles.includes(name)
+    ) {
+      throw sourceNotFound();
+    }
+    const extension = path.extname(name).toLowerCase();
+    if (!ALLOWED.has(extension)) throw validation(`Unsupported file type: ${extension || 'unknown'}.`);
+    const sourceRoot = path.resolve(this.root, id, 'sources');
+    const target = path.resolve(sourceRoot, name);
+    if (path.dirname(target) !== sourceRoot) throw sourceNotFound();
+    let info;
+    try {
+      info = await lstat(target);
+    } catch (error) {
+      if (error.code === 'ENOENT') throw sourceNotFound();
+      throw error;
+    }
+    if (!info.isFile() || info.isSymbolicLink() || info.size < 1 || info.size > this.maxFileBytes) {
+      throw sourceNotFound();
+    }
+    const buffer = await readFile(target);
+    if (buffer.length !== info.size) throw sourceNotFound();
+    return {
+      originalName: name.replace(/^\d{2}-/, ''),
+      storedName: name,
+      clientMediaType: MEDIA_TYPE[extension],
+      buffer,
+    };
   }
 
   async create(body, aiSession) {
@@ -119,6 +166,7 @@ function runChild(command, args, envPatch) {
 
 function validation(message) { return Object.assign(new Error(message), { code: 'PROFILE_VALIDATION' }); }
 function notFound() { return Object.assign(new Error('Profile not found.'), { code: 'PROFILE_NOT_FOUND' }); }
+function sourceNotFound() { return Object.assign(new Error('Profile source file not found.'), { code: 'PROFILE_SOURCE_NOT_FOUND' }); }
 function aiSessionRequired() {
   return Object.assign(new Error('Background profile parsing requires the currently selected AI model session.'), { code: 'PROFILE_AI_SESSION_REQUIRED' });
 }
