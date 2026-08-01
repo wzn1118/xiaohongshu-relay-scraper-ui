@@ -458,7 +458,7 @@ goals = true
             ), patch("scripts.ai_provider_runtime.run_with_tree_timeout", side_effect=complete):
                 self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
 
-    def test_tree_timeout_terminates_the_windows_process_group(self) -> None:
+    (self) -> None:
         class TimedProcess:
             pid = 43210
             returncode = 1
