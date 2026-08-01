@@ -6,8 +6,10 @@ from typing import Any, Callable
 
 from ai_application_workflow import (
     AIProvider,
+    _application_copy_source_hash,
     _deterministic_problems,
     _evaluate,
+    _human_quality_dimensions,
     _merge_feedback,
     _rubric_for_score,
 )
@@ -84,6 +86,18 @@ def _draft_with_grounding(record: dict[str, Any], draft: dict[str, Any]) -> dict
     return grounded
 
 
+def _attachment_context(payload: dict[str, Any], record: dict[str, Any]) -> Any:
+    for key in ("attachmentContext", "attachments"):
+        if key in payload:
+            value = payload.get(key)
+            return value if key == "attachmentContext" else {"attachments": value}
+    for key in ("attachmentContext", "applicationAttachments", "application_attachments"):
+        if key in record:
+            value = record.get(key)
+            return value if key == "attachmentContext" else {"attachments": value}
+    return None
+
+
 def evaluate_payload(
     payload: dict[str, Any],
     provider_factory: Callable[[], AIProvider] = AIProvider,
@@ -99,14 +113,42 @@ def evaluate_payload(
     evidence = _object_list(record.get("fit_evidence"))
     candidate_profile = _candidate_profile(payload, record)
     checked_draft = _draft_with_grounding(record, draft)
+    attachment_context = _attachment_context(payload, record)
+    current_source_hash = _application_copy_source_hash(record, candidate_profile, evidence)
+    outreach = _object(record.get("outreach"))
+    stored_source_hash = str(
+        payload.get("sourceHash")
+        or draft.get("sourceHash")
+        or outreach.get("sourceHash")
+        or ""
+    ).strip()
+    legacy_source_hash_inferred = not bool(stored_source_hash)
+    source_review_required = bool(stored_source_hash and stored_source_hash != current_source_hash)
     threshold = _threshold(payload, record)
-    evaluation = _object(_evaluate(
-        provider_factory(),
+    if attachment_context is None:
+        evaluation = _object(_evaluate(
+            provider_factory(),
+            role,
+            evidence,
+            checked_draft,
+            candidate_profile,
+        ))
+    else:
+        evaluation = _object(_evaluate(
+            provider_factory(),
+            role,
+            evidence,
+            checked_draft,
+            candidate_profile,
+            attachment_context,
+        ))
+    human_quality = _human_quality_dimensions(
+        checked_draft,
         role,
         evidence,
-        checked_draft,
         candidate_profile,
-    ))
+        attachment_context,
+    )
     deterministic = _deterministic_problems(
         checked_draft,
         role,
@@ -114,6 +156,18 @@ def evaluate_payload(
         candidate_profile,
         record,
     )
+    human_quality_problems = [
+        problem
+        for dimension in human_quality.values()
+        if not bool(dimension.get("passed"))
+        for problem in _text_list(dimension.get("problems"))
+    ]
+    deterministic = _merge_feedback(deterministic, human_quality_problems)
+    if source_review_required:
+        deterministic = _merge_feedback(
+            deterministic,
+            ["岗位或候选人证据已变化，当前保存的投递文案需要重新复核"],
+        )
 
     try:
         score = min(100, max(0, int(evaluation.get("score", 0))))
@@ -170,6 +224,11 @@ def evaluate_payload(
         "attempts": 1,
         "claim_validation": claim_validation,
         "claims": claim_validation["claims"],
+        "human_quality": human_quality,
+        "sourceHash": current_source_hash,
+        "sourceHashStatus": "changed" if source_review_required else ("legacy_inferred" if legacy_source_hash_inferred else "current"),
+        "sourceReviewRequired": source_review_required,
+        "legacySourceHashInferred": legacy_source_hash_inferred,
     }
 
 

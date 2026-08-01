@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
@@ -22,27 +24,60 @@ from evidence_claim_validator import validate_generated_claims
 
 
 GUIDE_RULES = [
-    "针对具体岗位和用人方，不写可替换到任何岗位的套话",
-    "用两到三段相关经历证明能力，不复述个人材料，也不罗列完整经历",
-    "从用人方关心的结果出发，说明行动、协作、产出和可迁移价值",
-    "保持第一人称、简洁、可信，并给出清晰的沟通下一步",
+    "只使用岗位证据、候选人证据和投递上下文中的事实，不补造经历、技能、结果、公司信息或联系方式",
+    "像候选人本人写短邮件：直接、自然、具体，不逐句复述招聘正文，不罗列整份简历",
+    "只选一至两项最相关的真实事实，分别说明做过什么以及它为何与当前岗位有关",
+    "避免高度匹配、深感荣幸、怀着极大热情、赋能、抓手、闭环、协同、全链路、完美契合等模板表达",
+    "结尾说明实际附件和自然的下一步；没有附件上下文时不声称已经附上文件",
 ]
 
 ACCEPTANCE_RULES = [
     "私信以第一人称表达，30-180 个中文字符，直接点名岗位和一个最强匹配点",
-    "邮件正文以第一人称表达，80-300 个中文字符，包含称呼、证据、岗位价值和沟通下一步",
+    "邮件正文以第一人称表达，120-260 个中文字符，最多四个短段落，每段只承担一个作用",
     "Cover Letter 以第一人称表达，280-520 个中文字符，写作目标为 320-460 个中文字符",
-    "Cover Letter 必须包含主题、称呼、候选人背景、岗位证据、到岗安排、此致敬礼和真实署名信息",
+    "邮件主题优先采用：岗位名称申请｜姓名｜最相关的一项能力；无法从证据确认的片段直接省略",
     "不得出现元叙述、占位符、自我贬低、虚构事实、夸大熟练度或逐句复述岗位正文",
     "至少引用一项当前岗位已匹配的真实经历证据，三种文案不得复用同一整段，并给出清晰的沟通下一步",
 ]
 
 CANDIDATE_PROFILE_RULES = [
-    "Cover Letter 必须包含主题、尊敬的招聘负责人、第一人称正文、此致敬礼和候选人署名信息。",
-    "主题格式优先为：应聘公司名与岗位名｜候选人姓名｜每周可实习可用天数天；公司名或岗位名无法从岗位正文确认时直接省略，不猜测。",
-    "正文优先写学校、专业、年级、相关实习或项目、每周可实习天数和预计实习时长；只使用运行时候选人档案和 candidate_evidence 中的真实字段。",
-    "电话/微信和邮箱只允许使用运行时候选人档案中的值；字段为空时省略整行，不输出 XX、XXXX 或其他占位符。",
+    "候选人资料只作为事实库，不按字段顺序复述；正文最多选择一至两项与岗位最相关的证据。",
+    "邮件主题优先为：岗位名称申请｜候选人姓名｜最相关的一项能力；缺失信息直接省略，不猜测。",
+    "到岗时间、每周可工作天数、地点和联系方式仅在运行时候选人档案存在对应值时使用。",
+    "电话/微信和邮箱不得重复堆砌；字段为空时省略，不输出 XX、XXXX 或其他占位符。",
 ]
+
+DEFAULT_APPLICATION_CONTEXT = {
+    "channel": "email",
+    "contactStage": "first_contact",
+    "tone": "natural",
+    "resumeAttached": False,
+    "coverLetterAttached": False,
+    "recipientType": "recruiter",
+}
+
+
+def _normalize_application_context(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    channel = str(source.get("channel") or source.get("medium") or "").strip().lower()
+    contact_stage = str(source.get("contactStage") or source.get("contact_stage") or "").strip().lower()
+    tone = str(source.get("tone") or "").strip().lower()
+    recipient_type = str(source.get("recipientType") or source.get("recipient_type") or "").strip()
+    return {
+        "channel": channel if channel in {"email", "direct_message"} else DEFAULT_APPLICATION_CONTEXT["channel"],
+        "contactStage": contact_stage if contact_stage in {"first_contact", "follow_up"} else DEFAULT_APPLICATION_CONTEXT["contactStage"],
+        "tone": tone if tone in {"formal", "natural", "concise"} else DEFAULT_APPLICATION_CONTEXT["tone"],
+        "resumeAttached": source.get("resumeAttached") is True or source.get("resume_attached") is True,
+        "coverLetterAttached": source.get("coverLetterAttached") is True or source.get("cover_letter_attached") is True,
+        "recipientType": recipient_type[:80] or DEFAULT_APPLICATION_CONTEXT["recipientType"],
+    }
+
+
+def _application_context_for_record(record: dict[str, Any]) -> dict[str, Any]:
+    raw = record.get("applicationContext")
+    if not isinstance(raw, dict):
+        raw = record.get("application_context")
+    return _normalize_application_context(raw)
 
 
 def _string() -> dict[str, Any]:
@@ -894,12 +929,15 @@ def _write(
     previous: dict[str, Any] | None,
     feedback: list[str],
     candidate_profile: dict[str, str] | None = None,
+    application_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    normalized_context = _normalize_application_context(application_context)
     payload = {
         "role": role,
         "candidate_evidence": evidence,
         "candidate_application_profile": candidate_profile or {},
         "candidate_profile_rules": CANDIDATE_PROFILE_RULES,
+        "application_context": normalized_context,
         "writing_guide": GUIDE_RULES,
         "acceptance_rules": ACCEPTANCE_RULES,
         "previous_draft": previous or {},
@@ -913,21 +951,24 @@ def _write(
         ],
     }
     return provider.generate_json(
-        """你是资深求职信写作 Agent。为当前岗位写一套真正专属的中文私信、邮件和 Cover Letter。
+        """你是投递文案编辑。请以候选人本人会发送的语气，为当前岗位写中文私信、短邮件和 Cover Letter。
+
+先在内部严格区分三类输入：
+A. 岗位证据：role 中的岗位名、职责、要求、投递方式和来源片段，只能用于理解岗位，不能整段复述。
+B. 候选人证据：candidate_evidence 与 candidate_application_profile，只能引用其中可核验的经历、项目、技能、教育、到岗安排和联系方式。
+  C. 投递上下文：application_context 明确给出 email/direct_message、first_contact/follow_up、formal/natural/concise、实际附件状态和 recipientType。只能按这些值写，不得自行改变联系阶段、语气或附件事实。
+
 硬规则：
-1. 全部以第一人称“我”表达，直接展示与岗位能力契合的行动、协作和结果。
-1.1 私信必须以“您好，我是候选人姓名”开场；作者昵称、账号名、发布时间、互动量和页面标签仅是来源元数据，严禁写入称呼或正文。
-1.2 私信前 80 字必须出现准确岗位名，并写出一项最强匹配证据或明确到岗安排；结尾提出“岗位是否仍在招聘”或同等明确的问题。
-2. 邮件和 Cover Letter 必须按固定顺序输出：主题—尊敬的招聘负责人—“您好！我是…”身份与申请动机—已核验证据—每周可实习天数与时长—“简历随信附上”及沟通邀请—此致敬礼—真实联系方式。禁止出现“附件”“原帖”“岗位提到”“候选人”“材料显示”等元叙述；不复述岗位职责，不引用招聘正文。
-3. candidate_evidence 只包含当前岗位已匹配证据。经历、组织、工具、数字和结果必须能在其中逐项找到；接触过某工具不得改写为“精通/熟练”，不得用其他经历补齐岗位要求。
-3.2 evidence_items.first_person_claim 是背景资料解析器基于原文归一化的第一人称事实句，优先作为正文事实表达；source_evidence 只用于核验，禁止复制文件名、标签、原文元叙述或第三人称措辞。
-3.1 skills/education 类证据和单个工具词只能辅助判断匹配，严禁单独扩写为经历；不得出现“在skills相关实践中”、"我R"、"我SQL"等残句。没有完整行动与结果证据时，必须输出克制的待审核稿，不得用套话伪装匹配度。
-4. Cover Letter 控制在 320-460 个中文字符，按“主题—称呼—身份与申请动机—1至2项证据及岗位价值—到岗与沟通下一步—此致敬礼—真实联系方式”成稿；资料为空的行直接省略。
-5. 私信控制在 50-160 字，邮件正文控制在 120-260 字；私信突出单一匹配点，邮件突出证据与到岗，Cover Letter 展开判断与迁移价值，三者不可复制同一整段。
-6. 必须逐条闭环 required_revisions。写岗位方法时使用“我会”，写过往事实时使用“我曾/我负责”，不得混淆计划与业绩。
-7. 对经历写清“问题或目标—我的判断和行动—交付物—结果—岗位迁移价值”，但只使用 candidate_evidence 中的事实。
-8. 主题必须点名 role.role_name；有候选人姓名、学校、专业、可实习天数和时长时必须自然写入，不输出任何占位符。
-9. used_evidence_ids 只能引用给定 id。输出前逐项核对每个工具、数字、组织和结果均有事实来源，严格输出 JSON。""",
+1. 每个事实必须能在 A 或 B 中逐项找到。不得把岗位要求写成候选人经历，不得补造公司、工具、数字、成果或联系方式。
+2. 只选一至两项与当前岗位最有关的候选人事实；不复述整份简历，不逐句重复招聘方已经知道的要求。
+3. 邮件正文 120-260 个中文字符、最多四个短段落。第一段直接说明申请哪个岗位；第二段用一个真实事实说明匹配；第三段仅在有证据时写到岗安排；结尾用一句自然的沟通邀请。每段只承担一个作用。
+4. 主题采用“岗位名称申请｜姓名｜最相关的一项能力”。禁止使用“求职申请”“应聘贵司职位”“优秀候选人”“关于贵司岗位的自荐信”“怀着热忱申请”。
+5. 禁止“高度匹配、深感荣幸、怀着极大热情、赋能、抓手、闭环、协同、全链路、完美契合、我相信凭借我的能力一定能够”等套话；避免连续排比和过度工整句式。
+6. 私信 50-160 字，点名岗位、一个真实匹配点和一个明确问题；作者昵称、发布时间、互动量等来源元数据不得进入正文。
+7. Cover Letter 320-460 字，可以比邮件展开，但仍只使用一至两项证据，不重复邮件整段，不堆砌联系方式。
+8. 过往事实用“我曾/我负责”等准确时态；入职后的做法用“我会”，不得把计划冒充业绩。接触过工具不得改写成精通或熟练。
+9. used_evidence_ids 只能引用给定 id。source_evidence 仅用于核验，不复制文件名、标签或第三人称元叙述。
+10. required_revisions 必须逐条处理；事实不足时缩短表达，不用套话填充。严格输出 JSON。""",
         json.dumps(payload, ensure_ascii=False),
         writing_schema(),
     )
@@ -958,8 +999,9 @@ def _finalize_local_draft(
             "请问岗位目前是否仍在招聘？期待进一步沟通，谢谢。"
         )
     if name and role_name:
-        availability_text = f"｜每周可实习{availability}天" if availability else ""
-        finalized["email_subject"] = f"应聘{role_name}｜{name}{availability_text}"
+        capability = next((str(item).strip() for item in finalized.get("capability_matches", []) if str(item).strip()), "")
+        subject_parts = [f"{role_name}申请", name, capability]
+        finalized["email_subject"] = "｜".join(part for part in subject_parts if part)
     return finalized
 
 
@@ -986,6 +1028,90 @@ BROKEN_OUTREACH_PATTERN = re.compile(
     r"(?:在\s*skills\s*相关实践中|我\s*(?:R|SQL|SPSS|Excel|Python|Power\s*BI)\s*[。；，]|这个岗位重视|业务理解与协作落地|我会先对齐目标和交付标准)",
     re.I,
 )
+AI_CLICHE_PATTERN = re.compile(
+    r"(?:高度匹配|深感荣幸|怀着(?:极大|满腔)?热情|赋能|抓手|闭环|全链路|完美契合|"
+    r"我相信凭借我的能力一定能够|优秀候选人|关于贵司岗位的自荐信|应聘贵司职位)",
+    re.I,
+)
+
+def _application_copy_source_hash(
+    record: dict[str, Any],
+    candidate_profile: dict[str, str] | None = None,
+    candidate_evidence: list[dict[str, Any]] | None = None,
+) -> str:
+    """Hash only evidence that can legitimately affect application copy."""
+    normalized_profile = {
+        str(key): value
+        for key, value in (candidate_profile or {}).items()
+        if str(value or "").strip()
+    }
+    media = record.get("media")
+    if isinstance(media, dict):
+        media = {key: value for key, value in media.items() if key != "analysis"} or None
+    evidence = candidate_evidence
+    if evidence is None:
+        evidence = [
+            dict(item)
+            for item in record.get("fit_evidence", [])
+            if isinstance(item, dict)
+        ]
+    source = {
+        "noteId": str(record.get("note_id") or record.get("id") or ""),
+        "title": record.get("title") or record.get("card_title"),
+        "body": record.get("body"),
+        "sourceCardText": record.get("source_card_text"),
+        "cardTextSegments": record.get("card_text_segments"),
+        "media": media,
+        "candidateProfile": normalized_profile,
+        "candidateEvidence": evidence,
+    }
+    raw_context = record.get("applicationContext")
+    if not isinstance(raw_context, dict):
+        raw_context = record.get("application_context")
+    if isinstance(raw_context, dict):
+        source["applicationContext"] = _normalize_application_context(raw_context)
+    serialized = json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _has_complete_application_copy(record: dict[str, Any]) -> bool:
+    outreach = record.get("outreach")
+    return isinstance(outreach, dict) and all(
+        str(outreach.get(field) or "").strip() for field in OUTREACH_TEXT_FIELDS
+    )
+
+
+def _apply_application_copy_source_state(record: dict[str, Any], current_hash: str) -> str:
+    """Preserve existing copy and classify its evidence-source relationship."""
+    outreach = record.get("outreach")
+    if not isinstance(outreach, dict) or not _has_complete_application_copy(record):
+        return "missing"
+    stored_hash = str(outreach.get("sourceHash") or "").strip()
+    if not stored_hash:
+        outreach["sourceHash"] = current_hash
+        outreach["sourceHashStatus"] = "legacy_inferred"
+        outreach["legacySourceHashInferred"] = True
+        outreach["sourceReviewRequired"] = False
+        return "legacy_inferred"
+    if stored_hash == current_hash:
+        outreach["sourceHashStatus"] = "current"
+        outreach["sourceReviewRequired"] = False
+        return "current"
+    outreach["sourceHashStatus"] = "changed"
+    outreach["sourceReviewRequired"] = True
+    outreach["status"] = "needs_review"
+    outreach["runtime_status"] = "source_changed_needs_review"
+    return "changed"
+
+
+def _stamp_application_copy_source(record: dict[str, Any], source_hash: str) -> None:
+    outreach = record.get("outreach")
+    if not isinstance(outreach, dict):
+        return
+    outreach["sourceHash"] = source_hash
+    outreach["sourceHashStatus"] = "current"
+    outreach["legacySourceHashInferred"] = False
+    outreach["sourceReviewRequired"] = False
 
 
 def _compact_text(value: Any) -> str:
@@ -1055,9 +1181,12 @@ def _deterministic_problems(
         problems.append("文案包含残缺技能句或空泛固定模板，必须改写为完整、可核验的行动证据")
     if any(phrase in greeting for phrase in ("想进一步沟通岗位重点", "参与相关项目实践")):
         problems.append("私信仍是通用套话，必须写出一项岗位专属证据或明确到岗信息")
-    for forbidden in ("附件", "原帖", "岗位提到", "候选人", "材料显示"):
+    for forbidden in ("原帖", "岗位提到", "候选人", "材料显示"):
         if forbidden in forbidden_scan:
             problems.append(f"出现禁用元叙述：{forbidden}")
+    cliches = list(dict.fromkeys(AI_CLICHE_PATTERN.findall(narrative)))
+    if cliches:
+        problems.append(f"文案包含模板化或夸张表达：{'、'.join(cliches)}")
     if PLACEHOLDER_PATTERN.search(joined):
         problems.append("文案仍含占位符或待填写内容")
     if re.search(r"(?:虽无|没有|缺乏|欠缺|不足|短板).{0,10}(?:经验|能力|技能|背景)", narrative):
@@ -1082,8 +1211,11 @@ def _deterministic_problems(
         problems.append(f"Cover Letter 当前 {len(cover)} 字，必须重写到 280-520 字，目标 320-460 字")
     if len(greeting) < 30 or len(greeting) > 180:
         problems.append(f"私信当前 {len(greeting)} 字，必须控制在 30-180 字")
-    if len(email) < 80 or len(email) > 300:
-        problems.append(f"邮件正文当前 {len(email)} 字，必须控制在 80-300 字")
+    if len(email) < 120 or len(email) > 260:
+        problems.append(f"邮件正文当前 {len(email)} 字，必须控制在 120-260 字")
+    email_paragraphs = [item.strip() for item in re.split(r"\n\s*\n", email) if item.strip()]
+    if len(email_paragraphs) > 4:
+        problems.append("邮件正文超过四个段落，应让每段只承担一个作用")
     if len(subject) < 8 or len(subject) > 120:
         problems.append(f"邮件主题当前 {len(subject)} 字，必须控制在 8-120 字")
 
@@ -1096,20 +1228,9 @@ def _deterministic_problems(
         problems.append("Cover Letter 缺少规范招聘负责人称呼")
     if "此致" not in cover or "敬礼" not in cover:
         problems.append("Cover Letter 缺少“此致/敬礼”收尾")
-    if not email.startswith("尊敬的招聘负责人：\n您好！我是"):
-        problems.append("邮件未遵循固定格式：必须先写招聘负责人称呼，再以“您好！我是……”介绍身份")
-    if "简历随信附上" not in email or "简历随信附上" not in cover:
-        problems.append("邮件或 Cover Letter 缺少固定的简历随信说明")
-    cover_order = [
-        cover.find("主题："),
-        cover.find("尊敬的招聘负责人："),
-        cover.find("您好！我是"),
-        cover.find("简历随信附上"),
-        cover.find("此致"),
-        cover.find("敬礼"),
-    ]
-    if any(index < 0 for index in cover_order) or cover_order != sorted(cover_order):
-        problems.append("Cover Letter 未遵循固定段落顺序")
+    prohibited_subjects = ("求职申请", "应聘贵司职位", "一封来自优秀候选人的邮件", "关于贵司岗位的自荐信")
+    if any(item in subject for item in prohibited_subjects):
+        problems.append("邮件主题过于模板化，应写明岗位、姓名和一项最相关能力")
 
     if name and (name not in subject or name not in cover):
         problems.append("主题或 Cover Letter 缺少候选人姓名")
@@ -1119,10 +1240,10 @@ def _deterministic_problems(
     duration = str(profile.get("internshipDuration") or "").strip()
     if duration and duration not in cover:
         problems.append("Cover Letter 未写明候选人的可实习时长")
-    for field, label in (("phoneWeChat", "电话/微信"), ("email", "邮箱")):
-        value = str(profile.get(field) or "").strip()
-        if value and value not in cover:
-            problems.append(f"Cover Letter 缺少已确认的{label}")
+    contact_values = [str(profile.get(field) or "").strip() for field in ("phoneWeChat", "email")]
+    repeated_contacts = [value for value in contact_values if value and narrative.count(value) > 1]
+    if repeated_contacts:
+        problems.append("联系方式在多段文案中重复堆砌，只需在必要位置保留一次")
 
     if not re.search(r"(?:期待|希望|方便|愿意).{0,18}(?:沟通|交流|面试|进一步了解)", narrative):
         problems.append("文案缺少清晰、克制的沟通下一步")
@@ -1159,12 +1280,256 @@ def _deterministic_problems(
     return list(dict.fromkeys(problems))
 
 
+def _selected_attachment_context(
+    attachment_context: Any,
+) -> tuple[bool, list[dict[str, Any]], list[str]]:
+    if attachment_context is None:
+        return False, [], []
+    if isinstance(attachment_context, list):
+        attachments = [dict(item) for item in attachment_context if isinstance(item, dict)]
+        selected_ids: list[str] = []
+    elif isinstance(attachment_context, dict):
+        raw_attachments = attachment_context.get("attachments")
+        if raw_attachments is None:
+            raw_attachments = attachment_context.get("selectedAttachments", [])
+        attachments = [dict(item) for item in raw_attachments if isinstance(item, dict)] if isinstance(raw_attachments, list) else []
+        ids_are_explicit = "attachmentIds" in attachment_context or "selectedAttachmentIds" in attachment_context
+        raw_ids = (
+            attachment_context.get("attachmentIds")
+            if "attachmentIds" in attachment_context
+            else attachment_context.get("selectedAttachmentIds", [])
+        )
+        selected_ids = [str(item).strip() for item in raw_ids if str(item).strip()] if isinstance(raw_ids, list) else []
+    else:
+        return False, [], []
+
+    def attachment_id(item: dict[str, Any]) -> str:
+        return str(item.get("attachmentId") or item.get("id") or "").strip()
+
+    if isinstance(attachment_context, dict) and ids_are_explicit:
+        selected_set = set(selected_ids)
+        selected = [item for item in attachments if attachment_id(item) in selected_set]
+        found = {attachment_id(item) for item in selected}
+        missing = [item for item in selected_ids if item not in found]
+        return True, selected, missing
+    if any("selected" in item for item in attachments):
+        return True, [item for item in attachments if item.get("selected") is True], []
+    return True, attachments, []
+
+
+def _attachment_name(item: dict[str, Any]) -> str:
+    return str(
+        item.get("displayName")
+        or item.get("originalName")
+        or item.get("filename")
+        or item.get("attachmentId")
+        or "未命名附件"
+    ).strip()
+
+
+def _attachment_kind(item: dict[str, Any]) -> str:
+    source = str(item.get("source") or "").casefold()
+    name = _attachment_name(item).casefold()
+    if source in {"generated_resume", "candidate_profile"} or re.search(r"(?:简历|履历|resume|\bcv\b)", name, re.I):
+        return "resume"
+    if source == "generated_cover_letter" or re.search(r"(?:求职信|自荐信|cover[ _-]?letter)", name, re.I):
+        return "cover_letter"
+    if re.search(r"(?:作品集|portfolio)", name, re.I):
+        return "portfolio"
+    return "other"
+
+
+def _attachment_consistency(
+    email: str,
+    attachment_context: Any,
+) -> tuple[int, list[str], list[str]]:
+    known, selected, missing_ids = _selected_attachment_context(attachment_context)
+    if not known:
+        return 100, [], ["未提供附件上下文；最终发送预览仍需复核"]
+
+    problems: list[str] = []
+    evidence_items: list[str] = []
+    if missing_ids:
+        problems.append(f"本次选择的附件不存在：{'、'.join(missing_ids)}")
+    invalid = []
+    for item in selected:
+        status = str(item.get("status") or "ready").casefold()
+        validation = str(item.get("validationStatus") or "valid").casefold()
+        if status != "ready" or validation not in {"valid", "passed", "ready"}:
+            invalid.append(_attachment_name(item))
+    if invalid:
+        problems.append(f"本次选择的附件尚未通过校验：{'、'.join(invalid)}")
+
+    names = [_attachment_name(item) for item in selected]
+    kinds = {_attachment_kind(item) for item in selected}
+    evidence_items.extend(names or ["本次未选择附件"])
+    resume_claim = bool(re.search(r"(?:简历|履历|resume|\bcv\b).{0,16}(?:附|附件|随信|attached)", email, re.I))
+    cover_claim = bool(re.search(r"(?:求职信|自荐信|cover[ _-]?letter).{0,16}(?:附|附件|随信|attached)", email, re.I))
+    portfolio_claim = bool(re.search(r"(?:作品集|portfolio).{0,16}(?:附|附件|随信|attached)", email, re.I))
+    generic_claim = bool(re.search(r"(?:附件.{0,12}(?:包含|包括|中有|见)|(?:附上|随信附上|attached).{0,12}(?:文件|材料|附件))", email, re.I))
+    has_claim = resume_claim or cover_claim or portfolio_claim or generic_claim
+
+    if has_claim and not selected:
+        problems.append("正文声称附有文件，但本次发送没有选择附件")
+    if selected and not has_claim:
+        problems.append("本次已选择附件，但邮件正文没有说明附件内容")
+    if resume_claim and "resume" not in kinds:
+        problems.append("正文声称附有简历，但已选附件中没有简历")
+    if cover_claim and "cover_letter" not in kinds:
+        problems.append("正文声称附有求职信，但已选附件中没有求职信")
+    if portfolio_claim and "portfolio" not in kinds:
+        problems.append("正文声称附有作品集，但已选附件中没有作品集")
+    problems = list(dict.fromkeys(problems))
+    return max(0, 100 - 35 * len(problems)), problems, evidence_items
+
+
+def _human_quality_dimensions(
+    draft: dict[str, Any],
+    role: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    candidate_profile: dict[str, str] | None = None,
+    attachment_context: Any = None,
+) -> dict[str, dict[str, Any]]:
+    profile = candidate_profile or {}
+    subject = str(draft.get("email_subject") or "").strip()
+    email = str(draft.get("email_body") or "").strip()
+    cover = str(draft.get("cover_letter") or "").strip()
+    narrative = "\n".join((email, cover))
+    role_name = str(role.get("role_name") or "").strip()
+    evidence_by_id = {str(item.get("id") or ""): item for item in evidence if str(item.get("id") or "")}
+    used_ids = [str(item) for item in draft.get("used_evidence_ids", []) if str(item)]
+    grounded_ids = [item for item in used_ids if item in evidence_by_id]
+    evidence_terms = {
+        term
+        for evidence_id in grounded_ids
+        for term in _evidence_anchor_terms(evidence_by_id[evidence_id])
+        if _compact_text(term) in _compact_text(narrative)
+    }
+    factual_source = "\n".join(
+        [role_name, *[str(value or "") for value in profile.values()]]
+        + [" ".join(str(item.get(key) or "") for key in ("label", "detail", "skills", "outcomes")) for item in evidence]
+    )
+    unsupported_tools = [term for term in FACTUAL_TOOL_TERMS if term.casefold() in narrative.casefold() and term.casefold() not in factual_source.casefold()]
+    unsupported_numbers = sorted(
+        number for number in set(re.findall(r"\d+(?:\.\d+)?%?", narrative))
+        if number not in set(re.findall(r"\d+(?:\.\d+)?%?", factual_source))
+    )
+    cliches = list(dict.fromkeys(AI_CLICHE_PATTERN.findall(narrative)))
+    email_paragraphs = [item.strip() for item in re.split(r"\n\s*\n", email) if item.strip()]
+    normalized_email = _compact_text(email)
+    repeated = bool(normalized_email and len(normalized_email) >= 80 and normalized_email in _compact_text(cover))
+    cta_found = bool(re.search(
+        r"(?:(?:期待|希望|方便|愿意).{0,18}(?:沟通|交流|面试|进一步了解)|"
+        r"(?:welcome|hope|available).{0,24}(?:interview|discuss|conversation|talk))",
+        email,
+        re.I,
+    ))
+    templated_subject = bool(re.search(
+        r"^(?:求职申请|应聘贵司职位|一封来自优秀候选人的邮件|关于贵司岗位的自荐信|怀着热忱申请|application)$",
+        subject,
+        re.I,
+    ))
+    empty_company_praise = list(dict.fromkeys(re.findall(
+        r"(?:贵司|贵公司).{0,16}(?:行业领先|卓越|优秀|声誉|令人向往|平台广阔)",
+        narrative,
+    )))
+    stance_phrases = re.findall(r"我(?:认为|相信|深知)", narrative)
+    sentence_starts = [
+        re.sub(r"[\s，。！？；：,.!?;:]", "", item)[:4]
+        for item in re.split(r"[。！？!?\n]+", email)
+        if len(re.sub(r"\s+", "", item)) >= 8
+    ]
+    repeated_starts = [prefix for prefix, count in Counter(sentence_starts).items() if prefix and count >= 3]
+    contacts = re.findall(
+        r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?<!\d)1[3-9]\d{9}(?!\d)",
+        narrative,
+        re.I,
+    )
+    repeated_contacts = sorted({item for item in contacts if contacts.count(item) > 1})
+    peer_drafts = []
+    if isinstance(attachment_context, dict):
+        candidate_peers = attachment_context.get("peerDrafts") or attachment_context.get("peer_drafts") or []
+        if isinstance(candidate_peers, list):
+            peer_drafts = [item for item in candidate_peers if isinstance(item, (str, dict))]
+    similarity_hits = []
+    if len(normalized_email) >= 80:
+        for item in peer_drafts:
+            peer_body = item if isinstance(item, str) else item.get("emailBody") or item.get("email_body") or ""
+            peer_normalized = _compact_text(peer_body)
+            if len(peer_normalized) < 80:
+                continue
+            ratio = SequenceMatcher(None, normalized_email, peer_normalized).ratio()
+            if ratio >= 0.82:
+                peer_id = "" if isinstance(item, str) else str(item.get("noteId") or item.get("note_id") or "")
+                similarity_hits.append(f"{peer_id or '另一封邮件'} {round(ratio * 100)}%")
+
+    def dimension(score: int, problems: list[str], evidence_items: list[str], suggested_fix: str) -> dict[str, Any]:
+        return {
+            "score": score,
+            "passed": score >= 80 and not problems,
+            "problems": problems,
+            "evidence": evidence_items,
+            "suggestedFix": suggested_fix if problems else "无需修改",
+        }
+
+    grounding_problems = []
+    if not grounded_ids or len(grounded_ids) != len(used_ids):
+        grounding_problems.append("经历引用为空或超出当前证据库")
+    if unsupported_tools:
+        grounding_problems.append(f"未获证据支持的工具：{'、'.join(unsupported_tools)}")
+    if unsupported_numbers:
+        grounding_problems.append(f"未获证据支持的数字：{'、'.join(unsupported_numbers)}")
+    specificity_problems = [] if evidence_terms else ["正文没有写出可核验的行动、项目或结果锚点"]
+    relevance_problems = [] if role_name and role_name in subject else ["主题没有准确点名当前岗位"]
+    if templated_subject:
+        relevance_problems.append("邮件主题使用了通用模板，未体现当前岗位和候选人证据")
+    naturalness_problems = [f"出现模板化表达：{'、'.join(cliches)}"] if cliches else []
+    if empty_company_praise:
+        naturalness_problems.append(f"出现无事实依据的公司赞美：{'、'.join(empty_company_praise)}")
+    if len(stance_phrases) >= 2:
+        naturalness_problems.append(f"重复使用主观判断句式：{'、'.join(stance_phrases)}")
+    if repeated_starts:
+        naturalness_problems.append(f"多个句子使用相同开头，句式过度工整：{'、'.join(repeated_starts)}")
+    brevity_problems = []
+    if not 120 <= len(email) <= 260:
+        brevity_problems.append(f"邮件正文为 {len(email)} 字，应控制在 120-260 字")
+    if len(email_paragraphs) > 4:
+        brevity_problems.append("邮件超过四个短段落")
+    tone_problems = []
+    if re.search(r"(?:一定能够|必将|完全胜任|精通|顶尖)", narrative):
+        tone_problems.append("语气包含无法由证据支撑的绝对化表述")
+    repetition_problems = ["邮件正文与 Cover Letter 存在整段重复"] if repeated else []
+    if similarity_hits:
+        repetition_problems.append(f"当前邮件与历史草稿高度雷同：{'、'.join(similarity_hits[:3])}")
+    if repeated_contacts:
+        repetition_problems.append(f"联系方式重复堆砌：{'、'.join(repeated_contacts)}")
+    attachment_score, attachment_problems, attachment_evidence = _attachment_consistency(
+        email,
+        attachment_context,
+    )
+    ai_cliche_problems = [f"AI 高频套话命中：{'、'.join(cliches)}"] if cliches else []
+
+    return {
+        "factual_grounding": dimension(100 if not grounding_problems else 60, grounding_problems, grounded_ids or ["无有效证据引用"], "删除无证据事实，只保留 candidate_evidence 中可逐项核验的表述"),
+        "specificity": dimension(100 if not specificity_problems else 65, specificity_problems, sorted(evidence_terms)[:6] or ["未检测到证据锚点"], "写明一项真实行动、交付物或结果，不用抽象能力词代替"),
+        "relevance": dimension(100 if not relevance_problems else 70, relevance_problems, [role_name or "岗位名缺失"], "在主题和开头准确点名当前岗位"),
+        "naturalness": dimension(100 if not naturalness_problems else 55, naturalness_problems, cliches or ["未命中模板化表达"], "改成候选人会直接说出的短句，删除夸张和行业套话"),
+        "brevity": dimension(100 if not brevity_problems else 65, brevity_problems, [f"正文 {len(email)} 字，{len(email_paragraphs)} 段"], "压缩到 120-260 字和四个短段落以内"),
+        "tone": dimension(100 if not tone_problems else 65, tone_problems, ["克制、直接、第一人称"], "把绝对判断改成可核验事实和自然沟通邀请"),
+        "repetition": dimension(100 if not repetition_problems else 55, repetition_problems, ["已比较邮件正文与 Cover Letter"], "保留一个最相关事实，删除重复段落和重复联系方式"),
+        "attachment_consistency": dimension(attachment_score, attachment_problems, attachment_evidence, "按本次实际选择的附件修改正文，或调整附件选择"),
+        "call_to_action": dimension(100 if cta_found else 65, [] if cta_found else ["邮件缺少简短、明确的沟通下一步"], ["已检测沟通邀请" if cta_found else "未检测到沟通邀请"], "用一句话询问是否方便进一步沟通或安排面试"),
+        "ai_cliche_score": dimension(100 if not cliches else max(0, 100 - len(cliches) * 25), ai_cliche_problems, cliches or ["未命中 AI 高频套话"], "删除套话，用具体岗位、事实和下一步替代"),
+    }
+
+
 def _evaluate(
     provider: AIProvider,
     role: dict[str, Any],
     evidence: list[dict[str, Any]],
     draft: dict[str, Any],
     candidate_profile: dict[str, str] | None = None,
+    attachment_context: Any = None,
 ) -> dict[str, Any]:
     if getattr(provider, "provider", "") == "local_qwen":
         problems = _deterministic_problems(draft, role, evidence, candidate_profile)
@@ -1175,6 +1540,7 @@ def _evaluate(
             "strengths": ["结构、事实边界和发送条件均通过程序复核。"] if not problems else [],
             "problems": problems,
             "rewrite_instructions": problems,
+            "human_quality": _human_quality_dimensions(draft, role, evidence, candidate_profile, attachment_context),
         }
     evaluation = provider.generate_json(
         """你是严格的用人单位终审 Agent。请从招聘决策角度评分，不因语言流畅自动给高分。
@@ -1186,6 +1552,7 @@ def _evaluate(
     rubric = evaluation.get("rubric") or {}
     rubric_sum = sum(int(rubric.get(key, 0)) for key in ("role_relevance", "evidence", "first_person", "concision", "credibility", "action_readiness"))
     evaluation["score"] = min(int(evaluation.get("score", 0)), rubric_sum)
+    evaluation["human_quality"] = _human_quality_dimensions(draft, role, evidence, candidate_profile, attachment_context)
     return evaluation
 
 
@@ -1466,6 +1833,10 @@ def enrich_payload(
     fit_agent = FitEvidenceAgent(fallback_profile)
     writer_agent = OutreachWriterAgent(fallback_profile)
     records = [record for record in payload.get("records", []) if isinstance(record, dict)]
+    source_states: dict[int, str] = {}
+    for record in records:
+        source_hash = _application_copy_source_hash(record, candidate_profile)
+        source_states[id(record)] = _apply_application_copy_source_state(record, source_hash)
     if target_note_ids is not None:
         target_records = [
             record
@@ -1473,7 +1844,12 @@ def enrich_payload(
             if str(record.get("note_id") or "") in target_note_ids
         ]
     else:
-        target_records = [record for record in records if not only_incomplete or record_needs_completion(record)]
+        target_records = [
+            record
+            for record in records
+            if source_states[id(record)] == "missing"
+            and (not only_incomplete or record_needs_completion(record))
+        ]
     skipped = len(records) - len(target_records)
     all_records_count = len(records)
     total_records = len(target_records)
@@ -1573,6 +1949,8 @@ def enrich_payload(
                 ],
                 "rewrite_instructions": [],
             }
+            source_hash = _application_copy_source_hash(record, candidate_profile)
+            _stamp_application_copy_source(record, source_hash)
             _apply_claim_validation(record, fallback_profile, candidate_profile)
             if progress_callback:
                 progress_callback(index, total_records, "needs_review", record)
@@ -1582,6 +1960,8 @@ def enrich_payload(
         except (AIProviderError, ValueError, TypeError, KeyError) as error:
             _mark_model_failure(record, error, provider)
             record["cover_letter_evaluation"]["threshold"] = threshold
+            source_hash = _application_copy_source_hash(record, candidate_profile)
+            _stamp_application_copy_source(record, source_hash)
             _apply_claim_validation(record, fallback_profile, candidate_profile)
             if progress_callback:
                 progress_callback(index, total_records, "needs_review", record)
@@ -1625,6 +2005,7 @@ def enrich_payload(
         final_evaluation: dict[str, Any] = {"score": 0, "problems": ["尚未评分"], "rewrite_instructions": []}
         draft: dict[str, Any] = {}
         generation_mode = provider.provider
+        application_context = _application_context_for_record(record)
         try:
             for attempt in range(1, max_attempts + 1):
                 total_attempts += 1
@@ -1635,6 +2016,7 @@ def enrich_payload(
                     None if getattr(provider, "provider", "") == "local_qwen" else previous,
                     feedback,
                     candidate_profile,
+                    application_context,
                 )
                 if getattr(provider, "provider", "") == "local_qwen":
                     draft = _finalize_local_draft(draft, role, candidate_profile)
@@ -1667,6 +2049,8 @@ def enrich_payload(
             if not draft:
                 _mark_model_failure(record, error, provider)
                 record["cover_letter_evaluation"]["threshold"] = threshold
+                source_hash = _application_copy_source_hash(record, candidate_profile)
+                _stamp_application_copy_source(record, source_hash)
                 _apply_claim_validation(record, fallback_profile, candidate_profile)
                 if progress_callback:
                     progress_callback(index, total_records, "needs_review", record)
@@ -1718,6 +2102,7 @@ def enrich_payload(
             "generation_mode": generation_mode,
             "runtime_status": "completed" if ready else "quality_threshold_not_met",
             "status": "ready" if ready else "needs_review",
+            "applicationContext": application_context,
         }
         record["quality"]["job_card_generated"] = True
         record["quality"]["outreach_generated"] = all(
@@ -1728,6 +2113,8 @@ def enrich_payload(
             "application_signal_detected": application_signal_detected,
         }
         record["cover_letter_evaluation"] = {**final_evaluation, "passed": ready, "attempts": final_evaluation.get("attempt", 0)}
+        source_hash = _application_copy_source_hash(record, candidate_profile)
+        _stamp_application_copy_source(record, source_hash)
         _apply_claim_validation(record, fallback_profile, candidate_profile)
         if progress_callback:
             progress_callback(
@@ -1759,6 +2146,11 @@ def enrich_payload(
         "attempts": total_attempts,
         "jobCardsGenerated": job_cards_generated,
         "applicationCopyGenerated": application_copy_generated,
+        "sourceReviewRequired": sum(
+            1
+            for record in records
+            if bool((record.get("outreach") or {}).get("sourceReviewRequired"))
+        ),
         "generationCoveragePercent": round((application_copy_generated / all_records_count) * 100, 2) if all_records_count else 100.0,
     }
     payload["codex_runtime"] = {**payload["ai_workflow"], "status": "completed" if processed == passed else "quality_failed"}
@@ -1788,18 +2180,30 @@ def enrich_payload(
     payload["claim_evidence_schema_version"] = 1
     payload["claim_evidence_map"] = existing_claim_map + claim_evidence_map
     gate = payload.get("quality_gate") or {}
-    gate["cover_letter_quality_passed"] = processed == passed and processed > 0
+    quality_ready_count = sum(
+        1
+        for record in records
+        if isinstance(record.get("cover_letter_evaluation"), dict)
+        and record["cover_letter_evaluation"].get("passed") is True
+        and int(record["cover_letter_evaluation"].get("score") or 0) >= threshold
+        and not bool((record.get("outreach") or {}).get("sourceReviewRequired"))
+    )
+    claims_valid_count = sum(
+        1
+        for record in records
+        if isinstance(record.get("claim_validation"), dict)
+        and record["claim_validation"].get("hardFactsPassed") is True
+        and not bool((record.get("outreach") or {}).get("sourceReviewRequired"))
+    )
+    gate["cover_letter_quality_passed"] = bool(
+        all_records_count > 0 and quality_ready_count == all_records_count
+    )
     checks = gate.setdefault("checks", {})
     checks["all_scraped_jobs_have_job_cards"] = job_cards_generated == all_records_count
     checks["all_scraped_jobs_have_application_copy"] = application_copy_generated == all_records_count
     checks["all_cover_letters_score_at_least_threshold"] = gate["cover_letter_quality_passed"]
     checks["all_generated_claims_evidence_valid"] = bool(
-        processed > 0
-        and all(
-            isinstance(record.get("claim_validation"), dict)
-            and record["claim_validation"].get("hardFactsPassed") is True
-            for record in target_records
-        )
+        all_records_count > 0 and claims_valid_count == all_records_count
     )
     gate["job_cards_generated"] = job_cards_generated
     gate["application_copy_generated"] = application_copy_generated
@@ -1835,22 +2239,17 @@ def enrich_payload(
             "message": f"{all_records_count - application_copy_generated} scraped jobs have no editable application copy",
         })
     if not checks["all_generated_claims_evidence_valid"]:
-        invalid_claim_records = sum(
-            1
-            for record in target_records
-            if not isinstance(record.get("claim_validation"), dict)
-            or record["claim_validation"].get("hardFactsPassed") is not True
-        )
+        invalid_claim_records = all_records_count - claims_valid_count
         gate["issues"].append({
             "check": "all_generated_claims_evidence_valid",
             "code": "GENERATED_CLAIM_EVIDENCE_INVALID",
             "message": f"{invalid_claim_records} drafts contain unsupported or review-required generated facts",
         })
-    if processed != passed:
+    if quality_ready_count != all_records_count:
         gate["issues"].append({
             "check": "all_cover_letters_score_at_least_threshold",
             "code": "COVER_LETTER_SCORE_BELOW_90",
-            "message": f"{processed - passed} drafts did not reach {threshold}",
+            "message": f"{all_records_count - quality_ready_count} drafts did not reach {threshold} or require source review",
         })
     payload["quality_gate"] = gate
     return WorkflowReport(processed, passed, processed - passed, total_attempts, skipped)
