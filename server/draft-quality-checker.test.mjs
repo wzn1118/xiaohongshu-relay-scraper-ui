@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import {
@@ -40,6 +41,8 @@ const validReport = {
   attempts: 1,
 };
 
+const fixtureScriptPath = path.resolve('fixtures', 'recheck_application_draft.py');
+
 test('passes the draft on stdin and AI configuration only through environment variables', async () => {
   let command;
   let args;
@@ -48,7 +51,7 @@ test('passes the draft on stdin and AI configuration only through environment va
   const child = fakeChild((chunk) => { input += chunk.toString('utf8'); });
   const checker = createDraftQualityChecker({
     pythonBin: 'fixture-python',
-    scriptPath: 'C:/repo/scripts/recheck_application_draft.py',
+    scriptPath: fixtureScriptPath,
     spawnImpl(nextCommand, nextArgs, nextOptions) {
       command = nextCommand;
       args = nextArgs;
@@ -72,7 +75,7 @@ test('passes the draft on stdin and AI configuration only through environment va
 
   assert.deepEqual(result, validReport);
   assert.equal(command, 'fixture-python');
-  assert.deepEqual(args, ['C:\\repo\\scripts\\recheck_application_draft.py']);
+  assert.deepEqual(args, [fixtureScriptPath]);
   assert.equal(options.windowsHide, true);
   assert.deepEqual(JSON.parse(input), payload);
   assert.equal(options.env.XHS_AI_PROVIDER, 'openai-compatible');
@@ -87,7 +90,7 @@ test('passes the draft on stdin and AI configuration only through environment va
 test('redacts AI secrets from child process errors', async () => {
   const child = fakeChild();
   const checker = createDraftQualityChecker({
-    scriptPath: 'C:/repo/scripts/recheck_application_draft.py',
+    scriptPath: fixtureScriptPath,
     spawnImpl() {
       queueMicrotask(() => {
         child.stderr.end('provider rejected key top-secret');
@@ -112,7 +115,7 @@ test('redacts AI secrets from child process errors', async () => {
 test('rejects invalid successful output', async () => {
   const child = fakeChild();
   const checker = createDraftQualityChecker({
-    scriptPath: 'C:/repo/scripts/recheck_application_draft.py',
+    scriptPath: fixtureScriptPath,
     spawnImpl() {
       queueMicrotask(() => {
         child.stdout.end('{"score":92}');
@@ -131,7 +134,7 @@ test('rejects invalid successful output', async () => {
 test('kills and rejects a timed-out process', async () => {
   const child = fakeChild();
   const checker = createDraftQualityChecker({
-    scriptPath: 'C:/repo/scripts/recheck_application_draft.py',
+    scriptPath: fixtureScriptPath,
     timeoutMs: 5,
     spawnImpl: () => child,
   });
@@ -146,7 +149,7 @@ test('kills and rejects a timed-out process', async () => {
 test('enforces a bounded stdout buffer', async () => {
   const child = fakeChild();
   const checker = createDraftQualityChecker({
-    scriptPath: 'C:/repo/scripts/recheck_application_draft.py',
+    scriptPath: fixtureScriptPath,
     maxOutputBytes: 16,
     spawnImpl() {
       queueMicrotask(() => child.stdout.write('x'.repeat(17)));

@@ -32,6 +32,7 @@ const ALLOWED_KEYS = new Set([
   'candidateProfile',
   'coverLetterThreshold',
   'coverLetterMaxAttempts',
+  'expansion',
 ]);
 
 const JOB_ID = /^[0-9]{14}-[a-f0-9]{8}$/;
@@ -100,6 +101,10 @@ export function validateRunRequest(value) {
   const collectAudience = analysisMode === 'general'
     ? booleanField(value.collectAudience, 'collectAudience', true)
     : false;
+  const expansion = expansionField(value.expansion);
+  if (expansion.enabled && analysisMode !== 'general') {
+    throw fieldError('expansion.enabled', 'requires_general_analysis_mode');
+  }
 
   const speedMode = value.speedMode ?? 'random';
   if (speedMode !== 'steady' && speedMode !== 'random') throw fieldError('speedMode', 'must_be_steady_or_random');
@@ -137,7 +142,7 @@ export function validateRunRequest(value) {
     randomDelayMaxSeconds,
     mode,
     completeMissingOnly,
-    collectAudience: collectAudience || audienceOnly,
+    collectAudience: collectAudience || audienceOnly || expansion.enabled,
     audienceOnly,
     skipPostprocess: booleanField(value.skipPostprocess, 'skipPostprocess', false),
     noAutoAttach: booleanField(value.noAutoAttach, 'noAutoAttach', true),
@@ -153,7 +158,60 @@ export function validateRunRequest(value) {
     candidateProfile: candidateProfileField(value.candidateProfile),
     coverLetterThreshold: integerField(value.coverLetterThreshold, 'coverLetterThreshold', 90, 90, 100),
     coverLetterMaxAttempts: integerField(value.coverLetterMaxAttempts, 'coverLetterMaxAttempts', 4, 1, 6),
+    expansion,
     resumeFromJobId,
+  });
+}
+
+function expansionField(value) {
+  const defaults = {
+    enabled: false,
+    rounds: 0,
+    includeReplies: true,
+    maxReplyDepth: 2,
+    maxUsersPerRound: 20,
+    maxPostsPerUser: 3,
+    maxCommentsPerPost: 100,
+    maxTotalUsers: 250,
+    maxTotalPosts: 500,
+    maxTotalComments: 5000,
+    timeBudgetMinutes: 30,
+    maxFailureCount: 10,
+    concurrency: 1,
+    postSelectionStrategy: 'latest',
+    schemaVersion: 1,
+  };
+  if (value === undefined || value === null) return Object.freeze(defaults);
+  if (!isPlainObject(value)) throw fieldError('expansion', 'must_be_object');
+  const allowed = new Set(Object.keys(defaults));
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unknown.length) {
+    throw new ValidationError(
+      'Unsupported expansion parameters.',
+      unknown.map((key) => ({ field: `expansion.${key}`, reason: 'not_allowed' })),
+    );
+  }
+  const postSelectionStrategy = value.postSelectionStrategy ?? defaults.postSelectionStrategy;
+  if (!['latest', 'keyword_match', 'top_engagement', 'all_reachable'].includes(postSelectionStrategy)) {
+    throw fieldError('expansion.postSelectionStrategy', 'unsupported_strategy');
+  }
+  const schemaVersion = integerField(value.schemaVersion, 'expansion.schemaVersion', 1, 1, 1);
+  return Object.freeze({
+    enabled: booleanField(value.enabled, 'expansion.enabled', defaults.enabled),
+    rounds: integerField(value.rounds, 'expansion.rounds', defaults.rounds, 0, 10),
+    includeReplies: booleanField(value.includeReplies, 'expansion.includeReplies', defaults.includeReplies),
+    maxReplyDepth: integerField(value.maxReplyDepth, 'expansion.maxReplyDepth', defaults.maxReplyDepth, 0, 10),
+    maxUsersPerRound: integerField(value.maxUsersPerRound, 'expansion.maxUsersPerRound', defaults.maxUsersPerRound, 1, 1000),
+    maxPostsPerUser: integerField(value.maxPostsPerUser, 'expansion.maxPostsPerUser', defaults.maxPostsPerUser, 1, 100),
+    maxCommentsPerPost: integerField(value.maxCommentsPerPost, 'expansion.maxCommentsPerPost', defaults.maxCommentsPerPost, 1, 5000),
+    maxTotalUsers: integerField(value.maxTotalUsers, 'expansion.maxTotalUsers', defaults.maxTotalUsers, 1, 100000),
+    maxTotalPosts: integerField(value.maxTotalPosts, 'expansion.maxTotalPosts', defaults.maxTotalPosts, 1, 100000),
+    maxTotalComments: integerField(value.maxTotalComments, 'expansion.maxTotalComments', defaults.maxTotalComments, 1, 1000000),
+    timeBudgetMinutes: integerField(value.timeBudgetMinutes, 'expansion.timeBudgetMinutes', defaults.timeBudgetMinutes, 1, 1440),
+    maxFailureCount: integerField(value.maxFailureCount, 'expansion.maxFailureCount', defaults.maxFailureCount, 1, 1000),
+    concurrency: integerField(value.concurrency, 'expansion.concurrency', defaults.concurrency, 1, 1),
+    postSelectionStrategy,
+    schemaVersion,
   });
 }
 
@@ -217,6 +275,9 @@ export function buildRunnerArgs(params, outputDir, execution = null) {
   args.push(params.useCodexRuntime ? '--codex-runtime' : '--no-codex-runtime');
   if (params.completeMissingOnly) args.push('--complete-missing-only');
   args.push(params.collectAudience ? '--collect-audience' : '--no-collect-audience');
+  if (params.expansion?.enabled) {
+    args.push('--expansion-config-json', JSON.stringify(params.expansion));
+  }
   if (params.audienceOnly) args.push('--audience-only');
   if (params.skipPostprocess) args.push('--skip-postprocess');
   if (params.noAutoAttach) args.push('--no-auto-attach');

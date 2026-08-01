@@ -368,6 +368,26 @@ export type ContentResearchContext = {
   goal: string
 }
 
+export type ExpansionPostSelectionStrategy = 'latest' | 'keyword_match' | 'top_engagement' | 'all_reachable'
+
+export type ExpansionRequest = {
+  enabled: boolean
+  rounds: number
+  includeReplies: boolean
+  maxReplyDepth: number
+  maxUsersPerRound: number
+  maxPostsPerUser: number
+  maxCommentsPerPost: number
+  maxTotalUsers: number
+  maxTotalPosts: number
+  maxTotalComments: number
+  timeBudgetMinutes: number
+  maxFailureCount: number
+  concurrency: number
+  postSelectionStrategy: ExpansionPostSelectionStrategy
+  schemaVersion: 1
+}
+
 export type JobRequest = {
   analysisMode: AnalysisMode
   keyword: string
@@ -402,6 +422,7 @@ export type JobRequest = {
   candidateProfile: CandidateApplicationProfile
   coverLetterThreshold: number
   coverLetterMaxAttempts: number
+  expansion: ExpansionRequest
 }
 
 export type PreflightCheckStatus = 'passed' | 'warning' | 'blocked'

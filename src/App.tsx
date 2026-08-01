@@ -28,6 +28,7 @@ import {
   Maximize2,
   MessageSquare,
   MessagesSquare,
+  Network,
   Copy,
   Cpu,
   Pause,
@@ -221,6 +222,23 @@ const defaultRequest: JobRequest = {
   candidateProfile: defaultCandidateProfile,
   coverLetterThreshold: 90,
   coverLetterMaxAttempts: 4,
+  expansion: {
+    enabled: false,
+    rounds: 0,
+    includeReplies: true,
+    maxReplyDepth: 2,
+    maxUsersPerRound: 20,
+    maxPostsPerUser: 3,
+    maxCommentsPerPost: 100,
+    maxTotalUsers: 250,
+    maxTotalPosts: 500,
+    maxTotalComments: 5000,
+    timeBudgetMinutes: 30,
+    maxFailureCount: 10,
+    concurrency: 1,
+    postSelectionStrategy: 'latest',
+    schemaVersion: 1,
+  },
 }
 
 const contentResearchOptions: Array<{
@@ -1656,6 +1674,13 @@ function App() {
 
   const updateRequest = <K extends keyof JobRequest>(key: K, value: JobRequest[K]) => {
     setRequest((current) => ({ ...current, [key]: value }))
+  }
+
+  const updateExpansion = <K extends keyof JobRequest['expansion']>(key: K, value: JobRequest['expansion'][K]) => {
+    setRequest((current) => ({
+      ...current,
+      expansion: { ...current.expansion, [key]: value },
+    }))
   }
 
   const updateCandidateProfile = <K extends keyof CandidateApplicationProfile>(key: K, value: CandidateApplicationProfile[K]) => {
@@ -3342,6 +3367,13 @@ function App() {
       ? activeAgentStages.reduce((last, stage, index) => stage.matcher.test(runningLog) ? index : last, 0)
       : -1
   const workflowSummary = activeJob?.workflowSummary || {}
+  const activeExpansion = Boolean(activeJob?.config?.expansion?.enabled)
+  const expansionSummary = activeExpansion && workflowSummary.audience && typeof workflowSummary.audience === 'object'
+    ? workflowSummary.audience as Record<string, unknown>
+    : null
+  const expansionCounters = expansionSummary?.counters && typeof expansionSummary.counters === 'object'
+    ? expansionSummary.counters as Record<string, unknown>
+    : null
   const partialAnalysis = workflowSummary.analysisMode === 'security_timeout_partial'
   const securityVerification = (workflowSummary.securityVerification || {}) as Record<string, unknown>
   const securityStatus = activeJob?.securityRestriction?.status || String(securityVerification.status || '')
@@ -4040,6 +4072,22 @@ function App() {
                     <Toggle checked={request.analysisMode === 'general' || request.useCodexRuntime} onChange={(value) => request.analysisMode === 'job' && updateRequest('useCodexRuntime', value)} label={request.analysisMode === 'general' ? 'AI 动态内容模块' : 'AI 文案与评分'} description={request.analysisMode === 'general' ? '根据关键词、正文和图片逐链接生成栏目' : '逐链接写作、评分并自动重写'} />
                     <Toggle checked={request.noAutoAttach} onChange={(value) => updateRequest('noAutoAttach', value)} label="禁用自动附加" description="保持现有浏览器会话" />
                     <Toggle checked={request.skipPostprocess} onChange={(value) => updateRequest('skipPostprocess', value)} label="跳过结构化导出" description="仅保留原始抓取结果" />
+                    {request.analysisMode === 'general' && <Toggle checked={request.expansion.enabled} onChange={(value) => updateExpansion('enabled', value)} label="关系扩散采集" description="按公开互动关系在原任务内执行有界 BFS" />}
+                    {request.analysisMode === 'general' && request.expansion.enabled && <>
+                      <label className="field"><span>扩散轮数</span><input type="number" min="0" max="10" value={request.expansion.rounds} onChange={(event) => updateExpansion('rounds', Number(event.target.value))} /></label>
+                      <label className="field"><span>每轮最大用户</span><input type="number" min="1" max="1000" value={request.expansion.maxUsersPerRound} onChange={(event) => updateExpansion('maxUsersPerRound', Number(event.target.value))} /></label>
+                      <label className="field"><span>每用户最大帖子</span><input type="number" min="1" max="100" value={request.expansion.maxPostsPerUser} onChange={(event) => updateExpansion('maxPostsPerUser', Number(event.target.value))} /></label>
+                      <label className="field"><span>每帖最大评论</span><input type="number" min="1" max="5000" value={request.expansion.maxCommentsPerPost} onChange={(event) => updateExpansion('maxCommentsPerPost', Number(event.target.value))} /></label>
+                      <label className="field"><span>总用户预算</span><input type="number" min="1" max="100000" value={request.expansion.maxTotalUsers} onChange={(event) => updateExpansion('maxTotalUsers', Number(event.target.value))} /></label>
+                      <label className="field"><span>总帖子预算</span><input type="number" min="1" max="100000" value={request.expansion.maxTotalPosts} onChange={(event) => updateExpansion('maxTotalPosts', Number(event.target.value))} /></label>
+                      <label className="field"><span>总评论预算</span><input type="number" min="1" max="1000000" value={request.expansion.maxTotalComments} onChange={(event) => updateExpansion('maxTotalComments', Number(event.target.value))} /></label>
+                      <label className="field"><span>时间预算 min</span><input type="number" min="1" max="1440" value={request.expansion.timeBudgetMinutes} onChange={(event) => updateExpansion('timeBudgetMinutes', Number(event.target.value))} /></label>
+                      <label className="field"><span>失败预算</span><input type="number" min="1" max="1000" value={request.expansion.maxFailureCount} onChange={(event) => updateExpansion('maxFailureCount', Number(event.target.value))} /></label>
+                      <label className="field"><span>调度并发（Relay 单页）</span><input type="number" min="1" max="1" value={request.expansion.concurrency} onChange={(event) => updateExpansion('concurrency', Number(event.target.value))} /></label>
+                      <label className="field"><span>帖子选择</span><select value={request.expansion.postSelectionStrategy} onChange={(event) => updateExpansion('postSelectionStrategy', event.target.value as JobRequest['expansion']['postSelectionStrategy'])}><option value="latest">最新可见</option><option value="keyword_match">关键词优先</option><option value="top_engagement">互动优先</option><option value="all_reachable">当前会话可达</option></select></label>
+                      <Toggle checked={request.expansion.includeReplies} onChange={(value) => updateExpansion('includeReplies', value)} label="采集评论回复" description="回复深度与总评论预算同时生效" />
+                      {request.expansion.includeReplies && <label className="field"><span>最大回复深度</span><input type="number" min="0" max="10" value={request.expansion.maxReplyDepth} onChange={(event) => updateExpansion('maxReplyDepth', Number(event.target.value))} /></label>}
+                    </>}
                   </div>
                 )}
 
@@ -4077,6 +4125,7 @@ function App() {
                 <>
                   <div className="mission-title"><span>关键词</span><strong>{activeJob.keyword}</strong><small>#{activeJob.id.slice(0, 8)}</small></div>
                   <div className="scope-stamp"><Target size={15} /><span><strong>{activeAllMode ? '全量模式' : '历史限定任务'}</strong><small>{activeAllMode ? `最新优先 · 不限时间 · 完整执行 ${activeJob.config?.maxScrolls ?? '-'} 轮发现 · 单路节流采正文` : '历史任务按原检查点展示'}</small></span></div>
+                  {activeExpansion && <div className="scope-stamp"><Network size={15} /><span><strong>关系扩散 · 第 {Number(expansionSummary?.completedRounds || 0)} / {activeJob.config?.expansion?.rounds ?? 0} 轮</strong><small>待处理 {Number(expansionSummary?.frontierCount || 0)} 用户 · 累计 {Number(expansionCounters?.posts || 0)} 帖子 / {Number(expansionCounters?.comments || 0)} 评论 · {String(expansionSummary?.stopReason || '运行中')}</small></span></div>}
                   <div className={`progress-block outcome-${activeOutcome}`} aria-live="polite">
                     <div className="progress-heading">
                       <span className={['resuming', 'running'].includes(activeJob.status) ? 'live-progress-title active' : 'live-progress-title'}><i />实时进度<small>{progressAge}</small></span>

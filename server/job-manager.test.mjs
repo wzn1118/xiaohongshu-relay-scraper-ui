@@ -123,6 +123,32 @@ test('audience comment logs keep current batch progress separate from cumulative
   assert.match(job.progressLabel, /3434/);
 });
 
+test('expansion log events update the existing SSE job state without replacing prior summary fields', () => {
+  const job = {
+    progress: 0,
+    params: { expansion: { enabled: true, rounds: 2 } },
+    workflowSummary: { analysisMode: 'general' },
+  };
+
+  assert.equal(updateProgressFromLog(
+    job,
+    'EXPANSION_EVENT expansion_frontier_updated {"roundIndex":1,"completedRounds":0,"frontierCount":3,"stopReason":"","status":"partial","counters":{"users":7,"posts":2,"comments":12}}',
+  ), true);
+  assert.equal(job.progressPhase, 'audience_expansion');
+  assert.equal(job.progressCurrent, 1);
+  assert.equal(job.progressTotal, 2);
+  assert.equal(job.workflowSummary.analysisMode, 'general');
+  assert.equal(job.workflowSummary.audience.frontierCount, 3);
+  assert.equal(job.workflowSummary.audience.counters.comments, 12);
+
+  assert.equal(updateProgressFromLog(
+    job,
+    'EXPANSION_EVENT expansion_round_completed {"roundIndex":1,"frontierUserCount":3,"expandedUserCount":2,"stopReason":"round_completed"}',
+  ), true);
+  assert.equal(job.workflowSummary.audience.roundSummaries.length, 1);
+  assert.equal(job.workflowSummary.audience.roundSummaries[0].expandedUserCount, 2);
+});
+
 test('JobManager persists history and enforces a single active task', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-manager-'));
   const fakeRunner = path.join(dataDir, 'runner.py');

@@ -20,6 +20,7 @@ from ai_application_workflow import (
     record_needs_content_completion,
 )
 from audience_collection import collect_audience, normalize_audience_post_status
+from expansion_collection import collect_expansion
 from body_completion_ledger import BodyCompletionLedger, LEDGER_FILENAME, load_ledger
 from parallel_body_completion import complete_bodies
 from workflow_state import (
@@ -112,6 +113,7 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser.add_argument("--complete-missing-only", action="store_true")
     parser.add_argument("--collect-audience", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--audience-only", action="store_true")
+    parser.add_argument("--expansion-config-json", default="")
     parser.add_argument("--upstream-runner", default="")
     parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
     parser.add_argument("--codex-runtime", action=argparse.BooleanOptionalAction, default=True)
@@ -129,6 +131,51 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser.add_argument("--state-path")
     parser.add_argument("--expected-state-revision", type=int)
     return parser.parse_known_args(arguments)
+
+
+def expansion_config(wrapper: argparse.Namespace) -> dict[str, Any] | None:
+    if not wrapper.expansion_config_json:
+        return None
+    try:
+        value = json.loads(wrapper.expansion_config_json)
+    except json.JSONDecodeError as error:
+        raise ValueError("--expansion-config-json must be valid JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("--expansion-config-json must contain an object")
+    return value if value.get("enabled") is True else None
+
+
+def collect_configured_audience(
+    wrapper: argparse.Namespace,
+    output_dir: Path,
+    arguments: list[str],
+    upstream_scraper: Path,
+    *,
+    progress_callback: Any = None,
+) -> dict[str, Any]:
+    common = {
+        "checkpoint_dirs": wrapper.resume_checkpoint_dir,
+        "attempt_id": wrapper.attempt_id or "",
+        "relay_port": int(option_value(arguments, "--relay-port") or 18800),
+        "goto_timeout_ms": int(option_value(arguments, "--goto-timeout-ms") or 15000),
+        "note_delay_seconds": float(option_value(arguments, "--note-delay-seconds") or 1.2),
+        "stable_rounds": int(option_value(arguments, "--stable-rounds") or 5),
+        "upstream_scraper": upstream_scraper,
+        "progress_callback": progress_callback,
+    }
+    configured_expansion = expansion_config(wrapper)
+    if configured_expansion is not None:
+        return collect_expansion(
+            output_dir,
+            config=configured_expansion,
+            keyword=option_value(arguments, "--keyword"),
+            **common,
+        )
+    return collect_audience(
+        output_dir,
+        security_verification_timeout_seconds=wrapper.security_verification_timeout_seconds,
+        **common,
+    )
 
 
 def add_flag_once(arguments: list[str], flag: str) -> list[str]:
@@ -1068,16 +1115,11 @@ def main_stateful(
                     flush=True,
                 )
             else:
-                audience_summary = collect_audience(
+                audience_summary = collect_configured_audience(
+                    wrapper,
                     output_dir,
-                    checkpoint_dirs=wrapper.resume_checkpoint_dir,
-                    attempt_id=wrapper.attempt_id or "",
-                    relay_port=int(option_value(unlimited_arguments, "--relay-port") or 18800),
-                    goto_timeout_ms=int(option_value(unlimited_arguments, "--goto-timeout-ms") or 15000),
-                    note_delay_seconds=float(option_value(unlimited_arguments, "--note-delay-seconds") or 1.2),
-                    stable_rounds=int(option_value(unlimited_arguments, "--stable-rounds") or 5),
-                    security_verification_timeout_seconds=wrapper.security_verification_timeout_seconds,
-                    upstream_scraper=upstream_scraper,
+                    unlimited_arguments,
+                    upstream_scraper,
                     progress_callback=audience_state_callback(state),
                 )
             audience_status = (
@@ -1168,16 +1210,11 @@ def main(arguments: list[str] | None = None) -> int:
         if not output_dir_value:
             raise ValueError("--output-dir is required for audience collection")
         output_dir = Path(output_dir_value).resolve()
-        audience = collect_audience(
+        audience = collect_configured_audience(
+            wrapper,
             output_dir,
-            checkpoint_dirs=wrapper.resume_checkpoint_dir,
-            attempt_id=wrapper.attempt_id or "",
-            relay_port=int(option_value(upstream_arguments, "--relay-port") or 18800),
-            goto_timeout_ms=int(option_value(upstream_arguments, "--goto-timeout-ms") or 15000),
-            note_delay_seconds=float(option_value(upstream_arguments, "--note-delay-seconds") or 1.2),
-            stable_rounds=int(option_value(upstream_arguments, "--stable-rounds") or 5),
-            security_verification_timeout_seconds=wrapper.security_verification_timeout_seconds,
-            upstream_scraper=resolve_upstream_scraper(upstream),
+            upstream_arguments,
+            resolve_upstream_scraper(upstream),
         )
         summary = merge_audience_summary(output_dir, audience)
         write_project_manifest(output_dir, summary)
@@ -1368,16 +1405,11 @@ def main(arguments: list[str] | None = None) -> int:
                 flush=True,
             )
         else:
-            audience_summary = collect_audience(
+            audience_summary = collect_configured_audience(
+                wrapper,
                 output_dir,
-                checkpoint_dirs=wrapper.resume_checkpoint_dir,
-                attempt_id=wrapper.attempt_id or "",
-                relay_port=int(option_value(unlimited_arguments, "--relay-port") or 18800),
-                goto_timeout_ms=int(option_value(unlimited_arguments, "--goto-timeout-ms") or 15000),
-                note_delay_seconds=float(option_value(unlimited_arguments, "--note-delay-seconds") or 1.2),
-                stable_rounds=int(option_value(unlimited_arguments, "--stable-rounds") or 5),
-                security_verification_timeout_seconds=wrapper.security_verification_timeout_seconds,
-                upstream_scraper=resolve_upstream_scraper(upstream),
+                unlimited_arguments,
+                resolve_upstream_scraper(upstream),
             )
     summary = build_workflow_summary(result.payload, body_summary)
     if audience_summary is not None:

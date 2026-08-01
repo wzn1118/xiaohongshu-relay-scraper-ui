@@ -1588,6 +1588,54 @@ export function updateProgressFromLog(job, message) {
   };
   const setProgress = (next) => update({ progress: Math.max(job.progress || 0, next) });
 
+  for (const match of message.matchAll(/EXPANSION_EVENT\s+([a-z_]+)\s+(\{[^\r\n]*\})/gi)) {
+    let payload;
+    try {
+      payload = JSON.parse(match[2]);
+    } catch {
+      continue;
+    }
+    const event = match[1].toLowerCase();
+    const previousSummary = job.workflowSummary && typeof job.workflowSummary === 'object'
+      ? job.workflowSummary
+      : {};
+    const previousAudience = previousSummary.audience && typeof previousSummary.audience === 'object'
+      ? previousSummary.audience
+      : {};
+    const previousRounds = Array.isArray(previousAudience.roundSummaries)
+      ? previousAudience.roundSummaries
+      : [];
+    const roundSummaries = event === 'expansion_round_completed'
+      ? [...previousRounds.filter((item) => Number(item?.roundIndex) !== Number(payload.roundIndex)), payload]
+          .sort((left, right) => Number(left.roundIndex) - Number(right.roundIndex))
+      : previousRounds;
+    const roundIndex = Number(payload.roundIndex ?? previousAudience.roundIndex ?? 0);
+    const maxRounds = Number(job.params?.expansion?.rounds ?? previousAudience.maxRounds ?? 0);
+    const audience = {
+      ...previousAudience,
+      enabled: true,
+      roundIndex,
+      maxRounds,
+      completedRounds: Number(payload.completedRounds ?? previousAudience.completedRounds ?? 0),
+      frontierCount: Number(payload.frontierCount ?? previousAudience.frontierCount ?? 0),
+      stopReason: String(payload.stopReason ?? previousAudience.stopReason ?? ''),
+      status: String(payload.status ?? previousAudience.status ?? 'running'),
+      counters: payload.counters && typeof payload.counters === 'object'
+        ? payload.counters
+        : previousAudience.counters || {},
+      roundSummaries,
+    };
+    update({
+      progressPhase: 'audience_expansion',
+      progressLabel: `关系扩散采集：第 ${roundIndex} / ${maxRounds} 轮，待处理 ${audience.frontierCount} 位用户`,
+      progressCurrent: roundIndex,
+      progressTotal: maxRounds,
+      workflowSummary: { ...previousSummary, audience },
+    });
+    const denominator = Math.max(1, maxRounds + 1);
+    setProgress(Math.min(98, 88 + Math.round(((roundIndex + 1) / denominator) * 10)));
+  }
+
   for (const match of message.matchAll(/AUDIENCE_RATE_LIMIT retry=(\d+)\/(\d+) wait=([\d.]+)s/gi)) {
     const now = new Date().toISOString();
     update({

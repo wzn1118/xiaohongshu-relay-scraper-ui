@@ -24,6 +24,23 @@ test('validateRunRequest applies bounded production defaults', () => {
   assert.equal(result.completeMissingOnly, false);
   assert.equal(result.collectAudience, false);
   assert.equal(result.audienceOnly, false);
+  assert.deepEqual(result.expansion, {
+    enabled: false,
+    rounds: 0,
+    includeReplies: true,
+    maxReplyDepth: 2,
+    maxUsersPerRound: 20,
+    maxPostsPerUser: 3,
+    maxCommentsPerPost: 100,
+    maxTotalUsers: 250,
+    maxTotalPosts: 500,
+    maxTotalComments: 5000,
+    timeBudgetMinutes: 30,
+    maxFailureCount: 10,
+    concurrency: 1,
+    postSelectionStrategy: 'latest',
+    schemaVersion: 1,
+  });
   assert.equal(result.securityVerificationTimeoutSeconds, 600);
   assert.equal(result.useCodexRuntime, true);
   assert.equal(result.codexBatchSize, 8);
@@ -80,6 +97,28 @@ test('audience-only collection requires a general resume source', () => {
   assert.equal(result.audienceOnly, true);
   assert.throws(() => validateRunRequest({ audienceOnly: true }), ValidationError);
   assert.throws(() => validateRunRequest({ analysisMode: 'job', mode: 'resume', resumeFromJobId: sourceId, audienceOnly: true }), ValidationError);
+});
+
+test('expansion parameters are optional, strict, bounded, and general-mode only', () => {
+  const result = validateRunRequest({
+    analysisMode: 'general',
+    expansion: {
+      enabled: true,
+      rounds: 2,
+      maxUsersPerRound: 50,
+      postSelectionStrategy: 'keyword_match',
+    },
+  });
+  assert.equal(result.collectAudience, true);
+  assert.equal(result.expansion.rounds, 2);
+  assert.equal(result.expansion.maxUsersPerRound, 50);
+  assert.equal(result.expansion.maxPostsPerUser, 3);
+  assert.throws(() => validateRunRequest({ expansion: { enabled: true } }), ValidationError);
+  assert.throws(() => validateRunRequest({ analysisMode: 'general', expansion: { enabled: true, unknown: 1 } }), ValidationError);
+  assert.throws(() => validateRunRequest({ analysisMode: 'general', expansion: { enabled: true, rounds: '2' } }), ValidationError);
+  assert.throws(() => validateRunRequest({ analysisMode: 'general', expansion: { enabled: true, rounds: 11 } }), ValidationError);
+  assert.throws(() => validateRunRequest({ analysisMode: 'general', expansion: { enabled: true, concurrency: 2 } }), ValidationError);
+  assert.throws(() => validateRunRequest({ analysisMode: 'general', expansion: { enabled: true, postSelectionStrategy: 'random' } }), ValidationError);
 });
 
 test('validateRunRequest always normalizes collection to full-body mode', () => {
@@ -180,6 +219,20 @@ test('buildRunnerArgs emits the isolated audience resume mode', () => {
   assert.ok(args.includes('--audience-only'));
   assert.equal(args.includes('--no-collect-audience'), false);
   assert.equal(args[args.indexOf('--keyword') + 1], '');
+});
+
+test('buildRunnerArgs emits expansion configuration only when enabled', () => {
+  const disabled = validateRunRequest({ analysisMode: 'general' });
+  assert.equal(buildRunnerArgs(disabled, path.resolve('output')).includes('--expansion-config-json'), false);
+
+  const enabled = validateRunRequest({
+    analysisMode: 'general',
+    expansion: { enabled: true, rounds: 1 },
+  });
+  const args = buildRunnerArgs(enabled, path.resolve('output'));
+  const index = args.indexOf('--expansion-config-json');
+  assert.ok(index > -1);
+  assert.deepEqual(JSON.parse(args[index + 1]), enabled.expansion);
 });
 
 test('buildRunnerArgs emits the complete workflow-state execution context', () => {
