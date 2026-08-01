@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { JobManager, publicJob, updateProgressFromLog } from './job-manager.mjs';
+import { JobManager, bodyMetricsForJob, publicJob, updateProgressFromLog } from './job-manager.mjs';
 import { validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
 import { emptyWorkflowStages } from './lib/workflow-state.mjs';
 
@@ -424,7 +424,8 @@ test('JobManager persists history and enforces a single active task', async () =
     child.stdout.write('Scraping note 2/999: https://example.test/2\n');
     child.stdout.write('NOTE_PROGRESS processed=2 total=999 saved=1 status=saved\n');
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(manager.get(job.id).bodyProcessedCount, 2);
+    assert.equal(manager.get(job.id).bodyProcessedCount, 1);
+    assert.equal(manager.get(job.id).bodyMetrics.legacyInferred, true);
     child.stdout.write('PARALLEL_ROUND 1/3 pending=997 workers=3\n');
     child.stdout.write('CARD_DISCOVERY complete=999; detail access delegated to guarded body completion\n');
     child.stdout.write('CARD_CHECKPOINT_NORMALIZED before=999 after=998 duplicates=1\n');
@@ -442,7 +443,7 @@ test('JobManager persists history and enforces a single active task', async () =
     assert.equal(manager.get(job.id).progressTotal, 999);
     assert.equal(manager.get(job.id).discoveredCount, 999);
     assert.equal(manager.get(job.id).scrapedCount, 998);
-    assert.equal(manager.get(job.id).bodyProcessedCount, 999);
+    assert.equal(manager.get(job.id).bodyProcessedCount, 998);
     assert.ok(manager.get(job.id).progressUpdatedAt);
     child.stdout.write('SECURITY_VERIFICATION detected timeout=600s; new collection paused while waiting for manual completion\n');
     await new Promise((resolve) => setImmediate(resolve));
@@ -593,7 +594,7 @@ test('security timeout can resume before the first card is discovered', () => {
   assert.equal(job.resumeAvailable, true);
 });
 
-test('public job keeps the furthest body progress from live and persisted counters', () => {
+test('public job derives body progress only from the persisted per-note ledger', () => {
   const job = publicJob({
     id: 'persisted-body-progress',
     status: 'incomplete',
@@ -601,6 +602,21 @@ test('public job keeps the furthest body progress from live and persisted counte
     discoveredCount: 258,
     scrapedCount: 93,
     bodyProcessedCount: 107,
+    stages: {
+      ...emptyWorkflowStages(),
+      bodyCompletion: {
+        ...emptyWorkflowStages().bodyCompletion,
+        status: 'partial',
+        statisticsSource: 'bodyCompletionLedger',
+        records: {
+          ok: { bodyStatus: 'succeeded', attemptCount: 1 },
+          failed: { bodyStatus: 'failed', attemptCount: 1 },
+          missing: { bodyStatus: 'not_attempted', attemptCount: 0 },
+          blocked: { bodyStatus: 'blocked', attemptCount: 1 },
+          cancelled: { bodyStatus: 'cancelled', attemptCount: 1 },
+        },
+      },
+    },
     workflowSummary: {
       cardsDiscovered: 258,
       notesCollected: 93,
@@ -608,7 +624,58 @@ test('public job keeps the furthest body progress from live and persisted counte
     },
   });
 
-  assert.equal(job.bodyProcessedCount, 181);
+  assert.equal(job.discoveredCount, 5);
+  assert.equal(job.bodyProcessedCount, 4);
+  assert.deepEqual(job.bodyMetrics, {
+    schemaVersion: 1,
+    statisticsSource: 'bodyCompletionLedger',
+    legacyInferred: false,
+    discovered: 5,
+    attempted: 4,
+    succeeded: 1,
+    failed: 1,
+    notAttempted: 1,
+    blocked: 1,
+    cancelled: 1,
+    pending: 0,
+    completionRatePercent: 20,
+    statusCounts: {
+      discovered: 0,
+      queued: 0,
+      attempted: 0,
+      succeeded: 1,
+      failed: 1,
+      not_attempted: 1,
+      blocked: 1,
+      cancelled: 1,
+    },
+    conservation: {
+      left: 5,
+      right: 5,
+      valid: true,
+      terminal: true,
+      formula: 'discovered = succeeded + failed + not_attempted + blocked + cancelled + pending',
+    },
+  });
+  assert.deepEqual(job.workflowSummary.bodyMetrics, job.bodyMetrics);
+});
+
+test('legacy body summaries remain readable and are explicitly marked inferred', () => {
+  const metrics = bodyMetricsForJob({
+    discoveredCount: 4,
+    workflowSummary: {
+      cardsDiscovered: 4,
+      bodyAttempted: 0,
+      bodySucceeded: 2,
+      bodyCancelled: 1,
+    },
+  });
+
+  assert.equal(metrics.legacyInferred, true);
+  assert.equal(metrics.statisticsSource, 'legacyInferred');
+  assert.equal(metrics.attempted, 3);
+  assert.equal(metrics.notAttempted, 1);
+  assert.equal(metrics.conservation.valid, true);
 });
 
 test('rate limiting is exposed as a resumable incomplete state instead of manual verification', () => {

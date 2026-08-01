@@ -74,6 +74,29 @@ export type Artifact = {
   url?: string
 }
 
+export type BodyMetrics = {
+  schemaVersion: number
+  statisticsSource: 'bodyCompletionLedger' | 'legacyInferred' | string
+  legacyInferred: boolean
+  discovered: number
+  attempted: number
+  succeeded: number
+  failed: number
+  notAttempted: number
+  blocked: number
+  cancelled: number
+  pending: number
+  completionRatePercent: number
+  statusCounts?: Record<string, number>
+  conservation: {
+    left: number
+    right: number
+    valid: boolean
+    terminal: boolean
+    formula: string
+  }
+}
+
 export type Job = {
   id: string
   schemaVersion?: number
@@ -97,6 +120,7 @@ export type Job = {
   discoveredCount?: number
   scrapedCount?: number
   bodyProcessedCount?: number
+  bodyMetrics?: BodyMetrics
   incompleteCount?: number
   progressPhase?: string | null
   progressLabel?: string | null
@@ -129,6 +153,11 @@ export type CoverageSummary = {
   discovered?: number
   bodyAttempted?: number
   bodySucceeded?: number
+  bodyFailed?: number
+  bodyNotAttempted?: number
+  bodyBlocked?: number
+  bodyCancelled?: number
+  bodyCompletionRatePercent?: number
   timesNormalized?: number
   applicationInfo?: number
   draftsGenerated?: number

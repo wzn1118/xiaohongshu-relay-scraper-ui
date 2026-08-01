@@ -44,6 +44,7 @@ export function emptyWorkflowStages() {
       status: 'not_started',
       ledgerSchemaVersion: 1,
       statisticsSource: 'bodyCompletionLedger',
+      legacyInferred: false,
       records: {},
       totalCount: 0,
       completedCount: 0,
@@ -216,6 +217,7 @@ function normalizeWorkflowState(value) {
         stage.ledgerSchemaVersion = 1;
         stage.statisticsSource = 'legacyInferred';
       }
+      stage.legacyInferred = stage.statisticsSource === 'legacyInferred';
       if (original.totalCount === undefined) stage.totalCount = Object.keys(records).length;
       if (original.completedCount === undefined) {
         stage.completedCount = Object.values(records).filter((record) => bodyRecordIsCompleted(record)).length;

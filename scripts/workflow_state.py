@@ -312,6 +312,7 @@ def _empty_stages() -> dict[str, dict[str, Any]]:
             "status": "not_started",
             "ledgerSchemaVersion": 1,
             "statisticsSource": "bodyCompletionLedger",
+            "legacyInferred": False,
             "records": {},
             "totalCount": 0,
             "completedCount": 0,
@@ -379,6 +380,7 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
             if "ledgerSchemaVersion" not in original:
                 stage["ledgerSchemaVersion"] = 1
                 stage["statisticsSource"] = "legacyInferred"
+            stage["legacyInferred"] = stage.get("statisticsSource") == "legacyInferred"
             if "totalCount" not in original:
                 stage["totalCount"] = len(records)
             if "completedCount" not in original:
@@ -978,6 +980,7 @@ class WorkflowStateSession:
                     "statisticsSource": str(
                         ledger.get("statisticsSource") or "bodyCompletionLedger"
                     ),
+                    "legacyInferred": bool(ledger.get("legacyInferred")),
                     "records": records,
                     "lastCheckpointAt": now,
                     "totalCount": len(records),
@@ -1065,6 +1068,7 @@ class WorkflowStateSession:
                 "attemptId": self.attempt_id,
                 "ledgerSchemaVersion": 1,
                 "statisticsSource": "legacyInferred",
+                "legacyInferred": True,
                 "lastCheckpointAt": now,
                 "totalCount": len(records),
                 "completedCount": completed_count,

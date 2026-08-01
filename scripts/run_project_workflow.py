@@ -233,6 +233,110 @@ def can_complete_from_checkpoint(output_dir: Path, complete_missing_only: bool) 
     )
 
 
+def _body_metrics_from_counts(
+    *,
+    discovered: int,
+    attempted: int,
+    succeeded: int,
+    failed: int,
+    not_attempted: int,
+    blocked: int,
+    cancelled: int,
+    pending: int,
+    statistics_source: str,
+    status_counts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    right = succeeded + failed + not_attempted + blocked + cancelled + pending
+    return {
+        "schemaVersion": 1,
+        "statisticsSource": statistics_source,
+        "legacyInferred": statistics_source == "legacyInferred",
+        "discovered": discovered,
+        "attempted": attempted,
+        "succeeded": succeeded,
+        "failed": failed,
+        "notAttempted": not_attempted,
+        "blocked": blocked,
+        "cancelled": cancelled,
+        "pending": pending,
+        "completionRatePercent": round((succeeded / discovered) * 100, 2) if discovered else 100.0,
+        "statusCounts": status_counts or {},
+        "conservation": {
+            "left": discovered,
+            "right": right,
+            "valid": discovered == right,
+            "terminal": pending == 0 and discovered == right,
+            "formula": (
+                "discovered = succeeded + failed + not_attempted + blocked + "
+                "cancelled + pending"
+            ),
+        },
+    }
+
+
+def canonical_body_metrics(
+    body_summary: dict[str, Any],
+    quality_gate: dict[str, Any],
+) -> dict[str, Any]:
+    formal = body_summary.get("bodyMetrics")
+    if isinstance(formal, dict) and all(
+        field in formal
+        for field in (
+            "discovered", "attempted", "succeeded", "failed",
+            "notAttempted", "blocked", "cancelled", "pending",
+        )
+    ):
+        source = str(formal.get("statisticsSource") or "bodyCompletionLedger")
+        return {
+            **formal,
+            "statisticsSource": source,
+            "legacyInferred": source == "legacyInferred",
+        }
+
+    ledger = body_summary.get("bodyCompletionLedger")
+    ledger_summary = ledger.get("summary") if isinstance(ledger, dict) else None
+    if isinstance(ledger_summary, dict):
+        source = str(body_summary.get("statisticsSource") or "bodyCompletionLedger")
+        return _body_metrics_from_counts(
+            discovered=int(ledger_summary.get("discoveredCount") or 0),
+            attempted=int(ledger_summary.get("attemptedCount") or 0),
+            succeeded=int(ledger_summary.get("succeededCount") or 0),
+            failed=int(ledger_summary.get("failedCount") or 0),
+            not_attempted=int(ledger_summary.get("notAttemptedCount") or 0),
+            blocked=int(ledger_summary.get("blockedCount") or 0),
+            cancelled=int(ledger_summary.get("cancelledCount") or 0),
+            pending=int(ledger_summary.get("pendingCount") or 0),
+            statistics_source=source,
+            status_counts=ledger_summary.get("statusCounts")
+            if isinstance(ledger_summary.get("statusCounts"), dict) else None,
+        )
+
+    # Old jobs did not persist request-start events. Preserve their readability,
+    # but expose the reconstruction explicitly instead of presenting it as exact.
+    discovered = int(body_summary.get("cardsDiscovered", quality_gate["discovered_count"]) or 0)
+    succeeded = int(body_summary.get("bodySucceeded", quality_gate["body_count"]) or 0)
+    failed = int(body_summary.get("bodyFailed") or 0)
+    blocked = int(body_summary.get("bodyBlocked") or 0)
+    cancelled = int(body_summary.get("bodyCancelled") or 0)
+    pending = int(body_summary.get("bodyPending") or 0)
+    accounted = succeeded + failed + blocked + cancelled + pending
+    not_attempted = int(body_summary["bodyNotAttempted"]) if "bodyNotAttempted" in body_summary else max(0, discovered - accounted)
+    minimum_attempted = succeeded + failed + blocked + cancelled
+    attempted = int(body_summary["bodyAttempted"]) if "bodyAttempted" in body_summary else minimum_attempted
+    attempted = max(attempted, minimum_attempted)
+    return _body_metrics_from_counts(
+        discovered=discovered,
+        attempted=attempted,
+        succeeded=succeeded,
+        failed=failed,
+        not_attempted=not_attempted,
+        blocked=blocked,
+        cancelled=cancelled,
+        pending=pending,
+        statistics_source="legacyInferred",
+    )
+
+
 def checkpoint_body_summary(output_dir: Path, *, stop_reason: str) -> dict[str, Any]:
     def load_list(filename: str) -> list[dict[str, Any]]:
         try:
@@ -246,6 +350,7 @@ def checkpoint_body_summary(output_dir: Path, *, stop_reason: str) -> dict[str, 
     ledger = load_ledger(output_dir / LEDGER_FILENAME)
     if ledger is not None:
         counts = ledger["summary"]
+        metrics = ledger["bodyMetrics"]
         return {
             "transitionedToAnalysis": True,
             "stopReason": stop_reason,
@@ -258,6 +363,8 @@ def checkpoint_body_summary(output_dir: Path, *, stop_reason: str) -> dict[str, 
             "bodyCancelled": counts["cancelledCount"],
             "missingBodies": max(0, counts["discoveredCount"] - counts["succeededCount"]),
             "statisticsSource": ledger.get("statisticsSource", "bodyCompletionLedger"),
+            "legacyInferred": bool(ledger.get("legacyInferred")),
+            "bodyMetrics": metrics,
             "bodyCompletionLedger": ledger,
             "checkpointFallback": True,
         }
@@ -266,7 +373,7 @@ def checkpoint_body_summary(output_dir: Path, *, stop_reason: str) -> dict[str, 
         for note in notes
         if str(note.get("access_status") or "") == "detail_ok" and str(note.get("body") or "").strip()
     )
-    return {
+    legacy_summary = {
         "transitionedToAnalysis": True,
         "stopReason": stop_reason,
         "cardsDiscovered": len(cards),
@@ -278,8 +385,14 @@ def checkpoint_body_summary(output_dir: Path, *, stop_reason: str) -> dict[str, 
         "bodyCancelled": 0,
         "missingBodies": max(0, len(cards) - completed),
         "statisticsSource": "legacyInferred",
+        "legacyInferred": True,
         "checkpointFallback": True,
     }
+    legacy_summary["bodyMetrics"] = canonical_body_metrics(legacy_summary, {
+        "discovered_count": len(cards),
+        "body_count": completed,
+    })
+    return legacy_summary
 
 
 def collect_body_checkpoint(
@@ -528,6 +641,7 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         or security_verification.get("status") == "timed_out"
     )
     rate_limit = body_summary.get("rateLimit")
+    body_metrics = canonical_body_metrics(body_summary, gate)
     if not isinstance(rate_limit, dict):
         rate_limit = {}
     rate_limited = collection_stop_reason == "rate_limited" or rate_limit.get("status") == "stopped"
@@ -566,10 +680,10 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         "securityVerification": security_verification,
         "rateLimit": rate_limit,
         "generatedAt": utc_now(),
-        "cardsDiscovered": int(body_summary.get("cardsDiscovered", gate["discovered_count"])),
+        "cardsDiscovered": body_metrics["discovered"],
         "notesCollected": gate["record_count"],
         "bodiesCaptured": gate["body_count"],
-        "bodyCoveragePercent": round(gate["body_coverage_rate"] * 100, 2),
+        "bodyCoveragePercent": body_metrics["completionRatePercent"],
         "timeNormalizedCount": time_normalized,
         "exactTimeCount": exact_time,
         "estimatedTimeCount": estimated_time,
@@ -589,14 +703,16 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         "checks": gate["checks"],
         "issues": [] if ai_deferred else gate["issues"],
         "agentStages": agent_stages,
-        "discovered": int(body_summary.get("cardsDiscovered", gate["discovered_count"])),
-        "bodyAttempted": int(body_summary.get("bodyAttempted", gate["body_count"])),
-        "bodySucceeded": int(body_summary.get("bodySucceeded", gate["body_count"])),
-        "bodyFailed": int(body_summary.get("bodyFailed", 0)),
-        "bodyNotAttempted": int(body_summary.get("bodyNotAttempted", 0)),
-        "bodyBlocked": int(body_summary.get("bodyBlocked", 0)),
-        "bodyCancelled": int(body_summary.get("bodyCancelled", 0)),
-        "bodyStatisticsSource": str(body_summary.get("statisticsSource") or "legacyInferred"),
+        "discovered": body_metrics["discovered"],
+        "bodyAttempted": body_metrics["attempted"],
+        "bodySucceeded": body_metrics["succeeded"],
+        "bodyFailed": body_metrics["failed"],
+        "bodyNotAttempted": body_metrics["notAttempted"],
+        "bodyBlocked": body_metrics["blocked"],
+        "bodyCancelled": body_metrics["cancelled"],
+        "bodyStatisticsSource": body_metrics["statisticsSource"],
+        "legacyInferred": body_metrics["legacyInferred"],
+        "bodyMetrics": body_metrics,
         "bodyCompletionLedger": body_summary.get("bodyCompletionLedger"),
         "timesNormalized": time_normalized,
         "applicationInfo": job_cards,

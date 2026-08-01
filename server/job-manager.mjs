@@ -1667,6 +1667,168 @@ function currentAttempt(job) {
     || null;
 }
 
+const BODY_LEDGER_STATUSES = new Set([
+  'discovered', 'queued', 'attempted', 'succeeded', 'failed',
+  'not_attempted', 'blocked', 'cancelled',
+]);
+
+function bodyMetricNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function bodyMetricsFromCounts({
+  discovered,
+  attempted,
+  succeeded,
+  failed,
+  notAttempted,
+  blocked,
+  cancelled,
+  pending,
+  statisticsSource,
+  statusCounts = {},
+}) {
+  const right = succeeded + failed + notAttempted + blocked + cancelled + pending;
+  return {
+    schemaVersion: 1,
+    statisticsSource,
+    legacyInferred: statisticsSource === 'legacyInferred',
+    discovered,
+    attempted,
+    succeeded,
+    failed,
+    notAttempted,
+    blocked,
+    cancelled,
+    pending,
+    completionRatePercent: discovered ? Math.round((succeeded / discovered) * 10000) / 100 : 100,
+    statusCounts,
+    conservation: {
+      left: discovered,
+      right,
+      valid: discovered === right,
+      terminal: pending === 0 && discovered === right,
+      formula: 'discovered = succeeded + failed + not_attempted + blocked + cancelled + pending',
+    },
+  };
+}
+
+function bodyMetricsFromRecords(records, statisticsSource) {
+  const statusCounts = Object.fromEntries([...BODY_LEDGER_STATUSES].map((status) => [status, 0]));
+  let attempted = 0;
+  for (const record of Object.values(records)) {
+    const rawStatus = String(record?.bodyStatus || record?.status || 'not_attempted');
+    const status = BODY_LEDGER_STATUSES.has(rawStatus) ? rawStatus : 'not_attempted';
+    statusCounts[status] += 1;
+    if (
+      bodyMetricNumber(record?.attemptCount) > 0
+      || ['succeeded', 'failed', 'blocked', 'cancelled'].includes(status)
+    ) attempted += 1;
+  }
+  return bodyMetricsFromCounts({
+    discovered: Object.keys(records).length,
+    attempted,
+    succeeded: statusCounts.succeeded,
+    failed: statusCounts.failed,
+    notAttempted: statusCounts.not_attempted,
+    blocked: statusCounts.blocked,
+    cancelled: statusCounts.cancelled,
+    pending: statusCounts.discovered + statusCounts.queued + statusCounts.attempted,
+    statisticsSource,
+    statusCounts,
+  });
+}
+
+function metricsFromPersistedSummary(summary, statisticsSource) {
+  return bodyMetricsFromCounts({
+    discovered: bodyMetricNumber(summary.discoveredCount),
+    attempted: bodyMetricNumber(summary.attemptedCount),
+    succeeded: bodyMetricNumber(summary.succeededCount),
+    failed: bodyMetricNumber(summary.failedCount),
+    notAttempted: bodyMetricNumber(summary.notAttemptedCount),
+    blocked: bodyMetricNumber(summary.blockedCount),
+    cancelled: bodyMetricNumber(summary.cancelledCount),
+    pending: bodyMetricNumber(summary.pendingCount),
+    statisticsSource,
+    statusCounts: summary.statusCounts && typeof summary.statusCounts === 'object'
+      ? structuredClone(summary.statusCounts)
+      : {},
+  });
+}
+
+export function bodyMetricsForJob(job) {
+  const stage = job?.stages?.bodyCompletion;
+  const stageRecords = stage?.records;
+  if (stageRecords && typeof stageRecords === 'object' && Object.keys(stageRecords).length > 0) {
+    return bodyMetricsFromRecords(
+      stageRecords,
+      String(stage.statisticsSource || 'bodyCompletionLedger'),
+    );
+  }
+
+  const summary = job?.workflowSummary && typeof job.workflowSummary === 'object'
+    ? job.workflowSummary
+    : {};
+  const formal = summary.bodyMetrics;
+  if (formal && typeof formal === 'object' && [
+    'discovered', 'attempted', 'succeeded', 'failed',
+    'notAttempted', 'blocked', 'cancelled', 'pending',
+  ].every((field) => Number.isFinite(Number(formal[field])))) {
+    return bodyMetricsFromCounts({
+      discovered: bodyMetricNumber(formal.discovered),
+      attempted: bodyMetricNumber(formal.attempted),
+      succeeded: bodyMetricNumber(formal.succeeded),
+      failed: bodyMetricNumber(formal.failed),
+      notAttempted: bodyMetricNumber(formal.notAttempted),
+      blocked: bodyMetricNumber(formal.blocked),
+      cancelled: bodyMetricNumber(formal.cancelled),
+      pending: bodyMetricNumber(formal.pending),
+      statisticsSource: String(formal.statisticsSource || 'bodyCompletionLedger'),
+      statusCounts: formal.statusCounts && typeof formal.statusCounts === 'object'
+        ? structuredClone(formal.statusCounts)
+        : {},
+    });
+  }
+
+  const compactLedgerSummary = summary.bodyCompletionLedger?.summary;
+  if (compactLedgerSummary && typeof compactLedgerSummary === 'object') {
+    return metricsFromPersistedSummary(
+      compactLedgerSummary,
+      String(summary.bodyStatisticsSource || 'bodyCompletionLedger'),
+    );
+  }
+
+  const discovered = bodyMetricNumber(
+    summary.cardsDiscovered ?? summary.discovered ?? job?.discoveredCount,
+  );
+  const succeeded = bodyMetricNumber(
+    summary.bodySucceeded ?? summary.bodiesCaptured ?? job?.scrapedCount,
+  );
+  const failed = bodyMetricNumber(summary.bodyFailed);
+  const blocked = bodyMetricNumber(summary.bodyBlocked);
+  const cancelled = bodyMetricNumber(summary.bodyCancelled);
+  const pending = bodyMetricNumber(summary.bodyPending);
+  const accounted = succeeded + failed + blocked + cancelled + pending;
+  const notAttempted = summary.bodyNotAttempted === undefined
+    ? (discovered >= accounted ? discovered - accounted : 0)
+    : bodyMetricNumber(summary.bodyNotAttempted);
+  const minimumAttempted = succeeded + failed + blocked + cancelled;
+  const reportedAttempted = bodyMetricNumber(summary.bodyAttempted, minimumAttempted);
+  const attempted = reportedAttempted >= minimumAttempted ? reportedAttempted : minimumAttempted;
+  return bodyMetricsFromCounts({
+    discovered,
+    attempted,
+    succeeded,
+    failed,
+    notAttempted,
+    blocked,
+    cancelled,
+    pending,
+    statisticsSource: 'legacyInferred',
+  });
+}
+
 function rateLimitResumeScope(job) {
   const explicitScope = job?.rateLimit?.resumeScope;
   if (explicitScope === 'audience' || explicitScope === 'body_completion') return explicitScope;
@@ -1676,20 +1838,11 @@ function rateLimitResumeScope(job) {
   if (job?.params?.audienceOnly) return 'audience';
 
   const summary = job?.workflowSummary || {};
-  const discovered = Math.max(
-    Number(summary.cardsDiscovered || 0),
-    Number(summary.discovered || 0),
-    Number(job?.discoveredCount || 0),
-  );
-  const completedBodies = Math.max(
-    Number(summary.bodySucceeded || 0),
-    Number(summary.bodiesCaptured || 0),
-    Number(job?.bodyProcessedCount || 0),
-  );
+  const bodyMetrics = bodyMetricsForJob(job);
   const bodyStageStatus = String(job?.stages?.bodyCompletion?.status || '');
   const collectionStopReason = String(summary.collectionStopReason || '');
   if (
-    discovered > completedBodies
+    bodyMetrics.discovered > bodyMetrics.succeeded
     || ['blocked', 'partial'].includes(bodyStageStatus)
     || ['rate_limited', 'security_verification_timeout'].includes(collectionStopReason)
   ) return 'body_completion';
@@ -1723,15 +1876,22 @@ function finishAttempt(attempt, values = {}) {
 
 function processedCountForJob(job) {
   const audience = job?.workflowSummary?.audience || {};
-  return Math.max(
-    0,
-    Number(job?.bodyProcessedCount || 0),
-    Number(job?.scrapedCount || 0),
-    Number(job?.workflowSummary?.bodyAttempted || 0),
-    Number(audience.postsAttempted || 0),
-    Number(audience.commentsCollected || 0),
-    Number(audience.usersDiscovered || 0),
-  );
+  const scope = currentAttempt(job)?.resumeScope || inferResumeScope(job?.params);
+  if (scope === 'audience') {
+    return Math.max(
+      0,
+      Number(audience.postsAttempted || 0),
+      Number(audience.commentsCollected || 0),
+      Number(audience.usersDiscovered || 0),
+    );
+  }
+  if (scope === 'analysis') {
+    return bodyMetricNumber(
+      job?.checkpointAnalysisCount ?? job?.workflowSummary?.applicationCopyGenerated,
+    );
+  }
+  if (scope === 'artifacts') return bodyMetricNumber(job?.artifactCount);
+  return bodyMetricsForJob(job).attempted;
 }
 
 function attemptProcessedCount(attempt, job) {
@@ -2000,16 +2160,10 @@ function errorCodeForJob(job) {
 
 export function publicJob(job) {
   const status = job.status === 'succeeded' ? 'completed' : job.status;
-  const discoveredCount = Number(job.discoveredCount || job.workflowSummary?.cardsDiscovered || 0);
+  const bodyMetrics = bodyMetricsForJob(job);
+  const discoveredCount = bodyMetrics.discovered;
   const scrapedCount = Number(job.scrapedCount || job.workflowSummary?.notesCollected || 0);
-  const rawBodyProcessedCount = Math.max(
-    Number(job.bodyProcessedCount || 0),
-    Number(job.workflowSummary?.bodyAttempted || 0),
-    scrapedCount,
-  );
-  const bodyProcessedCount = discoveredCount > 0
-    ? Math.min(discoveredCount, Math.max(scrapedCount, rawBodyProcessedCount))
-    : Math.max(scrapedCount, rawBodyProcessedCount);
+  const bodyProcessedCount = bodyMetrics.attempted;
   const incompleteCount = Number.isFinite(job.checkpointIncompleteCount)
     ? Number(job.checkpointIncompleteCount)
     : Math.max(0, discoveredCount - scrapedCount);
@@ -2078,7 +2232,14 @@ export function publicJob(job) {
     progressCurrent: Number(job.progressCurrent || 0),
     progressTotal: Number(job.progressTotal || 0),
     progressUpdatedAt: job.progressUpdatedAt || null,
-    workflowSummary: job.workflowSummary || null,
+    bodyMetrics,
+    workflowSummary: job.workflowSummary && typeof job.workflowSummary === 'object'
+      ? {
+          ...job.workflowSummary,
+          bodyMetrics,
+          legacyInferred: bodyMetrics.legacyInferred,
+        }
+      : null,
     securityRestriction,
     rateLimit,
     resumeAvailable,

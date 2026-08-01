@@ -21,7 +21,11 @@ from body_completion_ledger import (  # noqa: E402
     load_ledger,
 )
 import parallel_body_completion as body_completion  # noqa: E402
-from run_project_workflow import checkpoint_body_summary, write_project_manifest  # noqa: E402
+from run_project_workflow import (  # noqa: E402
+    canonical_body_metrics,
+    checkpoint_body_summary,
+    write_project_manifest,
+)
 
 
 REQUIRED_FIELDS = {
@@ -118,6 +122,23 @@ def test_result_cannot_be_recorded_before_request_start(tmp_path: Path) -> None:
         ledger.finish_attempt("n1", "missing-request", "failed")
 
 
+def test_user_cancel_only_cancels_an_in_flight_request(tmp_path: Path) -> None:
+    ledger = BodyCompletionLedger.open(tmp_path, cards("in-flight", "queued", "unseen"))
+    ledger.queue(["in-flight", "queued"])
+    assert ledger.start_attempt("in-flight", "request-in-flight")
+
+    ledger.finalize_pending("user_cancelled")
+
+    records = ledger.records
+    assert records["in-flight"]["bodyStatus"] == "cancelled"
+    assert records["in-flight"]["attemptCount"] == 1
+    assert records["queued"]["bodyStatus"] == "not_attempted"
+    assert records["queued"]["attemptCount"] == 0
+    assert records["unseen"]["bodyStatus"] == "not_attempted"
+    assert records["unseen"]["attemptCount"] == 0
+    assert all(record["stopReason"] == "user_cancelled" for record in records.values())
+
+
 def test_terminal_statuses_obey_conservation_and_keep_distinct_stop_reasons(tmp_path: Path) -> None:
     ledger = BodyCompletionLedger.open(tmp_path, cards("ok", "failed", "blocked", "cancelled", "limit"))
     finish(ledger, "ok", "succeeded", recoverable=False)
@@ -167,6 +188,8 @@ def test_resume_selects_only_unattempted_recoverable_failures_and_retryable_bloc
 
     eligible = {note_id for note_id in ledger.records if ledger.can_resume(note_id)}
     assert eligible == {"unattempted", "retry-failure", "security"}
+    assert ledger.start_attempt("fatal-failure", "request-after-fatal") is False
+    assert ledger.start_attempt("policy", "request-after-policy-block") is False
 
 
 def test_restart_recovers_in_flight_and_queued_records_without_double_counting(tmp_path: Path) -> None:
@@ -202,7 +225,7 @@ def test_discovery_observer_does_not_reclassify_live_attempt(tmp_path: Path) -> 
     assert observed.records["n2"]["bodyStatus"] == "discovered"
 
 
-def test_legacy_job_is_readable_without_fabricating_exact_attempt_count(tmp_path: Path) -> None:
+def test_legacy_job_exposes_an_explicitly_inferred_attempt_lower_bound(tmp_path: Path) -> None:
     legacy_notes = [{"note_id": "ok", "body": "full body", "access_status": "detail_ok"}]
     legacy_failures = [{"note_id": "failed", "access_status": "detail_timeout"}]
     ledger = BodyCompletionLedger.open(
@@ -214,7 +237,9 @@ def test_legacy_job_is_readable_without_fabricating_exact_attempt_count(tmp_path
 
     payload = ledger.snapshot()
     assert payload["statisticsSource"] == "legacyInferred"
-    assert payload["summary"]["attemptedCount"] == 0
+    assert payload["legacyInferred"] is True
+    assert payload["bodyMetrics"]["legacyInferred"] is True
+    assert payload["summary"]["attemptedCount"] == 2
     assert payload["records"]["ok"]["bodyStatus"] == "succeeded"
     assert payload["records"]["failed"]["bodyStatus"] == "failed"
     assert payload["records"]["missing"]["bodyStatus"] == "discovered"
@@ -228,9 +253,69 @@ def test_shadow_comparison_records_expected_legacy_difference(tmp_path: Path) ->
     shadow = ledger.snapshot()["shadowComparison"]
     assert shadow["mode"] == "promoted"
     assert shadow["promotionFixture"] == PROMOTION_FIXTURE
-    assert shadow["legacy"]["bodyAttempted"] == 2
-    assert shadow["ledger"]["bodyAttempted"] == 1
+    assert shadow["legacy"]["attempted"] == 2
+    assert shadow["ledger"]["attempted"] == 1
+    for field in (
+        "discovered", "succeeded", "failed", "notAttempted", "blocked",
+        "cancelled", "pending", "completionRatePercent",
+    ):
+        assert shadow["legacy"][field] == shadow["ledger"][field]
     assert shadow["matches"] is False
+
+
+def test_formal_metrics_use_ledger_counts_and_legacy_metrics_are_explicit() -> None:
+    exact = canonical_body_metrics({
+        "statisticsSource": "bodyCompletionLedger",
+        "bodyCompletionLedger": {
+            "summary": {
+                "discoveredCount": 7,
+                "attemptedCount": 4,
+                "succeededCount": 2,
+                "failedCount": 1,
+                "notAttemptedCount": 1,
+                "blockedCount": 1,
+                "cancelledCount": 1,
+                "pendingCount": 1,
+            },
+        },
+    }, {"discovered_count": 99, "body_count": 88})
+    assert exact == {
+        "schemaVersion": 1,
+        "statisticsSource": "bodyCompletionLedger",
+        "legacyInferred": False,
+        "discovered": 7,
+        "attempted": 4,
+        "succeeded": 2,
+        "failed": 1,
+        "notAttempted": 1,
+        "blocked": 1,
+        "cancelled": 1,
+        "pending": 1,
+        "completionRatePercent": 28.57,
+        "statusCounts": {},
+        "conservation": {
+            "left": 7,
+            "right": 7,
+            "valid": True,
+            "terminal": False,
+            "formula": "discovered = succeeded + failed + not_attempted + blocked + cancelled + pending",
+        },
+    }
+
+    legacy = canonical_body_metrics(
+        {
+            "cardsDiscovered": 4,
+            "bodyAttempted": 0,
+            "bodySucceeded": 2,
+            "bodyCancelled": 1,
+        },
+        {"discovered_count": 4, "body_count": 2},
+    )
+    assert legacy["legacyInferred"] is True
+    assert legacy["statisticsSource"] == "legacyInferred"
+    assert legacy["attempted"] == 3
+    assert legacy["notAttempted"] == 1
+    assert legacy["conservation"]["valid"] is True
 
 
 def test_ledger_is_exposed_in_summary_and_artifact_manifest(tmp_path: Path) -> None:
@@ -244,6 +329,8 @@ def test_ledger_is_exposed_in_summary_and_artifact_manifest(tmp_path: Path) -> N
 
     summary = checkpoint_body_summary(tmp_path, stop_reason="checkpoint_reused")
     assert summary["statisticsSource"] == "bodyCompletionLedger"
+    assert summary["legacyInferred"] is False
+    assert summary["bodyMetrics"]["conservation"]["valid"] is True
     assert summary["bodyAttempted"] == 0
     assert summary["bodyNotAttempted"] == 2
     summary.update({

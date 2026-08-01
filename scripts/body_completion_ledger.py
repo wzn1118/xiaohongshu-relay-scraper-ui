@@ -125,11 +125,17 @@ def summarize_records(records: dict[str, dict[str, Any]]) -> dict[str, Any]:
     for record in records.values():
         status = str(record.get("bodyStatus") or record.get("status") or "not_attempted")
         counts[status if status in counts else "not_attempted"] += 1
-        if int(record.get("attemptCount") or 0) > 0:
+        if int(record.get("attemptCount") or 0) > 0 or status in {
+            "succeeded", "failed", "blocked", "cancelled",
+        }:
             attempted_count += 1
     pending_count = counts["discovered"] + counts["queued"] + counts["attempted"]
     terminal_count = sum(counts[status] for status in TERMINAL_STATUSES)
     discovered_count = len(records)
+    completion_rate = round(
+        (counts["succeeded"] / discovered_count) * 100,
+        2,
+    ) if discovered_count else 100.0
     return {
         "discoveredCount": discovered_count,
         "attemptedCount": attempted_count,
@@ -139,6 +145,7 @@ def summarize_records(records: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "blockedCount": counts["blocked"],
         "cancelledCount": counts["cancelled"],
         "pendingCount": pending_count,
+        "completionRatePercent": completion_rate,
         "statusCounts": counts,
         "conservation": {
             "left": discovered_count,
@@ -153,19 +160,43 @@ def summarize_records(records: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def legacy_summary(records: dict[str, dict[str, Any]]) -> dict[str, int]:
-    summary = summarize_records(records)
+def _summary_projection(summary: dict[str, Any], attempted_count: int) -> dict[str, int | float]:
     return {
-        "bodyAttempted": summary["discoveredCount"],
-        "bodySucceeded": summary["succeededCount"],
+        "discovered": summary["discoveredCount"],
+        "attempted": attempted_count,
+        "succeeded": summary["succeededCount"],
+        "failed": summary["failedCount"],
+        "notAttempted": summary["notAttemptedCount"],
+        "blocked": summary["blockedCount"],
+        "cancelled": summary["cancelledCount"],
+        "pending": summary["pendingCount"],
+        "completionRatePercent": summary["completionRatePercent"],
     }
 
 
-def ledger_summary(records: dict[str, dict[str, Any]]) -> dict[str, int]:
+def legacy_summary(records: dict[str, dict[str, Any]]) -> dict[str, int | float]:
+    summary = summarize_records(records)
+    return _summary_projection(summary, summary["discoveredCount"])
+
+
+def ledger_summary(records: dict[str, dict[str, Any]]) -> dict[str, int | float]:
+    summary = summarize_records(records)
+    return _summary_projection(summary, summary["attemptedCount"])
+
+
+def body_metrics(
+    records: dict[str, dict[str, Any]],
+    *,
+    statistics_source: str,
+) -> dict[str, Any]:
     summary = summarize_records(records)
     return {
-        "bodyAttempted": summary["attemptedCount"],
-        "bodySucceeded": summary["succeededCount"],
+        "schemaVersion": 1,
+        "statisticsSource": statistics_source,
+        "legacyInferred": statistics_source == "legacyInferred",
+        **_summary_projection(summary, summary["attemptedCount"]),
+        "statusCounts": copy.deepcopy(summary["statusCounts"]),
+        "conservation": copy.deepcopy(summary["conservation"]),
     }
 
 
@@ -185,7 +216,14 @@ def load_ledger(path: Path) -> dict[str, Any] | None:
         for note_id, record in raw_records.items()
         if str(note_id) and isinstance(record, dict)
     }
+    statistics_source = str(payload.get("statisticsSource") or "bodyCompletionLedger")
+    payload["statisticsSource"] = statistics_source
+    payload["legacyInferred"] = statistics_source == "legacyInferred"
     payload["summary"] = summarize_records(payload["records"])
+    payload["bodyMetrics"] = body_metrics(
+        payload["records"],
+        statistics_source=statistics_source,
+    )
     return payload
 
 
@@ -227,6 +265,7 @@ class BodyCompletionLedger:
             payload: dict[str, Any] = {
                 "schemaVersion": LEDGER_SCHEMA_VERSION,
                 "statisticsSource": "legacyInferred" if legacy_inferred else "bodyCompletionLedger",
+                "legacyInferred": legacy_inferred,
                 "createdAt": now,
                 "updatedAt": now,
                 "records": {},
@@ -350,7 +389,7 @@ class BodyCompletionLedger:
     def start_attempt(self, note_id: str, request_id: str) -> bool:
         with self._lock:
             record = self._payload["records"].get(note_id)
-            if not isinstance(record, dict) or record["bodyStatus"] == "succeeded":
+            if not isinstance(record, dict) or not self.can_resume(note_id):
                 return False
             if request_id in record["requestIds"]:
                 return False
@@ -452,7 +491,7 @@ class BodyCompletionLedger:
                 status = record["bodyStatus"]
                 if status in TERMINAL_STATUSES:
                     continue
-                if stop_reason == "user_cancelled":
+                if stop_reason == "user_cancelled" and status == "attempted":
                     final_status = "cancelled"
                     failure_code = "user_cancelled"
                     recoverable = True
@@ -487,7 +526,15 @@ class BodyCompletionLedger:
             for key in ledger
             if ledger[key] != legacy[key]
         }
+        statistics_source = str(
+            self._payload.get("statisticsSource") or "bodyCompletionLedger"
+        )
+        self._payload["legacyInferred"] = statistics_source == "legacyInferred"
         self._payload["summary"] = summarize_records(records)
+        self._payload["bodyMetrics"] = body_metrics(
+            records,
+            statistics_source=statistics_source,
+        )
         self._payload["shadowComparison"] = {
             "mode": "promoted",
             "promotionFixture": PROMOTION_FIXTURE,

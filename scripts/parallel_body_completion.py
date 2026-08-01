@@ -680,6 +680,8 @@ def complete_bodies(
         "bodyBlocked": ledger_counts["blockedCount"],
         "bodyCancelled": ledger_counts["cancelledCount"],
         "statisticsSource": ledger_payload["statisticsSource"],
+        "legacyInferred": ledger_payload["legacyInferred"],
+        "bodyMetrics": ledger_payload["bodyMetrics"],
         "bodyCompletionLedger": {
             "schemaVersion": ledger_payload["schemaVersion"],
             "artifact": LEDGER_FILENAME,

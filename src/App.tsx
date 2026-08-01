@@ -821,6 +821,13 @@ function pickNumber(index: Map<string, number>, aliases: string[]) {
 function parseCoverage(value: unknown): CoverageSummary | null {
   const index = numberIndex(value)
   const root = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const bodyMetrics = root.bodyMetrics && typeof root.bodyMetrics === 'object'
+    ? root.bodyMetrics as Record<string, unknown>
+    : null
+  const bodyMetric = (field: string) => {
+    const metric = bodyMetrics?.[field]
+    return typeof metric === 'number' && Number.isFinite(metric) ? metric : undefined
+  }
   const qualityGate = root.quality_gate && typeof root.quality_gate === 'object'
     ? root.quality_gate as Record<string, unknown>
     : root
@@ -844,9 +851,14 @@ function parseCoverage(value: unknown): CoverageSummary | null {
     return quality && typeof quality === 'object' && Object.values(quality as Record<string, unknown>).every(Boolean)
   }).length
   const summary: CoverageSummary = {
-    discovered: pickNumber(index, ['discovered_count', 'discovered', 'discoveredNotes', 'searchCards']),
-    bodyAttempted: pickNumber(index, ['record_count', 'bodyAttempted', 'attempted', 'detailAttempted']),
-    bodySucceeded: pickNumber(index, ['body_count', 'bodySucceeded', 'fullBodies', 'detailSucceeded']),
+    discovered: bodyMetric('discovered') ?? pickNumber(index, ['discovered_count', 'discovered', 'discoveredNotes', 'searchCards']),
+    bodyAttempted: bodyMetric('attempted') ?? pickNumber(index, ['record_count', 'bodyAttempted', 'attempted', 'detailAttempted']),
+    bodySucceeded: bodyMetric('succeeded') ?? pickNumber(index, ['body_count', 'bodySucceeded', 'fullBodies', 'detailSucceeded']),
+    bodyFailed: bodyMetric('failed'),
+    bodyNotAttempted: bodyMetric('notAttempted'),
+    bodyBlocked: bodyMetric('blocked'),
+    bodyCancelled: bodyMetric('cancelled'),
+    bodyCompletionRatePercent: bodyMetric('completionRatePercent'),
     timesNormalized: records.length ? normalizedTimes : pickNumber(index, ['timesNormalized', 'normalizedTimes']),
     applicationInfo: records.length ? generatedJobCards : pickNumber(index, ['jobCardsGenerated', 'applicationInfo', 'applicationInfoCount']),
     draftsGenerated: records.length ? generatedDrafts : pickNumber(index, ['applicationCopyGenerated', 'draftsGenerated', 'outreachDrafts']),
@@ -3639,13 +3651,15 @@ function App() {
   const progress = activeJob?.progress ?? (activeJob ? progressByStatus[activeJob.status] : 0)
   const progressCurrent = Number(activeJob?.progressCurrent || 0)
   const progressTotal = Number(activeJob?.progressTotal || 0)
-  const discoveredCount = Number(activeJob?.discoveredCount || 0)
+  const officialBodyMetrics = activeJob?.bodyMetrics
+  const discoveredCount = Number(officialBodyMetrics?.discovered ?? activeJob?.discoveredCount ?? 0)
   const scrapedCount = Number(activeJob?.scrapedCount || 0)
-  const bodyProcessedCount = Math.min(
-    discoveredCount || Number.MAX_SAFE_INTEGER,
-    Math.max(scrapedCount, Number(activeJob?.bodyProcessedCount || 0)),
-  )
-  const remainingCount = Math.max(0, discoveredCount - bodyProcessedCount)
+  const bodyProcessedCount = Number(officialBodyMetrics?.attempted ?? activeJob?.bodyProcessedCount ?? 0)
+  const bodySucceededCount = Number(officialBodyMetrics?.succeeded ?? scrapedCount)
+  const remainingCount = officialBodyMetrics
+    ? officialBodyMetrics.failed + officialBodyMetrics.notAttempted + officialBodyMetrics.blocked
+      + officialBodyMetrics.cancelled + officialBodyMetrics.pending
+    : Math.max(0, discoveredCount - bodySucceededCount)
   const progressLabel = activeJob?.progressLabel || (({
     queued: '任务已排队，等待启动',
     resuming: '正在恢复原任务',
@@ -4460,7 +4474,7 @@ function App() {
                     <div className="live-progress-counts">
                       <span><small>已发现</small><b>{discoveredCount || '-'}</b></span>
                       <span><small>已检查正文</small><b>{bodyProcessedCount || '-'}</b></span>
-                      <span><small>成功保存</small><b>{scrapedCount || '-'}</b></span>
+                      <span><small>成功保存</small><b>{bodySucceededCount || '-'}</b></span>
                       <span><small>待处理正文</small><b>{discoveredCount ? remainingCount : '-'}</b></span>
                     </div>
                   </div>
