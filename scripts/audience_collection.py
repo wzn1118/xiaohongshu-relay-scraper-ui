@@ -814,6 +814,7 @@ def _wait_for_rate_limit_recovery(
     max_delay_seconds: float = 120.0,
     reload_timeout_ms: int = 15000,
     checkpoint_callback: Callable[[], Any] | None = None,
+    manual_recovery_path: Path | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[bool, str]:
     """Back off after a rate limit and probe the current page before resuming."""
@@ -830,9 +831,16 @@ def _wait_for_rate_limit_recovery(
         )
         remaining = delay
         while remaining > 0:
-            step = min(5.0, remaining)
+            step = min(1.0 if manual_recovery_path is not None else 5.0, remaining)
             sleep(step)
             remaining = max(0.0, remaining - step)
+            if manual_recovery_path is not None and manual_recovery_path.exists():
+                manual_recovery_path.unlink(missing_ok=True)
+                print(
+                    f"AUDIENCE_RATE_LIMIT manual_probe attempt={attempt}/{retries}; skipping remaining cooldown",
+                    flush=True,
+                )
+                remaining = 0.0
             if remaining > 0:
                 print(
                     f"AUDIENCE_RATE_LIMIT waiting attempt={attempt}/{retries} remaining={remaining:g}s",
@@ -1437,6 +1445,7 @@ def _collect_audience_impl(
     ] | None = None,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
+    manual_rate_limit_recovery_path = output_dir / ".rate-limit-recover.request"
     if _readthrough_context is None:
         readthrough_dirs = _normalized_checkpoint_dirs(output_dir, checkpoint_dirs)
         manifest_path, readthrough_manifest = _prepare_readthrough_manifest(
@@ -1594,6 +1603,7 @@ def _collect_audience_impl(
                     max_delay_seconds=rate_limit_max_delay_seconds,
                     reload_timeout_ms=goto_timeout_ms,
                     checkpoint_callback=checkpoint,
+                    manual_recovery_path=manual_rate_limit_recovery_path,
                 )
 
             def recover_access(limited_page: Any, challenge: str) -> tuple[bool, str]:

@@ -41,6 +41,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Shuffle,
+  Sparkles,
   SquareTerminal,
   Table2,
   Target,
@@ -56,6 +57,7 @@ import {
 } from 'lucide-react'
 import { api } from './api'
 import { draftContentHash } from './draft-state.mjs'
+import { AudienceAiPanel } from './AudienceAiPanel'
 import { ExpansionWorkspace } from './ExpansionWorkspace'
 import { UnsavedDraftDialog } from './UnsavedDraftDialog'
 import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
@@ -65,6 +67,8 @@ import type {
   ApplicationResult,
   ApplicationResultsResponse,
   AudienceComment,
+  AudienceAiAnchor,
+  AudienceAiStatus,
   AudiencePost,
   AudiencePublicProfile,
   AudienceResultsResponse,
@@ -120,6 +124,14 @@ type WorkspaceResultView = {
   resultOffset: number
   resultSort: 'newest' | 'oldest'
   resultTimeRange: ApplicationResultsResponse['filters']['timeRange']
+}
+
+type AudienceAnchorTarget = {
+  kind: 'comments' | 'users'
+  entityId: string
+  postId: string
+  offset: number
+  anchor: AudienceAiAnchor
 }
 
 class AiSectionBoundary extends Component<{
@@ -1038,37 +1050,142 @@ function audienceCommentUser(comment: AudienceComment): AudiencePublicProfile {
   }
 }
 
+function audienceAiOverviewStatus(value: Awaited<ReturnType<typeof api.audienceAi>>): AudienceAiStatus {
+  const candidate = value as typeof value & { overview?: typeof value }
+  const overview = candidate.overview || candidate
+  return overview.currentRun?.status || overview.activeVersion?.status || overview.status || 'not_started'
+}
+
+function audienceAiPostStatusLabel(status: AudienceAiStatus) {
+  if (status === 'snapshotting') return '准备中'
+  if (['waiting_profile_enrichment', 'collecting_profile_headers', 'collecting_profile_posts'].includes(status)) return '等待主页补采'
+  if (['analyzing_comments', 'analyzing_users'].includes(status)) return '分析中'
+  if (['synthesizing', 'validating', 'exporting', 'cancelling'].includes(status)) return '正在归并'
+  const labels: Partial<Record<AudienceAiStatus, string>> = {
+    not_started: '未分析',
+    partial: '部分完成',
+    completed: '已完成',
+    stale: '需更新',
+    blocked: '已阻断',
+    failed: '失败',
+    cancelled: '已取消',
+    interrupted: '可继续',
+  }
+  return labels[status] || status
+}
+
+function audienceEntityDomId(kind: 'comments' | 'users', entityId: string) {
+  return `audience-${kind}-${encodeURIComponent(entityId)}`
+}
+
 function AudienceWorkspace({
+  jobId,
   results,
   loading,
   task,
+  aiSession,
+  audienceAiEnabled,
+  anchorTarget,
   actionMessage,
   kind,
   postId,
   query,
+  pageSize,
   resuming,
+  growing,
+  growthScrolls,
   onKind,
   onPost,
   onQuery,
+  onPageSize,
   onPage,
   onResume,
+  onGrowthScrolls,
+  onGrow,
+  onConfigureAi,
+  onNavigateEvidence,
 }: {
+  jobId: string
   results: AudienceResultsResponse | null
   loading: boolean
   task: Job | null
+  aiSession: AiSession | null
+  audienceAiEnabled: boolean
+  anchorTarget: AudienceAnchorTarget | null
   actionMessage: string | null
   kind: 'comments' | 'users'
   postId: string
   query: string
+  pageSize: number
   resuming: boolean
+  growing: boolean
+  growthScrolls: number
   onKind: (kind: 'comments' | 'users') => void
   onPost: (postId: string) => void
   onQuery: (query: string) => void
+  onPageSize: (pageSize: number) => void
   onPage: (offset: number) => void
   onResume: () => void
+  onGrowthScrolls: (maxScrolls: number) => void
+  onGrow: () => void
+  onConfigureAi: () => void
+  onNavigateEvidence: (target: { kind: 'comments' | 'users'; entityId: string; anchor: AudienceAiAnchor }) => void
 }) {
+  const [aiPanelPostId, setAiPanelPostId] = useState('')
+  const [aiStatuses, setAiStatuses] = useState<Record<string, AudienceAiStatus>>({})
+  const aiButtonRefs = useRef(new Map<string, HTMLButtonElement>())
   const summary = results?.summary
   const posts = results?.posts || []
+  const postIds = posts.map((post) => post.post_id).join('|')
+  const aiPanelPost = posts.find((post) => post.post_id === aiPanelPostId) || null
+
+  useEffect(() => {
+    if (audienceAiEnabled) return
+    setAiPanelPostId('')
+    setAiStatuses({})
+  }, [audienceAiEnabled])
+
+  useEffect(() => {
+    if (aiPanelPostId && !posts.some((post) => post.post_id === aiPanelPostId)) setAiPanelPostId('')
+  }, [aiPanelPostId, postIds]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!audienceAiEnabled || !jobId || !postIds) return
+    let cancelled = false
+    void (async () => {
+      const entries: Array<readonly [string, AudienceAiStatus | null]> = []
+      let cursor = 0
+      let endpointUnavailable = false
+      const worker = async () => {
+        while (!cancelled && !endpointUnavailable) {
+          const post = posts[cursor]
+          cursor += 1
+          if (!post) return
+          try {
+            entries.push([post.post_id, audienceAiOverviewStatus(await api.audienceAi(jobId, post.post_id))])
+          } catch (error) {
+            if (Number((error as Error & { status?: number }).status) === 404) endpointUnavailable = true
+            else entries.push([post.post_id, null])
+          }
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(6, posts.length) }, worker))
+      if (cancelled) return
+      setAiStatuses((current) => {
+        const next = { ...current }
+        if (endpointUnavailable) for (const post of posts) next[post.post_id] = 'not_started'
+        for (const [id, status] of entries) if (status) next[id] = status
+        return next
+      })
+    })()
+    return () => { cancelled = true }
+  }, [audienceAiEnabled, jobId, postIds]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const closeAiPanel = () => {
+    const closingPostId = aiPanelPostId
+    setAiPanelPostId('')
+    window.requestAnimationFrame(() => aiButtonRefs.current.get(closingPostId)?.focus())
+  }
   const postsTotal = summary?.postsTotal ?? posts.length
   const postsAttempted = typeof summary?.postsAttempted === 'number'
     ? summary.postsAttempted
@@ -1090,6 +1207,7 @@ function AudienceWorkspace({
   }, { uncollected: 0, partial: 0, complete: 0 })
   const audienceTask = task?.config?.audienceOnly || task?.config?.collectAudience ? task : null
   const taskActive = Boolean(audienceTask && ['queued', 'resuming', 'running'].includes(audienceTask.status))
+  const taskGrowing = Boolean(taskActive && audienceTask?.config?.discoverMore)
   const taskMessage = taskActive ? (audienceTask?.progressLabel || actionMessage) : actionMessage
   const rateLimited = summary?.stopReason === 'rate_limited'
   return <div className="audience-workspace">
@@ -1102,7 +1220,11 @@ function AudienceWorkspace({
         <div><dt>独立用户</dt><dd>{audienceMetric(summary?.usersDiscovered)}<small> 位</small></dd></div>
         <div><dt>主页已补全</dt><dd>{audienceMetric(summary?.profilesComplete)}<small> 位 / {audienceMetric(summary?.usersDiscovered)}</small></dd></div>
       </dl>
-      {incomplete && <button type="button" className="audience-resume-button" disabled={resuming || loading || taskActive} onClick={onResume}>{resuming || taskActive ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{taskActive ? (audienceTask?.status === 'queued' ? '已排队，等待自动启动' : '正在补采未完成帖子') : results?.available ? '继续补采未完成帖子' : '开始采集评论与用户'}</button>}
+      {incomplete && <button type="button" className="audience-resume-button" disabled={resuming || growing || loading || taskActive} onClick={onResume}>{resuming || taskActive ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{taskGrowing ? '正在扩充帖子池' : taskActive ? (audienceTask?.status === 'queued' ? '已排队，等待自动启动' : '正在补采未完成帖子') : results?.available ? '继续补采未完成帖子' : '开始采集评论与用户'}</button>}
+      <div className="audience-growth-controls">
+        <label><span>扩量轮次</span><select value={growthScrolls} disabled={resuming || growing || loading || taskActive} onChange={(event) => onGrowthScrolls(Number(event.target.value))}><option value={40}>40 轮</option><option value={60}>60 轮</option><option value={100}>100 轮</option></select></label>
+        <button type="button" className="audience-grow-button" disabled={resuming || growing || loading || taskActive} onClick={onGrow}>{growing || taskGrowing ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}{taskGrowing ? (audienceTask?.status === 'queued' ? '扩量任务已排队' : '正在发现更多帖子') : '继续发现更多帖子'}</button>
+      </div>
     </section>
     {taskMessage && <div className={`audience-action-status ${taskActive ? 'active' : ''}`} role="status" aria-live="polite">{taskActive && <LoaderCircle className="spin" size={15} />}<span>{taskMessage}</span></div>}
     {incomplete && <div className={`audience-coverage-callout ${statusClass}`} role="status"><CircleAlert size={17} /><span><strong>{rateLimited ? '平台限流，自动恢复重试已耗尽' : '当前结果尚未证明全量完成'}</strong><small>{rateLimited ? `系统已自动冷却并多次探测恢复，当前已检查 ${audienceMetric(postsAttempted)} / ${audienceMetric(postsTotal)} 篇，检查点完整保留。平台恢复后点击继续补采，未完成帖子会优先处理。` : `${summary?.stopReason ? `停止原因：${audienceStopReasonLabel(summary.stopReason)}。` : '未完成和部分完成帖子仍待补采。'} 已保存的帖子、评论和用户结果会继续保留。`}</small></span></div>}
@@ -1119,15 +1241,47 @@ function AudienceWorkspace({
       <div className="audience-post-list">
         {posts.map((post) => {
           const state = audiencePostCollectionState(post)
+          const aiStatus = aiStatuses[post.post_id] || 'not_started'
+          const aiOpen = aiPanelPostId === post.post_id
+          const aiDisabled = Number(post.collected_comment_count || 0) === 0
           const expectedCount = typeof post.expected_comment_count === 'number' ? post.expected_comment_count : null
-          return <button type="button" key={post.post_id} className={postId === post.post_id ? 'active' : ''} aria-pressed={postId === post.post_id} onClick={() => onPost(postId === post.post_id ? '' : post.post_id)}>
-            <span className={`audience-post-state ${state}`}>{audiencePostCollectionLabel(state)}</span>
-            <span className="audience-post-copy"><strong>{post.title || '未命名原帖'}</strong><small>{audienceMetric(post.collected_comment_count || 0)} 条评论与回复{expectedCount === null ? '' : ` / 页面显示 ${audienceMetric(expectedCount)}`}</small></span>
-            {post.note_url && <ExternalLink size={14} aria-hidden="true" />}
-          </button>
+          return <article key={post.post_id} className={`audience-post-entry ${postId === post.post_id ? 'active' : ''} ${aiOpen ? 'ai-open' : ''}`}>
+            <button type="button" className="audience-post-select" aria-pressed={postId === post.post_id} onClick={() => onPost(postId === post.post_id ? '' : post.post_id)}>
+              <span className={`audience-post-state ${state}`}>{audiencePostCollectionLabel(state)}</span>
+              <span className="audience-post-copy"><strong>{post.title || '未命名原帖'}</strong><small>{audienceMetric(post.collected_comment_count || 0)} 条评论与回复{expectedCount === null ? '' : ` / 页面显示 ${audienceMetric(expectedCount)}`}</small></span>
+              {post.note_url && <ExternalLink size={14} aria-hidden="true" />}
+            </button>
+            {audienceAiEnabled && <button
+              type="button"
+              className={`audience-post-ai ${aiStatus}`}
+              aria-expanded={aiOpen}
+              aria-controls={aiOpen ? 'audience-ai-panel' : undefined}
+              aria-label={`${post.title || '该帖'}：结合原帖分析该帖评论与用户`}
+              title={aiDisabled ? '该帖尚无已采集评论' : '结合原帖分析该帖评论与用户'}
+              disabled={aiDisabled}
+              ref={(node) => { if (node) aiButtonRefs.current.set(post.post_id, node); else aiButtonRefs.current.delete(post.post_id) }}
+              onClick={() => {
+                onPost(post.post_id)
+                setAiPanelPostId((current) => current === post.post_id ? '' : post.post_id)
+              }}
+            >
+              <Sparkles size={14} />
+              <span>AI 分析</span>
+              <i>{aiDisabled ? '无评论' : audienceAiPostStatusLabel(aiStatus)}</i>
+            </button>}
+          </article>
         })}
       </div>
     </section>}
+    {audienceAiEnabled && aiPanelPost && <div id="audience-ai-panel"><AudienceAiPanel
+      jobId={jobId}
+      post={aiPanelPost}
+      aiSession={aiSession}
+      onClose={closeAiPanel}
+      onConfigureAi={onConfigureAi}
+      onNavigateEvidence={onNavigateEvidence}
+      onStatusChange={(targetPostId, status) => setAiStatuses((current) => ({ ...current, [targetPostId]: status }))}
+    /></div>}
     <div className="audience-toolbar">
       <div className="audience-view-switch" role="tablist" aria-label="受众数据视图">
         <button type="button" role="tab" aria-selected={kind === 'comments'} className={kind === 'comments' ? 'active' : ''} onClick={() => onKind('comments')}><MessagesSquare size={16} />评论流 <b>{audienceMetric(results?.totals.comments)} 条</b></button>
@@ -1139,17 +1293,23 @@ function AudienceWorkspace({
     <div className="audience-results-meta"><span>{postId ? '当前原帖' : '全部原帖'} · {kind === 'comments' ? '评论与楼中楼回复' : '原帖主与评论者'}</span><strong>{audienceMetric(selectedTotal)} {kind === 'comments' ? '条评论' : '位用户'}</strong></div>
     {(loading || changingKind) && items.length === 0 ? <div className="result-empty audience-empty"><LoaderCircle className="spin" size={28} /><strong>正在读取受众数据</strong></div> : items.length === 0 ? <div className="result-empty audience-empty"><UserRoundSearch size={28} /><strong>{selectedResults?.available ? '当前筛选没有结果' : '尚未采集评论与用户信息'}</strong><small>{selectedResults?.available ? '调整原帖或搜索条件后重试。' : '点击上方按钮从已保存帖子检查点开始采集。'}</small></div> : kind === 'comments' ? <div className="audience-comment-list">{(items as AudienceComment[]).map((comment) => {
       const user = audienceCommentUser(comment)
-      return <article className={`audience-comment ${comment.level === 'reply' ? 'is-reply' : ''}`} key={comment.comment_id}>
+      return <article id={audienceEntityDomId('comments', comment.comment_id)} tabIndex={-1} className={`audience-comment ${comment.level === 'reply' ? 'is-reply' : ''} ${anchorTarget?.kind === 'comments' && anchorTarget.entityId === comment.comment_id ? 'evidence-target' : ''}`} key={comment.comment_id}>
         <AudienceAvatar user={user} />
         <div><header><span><strong>{user.display_name || '未命名用户'}</strong>{comment.level === 'reply' && <i>回复</i>}{user.roles?.includes('author') && <i className="author">原帖主</i>}</span>{user.profile_url && <a href={user.profile_url} target="_blank" rel="noreferrer" title="打开公开主页"><ExternalLink size={14} /></a>}</header><p>{comment.text}</p><footer><span>{comment.post_title || '未命名原帖'}</span><small>{comment.publish_time || '时间未显示'}{(comment.ip_location || comment.location) ? ` · IP属地：${comment.ip_location || comment.location}` : ''}{comment.likes ? ` · ${comment.likes} 赞` : ''}</small></footer></div>
       </article>
-    })}</div> : <div className="audience-user-grid">{(items as AudiencePublicProfile[]).map((user) => <article className={`audience-user-card ${user.roles?.includes('author') ? 'author' : 'commenter'}`} key={user.user_id}>
+    })}</div> : <div className="audience-user-grid">{(items as AudiencePublicProfile[]).map((user) => <article id={audienceEntityDomId('users', user.user_id)} tabIndex={-1} className={`audience-user-card ${user.roles?.includes('author') ? 'author' : 'commenter'} ${anchorTarget?.kind === 'users' && anchorTarget.entityId === user.user_id ? 'evidence-target' : ''}`} key={user.user_id}>
       <header><AudienceAvatar user={user} /><div><strong>{user.display_name || '未命名用户'}</strong><span>{user.roles?.includes('author') && <i className="author">原帖主</i>}{user.roles?.includes('commenter') && <i>评论者</i>}</span></div>{user.profile_url && <a href={user.profile_url} target="_blank" rel="noreferrer" title="打开公开主页"><ExternalLink size={15} /></a>}</header>
       <p>{user.bio || '公开主页未显示简介'}</p>
       <dl><div><dt>粉丝</dt><dd>{audienceMetric(user.follower_count)}</dd></div><div><dt>关注</dt><dd>{audienceMetric(user.following_count)}</dd></div><div><dt>互动</dt><dd>{audienceMetric(user.liked_and_collected_count)}</dd></div><div><dt>评论</dt><dd>{audienceMetric(user.comment_count)}</dd></div></dl>
       <footer><span>{user.xhs_id ? `小红书号 ${user.xhs_id}` : '小红书号未公开'}</span><small>IP属地：{user.ip_location || '待采集'} · {audienceProfileStatusLabel(user)}</small></footer>
     </article>)}</div>}
-    {selectedResults && selectedResults.total > 0 && <div className="audience-pagination"><span>{offset + 1}-{Math.min(offset + items.length, selectedResults.total)} / {selectedResults.total}</span><div><button type="button" title="上一页" disabled={offset === 0 || loading} onClick={() => onPage(Math.max(0, offset - limit))}><ChevronLeft size={16} /></button><button type="button" title="下一页" disabled={offset + limit >= selectedResults.total || loading} onClick={() => onPage(offset + limit)}><ChevronRight size={16} /></button></div></div>}
+    {selectedResults && selectedResults.total > 0 && <div className="audience-pagination">
+      <span>{offset + 1}-{Math.min(offset + items.length, selectedResults.total)} / {selectedResults.total}</span>
+      <div className="audience-pagination-controls">
+        <label className="audience-page-size"><span>每页</span><select aria-label="每页显示条数" value={pageSize} disabled={loading} onChange={(event) => onPageSize(Number(event.target.value))}>{[20, 40, 100, 200, 500].map((size) => <option key={size} value={size}>{size}</option>)}</select><span>条</span></label>
+        <div className="audience-page-buttons"><button type="button" title="上一页" disabled={offset === 0 || loading} onClick={() => onPage(Math.max(0, offset - limit))}><ChevronLeft size={16} /></button><button type="button" title="下一页" disabled={offset + limit >= selectedResults.total || loading} onClick={() => onPage(offset + limit)}><ChevronRight size={16} /></button></div>
+      </div>
+    </div>}
   </div>
 }
 
@@ -1398,9 +1558,13 @@ function App() {
   const [audiencePostId, setAudiencePostId] = useState('')
   const [audienceQuery, setAudienceQuery] = useState('')
   const [audienceOffset, setAudienceOffset] = useState(0)
+  const [audiencePageSize, setAudiencePageSize] = useState(40)
   const [audienceLoading, setAudienceLoading] = useState(false)
   const [audienceResuming, setAudienceResuming] = useState(false)
+  const [audienceGrowing, setAudienceGrowing] = useState(false)
+  const [audienceGrowthScrolls, setAudienceGrowthScrolls] = useState(60)
   const [audienceActionMessage, setAudienceActionMessage] = useState<string | null>(null)
+  const [audienceAnchorTarget, setAudienceAnchorTarget] = useState<AudienceAnchorTarget | null>(null)
   const resultViewCache = useRef<Record<AnalysisMode, WorkspaceResultView>>({
     job: { activeJobId: null, results: null, selectedNoteId: null, resultOffset: 0, resultSort: 'newest', resultTimeRange: 'all' },
     general: { activeJobId: null, results: null, selectedNoteId: null, resultOffset: 0, resultSort: 'newest', resultTimeRange: 'all' },
@@ -1449,6 +1613,7 @@ function App() {
   const draftViewRevisionRef = useRef(0)
   const draftSaveResponseRef = useRef(0)
   const audienceRequestRef = useRef(0)
+  const audienceForegroundRequestRef = useRef(0)
   const audienceResultsRef = useRef<{ sourceJobId: string; value: AudienceResultsResponse } | null>(null)
   const generalModuleScrollRef = useRef<Record<GeneralResultModule, number>>({ insights: 0, audience: 0, expansion: 0 })
   const relayGuideAutoOpened = useRef(false)
@@ -1515,6 +1680,8 @@ function App() {
     disconnectJobStream()
     resultsRequestRef.current += 1
     audienceRequestRef.current += 1
+    audienceForegroundRequestRef.current += 1
+    setAudienceLoading(false)
     requestCache.current[workspaceMode] = request
     if (activeJob && jobAnalysisMode(activeJob) === workspaceMode) {
       activeJobIdCache.current[workspaceMode] = activeJob.id
@@ -2108,7 +2275,71 @@ function App() {
 
   const selectedModelValue = customModelMode ? CUSTOM_MODEL_OPTION : aiModel
 
+  const invalidateAiSession = () => {
+    setAiSession(null)
+    updateRequest('aiSessionId', null)
+  }
+
+  const normalizedAiBaseUrl = (value: string) => value.trim().replace(/\/+$/, '')
+
+  const rememberAiSession = (session: AiSession) => {
+    const sessionProviderId = session.provider as AiProviderOption['id']
+    setProviderId(sessionProviderId)
+    setAiModel(session.model)
+    setAiBaseUrl(session.baseUrl)
+    setAiWireApi(session.wireApi)
+    setAiSession(session)
+    updateRequest('aiSessionId', session.id)
+    setProviders((current) => current.map((item) => item.id === sessionProviderId
+      ? {
+          ...item,
+          configured: true,
+          hasApiKey: item.requiresKey ? true : item.hasApiKey,
+          model: session.model,
+          baseUrl: session.baseUrl,
+          wireApi: session.wireApi,
+          models: [...new Set([...item.models, session.model])],
+        }
+      : item))
+  }
+
+  const aiSessionMatchesSelection = (session: AiSession) => (
+    session.provider === providerId
+    && session.model === aiModel.trim()
+    && normalizedAiBaseUrl(session.baseUrl) === normalizedAiBaseUrl(aiBaseUrl)
+    && session.wireApi === aiWireApi
+    && Date.parse(session.expiresAt) > Date.now() + 60_000
+  )
+
+  const createSelectedAiSession = async () => {
+    const provider = providers.find((item) => item.id === providerId)
+    if (!provider) throw new Error('当前 AI 提供方不存在，请重新选择。')
+    const model = aiModel.trim()
+    const baseUrl = aiBaseUrl.trim()
+    if (!model) throw new Error('请先选择用于背景资料解析的模型。')
+    if (!baseUrl) throw new Error('请先填写当前模型的 Base URL。')
+    if (provider.requiresKey && !apiKey.trim() && !provider.hasApiKey) {
+      throw new Error('请先填写当前模型服务的 API Key。')
+    }
+    const session = await api.createAiSession({
+      provider: provider.id,
+      apiKey,
+      model,
+      baseUrl,
+      wireApi: aiWireApi,
+    })
+    rememberAiSession(session)
+    setApiKey('')
+    return session
+  }
+
+  const resolveProfileAiSession = async () => {
+    if (aiSession && aiSessionMatchesSelection(aiSession)) return aiSession
+    return createSelectedAiSession()
+  }
+
   const selectAiModel = (value: string) => {
+    invalidateAiSession()
     if (value === CUSTOM_MODEL_OPTION) {
       setCustomModelMode(true)
       setAiModel('')
@@ -2119,6 +2350,7 @@ function App() {
   }
 
   const updateAiBaseUrl = (value: string) => {
+    invalidateAiSession()
     setAiBaseUrl(value)
     setAiConnectionCheck(null)
     const provider = providers.find((item) => item.id === providerId)
@@ -2130,6 +2362,7 @@ function App() {
   }
 
   const applyDiscoveredModels = (result: { baseUrl: string; models: string[] }) => {
+    invalidateAiSession()
     const currentProvider = providers.find((item) => item.id === providerId)
     const models = currentProvider?.relay
       ? result.models
@@ -2160,13 +2393,8 @@ function App() {
       baseUrl: provider.baseUrl,
       wireApi: provider.wireApi,
     })
-    setProviderId(provider.id)
-    setAiModel(session.model)
-    setAiBaseUrl(session.baseUrl)
-    setAiWireApi(session.wireApi)
+    rememberAiSession(session)
     setCustomModelMode(Boolean(session.model && !provider.models.includes(session.model)))
-    setAiSession(session)
-    updateRequest('aiSessionId', session.id)
     return session
   }
 
@@ -2186,9 +2414,7 @@ function App() {
       }
       if (!resolvedModel) throw new Error('未找到可用模型，请先检测模型或填写模型 ID。')
       const session = await api.createAiSession({ provider: providerId, apiKey, model: resolvedModel, baseUrl: resolvedBaseUrl, wireApi: aiWireApi })
-      setAiSession(session)
-      setAiBaseUrl(session.baseUrl)
-      updateRequest('aiSessionId', session.id)
+      rememberAiSession(session)
       setApiKey('')
       setNotice(currentProvider?.local
         ? `${currentProvider.label} 已连接，文本仅在本机处理。`
@@ -2264,8 +2490,7 @@ function App() {
         baseUrl: localProvider.baseUrl,
         wireApi: localProvider.wireApi,
       })
-      setAiSession(session)
-      updateRequest('aiSessionId', session.id)
+      rememberAiSession(session)
       setNotice(`本地免费模型 ${model} 已就绪，文本整理不产生 API 费用。`)
     } catch (error) {
       setNotice(`${(error as Error).message} 可使用上方入口一键安装。`)
@@ -2300,15 +2525,16 @@ function App() {
   }
 
   const importProfile = async () => {
-    if (!aiSession) return setNotice('请先连接 AI')
     if (!backgroundFiles.length) return setNotice('请至少选择一个背景文件')
     setImportingProfile(true)
     setNotice(null)
     try {
+      const profileAiSession = await resolveProfileAiSession()
       const files = await Promise.all(backgroundFiles.map(async (file) => ({ name: file.name, base64: await fileBase64(file) })))
-      const profile = await api.importProfile({ aiSessionId: aiSession.id, backgroundText, files })
+      const profile = await api.importProfile({ aiSessionId: profileAiSession.id, backgroundText, files })
       const importedCandidateProfile = importedCandidateProfileValues(profile.candidate_application)
       const importedFieldCount = Object.keys(importedCandidateProfile).length
+      const evidenceCount = profile.evidence_items?.length || 0
       setProfiles((current) => [profile, ...current.filter((item) => item.id !== profile.id)])
       setRequest((current) => ({
         ...current,
@@ -2317,8 +2543,8 @@ function App() {
       }))
       setCandidateImportStatus(importedFieldCount ? 'recognized' : 'empty')
       setNotice(importedFieldCount
-        ? '简历已识别并回填候选人信息，请核对字段后再启动任务。'
-        : '背景记忆已更新，但未识别到候选人署名字段，请手动填写。')
+        ? `${profileAiSession.model} 已完成解析：回填 ${importedFieldCount} 个署名字段，生成 ${evidenceCount} 条可核验证据。请核对后再启动任务。`
+        : `${profileAiSession.model} 已完成解析并生成 ${evidenceCount} 条证据，但未识别到署名字段，请手动填写。`)
     } catch (error) {
       setNotice((error as Error).message)
     } finally {
@@ -2369,14 +2595,15 @@ function App() {
     options: { silent?: boolean; preserveExisting?: boolean; fallbackJobId?: string | null; sourceJobId?: string | null } = {},
   ) => {
     const requestId = ++audienceRequestRef.current
-    if (!options.silent) setAudienceLoading(true)
+    const foregroundRequestId = options.silent ? null : ++audienceForegroundRequestRef.current
+    if (foregroundRequestId !== null) setAudienceLoading(true)
     try {
-      let payload = await api.audience(jobId, audienceKind, offset, 40, {
+      let payload = await api.audience(jobId, audienceKind, offset, audiencePageSize, {
         postId: audiencePostId,
         query: audienceQuery,
       })
       if (!payload.available && options.fallbackJobId && options.fallbackJobId !== jobId) {
-        payload = await api.audience(options.fallbackJobId, audienceKind, offset, 40, {
+        payload = await api.audience(options.fallbackJobId, audienceKind, offset, audiencePageSize, {
           postId: audiencePostId,
           query: audienceQuery,
         })
@@ -2400,9 +2627,11 @@ function App() {
       if (requestId !== audienceRequestRef.current || options.silent) return
       setNotice(`受众数据读取失败：${(error as Error).message}`)
     } finally {
-      if (!options.silent && requestId === audienceRequestRef.current) setAudienceLoading(false)
+      if (foregroundRequestId !== null && foregroundRequestId === audienceForegroundRequestRef.current) {
+        setAudienceLoading(false)
+      }
     }
-  }, [audienceKind, audiencePostId, audienceQuery])
+  }, [audienceKind, audiencePageSize, audiencePostId, audienceQuery])
 
   useEffect(() => {
     let mounted = true
@@ -2516,10 +2745,14 @@ function App() {
       }
       const codex = expandedOptions.find((item) => item.id === 'codex')
       const localProvider = expandedOptions.find((item) => item.id === 'local_qwen')
-      const configuredProvider = expandedOptions.find((item) => item.configured && (!item.requiresKey || item.hasApiKey))
-      const preferredProvider = configuredProvider || localProvider || codex || options[0]
-      if (preferredProvider) selectProvider(preferredProvider.id, expandedOptions)
+      const configuredExternalProvider = expandedOptions.find((item) => !item.local && item.configured && (!item.requiresKey || item.hasApiKey))
       const localRuntimeReady = Boolean(localStatus?.runtime.ready && localStatus.installedModels.length)
+      const preferredProvider = configuredExternalProvider
+        || (localProvider && localRuntimeReady ? localProvider : undefined)
+        || localProvider
+        || codex
+        || options[0]
+      if (preferredProvider) selectProvider(preferredProvider.id, expandedOptions)
       if (preferredProvider && (preferredProvider.configured || (preferredProvider.local && localRuntimeReady))) {
         void api.createAiSession({
           provider: preferredProvider.id,
@@ -2528,14 +2761,32 @@ function App() {
           baseUrl: preferredProvider.baseUrl,
           wireApi: preferredProvider.wireApi,
         }).then((session) => {
-          setAiSession(session)
-          updateRequest('aiSessionId', session.id)
+          rememberAiSession(session)
           setNotice(`已自动恢复 ${preferredProvider.label}，可直接执行智能补全。`)
         }).catch(() => undefined)
       }
       if (saved[0]) updateRequest('profileId', saved[0].id)
     }).catch((error) => setNotice((error as Error).message))
   }, [])
+
+  useEffect(() => {
+    if (!request.profileId) {
+      setCandidateImportStatus(null)
+      return
+    }
+    const profile = profiles.find((item) => item.id === request.profileId)
+    if (!profile) return
+    const importedCandidateProfile = importedCandidateProfileValues(profile.candidate_application)
+    const importedFieldCount = Object.keys(importedCandidateProfile).length
+    setCandidateImportStatus(importedFieldCount ? 'recognized' : 'empty')
+    if (!importedFieldCount) return
+    setRequest((current) => {
+      if (current.profileId !== profile.id) return current
+      const candidateProfile = { ...current.candidateProfile, ...importedCandidateProfile }
+      const changed = candidateApplicationFields.some((key) => candidateProfile[key] !== current.candidateProfile[key])
+      return changed ? { ...current, candidateProfile } : current
+    })
+  }, [profiles, request.profileId])
 
   useEffect(() => {
     const install = localModelStatus?.install
@@ -2608,6 +2859,10 @@ function App() {
   }, [activeJob?.id, activeJob?.status, activeJob?.applicationCount, loadResults])
 
   useEffect(() => {
+    setAudienceAnchorTarget(null)
+  }, [activeJob?.id])
+
+  useEffect(() => {
     if (!activeJob || (activeJob.status !== 'running' && activeJob.status !== 'queued')) return
     const timer = window.setInterval(() => {
       void loadResults(activeJob.id, resultOffset, { silent: true, preserveDraft: true })
@@ -2624,6 +2879,28 @@ function App() {
     }), audienceQuery ? 250 : 0)
     return () => window.clearTimeout(timer)
   }, [audienceKind, audiencePostId, audienceQuery, audienceReadJobId, audienceSourceJobId, generalResultModule, loadAudienceResults, trackedAudienceTask?.status, workspaceMode])
+
+  useEffect(() => {
+    if (!audienceAnchorTarget || !audienceReadJobId || workspaceMode !== 'general' || generalResultModule !== 'audience') return
+    if (audienceAnchorTarget.kind !== audienceKind || audienceAnchorTarget.postId !== audiencePostId || audienceQuery) return
+    const timer = window.setTimeout(() => void loadAudienceResults(audienceReadJobId, audienceAnchorTarget.offset, {
+      preserveExisting: audienceReadJobId !== audienceSourceJobId,
+      fallbackJobId: audienceSourceJobId,
+      sourceJobId: audienceSourceJobId,
+    }), 0)
+    return () => window.clearTimeout(timer)
+  }, [audienceAnchorTarget, audienceKind, audiencePostId, audienceQuery, audienceReadJobId, audienceSourceJobId, generalResultModule, loadAudienceResults, workspaceMode])
+
+  useEffect(() => {
+    if (!audienceAnchorTarget || audienceResults?.kind !== audienceAnchorTarget.kind || audienceResults.filters.postId !== audienceAnchorTarget.postId) return
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(audienceEntityDomId(audienceAnchorTarget.kind, audienceAnchorTarget.entityId))
+      if (!target) return
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      target.focus({ preventScroll: true })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [audienceAnchorTarget, audienceResults])
 
   useEffect(() => {
     if (!audienceReadJobId || !trackedAudienceTask || workspaceMode !== 'general' || generalResultModule !== 'audience' || !['queued', 'resuming', 'running'].includes(trackedAudienceTask.status)) return
@@ -2703,21 +2980,27 @@ function App() {
 
   useEffect(() => {
     const rateLimitStatus = activeJob?.rateLimit?.status
-    if (!activeJob?.rateLimit?.detected || !['waiting', 'stopped'].includes(rateLimitStatus || '')) return
+    if (!activeJob?.rateLimit?.detected || !['waiting', 'scheduled', 'resuming', 'stopped'].includes(rateLimitStatus || '')) return
     const alertKey = `${activeJob.id}:${activeJob.rateLimit.detectedAt || 'detected'}:${rateLimitStatus}:${activeJob.rateLimit.retryAttempt || 0}`
     if (rateLimitAlertRef.current === alertKey) return
     rateLimitAlertRef.current = alertKey
+    const autoAttempt = activeJob.rateLimit.autoResumeAttempt || 0
+    const autoMax = activeJob.rateLimit.maxAutoResumeAttempts || 6
     setNotice(rateLimitStatus === 'waiting'
-      ? `检测到平台限流：系统正在自动冷却并进行第 ${activeJob.rateLimit.retryAttempt || 1} / ${activeJob.rateLimit.maxRetries || 5} 次恢复探测。`
-      : '平台限流自动恢复重试已耗尽，检查点已保存；平台恢复后可继续补采。')
-  }, [activeJob?.id, activeJob?.rateLimit?.detected, activeJob?.rateLimit?.detectedAt, activeJob?.rateLimit?.status, activeJob?.rateLimit?.retryAttempt, activeJob?.rateLimit?.maxRetries])
+      ? `检测到平台限流：系统正在冷却并进行第 ${activeJob.rateLimit.retryAttempt || 1} / ${activeJob.rateLimit.maxRetries || 5} 次恢复探测，也可一键跳过等待。`
+      : rateLimitStatus === 'scheduled'
+        ? `限流检查点已保存，系统已排定第 ${autoAttempt + 1} / ${autoMax} 轮自动续跑。`
+        : rateLimitStatus === 'resuming'
+          ? '限流冷却已结束，正在从原任务检查点自动续跑。'
+          : '自动恢复次数已用完，检查点已保存；可使用一键恢复重新探测并续跑。')
+  }, [activeJob?.id, activeJob?.rateLimit?.detected, activeJob?.rateLimit?.detectedAt, activeJob?.rateLimit?.status, activeJob?.rateLimit?.retryAttempt, activeJob?.rateLimit?.maxRetries, activeJob?.rateLimit?.autoResumeAttempt, activeJob?.rateLimit?.maxAutoResumeAttempts])
 
   useEffect(() => {
     if (!trackedAudienceTask) return
     const summary = trackedAudienceTask.workflowSummary?.audience as Record<string, unknown> | undefined
-    if (trackedAudienceTask.rateLimit?.status === 'waiting') {
+    if (['waiting', 'scheduled', 'resuming'].includes(trackedAudienceTask.rateLimit?.status || '')) {
       const users = Number(summary?.usersDiscovered || 0)
-      setAudienceActionMessage(`平台触发限流，已发现 ${users} 个公开用户并保存检查点；系统正在自动冷却并探测恢复，无需手动反复续跑。`)
+      setAudienceActionMessage(`平台触发限流，已发现 ${users} 个公开用户并保存检查点；系统会自动冷却和续跑，也可一键跳过当前等待。`)
       return
     }
     if (trackedAudienceTask.rateLimit?.status === 'stopped') {
@@ -2886,8 +3169,8 @@ function App() {
     draftGuard.requestTransition(payload.checkOnly ? '执行启动检查' : '启动新任务', () => performRunJob(payload, sessionHint))
   )
 
-  const performResumeAudienceCollection = async () => {
-    const resumeTargetJobId = selectedAudienceDataJob?.id || linkedAudienceTask?.id || audienceSourceJobId
+  const performResumeAudienceCollection = async (forceRateLimitRecovery = false, forcedJobId?: string) => {
+    const resumeTargetJobId = forcedJobId || selectedAudienceDataJob?.id || linkedAudienceTask?.id || audienceSourceJobId
     const resumeTargetJob = jobs.find((job) => job.id === resumeTargetJobId)
       || (activeJob?.id === resumeTargetJobId ? activeJob : null)
     if (!resumeTargetJob || !resumeTargetJobId || jobAnalysisMode(resumeTargetJob) !== 'general') {
@@ -2897,10 +3180,15 @@ function App() {
       return
     }
     setAudienceResuming(true)
-    setAudienceActionMessage('正在从检查点恢复原任务…')
+    setAudienceActionMessage(forceRateLimitRecovery ? '正在解除限流等待并从检查点续跑…' : '正在从检查点恢复原任务…')
     setNotice(null)
     try {
-      const response = await api.resumeAudience(resumeTargetJobId)
+      const rateLimitRecovery = forceRateLimitRecovery || Boolean(
+        resumeTargetJob.rateLimit?.detected && resumeTargetJob.rateLimit.status !== 'cleared',
+      )
+      const response = rateLimitRecovery
+        ? await api.recoverAudienceRateLimit(resumeTargetJobId)
+        : await api.resumeAudience(resumeTargetJobId)
       const resumedJob = response.job
       setAudienceTask(resumedJob)
       setJobs((current) => replaceJobInPlace(current, resumedJob))
@@ -2913,11 +3201,15 @@ function App() {
         fallbackJobId: linkedAudienceTask?.id !== resumeTargetJobId ? linkedAudienceTask?.id : undefined,
         sourceJobId: audienceSourceJobId,
       })
-      const message = response.action === 'already_complete'
+      const message = response.action === 'signaled'
+        ? '已跳过剩余冷却时间，正在立即探测页面；通过后会自动续采。'
+        : response.action === 'already_complete'
         ? '当前受众结果已经完整，无需再次续采。'
         : response.action === 'attached'
           ? '原任务正在采集，已重新连接实时进度；已有内容保持显示。'
-          : '已从原任务检查点继续，只补采未采集和部分采集的链接；已有内容保持显示。'
+          : rateLimitRecovery
+            ? '已取消限流倒计时并从原任务检查点续跑，已有内容保持显示。'
+            : '已从原任务检查点继续，只补采未采集和部分采集的链接；已有内容保持显示。'
       setAudienceActionMessage(message)
       setNotice(message)
     } catch (error) {
@@ -2932,8 +3224,59 @@ function App() {
     }
   }
 
-  const resumeAudienceCollection = () => (
-    draftGuard.requestTransition('恢复其他任务', performResumeAudienceCollection)
+  const resumeAudienceCollection = (forceRateLimitRecovery = false, forcedJobId?: string) => (
+    draftGuard.requestTransition(
+      forceRateLimitRecovery ? '一键解除限流并继续' : '恢复其他任务',
+      () => performResumeAudienceCollection(forceRateLimitRecovery, forcedJobId),
+    )
+  )
+
+  const performGrowAudienceCollection = async () => {
+    const growthTargetJobId = selectedAudienceDataJob?.id || linkedAudienceTask?.id || audienceSourceJobId
+    const growthTargetJob = jobs.find((job) => job.id === growthTargetJobId)
+      || (activeJob?.id === growthTargetJobId ? activeJob : null)
+    if (!growthTargetJob || !growthTargetJobId || jobAnalysisMode(growthTargetJob) !== 'general') {
+      const message = '请先选择一条非岗位内容采集任务。'
+      setAudienceActionMessage(message)
+      setNotice(message)
+      return
+    }
+    setAudienceGrowing(true)
+    setAudienceActionMessage(`正在按最新排序扩充帖子池（最多 ${audienceGrowthScrolls} 轮）…`)
+    setNotice(null)
+    try {
+      const response = await api.growAudience(growthTargetJobId, audienceGrowthScrolls)
+      const growthJob = response.job
+      setAudienceTask(growthJob)
+      setJobs((current) => replaceJobInPlace(current, growthJob))
+      if (['queued', 'resuming', 'running'].includes(growthJob.status)) connectJob(growthJob)
+      performSwitchGeneralResultModule('audience', growthTargetJobId)
+      setAudienceDataJobId(growthTargetJobId)
+      writeAudienceDataJobToLocation(growthTargetJobId)
+      await loadAudienceResults(growthTargetJobId, 0, {
+        preserveExisting: true,
+        fallbackJobId: linkedAudienceTask?.id !== growthTargetJobId ? linkedAudienceTask?.id : undefined,
+        sourceJobId: audienceSourceJobId,
+      })
+      const message = response.action === 'attached'
+        ? '该任务已经在运行，已重新连接实时进度；现有帖子与评论继续保留。'
+        : `扩量任务已启动：将按最新排序重新发现 ${audienceGrowthScrolls} 轮，新帖子去重追加后继续采集正文、评论与用户资料。`
+      setAudienceActionMessage(message)
+      setNotice(message)
+    } catch (error) {
+      const apiError = error as Error & { code?: string }
+      const message = apiError.code === 'JOB_BUSY'
+        ? '当前任务仍在运行，请等待或中断后再扩充帖子池。'
+        : `扩充帖子池启动失败：${apiError.message}`
+      setAudienceActionMessage(message)
+      setNotice(message)
+    } finally {
+      setAudienceGrowing(false)
+    }
+  }
+
+  const growAudienceCollection = () => (
+    draftGuard.requestTransition('扩充帖子池', performGrowAudienceCollection)
   )
 
   const submit = (event: FormEvent) => {
@@ -2968,7 +3311,6 @@ function App() {
   }
 
   const performResumeJob = async (job: Job, scope: ResumeScope = 'full', sessionHint: AiSession | null = aiSession) => {
-    if (scope !== 'audience' && !job.resumeAvailable && !['queued', 'resuming', 'running'].includes(job.status)) return null
     const needsAi = !['audience', 'artifacts', 'discovery'].includes(scope)
     let session = sessionHint
     if (needsAi && !session) {
@@ -3106,91 +3448,48 @@ function App() {
     setNotice(`正在核对所有未完整${noun}…`)
     try {
       let session = aiSession
-      if (!session) {
-        setRestoringAi(true)
-        setCompletionFlow((current) => current ? {
-          ...current,
-          stage: 'restoring_ai',
-          message: '正在恢复本机已保存的 AI 配置。',
-        } : current)
-        try {
-          session = await restoreAiSession()
-        } finally {
-          setRestoringAi(false)
-        }
-      }
       setCompletionFlow((current) => current ? {
         ...current,
         stage: 'starting',
         message: '正在从检查点恢复原任务，仅处理缺失记录。',
       } : current)
 
+      const requestCompletion = () => api.completeMissing(sourceJobId, session?.id || null)
       let response
       try {
-        const resumedJob = await performResumeJob(activeJob, 'body_completion', session)
-        if (!resumedJob) throw new Error('原任务未能从正文检查点恢复。')
-        response = {
-          action: 'started' as const,
-          sourceJobId,
-          incompleteBefore: knownIncomplete,
-          job: resumedJob,
-          message: 'The original task resumed from its body checkpoint.',
-        }
+        response = await requestCompletion()
       } catch (error) {
-        const apiError = error as Error & { code?: string; status?: number }
-        if (apiError.status === 404) {
-          const refreshedJob = await api.job(sourceJobId)
-          if (['queued', 'resuming', 'running'].includes(refreshedJob.status)) {
-            response = {
-              action: 'attached' as const,
-              sourceJobId,
-              incompleteBefore: knownIncomplete,
-              job: refreshedJob,
-              message: 'The source task is still running.',
-            }
-          } else {
-            const resumedJob = await performResumeJob(refreshedJob, 'body_completion', session)
-            if (!resumedJob) {
-              const fallbackError = new Error('当前版本未找到可复用的正文检查点。') as Error & { code?: string }
-              fallbackError.code = 'RESUME_CHECKPOINTS_MISSING'
-              throw fallbackError
-            }
-            response = {
-              action: 'started' as const,
-              sourceJobId,
-              incompleteBefore: knownIncomplete,
-              job: resumedJob,
-              message: 'Started completion through the compatible task endpoint.',
-            }
-          }
-        } else {
-          if (apiError.code !== 'AI_SESSION_EXPIRED' || !session) throw error
-          setRestoringAi(true)
-          setCompletionFlow((current) => current ? {
-            ...current,
-            stage: 'restoring_ai',
-            message: 'AI 会话已过期，正在自动重连后继续。',
-          } : current)
-          try {
-            session = await restoreAiSession()
-          } finally {
-            setRestoringAi(false)
-          }
-          const resumedJob = await performResumeJob(activeJob, 'body_completion', session)
-          if (!resumedJob) throw new Error('原任务未能从正文检查点恢复。')
-          response = {
-            action: 'started' as const,
-            sourceJobId,
-            incompleteBefore: knownIncomplete,
-            job: resumedJob,
-            message: 'The original task resumed after reconnecting AI.',
-          }
+        const apiError = error as Error & { code?: string }
+        if (apiError.code !== 'AI_SESSION_EXPIRED') throw error
+        setRestoringAi(true)
+        setCompletionFlow((current) => current ? {
+          ...current,
+          stage: 'restoring_ai',
+          message: 'AI 会话已过期，正在自动重连后继续。',
+        } : current)
+        try {
+          session = await restoreAiSession()
+        } finally {
+          setRestoringAi(false)
         }
+        response = await requestCompletion()
       }
 
       setActiveJob(response.job)
       setJobs((current) => replaceJobInPlace(current, response.job))
-      connectJob(response.job)
+      if (response.action === 'already_complete') {
+        setCompletionFlow({
+          stage: 'complete',
+          sourceJobId: response.sourceJobId,
+          jobId: response.job.id,
+          incompleteBefore: 0,
+          message: `核对完成，当前没有未完整${noun}。`,
+        })
+        setNotice(`所有${noun}均已完整，无需重复运行。`)
+        await loadResults(response.job.id, 0)
+        return
+      }
+      if (['queued', 'resuming', 'running'].includes(response.job.status)) connectJob(response.job)
       setCompletionFlow({
         stage: 'running',
         sourceJobId: response.sourceJobId,
@@ -3404,13 +3703,20 @@ function App() {
   const securityTimeoutLabel = securityTimeoutSeconds % 60 === 0 ? `${securityTimeoutSeconds / 60} 分钟` : `${securityTimeoutSeconds} 秒`
   const workflowRateLimit = (workflowSummary.rateLimit || {}) as Record<string, unknown>
   const rateLimitStatus = activeJob?.rateLimit?.status || String(workflowRateLimit.status || '')
-  const rateLimitRecovering = rateLimitStatus === 'waiting'
+  const rateLimitWaiting = rateLimitStatus === 'waiting'
+  const rateLimitScheduled = rateLimitStatus === 'scheduled'
+  const rateLimitResuming = rateLimitStatus === 'resuming'
+  const rateLimitRecovering = rateLimitWaiting || rateLimitScheduled || rateLimitResuming
   const rateLimitDetected = rateLimitStatus
     ? rateLimitStatus !== 'cleared'
     : activeJob?.progressPhase === 'rate_limited'
       || workflowSummary.analysisMode === 'rate_limited_partial'
   const rateLimitDetectedAt = activeJob?.rateLimit?.detectedAt || String(workflowRateLimit.detectedAt || '')
   const rateLimitReadyToResume = Boolean(activeJob?.resumeAvailable && !securityNeedsAttention)
+  const rateLimitManualAvailable = Boolean(activeJob && rateLimitDetected && !rateLimitResuming && !securityNeedsAttention)
+  const rateLimitAutoAttempt = activeJob?.rateLimit?.autoResumeAttempt || 0
+  const rateLimitAutoMax = activeJob?.rateLimit?.maxAutoResumeAttempts || 6
+  const rateLimitNextRetryAt = activeJob?.rateLimit?.nextRetryAt || null
   const codexRuntime = results?.codexRuntime || (workflowSummary.codexRuntime as Record<string, unknown> | undefined)
   const selectedProvider = providers.find((item) => item.id === providerId)
   const selectedLocalModel = localModelStatus?.catalog.find((item) => item.id === localModelChoice)
@@ -3422,6 +3728,10 @@ function App() {
   }, [])
   const localInstallActive = Boolean(localModelStatus?.install && ['queued', 'running'].includes(localModelStatus.install.status))
   const activeProfile = profiles.find((item) => item.id === request.profileId)
+  const profileAiRouteLabel = selectedProvider?.local
+    ? `${selectedProvider.label} · ${aiModel || '待选择'} · 未配置外部模型时默认`
+    : `${selectedProvider?.label || providerId} · ${aiModel || '待选择'} · 严格使用当前选择`
+  const profileAiSessionReady = Boolean(aiSession && aiSessionMatchesSelection(aiSession))
   const candidateReady = [
     request.candidateProfile.name,
     request.candidateProfile.school,
@@ -3443,8 +3753,8 @@ function App() {
   const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message' && route.actionable)
   const selectedResultIncomplete = Boolean(selectedResult && isIncompleteApplicationResult(selectedResult))
   const draftOperationPending = draftSaving || emailSending || deliveryUpdating
-  const selectedDraftQualityVerified = Boolean(selectedResult && hasVerifiedDraftQuality(selectedResult))
-  const selectedDraftQualityStale = selectedResult?.draftVersion?.qualityStatus === 'stale'
+  const selectedDraftQualityVerified = Boolean(selectedResult && !selectedResultIncomplete && hasVerifiedDraftQuality(selectedResult))
+  const selectedDraftQualityStale = Boolean(selectedResult && !selectedResultIncomplete && selectedResult.draftVersion?.qualityStatus === 'stale')
   const selectedDraftQualityRetryable = Boolean(selectedResult?.draftVersion && !draftDirty && !selectedDraftQualityVerified)
   const draftSaveLabel = draftSaving
     ? '保存中'
@@ -3943,29 +4253,34 @@ function App() {
                     <label className="field relay-base-url-field"><span>API Base URL</span><div className="relay-url-control"><input value={aiBaseUrl} onChange={(event) => updateAiBaseUrl(event.target.value)} placeholder="https://gateway.example/v1" inputMode="url" spellCheck={false} /><button type="button" className="secondary-button relay-model-test" disabled={refreshingModels || !aiBaseUrl.trim() || (!apiKey && !selectedProvider.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}检测模型</button></div><small className={`relay-check-message ${aiConnectionCheck?.status || 'idle'}`} aria-live="polite">{aiConnectionCheck?.message || '支持粘贴 API 根地址或完整的 /chat/completions 接口地址'}</small></label>
                   </div>
                   <div className="form-row ai-provider-row ai-relay-credentials-row">
-                    <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAiConnectionCheck(null) }} placeholder={selectedProvider.hasApiKey ? '已保存，留空即可复用' : '粘贴中转服务 API Key'} /></label>
-                    <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="chat_completions">Chat Completions</option><option value="responses">Responses API</option></select></label>
+                    <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { invalidateAiSession(); setApiKey(event.target.value); setAiConnectionCheck(null) }} placeholder={selectedProvider.hasApiKey ? '已保存，留空即可复用' : '粘贴中转服务 API Key'} /></label>
+                    <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => { invalidateAiSession(); setAiWireApi(event.target.value as 'responses' | 'chat_completions') }}><option value="chat_completions">Chat Completions</option><option value="responses">Responses API</option></select></label>
                     <div className="field model-field"><span id="relay-ai-model-label">模型</span><div className="model-picker single"><select aria-labelledby="relay-ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>检测后选择模型</option>{(selectedProvider.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select></div><small>{selectedProvider.models.length || 0} 个可选模型</small></div>
                   </div>
                 </> : <>
                   <div className="form-row ai-provider-row">
                     <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
                     {selectedProvider?.requiresKey
-                      ? <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
+                      ? <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { invalidateAiSession(); setApiKey(event.target.value) }} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
                       : <div className="field local-access-field"><span>运行方式</span><strong><Cpu size={14} />本机免密 · 零 API 费用</strong></div>}
                     <div className="field model-field"><span id="ai-model-label">模型</span><div className="model-picker"><select aria-labelledby="ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select><button type="button" className="model-refresh-button" title={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} aria-label={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} disabled={refreshingModels || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}</button></div><small>{selectedProvider?.models.length || 0} 个可选模型</small></div>
                   </div>
                   <div className="form-row ai-provider-row">
                     <label className="field base-url-field"><span>Base URL</span><input value={aiBaseUrl} onChange={(event) => updateAiBaseUrl(event.target.value)} placeholder="https://gateway.example/v1" /></label>
-                    <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => setAiWireApi(event.target.value as 'responses' | 'chat_completions')}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
+                    <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => { invalidateAiSession(); setAiWireApi(event.target.value as 'responses' | 'chat_completions') }}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
                   </div>
                 </>}
-                {customModelMode && <label className="field custom-model-field"><span>自定义模型 ID</span><input value={aiModel} onChange={(event) => setAiModel(event.target.value)} placeholder="例如 provider/model-name" /></label>}
+                {customModelMode && <label className="field custom-model-field"><span>自定义模型 ID</span><input value={aiModel} onChange={(event) => { invalidateAiSession(); setAiModel(event.target.value) }} placeholder="例如 provider/model-name" /></label>}
                 <small className="form-hint">{selectedProvider?.local ? request.analysisMode === 'general' ? '用于正文归纳、图片文字理解和动态栏目生成；速度取决于本机硬件。' : '适合职位信息提炼、简历事实整理和初稿生成；速度取决于本机硬件。' : selectedProvider?.relay ? '密钥仅保存在当前设备；连接时会再次验证地址和模型，不写入任务历史或 GitHub。' : providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写模型服务 Base URL 后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
                 <button type="button" className="secondary-button setup-action" disabled={configuringAi || (!selectedProvider?.relay && !aiModel.trim()) || (selectedProvider?.relay && customModelMode && !aiModel.trim()) || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : selectedProvider?.relay ? <Wifi size={16} /> : <BrainCircuit size={16} />}{selectedProvider?.relay ? (aiSession ? '重新验证并连接' : '验证并连接') : aiSession ? '重新连接' : '连接 AI'}</button>
               </section>
               {request.analysisMode === 'job' && <section>
                 <div className="setup-title"><Upload size={17} /><span><strong>背景资料</strong><small>{activeProfile ? `${activeProfile.display_name || '个人档案'} · ${activeProfile.sourceFiles?.length || 0} 个来源` : 'PDF / DOCX / TXT / MD / JSON / CSV / RTF'}</small></span></div>
+                <div className={`profile-ai-route ${selectedProvider?.local ? 'local' : 'external'}`}>
+                  <BrainCircuit size={18} />
+                  <span><strong>本次解析模型</strong><small>{profileAiRouteLabel}</small></span>
+                  <b>{profileAiSessionReady ? '会话已匹配' : '解析时按此配置连接'}</b>
+                </div>
                 <label className="upload-zone"><input type="file" multiple accept=".pdf,.docx,.txt,.md,.json,.csv,.rtf" onChange={(event) => setBackgroundFiles(Array.from(event.target.files || []))} /><Upload size={18} /><span>{backgroundFiles.length ? `已选择 ${backgroundFiles.length} 个文件` : '选择多格式背景文件'}</span></label>
                 <textarea className="background-text" value={backgroundText} onChange={(event) => setBackgroundText(event.target.value)} placeholder="可补充项目背景、工作偏好或可验证成果" />
                 <div className="profile-actions">
@@ -3973,9 +4288,16 @@ function App() {
                     const profileId = event.target.value || null
                     void draftGuard.requestTransition('切换 Profile', () => updateRequest('profileId', profileId))
                   }}><option value="">选择背景记忆</option>{profiles.map((item) => <option key={item.id} value={item.id}>{item.display_name || item.id}</option>)}</select>
-                  <button type="button" className="secondary-button" disabled={!aiSession || importingProfile || !backgroundFiles.length} onClick={() => void importProfile()}>{importingProfile ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}解析并写入记忆</button>
+                  <button type="button" className="secondary-button" disabled={importingProfile || !backgroundFiles.length || !aiModel.trim() || !aiBaseUrl.trim()} onClick={() => void importProfile()}>{importingProfile ? <LoaderCircle className="spin" size={16} /> : <BrainCircuit size={16} />}用当前模型解析</button>
                 </div>
-                {activeProfile && <div className="memory-preview"><strong>{activeProfile.summary}</strong><span>{(activeProfile.skills || []).slice(0, 6).join(' · ')}</span></div>}
+                {activeProfile && <div className="memory-preview">
+                  <div className="memory-preview-meta"><span>{activeProfile.analysis_runtime ? `${activeProfile.analysis_runtime.provider} / ${activeProfile.analysis_runtime.model}` : '旧版档案'}</span><b>{activeProfile.evidence_items?.length || 0} 条可核验证据</b></div>
+                  {activeProfile.analysis_runtime?.base_url && <small className="memory-preview-endpoint">解析端点：{activeProfile.analysis_runtime.base_url}</small>}
+                  <strong>{activeProfile.first_person_profile?.narrative || activeProfile.summary}</strong>
+                  {!!activeProfile.first_person_profile?.core_strengths?.length && <ul>{activeProfile.first_person_profile.core_strengths.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul>}
+                  {!!activeProfile.writing_constraints?.missing_information?.length && <p>待补充：{activeProfile.writing_constraints.missing_information.join('、')}</p>}
+                  <span>{(activeProfile.skills || []).slice(0, 8).join(' · ')}</span>
+                </div>}
               </section>}
             </div>
             {request.analysisMode === 'job' && <section className="candidate-profile-section">
@@ -4170,21 +4492,21 @@ function App() {
                       <div className="security-recovery-heading">
                         <BellRing size={20} />
                         <span>
-                          <strong>{rateLimitRecovering ? '检测到平台限流，正在自动恢复' : '平台限流自动恢复重试已耗尽'}</strong>
-                          <small>{rateLimitRecovering ? `系统正在冷却并进行第 ${activeJob.rateLimit?.retryAttempt || 1} / ${activeJob.rateLimit?.maxRetries || 5} 次恢复探测，检查点持续保存。` : '已完成内容和检查点均已保留，平台恢复后可从未完成位置继续。'}</small>
+                          <strong>{rateLimitResuming ? '正在从限流检查点续跑' : rateLimitScheduled ? '平台限流，已排定自动续跑' : rateLimitWaiting ? '检测到平台限流，正在自动冷却' : '自动恢复次数已用完'}</strong>
+                          <small>{rateLimitResuming ? `正在执行第 ${Math.max(1, rateLimitAutoAttempt)} / ${rateLimitAutoMax} 轮检查点续跑，已有结果不会丢失。` : rateLimitScheduled ? `将执行第 ${rateLimitAutoAttempt + 1} / ${rateLimitAutoMax} 轮自动续跑，也可一键取消倒计时。` : rateLimitWaiting ? `进程内正在进行第 ${activeJob.rateLimit?.retryAttempt || 1} / ${activeJob.rateLimit?.maxRetries || 5} 次恢复探测，可一键跳过剩余冷却。` : '已完成内容和检查点均已保留，可一键重新探测并续跑。'}</small>
                         </span>
-                        <em>{rateLimitRecovering ? '自动处理' : '等待恢复'}</em>
+                        <em>{rateLimitResuming ? '续跑中' : rateLimitRecovering ? '自动处理' : '可手动恢复'}</em>
                       </div>
                       <ol className="security-recovery-steps rate-limit-recovery-steps">
                         <li className="done"><span><Check size={13} /></span><div><strong>保存检查点</strong><small>帖子、评论与用户结果已落盘，不会重复丢失</small></div></li>
-                        <li className={rateLimitRecovering ? 'current' : 'done'}><span>{rateLimitRecovering ? '2' : <Check size={13} />}</span><div><strong>递增冷却</strong><small>{rateLimitRecovering ? `剩余约 ${activeJob.rateLimit?.retryAfterSeconds || 0} 秒后探测页面恢复` : '有限次数的自动冷却和恢复探测已执行'}</small></div></li>
-                        <li className={!rateLimitRecovering && rateLimitReadyToResume ? 'current' : ''}><span>3</span><div><strong>{rateLimitRecovering ? '自动续采' : '稍后续跑'}</strong><small>{rateLimitRecovering ? '页面恢复后自动从当前帖子继续' : rateLimitReadyToResume ? '平台恢复后点击续跑，优先处理未完成帖子' : '正在整理并保存当前检查点，请稍候'}</small></div></li>
+                        <li className={rateLimitWaiting || rateLimitScheduled ? 'current' : 'done'}><span>{rateLimitWaiting || rateLimitScheduled ? '2' : <Check size={13} />}</span><div><strong>递增冷却</strong><small>{rateLimitWaiting ? `剩余约 ${activeJob.rateLimit?.retryAfterSeconds || 0} 秒后探测页面恢复` : rateLimitScheduled ? `自动续跑时间：${rateLimitNextRetryAt ? formatTime(rateLimitNextRetryAt) : '即将执行'}` : '自动冷却与探测已执行'}</small></div></li>
+                        <li className={rateLimitResuming || (!rateLimitRecovering && rateLimitReadyToResume) ? 'current' : ''}><span>3</span><div><strong>{rateLimitResuming ? '检查点续跑' : rateLimitRecovering ? '自动续采' : '一键续跑'}</strong><small>{rateLimitResuming ? '只处理未完成帖子、评论与用户资料' : rateLimitRecovering ? '页面恢复后自动从当前位置继续' : '重新探测并从未完成位置续跑'}</small></div></li>
                       </ol>
-                      {!rateLimitRecovering && <div className="security-recovery-actions">
+                      {!rateLimitResuming && <div className="security-recovery-actions">
                         <button type="button" onClick={() => void openRelayLogin()} disabled={relayLoginOpening}><ExternalLink size={15} />{relayLoginOpening ? '正在打开' : '打开小红书检查页'}</button>
-                        <button type="button" className="primary-button" onClick={() => void resumeJob(activeJob)} disabled={submitting || !rateLimitReadyToResume} title={rateLimitReadyToResume ? '仅在确认页面访问恢复后续跑' : '检查点尚未准备完成'}><Play size={15} fill="currentColor" />{rateLimitReadyToResume ? '我已确认恢复，续跑' : '等待检查点完成'}</button>
+                        <button type="button" className="primary-button" onClick={() => void resumeAudienceCollection(true, activeJob.id)} disabled={submitting || audienceResuming || !rateLimitManualAvailable} title="保留原任务与检查点，立即探测并续跑"><Play size={15} fill="currentColor" />{audienceResuming ? '正在执行' : rateLimitWaiting ? '跳过等待，立即探测' : rateLimitScheduled ? '取消倒计时并续跑' : '一键解除限流并继续'}</button>
                       </div>}
-                      <p><Clock3 size={14} />{rateLimitDetectedAt ? `限流触发时间：${formatTime(rateLimitDetectedAt)}。` : ''}{rateLimitRecovering ? '系统不会高频刷新，冷却结束后仅进行一次恢复探测。' : '恢复前先等待一段时间，并以小红书页面可正常访问为准。'}</p>
+                      <p><Clock3 size={14} />{rateLimitDetectedAt ? `限流触发时间：${formatTime(rateLimitDetectedAt)}。` : ''}自动模式使用递增冷却、有限探测和持久化断点；手动按钮只跳过当前等待，不清空已采集结果。</p>
                     </div>
                   )}
                   {activeOutcome === 'failed' && !rateLimitDetected && <div className="task-outcome-callout failed"><CircleAlert size={18} /><span><strong>执行失败</strong><small>{activeJob.message || (activeJob.resumeAvailable ? '任务因错误终止，检查点仍可用于重试。' : '任务因错误终止，请查看运行日志定位原因。')}</small></span></div>}
@@ -4260,23 +4582,47 @@ function App() {
               setJobs((current) => current.map((item) => item.id === job.id ? job : item))
             }} onReturnInsights={() => switchGeneralResultModule('insights')} />}
             {!expansionModuleActive && (audienceModuleActive ? <AudienceWorkspace
+              jobId={audienceSourceJobId || audienceReadJobId || ''}
               results={audienceResults}
               loading={audienceLoading}
               task={trackedAudienceTask}
+              aiSession={aiSession}
+              audienceAiEnabled={health?.audienceAi?.enabled === true}
+              anchorTarget={audienceAnchorTarget}
               actionMessage={audienceActionMessage}
               kind={audienceKind}
               postId={audiencePostId}
               query={audienceQuery}
+              pageSize={audiencePageSize}
               resuming={audienceResuming}
-              onKind={(value) => { setAudienceKind(value); setAudienceOffset(0) }}
-              onPost={(value) => { setAudiencePostId(value); setAudienceOffset(0) }}
-              onQuery={(value) => { setAudienceQuery(value); setAudienceOffset(0) }}
-              onPage={(offset) => audienceReadJobId && void loadAudienceResults(audienceReadJobId, offset, {
+              growing={audienceGrowing}
+              growthScrolls={audienceGrowthScrolls}
+              onKind={(value) => { setAudienceAnchorTarget(null); setAudienceKind(value); setAudienceOffset(0) }}
+              onPost={(value) => { setAudienceAnchorTarget(null); setAudiencePostId(value); setAudienceOffset(0) }}
+              onQuery={(value) => { setAudienceAnchorTarget(null); setAudienceQuery(value); setAudienceOffset(0) }}
+              onPageSize={(value) => { setAudienceAnchorTarget(null); setAudiencePageSize(value); setAudienceOffset(0) }}
+              onPage={(offset) => { setAudienceAnchorTarget(null); if (audienceReadJobId) void loadAudienceResults(audienceReadJobId, offset, {
                 preserveExisting: audienceReadJobId !== audienceSourceJobId,
                 fallbackJobId: audienceSourceJobId,
                 sourceJobId: audienceSourceJobId,
-              })}
+              }) }}
               onResume={() => void resumeAudienceCollection()}
+              onGrowthScrolls={setAudienceGrowthScrolls}
+              onGrow={() => void growAudienceCollection()}
+              onConfigureAi={() => document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+              onNavigateEvidence={(target) => {
+                const targetPostId = target.anchor.postId || audiencePostId
+                setAudienceKind(target.kind)
+                setAudiencePostId(targetPostId)
+                setAudienceQuery('')
+                setAudienceAnchorTarget({
+                  kind: target.kind,
+                  entityId: target.entityId,
+                  postId: targetPostId,
+                  offset: Math.max(0, Number(target.anchor.offset || 0)),
+                  anchor: target.anchor,
+                })
+              }}
             /> : <>{completionFlow && <MissingCompletionFlowPanel
               flow={completionFlow}
               job={completionFlow.jobId === activeJob?.id ? activeJob : null}
@@ -4332,16 +4678,17 @@ function App() {
                   <div className="result-rows">
                     {results.items.map((item) => {
                       const routeLabels = deliveryRoutes(item).map((route) => route.label)
-                      const draftQualityStale = item.draftVersion?.qualityStatus === 'stale'
-                      const draftQualityVerified = hasVerifiedDraftQuality(item)
+                      const missingJobBody = isIncompleteApplicationResult(item)
+                      const draftQualityStale = !missingJobBody && item.draftVersion?.qualityStatus === 'stale'
+                      const draftQualityVerified = !missingJobBody && hasVerifiedDraftQuality(item)
                       const draftState = item.delivery?.action === 'email_sent'
                         ? '已发送'
-                        : draftQualityStale
-                          ? '质量失效'
-                          : draftQualityVerified
-                            ? '≥ 90'
-                            : item.outreach?.runtime_status === 'fallback_missing_job_body'
-                              ? '信息未完整'
+                        : missingJobBody
+                          ? '信息未完整'
+                          : draftQualityStale
+                            ? '质量失效'
+                            : draftQualityVerified
+                              ? '≥ 90'
                               : item.outreach?.runtime_status === 'fallback_model_error'
                                 ? 'AI 失败 · 有初稿'
                                 : '待重写'
@@ -4354,7 +4701,7 @@ function App() {
                               <strong>{item.title || '未命名岗位'}</strong>
                               <i className={item.delivery?.action === 'email_sent' ? 'sent' : draftQualityVerified ? 'ready' : ''}>{draftState}</i>
                             </span>
-                            <small>{item.publish_time?.value || '日期待核验'} · {draftQualityStale ? '-' : item.cover_letter_evaluation?.score ?? '-'} 分 · {routeLabels.length ? [...new Set(routeLabels)].join(' / ') : '投递方式待确认'}</small>
+                            <small>{item.publish_time?.value || '日期待核验'} · {missingJobBody || draftQualityStale ? '-' : item.cover_letter_evaluation?.score ?? '-'} 分 · {routeLabels.length ? [...new Set(routeLabels)].join(' / ') : '投递方式待确认'}</small>
                             </span>
                           </button>
                         </div>

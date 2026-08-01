@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { appendFile, mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
-import { ValidationError, validateExpansionCancelRequest, validateExpansionResumeRequest, validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
+import { ValidationError, validateAudienceGrowthRequest, validateExpansionCancelRequest, validateExpansionResumeRequest, validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
 import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
 import { setupRelayRuntime } from './lib/relay-setup.mjs';
@@ -26,6 +26,15 @@ import { createDraftQualityChecker } from './lib/draft-quality-checker.mjs';
 import { normalizeDiagnosticRoute } from './lib/diagnostics.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 import { createPreflightService } from './preflight-service.mjs';
+import { AudienceAiService } from './audience-ai-service.mjs';
+import { createAudienceAiProfileRunner } from './lib/audience-ai-profile-runner.mjs';
+import {
+  AudienceAiValidationError,
+  validateAudienceAiEmptyRequest,
+  validateAudienceAiPreviewRequest,
+  validateAudienceAiResultsQuery,
+  validateAudienceAiStartRequest,
+} from './lib/audience-ai-contracts.mjs';
 
 export { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 
@@ -49,7 +58,7 @@ const CONTENT_RESEARCH_LABELS = Object.freeze({
   custom: '自定义研究',
 });
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const relayRuntime = relaySupervisor || createRelaySupervisor({
     getConfig: getRelayConfig,
@@ -80,6 +89,12 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
   const checkDraftQuality = draftQualityChecker || createDraftQualityChecker({
     pythonBin: config.pythonBin || (process.platform === 'win32' ? 'python' : 'python3'),
     scriptPath: path.join(config.projectRoot || process.cwd(), 'scripts', 'recheck_application_draft.py'),
+  });
+  const audienceAi = audienceAiService || new AudienceAiService({
+    manager,
+    aiSessions,
+    config,
+    profileEnricher: createAudienceAiProfileRunner({ manager, config, getRelayConfig }),
   });
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
@@ -134,6 +149,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           activeJob: manager.active?.id || null,
           emailDelivery: deliveryMailer.status(),
           relaySupervisor: relayRuntime.snapshot(),
+          audienceAi: {
+            enabled: config.audienceAiEnabled === true,
+            runnerAvailable: config.audienceAiRunnerAvailable === true,
+          },
         });
       }
       if (req.method === 'GET' && url.pathname === '/api/relay/config') {
@@ -348,9 +367,26 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       }
       if (parts[0] === 'api' && parts[1] === 'jobs' && parts[2]) {
         const id = parts[2];
-        if (!JOB_ID.test(id)) return json(res, 404, errorBody('NOT_FOUND', 'Task not found.'));
+        const audienceAiRoute = isAudienceAiRouteParts(parts);
+        if (!JOB_ID.test(id)) {
+          if (audienceAiRoute) {
+            const error = Object.assign(new Error('The requested task was not found.'), { code: 'AUDIENCE_AI_JOB_NOT_FOUND', jobId: id });
+            return json(res, 404, audienceAiErrorBody(error, {
+              code: error.code, requestId, jobId: id, postId: safeDecodePathSegment(parts[5]), runId: null,
+            }));
+          }
+          return json(res, 404, errorBody('NOT_FOUND', 'Task not found.'));
+        }
         const internal = manager.getInternal(id);
-        if (!internal) return json(res, 404, errorBody('NOT_FOUND', 'Task not found.'));
+        if (!internal) {
+          if (audienceAiRoute) {
+            const error = Object.assign(new Error('The requested task was not found.'), { code: 'AUDIENCE_AI_JOB_NOT_FOUND', jobId: id });
+            return json(res, 404, audienceAiErrorBody(error, {
+              code: error.code, requestId, jobId: id, postId: safeDecodePathSegment(parts[5]), runId: null,
+            }));
+          }
+          return json(res, 404, errorBody('NOT_FOUND', 'Task not found.'));
+        }
         if (req.method === 'GET' && parts.length === 3) return json(res, 200, manager.get(id));
         if (req.method === 'POST' && parts[3] === 'resume' && parts.length === 4) {
           const options = validateResumeRequest(await readJsonBody(req, config.maxBodyBytes));
@@ -461,15 +497,68 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             mediaDownloads,
           });
         }
+        if (parts[3] === 'audience' && parts[4] === 'posts' && parts[5] && parts[6] === 'ai') {
+          const postId = decodePathSegment(parts[5]);
+          if (req.method === 'GET' && parts.length === 7) {
+            return json(res, 200, await audienceAi.getState(id, postId));
+          }
+          if (req.method === 'POST' && parts[7] === 'preview' && parts.length === 8) {
+            const request = validateAudienceAiPreviewRequest(await readJsonBody(req, config.maxBodyBytes));
+            return json(res, 200, await audienceAi.preview(id, postId, request));
+          }
+          if (req.method === 'POST' && parts[7] === 'runs' && parts.length === 8) {
+            const request = validateAudienceAiStartRequest(await readJsonBody(req, config.maxBodyBytes));
+            return json(res, 202, await audienceAi.start(id, postId, request));
+          }
+          if (req.method === 'GET' && parts[7] === 'events' && parts.length === 8) {
+            return await streamAudienceAiEvents(req, res, audienceAi, id, postId, url.searchParams);
+          }
+          if (req.method === 'GET' && parts[7] === 'results' && parts.length === 8) {
+            return json(res, 200, await audienceAi.getResults(id, postId, validateAudienceAiResultsQuery(url.searchParams)));
+          }
+          if (parts[7] === 'runs' && parts[8]) {
+            const runId = decodePathSegment(parts[8]);
+            if (req.method === 'GET' && parts.length === 9) {
+              return json(res, 200, await audienceAi.getRun(id, postId, runId));
+            }
+            if (req.method === 'GET' && parts[9] === 'results' && parts.length === 10) {
+              const query = validateAudienceAiResultsQuery(url.searchParams);
+              return json(res, 200, await audienceAi.getResults(id, postId, { ...query, runId }));
+            }
+            if (req.method === 'POST' && ['cancel', 'resume'].includes(parts[9]) && parts.length === 10) {
+              validateAudienceAiEmptyRequest(await readJsonBody(req, config.maxBodyBytes));
+              const result = parts[9] === 'cancel'
+                ? await audienceAi.cancel(id, postId, runId)
+                : await audienceAi.resume(id, postId, runId);
+              return json(res, 202, result);
+            }
+          }
+        }
+        if (
+          req.method === 'GET'
+          && parts[3] === 'audience'
+          && parts[4] === 'posts'
+          && parts[5]
+          && ['comments', 'users'].includes(parts[6])
+          && parts[7]
+          && parts[8] === 'anchor'
+          && parts.length === 9
+        ) {
+          const postId = decodePathSegment(parts[5]);
+          const entityType = parts[6] === 'comments' ? 'comment' : 'user';
+          const entityId = decodePathSegment(parts[7]);
+          const pageSize = strictBoundedInteger(url.searchParams.get('pageSize'), 50, 1, 500, 'pageSize');
+          return json(res, 200, await audienceAi.getAnchor(id, postId, entityType, entityId, pageSize));
+        }
         if (req.method === 'GET' && parts[3] === 'audience' && parts.length === 4) {
           return json(res, 200, await readAudienceSnapshot(manager, id, url.searchParams));
         }
         if (req.method === 'GET' && parts[3] === 'expansion' && parts.length === 4) {
-          return json(res, 200, await readExpansionSnapshot(
+          return json(res, 200, localizeExpansionMedia(await readExpansionSnapshot(
             internal.outputDir,
             url.searchParams,
             manager.get(id)?.workflowSummary?.expansion || {},
-          ));
+          ), id));
         }
         if (req.method === 'POST' && parts[3] === 'expansion' && parts[4] === 'start' && parts.length === 5) {
           const request = validateExpansionStartRequest(await readJsonBody(req, config.maxBodyBytes));
@@ -479,19 +568,25 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             throw new ValidationError('Expansion seeds must belong to the current task.', foreign.map((postId) => ({ field: 'seedPostIds', reason: 'not_owned_by_task', value: postId })));
           }
           const result = await manager.startExpansion(id, request);
-          return json(res, 202, { ...result, expansion: await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}) });
+          return json(res, 202, { ...result, expansion: localizeExpansionMedia(await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}), id) });
         }
         if (req.method === 'POST' && parts[3] === 'expansion' && parts[4] === 'resume' && parts.length === 5) {
           const request = validateExpansionResumeRequest(await readJsonBody(req, config.maxBodyBytes));
           const result = await manager.resumeExpansion(id, request);
-          return json(res, 202, { ...result, expansion: await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}) });
+          return json(res, 202, { ...result, expansion: localizeExpansionMedia(await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}), id) });
         }
         if (req.method === 'POST' && parts[3] === 'expansion' && parts[4] === 'cancel' && parts.length === 5) {
           validateExpansionCancelRequest(await readJsonBody(req, config.maxBodyBytes));
           const result = await manager.cancelExpansion(id);
-          return json(res, 202, { ...result, expansion: await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}) });
+          return json(res, 202, { ...result, expansion: localizeExpansionMedia(await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}), id) });
         }
-        if (req.method === 'POST' && parts[3] === 'audience' && parts[4] === 'resume' && parts.length === 5) {
+        if (
+          req.method === 'POST'
+          && parts[3] === 'audience'
+          && ['resume', 'recover-rate-limit'].includes(parts[4])
+          && parts.length === 5
+        ) {
+          const rateLimitRecovery = parts[4] === 'recover-rate-limit';
           const body = await readJsonBody(req, config.maxBodyBytes);
           const resumeOptions = validateResumeRequest({ ...body, scope: 'audience' }, { fixedScope: 'audience' });
           const {
@@ -506,6 +601,19 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             const error = new Error('Audience collection source task was not found.');
             error.code = 'RESUME_SOURCE_NOT_FOUND';
             throw error;
+          }
+          if (rateLimitRecovery && typeof manager.signalRateLimitRecovery === 'function') {
+            const recoverySignal = await manager.signalRateLimitRecovery(id);
+            if (recoverySignal.signaled) {
+              return json(res, 202, {
+                action: 'signaled',
+                sourceJobId,
+                checkpointJobId: id,
+                stateOwnerJobId,
+                job: recoverySignal.job,
+                message: 'The running collector will skip the remaining cooldown and probe immediately.',
+              });
+            }
           }
           if (ACTIVE_JOB_STATUSES.has(requestedJob.status)) {
             return json(res, 200, {
@@ -552,8 +660,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           const job = await manager.resume(id, {
             ...resumeOptions,
             params,
-            requestedBy: resumeOptions.requestedBy || 'audience_resume_api',
+            requestedBy: resumeOptions.requestedBy || (rateLimitRecovery ? 'rate_limit_manual_recovery' : 'audience_resume_api'),
             resumeCheckpointJobIds,
+            forceCompleted: rateLimitRecovery || resumeOptions.forceCompleted,
+            rateLimitRecoveryMode: rateLimitRecovery ? 'manual' : undefined,
           });
           return json(res, 202, {
             action: 'started',
@@ -562,7 +672,71 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             stateOwnerJobId,
             readThroughJobIds: resumeCheckpointJobIds,
             job,
-            message: 'Audience collection resumed in the original task from the saved checkpoint.',
+            message: rateLimitRecovery
+              ? 'Rate-limit cooldown was cancelled and audience collection resumed from the saved checkpoint.'
+              : 'Audience collection resumed in the original task from the saved checkpoint.',
+          });
+        }
+        if (req.method === 'POST' && parts[3] === 'audience' && parts[4] === 'grow' && parts.length === 5) {
+          const request = validateAudienceGrowthRequest(await readJsonBody(req, config.maxBodyBytes));
+          const {
+            sourceJobId,
+            stateOwnerJobId,
+            readThroughJobIds: resumeCheckpointJobIds,
+          } = await resolveAudienceResumeOwner(manager, id);
+          const sourceInternal = manager.getInternal(sourceJobId);
+          const sourceJob = manager.get(sourceJobId);
+          const requestedJob = manager.get(id);
+          if (!sourceInternal || !sourceJob || !requestedJob) {
+            const error = new Error('Audience growth source task was not found.');
+            error.code = 'RESUME_SOURCE_NOT_FOUND';
+            throw error;
+          }
+          if (ACTIVE_JOB_STATUSES.has(requestedJob.status)) {
+            return json(res, 200, {
+              action: 'attached',
+              sourceJobId,
+              checkpointJobId: id,
+              stateOwnerJobId,
+              job: requestedJob,
+              message: 'The original task is already running.',
+            });
+          }
+          const sourceParams = sourceInternal.params || sourceInternal.config || sourceJob.config || {};
+          const params = validateRunRequest({
+            ...sourceParams,
+            analysisMode: 'general',
+            searchSort: 'latest',
+            maxAgeDays: 0,
+            limit: 0,
+            maxScrolls: request.maxScrolls,
+            mode: 'resume',
+            resumeFromJobId: sourceJobId,
+            completeMissingOnly: false,
+            collectAudience: true,
+            audienceOnly: false,
+            discoverMore: true,
+            checkOnly: false,
+            securityVerificationTimeoutSeconds: 86400,
+            aiSessionId: null,
+            profileId: null,
+          });
+          const job = await manager.resume(id, {
+            scope: 'full',
+            params,
+            requestedBy: 'audience_grow_api',
+            resumeCheckpointJobIds,
+            forceCompleted: true,
+          });
+          return json(res, 202, {
+            action: 'started',
+            sourceJobId,
+            checkpointJobId: id,
+            stateOwnerJobId,
+            readThroughJobIds: resumeCheckpointJobIds,
+            maxScrolls: request.maxScrolls,
+            job,
+            message: 'Latest-first discovery started; existing audience data will be retained and merged.',
           });
         }
         if (req.method === 'POST' && parts[3] === 'delivery' && parts.length === 4) {
@@ -626,6 +800,16 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         errorCode: error?.code || error?.name || 'INTERNAL_ERROR',
         durationMs: performance.now() - requestStartedAt,
       });
+      if (error instanceof AudienceAiValidationError || String(error.code || '').startsWith('AUDIENCE_AI_')) {
+        const code = error.code || 'AUDIENCE_AI_INVALID_SCOPE';
+        return json(res, audienceAiHttpStatus(code), audienceAiErrorBody(error, {
+          code,
+          requestId,
+          jobId: error.jobId || parts[2] || null,
+          postId: error.postId || (parts[5] ? safeDecodePathSegment(parts[5]) : null),
+          runId: error.runId || (parts[7] === 'runs' && parts[8] ? safeDecodePathSegment(parts[8]) : null),
+        }));
+      }
       if (error instanceof ValidationError) return json(res, 400, errorBody('VALIDATION_ERROR', error.message, error.details));
       if (error.code === 'DRAFT_VERSION_CONFLICT') {
         return json(res, 409, {
@@ -675,7 +859,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'MEDIA_SOURCE_INVALID') return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'MEDIA_SOURCE_UNAVAILABLE') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'BODY_TOO_LARGE') return json(res, 413, errorBody('BODY_TOO_LARGE', 'Request body is too large.'));
-      if (['AI_VALIDATION', 'AI_SESSION_EXPIRED', 'PROFILE_VALIDATION', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
+      if (['AI_VALIDATION', 'AI_SESSION_EXPIRED', 'PROFILE_VALIDATION', 'PROFILE_AI_SESSION_REQUIRED', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'AI_MODEL_DISCOVERY_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'LOCAL_MODEL_VALIDATION') return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'LOCAL_MODEL_BUSY') return json(res, 409, { ...errorBody(error.code, error.message), install: error.install });
@@ -1205,6 +1389,22 @@ function localizeAudienceAvatars(result, jobId) {
     ))
     : [];
   return { ...result, posts, items };
+}
+
+function localizeExpansionMedia(result, jobId) {
+  if (!result || !jobId) return result;
+  const seeds = Array.isArray(result.seeds)
+    ? result.seeds.map((seed) => {
+      const sourceUrl = String(seed?.coverUrl || '').trim();
+      if (!isCacheableMediaUrl(sourceUrl)) return seed;
+      return {
+        ...seed,
+        coverUrl: `/api/jobs/${encodeURIComponent(jobId)}/media?url=${encodeURIComponent(sourceUrl)}`,
+        coverOriginalUrl: sourceUrl,
+      };
+    })
+    : [];
+  return { ...result, seeds };
 }
 
 async function serveCachedMedia(res, { outputDir, sourceUrl, mediaFetcher, mediaDownloads }) {
@@ -2374,6 +2574,25 @@ function boundedInteger(raw, fallback, min, max) {
   return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
 }
 
+function strictBoundedInteger(raw, fallback, min, max, field) {
+  if (raw === null || raw === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new AudienceAiValidationError('Invalid audience AI query.', [{ field, reason: `must_be_integer_${min}_to_${max}` }]);
+  }
+  return value;
+}
+
+function decodePathSegment(value) {
+  try {
+    const decoded = decodeURIComponent(String(value || ''));
+    if (!decoded || decoded.includes('/') || decoded.includes('\\') || /\p{Cc}/u.test(decoded)) throw new Error('invalid');
+    return decoded;
+  } catch {
+    throw new AudienceAiValidationError('Invalid audience AI path identifier.', [{ field: 'path', reason: 'invalid_identifier' }]);
+  }
+}
+
 function streamEvents(req, res, manager, id) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -2406,6 +2625,88 @@ function streamEvents(req, res, manager, id) {
   });
   heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15000);
   req.on('close', close);
+}
+
+async function streamAudienceAiEvents(req, res, service, jobId, postId, searchParams) {
+  const afterRaw = searchParams.get('after') || req.headers['last-event-id'] || '0';
+  const after = strictBoundedInteger(afterRaw, 0, 0, Number.MAX_SAFE_INTEGER, 'after');
+  let closed = false;
+  let heartbeat;
+  let unsubscribe = () => {};
+  let live = false;
+  let lastSent = after;
+  const buffered = [];
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+    res.end();
+  };
+  req.on('close', close);
+  const deliver = (event) => {
+    if (closed || !Number.isSafeInteger(event?.sequence) || event.sequence <= lastSent) return;
+    if (!live) {
+      buffered.push(event);
+      return;
+    }
+    writeSequencedEvent(res, event);
+    lastSent = event.sequence;
+  };
+  unsubscribe = service.subscribe(jobId, postId, deliver);
+  try {
+    const throughSequence = await service.getEventHighWater(jobId, postId);
+    const snapshot = await service.getState(jobId, postId);
+    if (closed) return;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    writeEvent(res, 'audience_ai_snapshot', { type: 'audience_ai_snapshot', jobId, postId, state: snapshot });
+
+    let cursor = after;
+    while (cursor < throughSequence) {
+      const page = await service.listEventPage(jobId, postId, cursor, { limit: 500, throughSequence });
+      if (closed) return;
+      for (const event of page.events) {
+        if (event.sequence <= lastSent) continue;
+        writeSequencedEvent(res, event);
+        lastSent = event.sequence;
+      }
+      if (!page.hasMore || page.nextAfter <= cursor) break;
+      cursor = page.nextAfter;
+    }
+
+    buffered.sort((left, right) => left.sequence - right.sequence);
+    for (const event of buffered) {
+      if (event.sequence <= lastSent) continue;
+      writeSequencedEvent(res, event);
+      lastSent = event.sequence;
+    }
+    buffered.length = 0;
+    live = true;
+    heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
+  } catch (error) {
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+    req.off('close', close);
+    throw error;
+  }
+}
+
+function writeSequencedEvent(res, event) {
+  res.write(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify({
+    ...event.data,
+    type: event.type,
+    sequence: event.sequence,
+    runId: event.runId,
+    jobId: event.jobId,
+    postId: event.postId,
+    createdAt: event.createdAt,
+  })}\n\n`);
 }
 
 function writeEvent(res, event, data) {
@@ -2451,6 +2752,44 @@ function noContent(res) {
 
 function errorBody(code, message, details) {
   return { message, error: { code, message, ...(details?.length ? { details } : {}) } };
+}
+
+function audienceAiHttpStatus(code) {
+  if (['AUDIENCE_AI_DISABLED', 'AUDIENCE_AI_JOB_NOT_FOUND', 'AUDIENCE_AI_POST_NOT_FOUND', 'AUDIENCE_AI_POST_NOT_OWNED', 'AUDIENCE_AI_RUN_NOT_FOUND', 'AUDIENCE_AI_RESULT_NOT_FOUND', 'AUDIENCE_AI_ANCHOR_NOT_FOUND'].includes(code)) return 404;
+  if (['AUDIENCE_AI_ALREADY_RUNNING', 'AUDIENCE_AI_REVISION_CONFLICT', 'AUDIENCE_AI_RUN_NOT_RESUMABLE', 'AUDIENCE_AI_CANCELLED', 'AUDIENCE_AI_RELAY_BUSY', 'AUDIENCE_AI_SECURITY_BLOCKED'].includes(code)) return 409;
+  if (code === 'AUDIENCE_AI_PROVIDER_RATE_LIMITED') return 429;
+  if (['AUDIENCE_AI_PROVIDER_FAILED'].includes(code)) return 502;
+  if (['AUDIENCE_AI_SCHEMA_INVALID', 'AUDIENCE_AI_EVIDENCE_INVALID'].includes(code)) return 422;
+  if (code === 'AUDIENCE_AI_INTERNAL_ERROR') return 503;
+  return 400;
+}
+
+function audienceAiErrorBody(error, { code, requestId, jobId, postId, runId }) {
+  const message = String(error.message || 'Audience AI request failed.');
+  const details = Array.isArray(error.details) ? error.details : undefined;
+  const resumable = Boolean(error.resumable || ['AUDIENCE_AI_PROVIDER_FAILED', 'AUDIENCE_AI_PROVIDER_RATE_LIMITED', 'AUDIENCE_AI_RELAY_BUSY'].includes(code));
+  return {
+    errorCode: code,
+    message,
+    jobId,
+    postId,
+    runId,
+    resumable,
+    retryAfter: Number.isFinite(Number(error.retryAfter)) ? Number(error.retryAfter) : null,
+    requestId: requestId || null,
+    error: { code, message, ...(details?.length ? { details } : {}) },
+  };
+}
+
+function safeDecodePathSegment(value) {
+  try { return decodeURIComponent(String(value || '')) || null; } catch { return null; }
+}
+
+function isAudienceAiRouteParts(parts) {
+  return parts[3] === 'audience'
+    && parts[4] === 'posts'
+    && Boolean(parts[5])
+    && (parts[6] === 'ai' || ['comments', 'users'].includes(parts[6]));
 }
 
 async function serveSpa(req, res, staticDir, pathname) {

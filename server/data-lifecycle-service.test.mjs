@@ -14,7 +14,7 @@ const PROFILE_A = 'aabbccddeeff0011';
 const PROFILE_B = '1122334455667788';
 const DRAFT_A = `draft_${'a'.repeat(64)}`;
 
-async function fixture(t, { jobs = [], now } = {}) {
+async function fixture(t, { jobs = [], now, audienceAi } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'xhs-lifecycle-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const dataDir = path.join(root, 'jobs');
@@ -27,6 +27,7 @@ async function fixture(t, { jobs = [], now } = {}) {
   const service = new DataLifecycleService({
     manager,
     profileStore,
+    audienceAi,
     retentionPath: path.join(root, 'data-retention.json'),
     auditPath: path.join(root, 'deletion-audit.jsonl'),
     ...(now ? { now } : {}),
@@ -209,6 +210,32 @@ test('running Job deletion quiesces resources before physical removal', async (t
   assert.equal(existsSync(path.join(ctx.dataDir, JOB_A)), false);
 });
 
+test('Job deletion quiesces audience AI before removing its ownership tree and releases the guard', async (t) => {
+  const target = job(JOB_A, 'running');
+  const calls = [];
+  let dataDir;
+  const audienceAi = {
+    async quiesceJob(id, options) {
+      calls.push(['quiesce', id, options]);
+      assert.equal(existsSync(path.join(dataDir, id)), true);
+    },
+    releaseJobQuiesce(id) {
+      calls.push(['release', id]);
+      assert.equal(existsSync(path.join(dataDir, id)), false);
+    },
+  };
+  const ctx = await fixture(t, { jobs: [target], audienceAi });
+  dataDir = ctx.dataDir;
+  await materializeJob(ctx.dataDir, target);
+
+  await execute(ctx.service, { entityType: 'job', jobId: JOB_A });
+
+  assert.deepEqual(calls, [
+    ['quiesce', JOB_A, { rejectActive: false }],
+    ['release', JOB_A],
+  ]);
+});
+
 test('deleting a source Job detaches historical lineage references', async (t) => {
   const source = job(JOB_A);
   const dependent = job(JOB_B, 'succeeded', { params: { resumeFromJobId: JOB_A }, sourceJobId: JOB_A });
@@ -319,6 +346,36 @@ test('retention rechecks eligibility under the deletion lock and skips a task th
   assert.ok(ctx.manager.getInternal(JOB_A));
 });
 
+test('retention skips a task when its audience AI run becomes active under the deletion lock', async (t) => {
+  const target = job(JOB_A);
+  const calls = [];
+  const audienceAi = {
+    async quiesceJob(id, options) {
+      calls.push(['quiesce', id, options]);
+      throw Object.assign(new Error('audience AI became active'), { code: 'JOB_ACTIVE_RETENTION' });
+    },
+    releaseJobQuiesce(id) { calls.push(['release', id]); },
+  };
+  const ctx = await fixture(t, {
+    jobs: [target],
+    audienceAi,
+    now: () => new Date('2026-08-01T00:00:00.000Z'),
+  });
+  await materializeJob(ctx.dataDir, target);
+  await ctx.service.updateRetention({ enabled: true, days: 30, pinnedJobIds: [] });
+
+  const result = await ctx.service.cleanupExpired({ dryRun: false });
+
+  assert.deepEqual(result.deleted, []);
+  assert.deepEqual(result.skipped, [{ type: 'job', id: JOB_A, reason: 'became_active' }]);
+  assert.deepEqual(calls, [
+    ['quiesce', JOB_A, { rejectActive: true }],
+    ['release', JOB_A],
+  ]);
+  assert.equal(existsSync(path.join(ctx.dataDir, JOB_A)), true);
+  assert.ok(ctx.manager.getInternal(JOB_A));
+});
+
 test('clear-all requires the strong confirmation phrase', async (t) => {
   const ctx = await fixture(t);
   const preview = await ctx.service.preview({ entityType: 'all' });
@@ -336,6 +393,36 @@ test('clear-all physically removes every Profile and Job ownership tree', async 
   assert.deepEqual(await ctx.profileStore.list(), []);
   assert.equal(ctx.manager.jobs.length, 0);
   assert.deepEqual((await readdir(ctx.dataDir)).sort(), ['jobs.json']);
+});
+
+test('clear-all quiesces every audience AI job before removing any ownership tree', async (t) => {
+  const first = job(JOB_A);
+  const second = job(JOB_B);
+  const quiesced = [];
+  const released = [];
+  let dataDir;
+  const audienceAi = {
+    async quiesceJob(id) {
+      quiesced.push(id);
+      assert.equal(existsSync(path.join(dataDir, JOB_A)), true);
+      assert.equal(existsSync(path.join(dataDir, JOB_B)), true);
+    },
+    releaseJobQuiesce(id) { released.push(id); },
+  };
+  const ctx = await fixture(t, { jobs: [first, second], audienceAi });
+  dataDir = ctx.dataDir;
+  await Promise.all([materializeJob(ctx.dataDir, first), materializeJob(ctx.dataDir, second)]);
+  const preview = await ctx.service.preview({ entityType: 'all' });
+
+  await ctx.service.execute({
+    entityType: 'all',
+    confirmationToken: preview.confirmationToken,
+    confirmationPhrase: preview.confirmationPhrase,
+  });
+
+  assert.deepEqual(quiesced, [JOB_A, JOB_B]);
+  assert.deepEqual(released, [JOB_A, JOB_B]);
+  assert.deepEqual(ctx.manager.jobs, []);
 });
 
 test('audit records are redacted and never contain entity ids or content', async (t) => {

@@ -65,6 +65,35 @@ test('audience results return an explicit pending state before collection starts
   }
 });
 
+test('audience results support page sizes up to 500 and clamp larger requests', async () => {
+  const outputDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-page-size-'));
+  try {
+    const comments = Array.from({ length: 520 }, (_, index) => ({
+      comment_id: `comment-${index + 1}`,
+      post_id: 'post-1',
+      text: `Comment ${index + 1}`,
+      user: { user_id: `user-${index + 1}` },
+    }));
+    await Promise.all([
+      writeFile(path.join(outputDir, 'audience-summary.json'), JSON.stringify({ status: 'complete', postsTotal: 1, commentsCollected: comments.length }), 'utf8'),
+      writeFile(path.join(outputDir, 'audience-posts.json'), JSON.stringify([{ post_id: 'post-1', title: 'Page size test', status: 'complete' }]), 'utf8'),
+      writeFile(path.join(outputDir, 'audience-comments.json'), JSON.stringify(comments), 'utf8'),
+      writeFile(path.join(outputDir, 'audience-users.json'), '[]', 'utf8'),
+    ]);
+
+    const page = await readAudienceResults(outputDir, new URLSearchParams({ limit: '500' }));
+    assert.equal(page.limit, 500);
+    assert.equal(page.items.length, 500);
+    assert.equal(page.total, 520);
+
+    const clamped = await readAudienceResults(outputDir, new URLSearchParams({ limit: '999' }));
+    assert.equal(clamped.limit, 500);
+    assert.equal(clamped.items.length, 500);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('audience results expose saved note checkpoints as uncollected post targets', async () => {
   const outputDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-targets-'));
   try {

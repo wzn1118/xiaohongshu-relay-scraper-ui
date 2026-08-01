@@ -20,6 +20,8 @@ const TERMINAL = new Set(['succeeded', 'incomplete', 'failed', 'cancelled', 'int
 const ACTIVE_ATTEMPT_STATUSES = new Set(['queued', 'resuming', 'running']);
 const RESUMABLE_JOB_STATUSES = new Set(['incomplete', 'interrupted', 'failed', 'cancelled', 'blocked']);
 const RESUME_SCOPES = new Set(['full', 'discovery', 'body_completion', 'analysis', 'audience', 'artifacts']);
+const RATE_LIMIT_RECOVERY_STATUSES = new Set(['waiting', 'stopped', 'scheduled', 'resuming']);
+const RATE_LIMIT_TERMINAL_STATUSES = new Set(['stopped', 'scheduled']);
 
 export class JobManager {
   constructor({
@@ -34,6 +36,7 @@ export class JobManager {
     profileStore,
     legacyProfilePath,
     diagnostics,
+    rateLimitRecovery,
   }) {
     this.dataDir = dataDir;
     this.historyPath = path.join(dataDir, 'jobs.json');
@@ -46,6 +49,7 @@ export class JobManager {
     this.checkpointAnalyzerImpl = checkpointAnalyzerImpl;
     this.jobs = [];
     this.active = null;
+    this.relaySubtask = null;
     this.processes = new Map();
     this.events = new EventEmitter();
     this.events.setMaxListeners(0);
@@ -59,6 +63,8 @@ export class JobManager {
     this.recoveryBlockers = [];
     this.jobLocks = new Map();
     this.deletingJobs = new Set();
+    this.rateLimitRecovery = normalizeRateLimitRecoveryOptions(rateLimitRecovery);
+    this.rateLimitRecoveryTimers = new Map();
   }
 
   async initialize() {
@@ -176,7 +182,18 @@ export class JobManager {
       job.workflowSummary = persistedExpansion
         ? { ...(diskSummary || {}), expansion: { ...(diskSummary?.expansion || {}), ...persistedExpansion } }
         : diskSummary;
+      if (!job.rateLimit && job.workflowSummary?.rateLimit?.status === 'stopped') {
+        job.rateLimit = {
+          detected: true,
+          ...job.workflowSummary.rateLimit,
+          recoveryAction: job.workflowSummary.rateLimit.recoveryAction || 'wait_then_resume',
+        };
+        changed = true;
+      }
       job.artifactCount = await countArtifactFiles(job.outputDir);
+    }
+    for (const job of this.jobs) {
+      changed = this.#armRateLimitRecovery(job, { restore: true }) || changed;
     }
     if (changed) await this.persist();
   }
@@ -192,6 +209,29 @@ export class JobManager {
 
   getInternal(id) {
     return this.jobs.find((item) => item.id === id) || null;
+  }
+
+  async runRelaySubtask(options, operation) {
+    if (typeof operation !== 'function') throw new TypeError('Relay subtask operation must be a function.');
+    const ownerId = String(options?.ownerId || `relay-subtask-${Date.now()}`);
+    const waitIntervalMs = Math.max(100, Number(options?.waitIntervalMs) || 1_000);
+    while (this.active || this.relaySubtask) {
+      assertRelaySubtaskNotAborted(options?.signal);
+      await options?.onWait?.({
+        activeJobId: this.active?.id || null,
+        activeSubtaskId: this.relaySubtask?.ownerId || null,
+        retryAfter: Math.max(1, Math.ceil(waitIntervalMs / 1_000)),
+      });
+      await relaySubtaskDelay(waitIntervalMs, options?.signal);
+    }
+    this.relaySubtask = { ownerId, startedAt: new Date().toISOString() };
+    try {
+      assertRelaySubtaskNotAborted(options?.signal);
+      return await operation();
+    } finally {
+      if (this.relaySubtask?.ownerId === ownerId) this.relaySubtask = null;
+      queueMicrotask(() => this.#startNextQueued());
+    }
   }
 
   async start(params, options = {}) {
@@ -213,10 +253,13 @@ export class JobManager {
       throw error;
     }
     const queuedBehind = this.active;
-    if (queuedBehind && !queueIfBusy) {
+    const relaySubtaskBusy = Boolean(this.relaySubtask);
+    const runtimeBusy = Boolean(queuedBehind || relaySubtaskBusy);
+    if (runtimeBusy && !queueIfBusy) {
       const error = new Error('A scrape task is already running.');
       error.code = 'JOB_BUSY';
-      error.activeJob = publicJob(queuedBehind);
+      if (queuedBehind) error.activeJob = publicJob(queuedBehind);
+      if (relaySubtaskBusy) error.activeSubtask = { ...this.relaySubtask };
       throw error;
     }
     const id = `${timestampId()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -280,7 +323,7 @@ export class JobManager {
       statePath: workflowStatePath(outputDir),
       artifactCount: 0,
     };
-    if (queuedBehind) job.progressLabel = '任务已排队，当前任务结束后将自动启动';
+    if (runtimeBusy) job.progressLabel = '任务已排队，当前采集或任务内补采结束后将自动启动';
     const state = await initializeWorkflowState(job.statePath, workflowStateFromJob(job));
     applyWorkflowStateToJob(job, state);
     this.jobs.unshift(job);
@@ -290,12 +333,12 @@ export class JobManager {
       runnerParams: params,
       attemptId: attempt.attemptId,
     });
-    if (!queuedBehind) {
+    if (!runtimeBusy) {
       this.active = job;
       await this.#markAttemptRunning(job);
     }
     await this.persist();
-    if (!queuedBehind) queueMicrotask(() => this.#run(job));
+    if (!runtimeBusy) queueMicrotask(() => this.#run(job));
     return publicJob(job);
   }
 
@@ -325,14 +368,15 @@ export class JobManager {
         error.jobs = this.recoveryBlockers.map((item) => item.id);
         throw error;
       }
-      if (this.active) {
-        if (this.active.id === job.id) {
+      if (this.active || this.relaySubtask) {
+        if (this.active?.id === job.id) {
           const error = jobError('JOB_ALREADY_RUNNING', 'The task already has an active attempt.');
           error.activeJob = publicJob(job);
           throw error;
         }
         const error = jobError('JOB_BUSY', 'Another scrape task is already running.');
-        error.activeJob = publicJob(this.active);
+        if (this.active) error.activeJob = publicJob(this.active);
+        if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
         throw error;
       }
       const activeAttempt = currentActiveAttempt(job);
@@ -399,6 +443,21 @@ export class JobManager {
       );
       const runtime = await this.#resolveResumeRuntime(job, runnerParams, options);
       const now = new Date().toISOString();
+      if (options.rateLimitRecoveryMode) {
+        this.#cancelRateLimitRecovery(job.id);
+        const manual = options.rateLimitRecoveryMode === 'manual';
+        job.rateLimit = {
+          ...(job.rateLimit || {}),
+          detected: true,
+          status: 'resuming',
+          nextRetryAt: null,
+          retryAfterSeconds: 0,
+          recoveryAction: manual ? 'manual_resume' : 'automatic_resume',
+          ...(manual
+            ? { autoResumeAttempt: 0, lastManualResumeAt: now }
+            : { lastAutoResumeAt: now }),
+        };
+      }
       const sequence = nextAttemptSequence(job.attempts);
       const attempt = createAttempt({
         jobId: job.id,
@@ -448,6 +507,154 @@ export class JobManager {
     });
   }
 
+  async signalRateLimitRecovery(id) {
+    const job = this.getInternal(id);
+    if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+    if (this.active?.id !== id || job.rateLimit?.status !== 'waiting') {
+      return { signaled: false, job: publicJob(job) };
+    }
+    const now = new Date().toISOString();
+    await writeFile(path.join(job.outputDir, '.rate-limit-recover.request'), `${now}\n`, 'utf8');
+    job.rateLimit = {
+      ...job.rateLimit,
+      manualProbeRequestedAt: now,
+      recoveryAction: 'manual_probe',
+    };
+    job.progressLabel = '已收到手动恢复指令，正在跳过剩余冷却并立即探测页面';
+    job.progressUpdatedAt = now;
+    job.updatedAt = now;
+    await this.persist();
+    this.#emit(id, 'state', publicJob(job));
+    return { signaled: true, job: publicJob(job) };
+  }
+
+  #cancelRateLimitRecovery(id) {
+    const timer = this.rateLimitRecoveryTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.rateLimitRecoveryTimers.delete(id);
+  }
+
+  #armRateLimitRecovery(job, { restore = false, busy = false } = {}) {
+    this.#cancelRateLimitRecovery(job.id);
+    const resumeScope = rateLimitResumeScope(job);
+    if (
+      !this.rateLimitRecovery.enabled
+      || !RATE_LIMIT_TERMINAL_STATUSES.has(job.rateLimit?.status)
+      || !RESUMABLE_JOB_STATUSES.has(job.status)
+      || !resumeScope
+    ) return false;
+
+    const completedAttempts = Math.max(0, Number(job.rateLimit.autoResumeAttempt || 0));
+    if (completedAttempts >= this.rateLimitRecovery.maxAttempts) {
+      const changed = job.rateLimit.status !== 'stopped'
+        || job.rateLimit.recoveryAction !== 'manual_resume';
+      job.rateLimit = {
+        ...job.rateLimit,
+        status: 'stopped',
+        autoRecoveryEnabled: false,
+        nextRetryAt: null,
+        retryAfterSeconds: 0,
+        maxAutoResumeAttempts: this.rateLimitRecovery.maxAttempts,
+        resumeScope,
+        recoveryAction: 'manual_resume',
+      };
+      return changed;
+    }
+
+    const now = Date.now();
+    const persistedDueAt = Date.parse(job.rateLimit.nextRetryAt || '');
+    const exponentialDelay = Math.min(
+      this.rateLimitRecovery.maxDelayMs,
+      this.rateLimitRecovery.initialDelayMs * (2 ** completedAttempts),
+    );
+    const delayMs = busy
+      ? this.rateLimitRecovery.busyDelayMs
+      : restore && Number.isFinite(persistedDueAt)
+        ? Math.max(0, persistedDueAt - now)
+        : exponentialDelay;
+    const nextRetryAt = new Date(now + delayMs).toISOString();
+    job.rateLimit = {
+      ...job.rateLimit,
+      detected: true,
+      status: 'scheduled',
+      autoRecoveryEnabled: true,
+      autoResumeAttempt: completedAttempts,
+      maxAutoResumeAttempts: this.rateLimitRecovery.maxAttempts,
+      resumeScope,
+      nextRetryAt,
+      retryAfterSeconds: Math.ceil(delayMs / 1000),
+      recoveryAction: 'automatic_resume',
+    };
+    job.progressPhase = 'rate_limit_scheduled';
+    job.progressLabel = busy
+      ? '其他任务正在运行，限流断点续跑已顺延且不会丢失'
+      : `平台限流冷却中，将自动进行第 ${completedAttempts + 1} / ${this.rateLimitRecovery.maxAttempts} 轮断点续跑`;
+    job.progressUpdatedAt = new Date().toISOString();
+    const timer = setTimeout(() => {
+      void this.#runScheduledRateLimitRecovery(job.id);
+    }, delayMs);
+    timer.unref?.();
+    this.rateLimitRecoveryTimers.set(job.id, timer);
+    return true;
+  }
+
+  async #runScheduledRateLimitRecovery(id) {
+    this.rateLimitRecoveryTimers.delete(id);
+    const job = this.getInternal(id);
+    if (!job || !RATE_LIMIT_TERMINAL_STATUSES.has(job.rateLimit?.status)) return;
+    const resumeScope = rateLimitResumeScope(job);
+    if (!resumeScope) return;
+    if (this.active || this.relaySubtask) {
+      this.#armRateLimitRecovery(job, { busy: true });
+      await this.persist();
+      this.#emit(id, 'state', publicJob(job));
+      return;
+    }
+
+    const attempt = Math.max(0, Number(job.rateLimit.autoResumeAttempt || 0)) + 1;
+    const now = new Date().toISOString();
+    job.rateLimit = {
+      ...job.rateLimit,
+      status: 'resuming',
+      autoResumeAttempt: attempt,
+      maxAutoResumeAttempts: this.rateLimitRecovery.maxAttempts,
+      resumeScope,
+      nextRetryAt: null,
+      retryAfterSeconds: 0,
+      lastAutoResumeAt: now,
+      recoveryAction: 'automatic_resume',
+    };
+    job.progressPhase = 'rate_limit_resuming';
+    job.progressLabel = `限流冷却结束，正在自动执行第 ${attempt} / ${this.rateLimitRecovery.maxAttempts} 轮断点续跑`;
+    job.progressUpdatedAt = now;
+    await this.persist();
+    this.#emit(id, 'state', publicJob(job));
+    try {
+      await this.resume(id, {
+        scope: resumeScope,
+        forceCompleted: true,
+        requestedBy: 'rate_limit_auto_recovery',
+        idempotencyKey: `rate-limit-auto-${resumeScope}-${attempt}`,
+        rateLimitRecoveryMode: 'auto',
+      });
+    } catch (error) {
+      const current = this.getInternal(id);
+      if (!current || ACTIVE_ATTEMPT_STATUSES.has(current.status)) return;
+      current.rateLimit = {
+        ...(current.rateLimit || {}),
+        detected: true,
+        status: 'stopped',
+        resumeScope,
+        autoResumeAttempt: attempt,
+        lastAutoResumeError: String(error?.message || error),
+        recoveryAction: 'automatic_resume',
+      };
+      this.#armRateLimitRecovery(current, { busy: error?.code === 'JOB_BUSY' });
+      await this.persist();
+      this.#emit(id, 'state', publicJob(current));
+    }
+  }
+
   async cancel(id) {
     const job = this.getInternal(id);
     if (!job) return { found: false };
@@ -474,7 +681,7 @@ export class JobManager {
       this.#emit(id, 'state', publicJob(job));
       this.#emit(id, 'end', { status: job.status, exitCode: job.exitCode });
       await this.persist();
-      if (!this.active) queueMicrotask(() => this.#startNextQueued());
+      if (!this.active && !this.relaySubtask) queueMicrotask(() => this.#startNextQueued());
       return { found: true, job: publicJob(job), changed: true };
     }
     if (child) await this.terminateImpl(child);
@@ -488,9 +695,10 @@ export class JobManager {
       const job = this.getInternal(id);
       if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
       if (job.params?.analysisMode !== 'general') throw jobError('EXPANSION_SOURCE_INVALID', 'Relationship expansion requires a content research task.');
-      if (this.active) {
+      if (this.active || this.relaySubtask) {
         const error = jobError('JOB_BUSY', 'A collection process is already running.');
-        error.activeJob = publicJob(this.active);
+        if (this.active) error.activeJob = publicJob(this.active);
+        if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
         throw error;
       }
       const previous = job.workflowSummary?.expansion;
@@ -505,9 +713,10 @@ export class JobManager {
     return this.#withJobLock('__active_runtime__', () => this.#withJobLock(id, async () => {
       const job = this.getInternal(id);
       if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
-      if (this.active) {
+      if (this.active || this.relaySubtask) {
         const error = jobError('JOB_BUSY', 'A collection process is already running.');
-        error.activeJob = publicJob(this.active);
+        if (this.active) error.activeJob = publicJob(this.active);
+        if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
         throw error;
       }
       const previous = job.workflowSummary?.expansion;
@@ -752,6 +961,8 @@ export class JobManager {
   }
 
   async shutdown() {
+    for (const timer of this.rateLimitRecoveryTimers.values()) clearTimeout(timer);
+    this.rateLimitRecoveryTimers.clear();
     const job = this.active;
     if (!job) return { interrupted: false };
     const expansion = job.workflowSummary?.expansion;
@@ -1215,6 +1426,7 @@ export class JobManager {
         job.error = String(error?.message || error);
         append('system', `${job.error}\n`);
       }
+      this.#armRateLimitRecovery(job);
       await this.persist();
       this.#emit(job.id, 'state', publicJob(job));
       await Promise.all([closeWriteStream(log), closeWriteStream(attemptLog)]);
@@ -1224,7 +1436,7 @@ export class JobManager {
   }
 
   async #startNextQueued() {
-    if (this.active) return;
+    if (this.active || this.relaySubtask) return;
     const next = [...this.jobs].reverse().find((job) => job.status === 'queued' && !job.cancelRequested);
     if (!next) return;
     this.active = next;
@@ -1446,6 +1658,37 @@ function currentAttempt(job) {
     || null;
 }
 
+function rateLimitResumeScope(job) {
+  const explicitScope = job?.rateLimit?.resumeScope;
+  if (explicitScope === 'audience' || explicitScope === 'body_completion') return explicitScope;
+
+  const attemptScope = currentAttempt(job)?.resumeScope;
+  if (attemptScope === 'audience' || attemptScope === 'body_completion') return attemptScope;
+  if (job?.params?.audienceOnly) return 'audience';
+
+  const summary = job?.workflowSummary || {};
+  const discovered = Math.max(
+    Number(summary.cardsDiscovered || 0),
+    Number(summary.discovered || 0),
+    Number(job?.discoveredCount || 0),
+  );
+  const completedBodies = Math.max(
+    Number(summary.bodySucceeded || 0),
+    Number(summary.bodiesCaptured || 0),
+    Number(job?.bodyProcessedCount || 0),
+  );
+  const bodyStageStatus = String(job?.stages?.bodyCompletion?.status || '');
+  const collectionStopReason = String(summary.collectionStopReason || '');
+  if (
+    discovered > completedBodies
+    || ['blocked', 'partial'].includes(bodyStageStatus)
+    || ['rate_limited', 'security_verification_timeout'].includes(collectionStopReason)
+  ) return 'body_completion';
+
+  if (job?.params?.collectAudience || summary.audience) return 'audience';
+  return null;
+}
+
 function currentActiveAttempt(job) {
   if (!Array.isArray(job?.attempts)) return null;
   const identified = job.attempts.find((attempt) => attempt.attemptId === job.activeAttemptId);
@@ -1524,7 +1767,7 @@ function isRestartInterruption(job) {
 
 function hasRecoverableCheckpoint(job, state, scope) {
   if (job.checkpointAvailable || Number(job.artifactCount || 0) > 0) return true;
-  if (job.securityRestriction?.status === 'timed_out' || job.rateLimit?.status === 'stopped') return true;
+  if (job.securityRestriction?.status === 'timed_out' || RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)) return true;
   const stages = state?.stages || {};
   const relevant = scope === 'full'
     ? Object.values(stages)
@@ -1715,7 +1958,7 @@ function stopReasonForJob(job) {
   if (job.interruptRequested) return 'server_shutdown';
   if (job.cancelRequested || job.status === 'cancelled') return 'user_cancelled';
   if (job.securityRestriction?.status === 'timed_out') return 'security_verification';
-  if (job.rateLimit?.status === 'stopped') return 'rate_limit';
+  if (RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)) return 'rate_limit';
   if (job.status === 'incomplete') return 'quality_gate';
   if (job.status === 'succeeded') return 'completed';
   if (job.status === 'failed') return 'runner_failed';
@@ -1735,7 +1978,7 @@ function finalizeRunningAudienceStage(job, stopReason, timestamp = new Date().to
 function errorCodeForJob(job) {
   if (job.status === 'succeeded' || job.status === 'cancelled') return null;
   if (job.securityRestriction?.status === 'timed_out') return 'SECURITY_VERIFICATION_TIMEOUT';
-  if (job.rateLimit?.status === 'stopped') return 'RATE_LIMITED';
+  if (RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)) return 'RATE_LIMITED';
   if (job.status === 'incomplete' && job.progressPhase === 'audience_incomplete') {
     return 'AUDIENCE_RUNNER_INTERRUPTED';
   }
@@ -1776,10 +2019,10 @@ export function publicJob(job) {
   );
   const summaryRateLimit = job.workflowSummary?.rateLimit;
   const rateLimit = job.rateLimit || (
-    summaryRateLimit && summaryRateLimit.status === 'stopped'
+    summaryRateLimit && RATE_LIMIT_RECOVERY_STATUSES.has(summaryRateLimit.status)
       ? {
           detected: true,
-          status: 'stopped',
+          ...summaryRateLimit,
           detectedAt: summaryRateLimit.detectedAt || null,
           recoveryAction: summaryRateLimit.recoveryAction || 'wait_then_resume',
         }
@@ -1788,7 +2031,7 @@ export function publicJob(job) {
   const resumeAvailable = resumableStatus && (
     Boolean(job.checkpointAvailable)
     || securityRestriction?.status === 'timed_out'
-    || rateLimit?.status === 'stopped'
+    || RATE_LIMIT_RECOVERY_STATUSES.has(rateLimit?.status)
     || hasRecoverableStageState(job.stages)
   );
   return {
@@ -1899,13 +2142,32 @@ export function updateProgressFromLog(job, message) {
       progressPhase: 'rate_limit_backoff',
       progressLabel: `平台访问频率受限，自动冷却 ${match[3]} 秒后进行第 ${match[1]} / ${match[2]} 次恢复探测`,
       rateLimit: {
+        ...(job.rateLimit || {}),
         detected: true,
         status: 'waiting',
+        resumeScope: 'audience',
         detectedAt: job.rateLimit?.detectedAt || now,
         retryAttempt: Number(match[1]),
         maxRetries: Number(match[2]),
         retryAfterSeconds: Number(match[3]),
         recoveryAction: 'automatic_backoff',
+      },
+    });
+  }
+  for (const match of message.matchAll(/AUDIENCE_RATE_LIMIT manual_probe attempt=(\d+)\/(\d+)/gi)) {
+    update({
+      progressPhase: 'rate_limit_probe',
+      progressLabel: `已跳过剩余冷却，正在执行第 ${match[1]} / ${match[2]} 次恢复探测`,
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'waiting',
+        resumeScope: 'audience',
+        retryAttempt: Number(match[1]),
+        maxRetries: Number(match[2]),
+        retryAfterSeconds: 0,
+        manualProbeConsumedAt: new Date().toISOString(),
+        recoveryAction: 'manual_probe',
       },
     });
   }
@@ -1917,6 +2179,7 @@ export function updateProgressFromLog(job, message) {
         ...(job.rateLimit || {}),
         detected: true,
         status: 'waiting',
+        resumeScope: 'audience',
         retryAttempt: Number(match[1]),
         maxRetries: Number(match[2]),
         retryAfterSeconds: Number(match[3]),
@@ -1932,6 +2195,7 @@ export function updateProgressFromLog(job, message) {
         ...(job.rateLimit || {}),
         detected: true,
         status: 'cleared',
+        resumeScope: 'audience',
         clearedAt: new Date().toISOString(),
         retryAfterSeconds: 0,
         recoveryAction: null,
@@ -1946,6 +2210,7 @@ export function updateProgressFromLog(job, message) {
         ...(job.rateLimit || {}),
         detected: true,
         status: 'stopped',
+        resumeScope: 'audience',
         exhaustedAt: new Date().toISOString(),
         retryAfterSeconds: 0,
         recoveryAction: 'wait_then_resume',
@@ -1958,8 +2223,10 @@ export function updateProgressFromLog(job, message) {
       progressPhase: 'rate_limited',
       progressLabel: '平台访问频率受限，已停止新增访问并转入检查点智能补全',
       rateLimit: {
+        ...(job.rateLimit || {}),
         detected: true,
         status: 'stopped',
+        resumeScope: 'body_completion',
         detectedAt: job.rateLimit?.detectedAt || new Date().toISOString(),
         recoveryAction: 'wait_then_resume',
       },
@@ -1980,6 +2247,16 @@ export function updateProgressFromLog(job, message) {
           recoveryAction: null,
         }
       : job.securityRestriction;
+    const recoveredRateLimit = RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)
+      ? {
+          ...job.rateLimit,
+          status: 'cleared',
+          clearedAt: new Date().toISOString(),
+          nextRetryAt: null,
+          retryAfterSeconds: 0,
+          recoveryAction: null,
+        }
+      : job.rateLimit;
     update({
       progressPhase: phase === 'comments' ? 'audience_comments' : 'audience_profiles',
       progressLabel: phase === 'comments'
@@ -1992,6 +2269,7 @@ export function updateProgressFromLog(job, message) {
       progressCurrent: current,
       progressTotal: total,
       securityRestriction: recoveredSecurity,
+      rateLimit: recoveredRateLimit,
     });
     setProgress(Math.min(98, 88 + Math.round((current / Math.max(1, total)) * 10)));
   }
@@ -2566,8 +2844,64 @@ function execFileSettled(file, args, options) {
   });
 }
 
+function relaySubtaskDelay(milliseconds, signal) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  return new Promise((resolve, reject) => {
+    const finish = () => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', abort);
+      reject(relaySubtaskAbortError());
+    };
+    signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function assertRelaySubtaskNotAborted(signal) {
+  if (signal?.aborted) throw relaySubtaskAbortError();
+}
+
+function relaySubtaskAbortError() {
+  const error = new Error('Relay subtask was cancelled.');
+  error.name = 'AbortError';
+  error.code = 'AUDIENCE_AI_CANCELLED';
+  return error;
+}
+
 function timestampId() {
   return new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+}
+
+function normalizeRateLimitRecoveryOptions(options = {}) {
+  const enabledValue = options.enabled ?? process.env.XHS_RATE_LIMIT_AUTO_RECOVERY;
+  const positiveInteger = (value, fallback) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+  };
+  const initialDelayMs = positiveInteger(
+    options.initialDelayMs ?? process.env.XHS_RATE_LIMIT_AUTO_RECOVERY_INITIAL_MS,
+    5 * 60 * 1000,
+  );
+  return {
+    enabled: enabledValue !== false && String(enabledValue ?? '1').toLowerCase() !== '0',
+    initialDelayMs,
+    maxDelayMs: Math.max(initialDelayMs, positiveInteger(
+      options.maxDelayMs ?? process.env.XHS_RATE_LIMIT_AUTO_RECOVERY_MAX_MS,
+      30 * 60 * 1000,
+    )),
+    maxAttempts: positiveInteger(
+      options.maxAttempts ?? process.env.XHS_RATE_LIMIT_AUTO_RECOVERY_ATTEMPTS,
+      6,
+    ),
+    busyDelayMs: positiveInteger(
+      options.busyDelayMs ?? process.env.XHS_RATE_LIMIT_AUTO_RECOVERY_BUSY_MS,
+      60 * 1000,
+    ),
+  };
 }
 
 async function countArtifactFiles(root) {

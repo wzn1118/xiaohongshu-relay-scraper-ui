@@ -57,6 +57,7 @@ class AiProviderRuntimeTests(unittest.TestCase):
             model="qwen3:4b",
             wire_api="chat_completions",
             timeout=30,
+            model_context_tokens=16_384,
         )
 
         class Response:
@@ -81,7 +82,41 @@ class AiProviderRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["think"], False)
         self.assertEqual(payload["options"]["temperature"], 0)
         self.assertEqual(payload["options"]["num_predict"], 4096)
+        self.assertEqual(payload["options"]["num_ctx"], 16_384)
         self.assertTrue(payload["messages"][-1]["content"].endswith("/no_think"))
+
+    def test_local_model_honors_bounded_output_token_override(self) -> None:
+        provider = AIProvider(
+            provider="local_qwen",
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3:4b",
+            timeout=30,
+            max_output_tokens=1_536,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"message":{"content":"{\\"summary\\":\\"ready\\"}"}}'
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", return_value=Response()) as open_url:
+            provider.generate_json("system", "user", {"type": "object"})
+
+        payload = json.loads(open_url.call_args.args[0].data)
+        self.assertEqual(payload["options"]["num_predict"], 1_536)
+        self.assertEqual(AIProvider(max_output_tokens=1).max_output_tokens, 256)
+        self.assertEqual(AIProvider(max_output_tokens=99_999).max_output_tokens, 16_384)
+
+    def test_invalid_output_token_override_falls_back_to_default(self) -> None:
+        with patch.dict(os.environ, {"XHS_AI_MAX_OUTPUT_TOKENS": "invalid"}):
+            provider = AIProvider()
+
+        self.assertEqual(provider.max_output_tokens, 4_096)
 
     def test_local_model_retries_incomplete_structured_json(self) -> None:
         provider = AIProvider(

@@ -245,24 +245,59 @@ def evaluation_schema() -> dict[str, Any]:
 
 def _profile_evidence(profile: dict[str, Any]) -> list[dict[str, Any]]:
     evidence = []
+    seen: set[str] = set()
+    for index, item in enumerate(profile.get("evidence_items", []), start=1):
+        if not isinstance(item, dict):
+            continue
+        evidence_id = str(item.get("id") or f"evidence-{index}").strip()
+        detail = str(item.get("detail") or "").strip()
+        first_person_claim = str(item.get("first_person_claim") or "").strip()
+        if not evidence_id or not (detail or first_person_claim) or evidence_id in seen:
+            continue
+        seen.add(evidence_id)
+        evidence.append({
+            "id": evidence_id,
+            "category": str(item.get("category") or "evidence"),
+            "label": str(item.get("label") or detail[:36]),
+            "organization": str(item.get("organization") or ""),
+            "period": str(item.get("period") or ""),
+            "detail": detail,
+            "first_person_claim": first_person_claim,
+            "skills": item.get("skills", []),
+            "outcomes": item.get("outcomes", []),
+            "source": str(item.get("source") or ""),
+            "source_evidence": str(item.get("evidence") or ""),
+            "confidence": item.get("confidence", 0),
+        })
     for index, item in enumerate(profile.get("education", []), start=1):
         text = str(item or "").strip()
         if text:
-            evidence.append({"id": f"education-{index}", "label": "教育经历", "detail": text})
+            evidence_id = f"education-{index}"
+            if evidence_id not in seen:
+                seen.add(evidence_id)
+                evidence.append({"id": evidence_id, "label": "教育经历", "detail": text})
     for item in profile.get("evidence", []):
         if isinstance(item, dict) and item.get("id"):
+            evidence_id = str(item["id"])
+            if evidence_id in seen:
+                continue
             detail = re.sub(
                 r"^(?:候选人)?(?:多份|三份)?简历(?:共同)?(?:确认|记载|显示)?的?[：:]?\s*",
                 "",
                 str(item.get("detail", "")),
             )
-            evidence.append({"id": item["id"], "label": item.get("label", ""), "detail": detail})
+            seen.add(evidence_id)
+            evidence.append({"id": evidence_id, "label": item.get("label", ""), "detail": detail})
     for section in ("experiences", "projects"):
         for item in profile.get(section, []):
             if not isinstance(item, dict) or not item.get("id"):
                 continue
+            evidence_id = str(item["id"])
+            if evidence_id in seen:
+                continue
+            seen.add(evidence_id)
             evidence.append({
-                "id": item["id"],
+                "id": evidence_id,
                 "label": " / ".join(filter(None, [str(item.get("organization", "")), str(item.get("title", ""))])),
                 "detail": "；".join([*item.get("actions", []), *item.get("results", [])]),
                 "skills": item.get("skills", []),
@@ -885,6 +920,7 @@ def _write(
 1.2 私信前 80 字必须出现准确岗位名，并写出一项最强匹配证据或明确到岗安排；结尾提出“岗位是否仍在招聘”或同等明确的问题。
 2. 邮件和 Cover Letter 必须按固定顺序输出：主题—尊敬的招聘负责人—“您好！我是…”身份与申请动机—已核验证据—每周可实习天数与时长—“简历随信附上”及沟通邀请—此致敬礼—真实联系方式。禁止出现“附件”“原帖”“岗位提到”“候选人”“材料显示”等元叙述；不复述岗位职责，不引用招聘正文。
 3. candidate_evidence 只包含当前岗位已匹配证据。经历、组织、工具、数字和结果必须能在其中逐项找到；接触过某工具不得改写为“精通/熟练”，不得用其他经历补齐岗位要求。
+3.2 evidence_items.first_person_claim 是背景资料解析器基于原文归一化的第一人称事实句，优先作为正文事实表达；source_evidence 只用于核验，禁止复制文件名、标签、原文元叙述或第三人称措辞。
 3.1 skills/education 类证据和单个工具词只能辅助判断匹配，严禁单独扩写为经历；不得出现“在skills相关实践中”、"我R"、"我SQL"等残句。没有完整行动与结果证据时，必须输出克制的待审核稿，不得用套话伪装匹配度。
 4. Cover Letter 控制在 320-460 个中文字符，按“主题—称呼—身份与申请动机—1至2项证据及岗位价值—到岗与沟通下一步—此致敬礼—真实联系方式”成稿；资料为空的行直接省略。
 5. 私信控制在 50-160 字，邮件正文控制在 120-260 字；私信突出单一匹配点，邮件突出证据与到岗，Cover Letter 展开判断与迁移价值，三者不可复制同一整段。

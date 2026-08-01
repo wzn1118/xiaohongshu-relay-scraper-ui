@@ -6,6 +6,10 @@ const serverDir = path.dirname(fileURLToPath(import.meta.url));
 const runnerPath =
   process.env.XHS_RUNNER_PATH ||
   path.resolve(serverDir, '..', 'scripts', 'run_project_workflow.py');
+const audienceAiRunnerPath =
+  process.env.XHS_AUDIENCE_AI_RUNNER_PATH ||
+  path.resolve(serverDir, '..', 'scripts', 'run_audience_ai.py');
+const audienceProfileSupplementPath = path.resolve(serverDir, '..', 'scripts', 'audience_profile_supplement.py');
 const dataDir = path.resolve(process.env.XHS_SERVER_DATA_DIR || path.join(serverDir, '..', 'data', 'jobs'));
 const smtpPort = readPort(process.env.SMTP_PORT, 587);
 const smtpUser = String(process.env.SMTP_USER || '').trim();
@@ -20,6 +24,11 @@ export const config = Object.freeze({
   pythonBin: process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3'),
   runnerPath,
   runnerAvailable: existsSync(runnerPath),
+  audienceAiEnabled: readBoolean(process.env.XHS_AUDIENCE_AI_ENABLED, false),
+  audienceAiRunnerPath,
+  audienceAiRunnerAvailable: existsSync(audienceAiRunnerPath),
+  audienceAiMaxConcurrent: readInt(process.env.XHS_AUDIENCE_AI_MAX_CONCURRENT, 2, 1, 8),
+  audienceProfileSupplementPath,
   staticDir: path.resolve(process.env.XHS_STATIC_DIR || path.join(serverDir, '..', 'dist')),
   projectRoot: path.resolve(serverDir, '..'),
   windowsPrerequisiteScriptPath: path.resolve(serverDir, '..', 'scripts', 'ensure-windows-prerequisites.ps1'),

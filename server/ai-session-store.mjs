@@ -121,9 +121,14 @@ export class AiSessionStore {
     const definition = PROVIDERS[provider];
     if (!definition) throw validation('Unsupported AI provider.');
     const saved = this.configurations.get(provider) || {};
-    const apiKey = String(value.apiKey || saved.apiKey || '').trim();
+    const suppliedApiKey = String(value.apiKey || '').trim();
+    const requestedBaseUrl = normalizeBaseUrl(value.baseUrl || saved.baseUrl || definition.baseUrl);
+    if (!suppliedApiKey && saved.apiKey && saved.baseUrl && requestedBaseUrl !== normalizeBaseUrl(saved.baseUrl)) {
+      throw validation('Enter the API key again after changing the Base URL.');
+    }
+    const apiKey = suppliedApiKey || String(saved.apiKey || '').trim();
     const model = String(value.model || saved.model || definition.model || '').trim();
-    const baseUrl = normalizeBaseUrl(value.baseUrl || saved.baseUrl || definition.baseUrl);
+    const baseUrl = requestedBaseUrl;
     const wireApi = normalizeWireApi(value.wireApi || saved.wireApi || definition.wireApi);
     if (definition.requiresKey && !apiKey) throw validation('API key is required for this provider.');
     if (!model) throw validation('Model is required.');

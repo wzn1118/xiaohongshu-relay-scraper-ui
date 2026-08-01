@@ -11,6 +11,8 @@ import { LocalModelManager } from './local-model-manager.mjs';
 import { createRelaySupervisor } from './lib/relay-supervisor.mjs';
 import { DataLifecycleService } from './data-lifecycle-service.mjs';
 import { createDiagnostics } from './lib/diagnostics.mjs';
+import { AudienceAiService } from './audience-ai-service.mjs';
+import { createAudienceAiProfileRunner } from './lib/audience-ai-profile-runner.mjs';
 
 const diagnostics = createDiagnostics({ filePath: config.diagnosticsPath });
 
@@ -33,9 +35,17 @@ await manager.initialize();
 diagnostics.record('state_initialization_completed', {
   migration: { component: 'jobs', status: 'completed', count: manager.list().length },
 });
+const audienceAi = new AudienceAiService({
+  manager,
+  aiSessions,
+  config,
+  profileEnricher: createAudienceAiProfileRunner({ manager, config, getRelayConfig: () => relayConfig.get() }),
+});
+await audienceAi.initialize();
 const dataLifecycle = new DataLifecycleService({
   manager,
   profileStore,
+  audienceAi,
   retentionPath: config.dataRetentionPath,
   auditPath: config.deletionAuditPath,
 });
@@ -53,7 +63,7 @@ const relaySupervisor = createRelaySupervisor({
   connectTimeoutMs: config.relayConnectTimeoutMs,
   playwrightTimeoutMs: config.relayPlaywrightTimeoutMs,
 });
-const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relaySupervisor, dataLifecycle, diagnostics }));
+const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relaySupervisor, dataLifecycle, diagnostics, audienceAiService: audienceAi }));
 server.listen(config.port, config.host, () => {
   diagnostics.record('server_started', { status: 'ready' });
   console.log(`Xiaohongshu relay scraper API listening at http://${config.host}:${config.port}`);
@@ -82,8 +92,11 @@ async function shutdown(signal) {
   clearInterval(retentionTimer);
   relaySupervisor.stop();
   try {
-    await manager.shutdown();
+    const shutdownErrors = [];
+    try { await audienceAi.close(); } catch (error) { shutdownErrors.push(error); }
+    try { await manager.shutdown(); } catch (error) { shutdownErrors.push(error); }
     await diagnostics.flush();
+    if (shutdownErrors.length) throw shutdownErrors[0];
     clearTimeout(forcedExit);
     process.exit(0);
   } catch (error) {

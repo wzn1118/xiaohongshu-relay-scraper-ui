@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Ban, ChevronLeft, ChevronRight, Download, ExternalLink, FileDown, LoaderCircle, Network, Play, RefreshCw, RotateCcw, Wifi, WifiOff } from 'lucide-react'
+import { Ban, ChevronLeft, ChevronRight, Download, ExternalLink, FileDown, Image as ImageIcon, LoaderCircle, Network, Play, RefreshCw, RotateCcw, Wifi, WifiOff } from 'lucide-react'
 import { api } from './api'
 import type { ExpansionConfig, ExpansionWorkspaceState, Job, RelayStatus } from './types'
 
@@ -33,6 +33,15 @@ type Props = {
   visible: boolean
   onJobUpdated: (job: Job) => void
   onReturnInsights: () => void
+}
+
+function SeedCover({ src, title }: { src: string; title: string }) {
+  const [failed, setFailed] = useState(false)
+  return <span className="expansion-seed-cover" title={title} aria-hidden="true">
+    {src && !failed
+      ? <img src={src} alt="" loading="lazy" decoding="async" onError={() => setFailed(true)} />
+      : <ImageIcon size={18} />}
+  </span>
 }
 
 export function ExpansionWorkspace({ job, relay, visible, onJobUpdated, onReturnInsights }: Props) {
@@ -151,7 +160,8 @@ export function ExpansionWorkspace({ job, relay, visible, onJobUpdated, onReturn
         <div className="expansion-seed-list">
           {state?.seeds.map((seed) => <label key={seed.postId} className={`${selected.includes(seed.postId) ? 'selected' : ''} ${!seed.available ? 'unavailable' : ''}`}>
             <input type="checkbox" checked={selected.includes(seed.postId)} disabled={immutable || !seed.available} onChange={(event) => setSelected((current) => event.target.checked ? [...new Set([...current, seed.postId])] : current.filter((item) => item !== seed.postId))} />
-            <span><strong>{seed.title}</strong><small>{String(seed.author?.display_name || '作者待确认')} · {seed.collectedComments} 条评论{seed.unavailableReason ? ` · ${seed.unavailableReason}` : ''}</small>{seed.url && <a href={seed.url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>打开原帖 <ExternalLink size={11} /></a>}</span>
+            <SeedCover key={seed.coverUrl || 'empty'} src={seed.coverUrl} title={seed.title} />
+            <span className="expansion-seed-copy"><strong>{seed.title}</strong><small>{String(seed.author?.display_name || '作者待确认')} · {seed.collectedComments} 条评论{seed.unavailableReason ? ` · ${seed.unavailableReason}` : ''}</small>{seed.url && <a href={seed.url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>打开原帖 <ExternalLink size={11} /></a>}</span>
             <i className={`seed-state ${seed.commentStatus}`} title={seed.collectionReason}>{seed.expansionStatus === 'expanding' ? '扩散中' : seed.expansionStatus === 'used' ? '已用于扩散' : seed.commentStatus === 'complete' ? '已采集' : seed.commentStatus === 'partial' ? '部分采集' : '未采集'}</i>
           </label>)}
           {!state?.seeds.length && <p className="expansion-empty">内容洞察暂无可用种子。<button onClick={onReturnInsights}>返回内容洞察</button></p>}

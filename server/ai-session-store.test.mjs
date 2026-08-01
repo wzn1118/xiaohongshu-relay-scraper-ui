@@ -75,6 +75,28 @@ test('AI model discovery reuses a saved key only for its saved Base URL', async 
   );
 });
 
+test('AI session creation never reuses a saved key for a different Base URL', async () => {
+  const store = new AiSessionStore();
+  await store.create({
+    provider: 'openai',
+    apiKey: 'secret-key',
+    baseUrl: 'https://first.example/v1',
+    model: 'model-a',
+    wireApi: 'chat_completions',
+  });
+
+  await assert.rejects(
+    store.create({
+      provider: 'openai',
+      apiKey: '',
+      baseUrl: 'https://second.example/v1',
+      model: 'model-b',
+      wireApi: 'chat_completions',
+    }),
+    (error) => error.code === 'AI_VALIDATION' && /API key/i.test(error.message),
+  );
+});
+
 test('local free model creates a session and discovers installed models without an API key', async () => {
   const calls = [];
   const store = new AiSessionStore({

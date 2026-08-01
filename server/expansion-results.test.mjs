@@ -9,7 +9,7 @@ test('expansion snapshot is task-local, paged, and merges persisted runtime stat
   const outputDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-expansion-results-'));
   try {
     await writeFile(path.join(outputDir, 'audience-posts.json'), JSON.stringify([
-      { post_id: 'post-1', title: 'Seed one', note_url: 'https://www.xiaohongshu.com/explore/post-1', status: 'partial', collected_comment_count: 2 },
+      { post_id: 'post-1', title: 'Seed one', note_url: 'https://www.xiaohongshu.com/explore/post-1', cover_url: 'https://sns-webpic-qc.xhscdn.com/post-1.webp', status: 'partial', collected_comment_count: 2 },
       { post_id: 'post-2', title: 'Seed two', note_url: 'https://www.xiaohongshu.com/explore/post-2', status: 'complete', collected_comment_count: 8 },
       { post_id: 'post-3', title: 'Seed unavailable', note_url: '', status: 'partial', collected_comment_count: 0 },
     ]), 'utf8');
@@ -31,6 +31,7 @@ test('expansion snapshot is task-local, paged, and merges persisted runtime stat
 
     const seeds = await readExpansionSeeds(outputDir);
     assert.deepEqual(seeds.map((seed) => seed.postId), ['post-1', 'post-2', 'post-3']);
+    assert.equal(seeds[0].coverUrl, 'https://sns-webpic-qc.xhscdn.com/post-1.webp');
     assert.equal(seeds[2].available, false);
     assert.match(seeds[2].unavailableReason, /链接/);
     const snapshot = await readExpansionSnapshot(outputDir, new URLSearchParams('kind=users&offset=1&limit=1'), {

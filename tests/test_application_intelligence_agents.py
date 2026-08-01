@@ -283,6 +283,39 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertNotIn("skills相关实践", str(result))
         self.assertNotIn("我R", str(result))
 
+    def test_outreach_uses_verified_first_person_claim_verbatim(self) -> None:
+        writer = OutreachWriterAgent({
+            "candidate_application": {
+                "name": "示例候选人",
+                "school": "示例大学",
+                "major": "商业分析",
+                "degreeYear": "研二",
+                "availabilityDays": "5",
+                "internshipDuration": "6个月",
+            },
+        })
+        claim = "我负责整理业务数据、分析关键指标并输出周报"
+        result = writer.run(
+            {"job_card": {"role_name": "数据分析实习生"}},
+            {"responsibilities": [{"text": "整理业务数据并分析关键指标"}], "requirements": []},
+            [{
+                "id": "project-verified",
+                "category": "project",
+                "label": "业务分析项目",
+                "detail": "负责整理业务数据、分析关键指标并输出周报",
+                "first_person_claim": claim,
+                "source": "resume.txt",
+                "source_evidence": "负责整理业务数据、分析关键指标并输出周报",
+                "confidence": 96,
+            }],
+        )
+
+        self.assertIn(f"{claim}。", result["email_body"])
+        self.assertIn(f"{claim}。", result["cover_letter"])
+        self.assertEqual(result["used_evidence_ids"], ["project-verified"])
+        self.assertNotIn("resume.txt", str(result))
+        self.assertNotIn("我我", str(result))
+
     def test_business_analysis_matching_prefers_complete_experience_over_skill_tag(self) -> None:
         agent = FitEvidenceAgent({
             "experiences": [{

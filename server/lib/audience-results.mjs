@@ -10,7 +10,7 @@ export async function readAudienceResults(outputDir, searchParams = new URLSearc
 } = {}) {
   const kind = KINDS.has(searchParams.get('kind')) ? searchParams.get('kind') : 'comments';
   const offset = boundedInteger(searchParams.get('offset'), 0, 0, 1_000_000);
-  const limit = boundedInteger(searchParams.get('limit'), 40, 1, 100);
+  const limit = boundedInteger(searchParams.get('limit'), 40, 1, 500);
   const postId = String(searchParams.get('postId') || '').trim().slice(0, 200);
   const query = String(searchParams.get('query') || '').trim().toLocaleLowerCase('zh-CN').slice(0, 100);
   const materialized = await materializeAudienceResults(outputDir, { fallbackOutputDirs });
@@ -164,6 +164,7 @@ function postFromCheckpoint(note) {
     post_id: postId,
     title: firstString(note.title) || 'Untitled post',
     note_url: noteUrl,
+    cover_url: checkpointPostCover(note),
     author: {
       user_id: profileId(firstString(note.author_profile, note.author_url)),
       display_name: firstString(note.author, note.nickname),
@@ -176,6 +177,32 @@ function postFromCheckpoint(note) {
     expected_comment_count: numericCount(note.comment_count ?? note.comments),
     status: 'pending',
   };
+}
+
+function checkpointPostCover(note) {
+  const media = isRecord(note.media) ? note.media : {};
+  const mediaImages = arrayOfObjects(media.images).map((image) => firstString(image.url));
+  const candidates = [
+    media.cover_url,
+    ...mediaImages,
+    note.card_cover_url,
+    ...mediaFieldValues(note.card_image_urls),
+    ...mediaFieldValues(note.detail_image_urls),
+    ...mediaFieldValues(note.image_urls),
+  ];
+  return candidates.map((value) => firstString(value)).find(isPostImageUrl) || '';
+}
+
+function mediaFieldValues(value) {
+  return Array.isArray(value)
+    ? value
+    : String(value || '').split('|');
+}
+
+function isPostImageUrl(value) {
+  const normalized = String(value || '').trim();
+  return /^https?:\/\//i.test(normalized)
+    && !/sns-avatar|\/avatar\/|avatar_/i.test(normalized);
 }
 
 function checkpointAuthorAvatar(note) {

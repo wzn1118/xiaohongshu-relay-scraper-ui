@@ -44,6 +44,7 @@ export class ProfileStore {
   }
 
   async create(body, aiSession) {
+    const aiEnvironment = profileAiEnvironment(aiSession);
     const files = Array.isArray(body?.files) ? body.files : [];
     if (!files.length || files.length > 8) throw validation('Upload between 1 and 8 background files.');
     const id = crypto.randomBytes(8).toString('hex');
@@ -68,15 +69,32 @@ export class ProfileStore {
     const extra = String(body.backgroundText || '').trim();
     const args = [this.scriptPath, '--source-dir', sourceDir, '--output', output, '--profile-id', id];
     if (extra) args.push('--background-text', extra.slice(0, 12000));
-    await runChild(this.pythonBin, args, {
-      XHS_AI_PROVIDER: aiSession.provider,
-      XHS_AI_API_KEY: aiSession.apiKey,
-      XHS_AI_BASE_URL: aiSession.baseUrl,
-      XHS_AI_MODEL: aiSession.model,
-      XHS_AI_WIRE_API: aiSession.wireApi || 'responses',
-    });
+    await runChild(this.pythonBin, args, aiEnvironment);
     return this.get(id);
   }
+}
+
+export function profileAiEnvironment(aiSession) {
+  if (!aiSession || typeof aiSession !== 'object') throw aiSessionRequired();
+  const provider = String(aiSession.provider || '').trim();
+  const model = String(aiSession.model || '').trim();
+  const baseUrl = String(aiSession.baseUrl || '').trim();
+  const wireApi = String(aiSession.wireApi || '').trim() || 'responses';
+  const apiKey = String(aiSession.apiKey || '').trim();
+  if (!provider || !model || !baseUrl) throw aiSessionRequired();
+  if (!['responses', 'chat_completions'].includes(wireApi)) {
+    throw Object.assign(new Error('Background profile parsing requires a supported AI protocol.'), { code: 'PROFILE_AI_SESSION_REQUIRED' });
+  }
+  if (provider !== 'local_qwen' && !apiKey) {
+    throw Object.assign(new Error('The selected external model is missing its API key. Reconnect that model before parsing.'), { code: 'PROFILE_AI_SESSION_REQUIRED' });
+  }
+  return {
+    XHS_AI_PROVIDER: provider,
+    XHS_AI_API_KEY: apiKey,
+    XHS_AI_BASE_URL: baseUrl,
+    XHS_AI_MODEL: model,
+    XHS_AI_WIRE_API: wireApi,
+  };
 }
 
 function runChild(command, args, envPatch) {
@@ -101,3 +119,6 @@ function runChild(command, args, envPatch) {
 
 function validation(message) { return Object.assign(new Error(message), { code: 'PROFILE_VALIDATION' }); }
 function notFound() { return Object.assign(new Error('Profile not found.'), { code: 'PROFILE_NOT_FOUND' }); }
+function aiSessionRequired() {
+  return Object.assign(new Error('Background profile parsing requires the currently selected AI model session.'), { code: 'PROFILE_AI_SESSION_REQUIRED' });
+}

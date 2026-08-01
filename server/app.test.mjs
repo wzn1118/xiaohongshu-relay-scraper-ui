@@ -29,7 +29,9 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     records: [{
       note_id: 'n1',
       title: '内容运营实习',
+      note_url: 'https://www.xiaohongshu.com/explore/n1',
       body: '负责内容运营，请投递 jobs@example.com',
+      media: { cover_url: 'https://sns-webpic-qc.xhscdn.com/n1-cover.webp' },
       application_info: {
         contacts: [],
         application_routes: [{ type: 'email', channel: 'email', value: 'email', evidence: '请发送至 jobs@example.com', confidence: 100 }],
@@ -73,6 +75,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   };
   const startCalls = [];
   const resumeCalls = [];
+  const rateLimitSignalCalls = [];
   const expansionCalls = [];
   const manager = {
     active: null,
@@ -86,6 +89,13 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     resume: async (...args) => {
       resumeCalls.push(args);
       return { ...job, status: 'resuming', attemptId: 'attempt-2' };
+    },
+    signalRateLimitRecovery: async (id) => {
+      rateLimitSignalCalls.push(id);
+      return {
+        signaled: true,
+        job: { ...job, rateLimit: { detected: true, status: 'waiting', recoveryAction: 'manual_probe' } },
+      };
     },
     cancel: async () => ({ found: true, job: { ...job, status: 'cancelled' }, changed: true }),
     startExpansion: async (id, request) => {
@@ -444,6 +454,8 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     const expansion = await fetch(`${origin}/api/jobs/${job.id}/expansion`).then((response) => response.json());
     assert.equal(expansion.available, true);
     assert.equal(expansion.seeds[0].postId, 'n1');
+    assert.equal(expansion.seeds[0].coverUrl, `/api/jobs/${job.id}/media?url=${encodeURIComponent('https://sns-webpic-qc.xhscdn.com/n1-cover.webp')}`);
+    assert.equal(expansion.seeds[0].coverOriginalUrl, 'https://sns-webpic-qc.xhscdn.com/n1-cover.webp');
 
     const expansionStart = await fetch(`${origin}/api/jobs/${job.id}/expansion/start`, {
       method: 'POST',
@@ -472,6 +484,14 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(audienceResumePayload.action, 'attached');
     assert.equal(audienceResumePayload.sourceJobId, job.id);
     assert.equal(audienceResumePayload.job.id, job.id);
+    assert.equal(resumeCalls.length, 0);
+
+    const runningRateLimitRecovery = await fetch(`${origin}/api/jobs/${job.id}/audience/recover-rate-limit`, { method: 'POST' });
+    assert.equal(runningRateLimitRecovery.status, 202);
+    const runningRateLimitPayload = await runningRateLimitRecovery.json();
+    assert.equal(runningRateLimitPayload.action, 'signaled');
+    assert.equal(runningRateLimitPayload.job.rateLimit.recoveryAction, 'manual_probe');
+    assert.deepEqual(rateLimitSignalCalls, [job.id]);
     assert.equal(resumeCalls.length, 0);
 
     const restoredEmailConfig = await fetch(`${origin}/api/email/config`, {
@@ -708,6 +728,42 @@ test('audience supplements read through queued checkpoints and resume from the l
     assert.equal(resumeCalls[1][1].params.resumeFromJobId, rootId);
     assert.equal(resumeCalls[1][1].params.keyword, 'original-content-query');
     assert.deepEqual(resumeCalls[1][1].resumeCheckpointJobIds, [rootId, childId]);
+
+    const rateLimitRecovery = await fetch(`${origin}/api/jobs/${rootId}/audience/recover-rate-limit`, {
+      method: 'POST',
+    });
+    assert.equal(rateLimitRecovery.status, 202);
+    const rateLimitPayload = await rateLimitRecovery.json();
+    assert.equal(rateLimitPayload.action, 'started');
+    assert.equal(rateLimitPayload.sourceJobId, rootId);
+    assert.equal(rateLimitPayload.stateOwnerJobId, childId);
+    assert.equal(resumeCalls[2][0], rootId);
+    assert.equal(resumeCalls[2][1].scope, 'audience');
+    assert.equal(resumeCalls[2][1].forceCompleted, true);
+    assert.equal(resumeCalls[2][1].requestedBy, 'rate_limit_manual_recovery');
+    assert.equal(resumeCalls[2][1].rateLimitRecoveryMode, 'manual');
+    assert.deepEqual(resumeCalls[2][1].resumeCheckpointJobIds, [rootId, childId]);
+
+    const grown = await fetch(`${origin}/api/jobs/${rootId}/audience/grow`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ maxScrolls: 100 }),
+    });
+    assert.equal(grown.status, 202);
+    const growthPayload = await grown.json();
+    assert.equal(growthPayload.action, 'started');
+    assert.equal(growthPayload.sourceJobId, rootId);
+    assert.equal(growthPayload.stateOwnerJobId, childId);
+    assert.equal(growthPayload.maxScrolls, 100);
+    assert.equal(resumeCalls[3][0], rootId);
+    assert.equal(resumeCalls[3][1].scope, 'full');
+    assert.equal(resumeCalls[3][1].forceCompleted, true);
+    assert.equal(resumeCalls[3][1].params.discoverMore, true);
+    assert.equal(resumeCalls[3][1].params.audienceOnly, false);
+    assert.equal(resumeCalls[3][1].params.collectAudience, true);
+    assert.equal(resumeCalls[3][1].params.searchSort, 'latest');
+    assert.equal(resumeCalls[3][1].params.maxScrolls, 100);
+    assert.deepEqual(resumeCalls[3][1].resumeCheckpointJobIds, [rootId, childId]);
 
   } finally {
     await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));

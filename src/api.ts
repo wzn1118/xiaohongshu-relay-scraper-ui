@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -108,6 +108,33 @@ export const api = {
     return request<AudienceResultsResponse>(`/api/jobs/${encodeURIComponent(id)}/audience?${params}`)
   },
   resumeAudience: (id: string) => request<AudienceResumeResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/resume`, { method: 'POST' }),
+  recoverAudienceRateLimit: (id: string) => request<AudienceResumeResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/recover-rate-limit`, { method: 'POST' }),
+  growAudience: (id: string, maxScrolls: number) => request<AudienceGrowthResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/grow`, {
+    method: 'POST',
+    body: JSON.stringify({ maxScrolls }),
+  }),
+  audienceAi: (jobId: string, postId: string) => request<AudienceAiOverview>(audienceAiPath(jobId, postId)),
+  previewAudienceAi: (jobId: string, postId: string, scope: AudienceAiScope) => request<AudienceAiPreview>(`${audienceAiPath(jobId, postId)}/preview`, {
+    method: 'POST',
+    body: JSON.stringify(scope),
+  }),
+  startAudienceAi: (jobId: string, postId: string, scope: AudienceAiStartRequest) => request<AudienceAiActionResponse>(`${audienceAiPath(jobId, postId)}/runs`, {
+    method: 'POST',
+    body: JSON.stringify(scope),
+  }),
+  cancelAudienceAi: (jobId: string, postId: string, runId: string) => request<AudienceAiActionResponse>(`${audienceAiPath(jobId, postId)}/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  }),
+  resumeAudienceAi: (jobId: string, postId: string, runId: string) => request<AudienceAiActionResponse>(`${audienceAiPath(jobId, postId)}/runs/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  }),
+  audienceAiRun: (jobId: string, postId: string, runId: string) => request<AudienceAiActionResponse>(`${audienceAiPath(jobId, postId)}/runs/${encodeURIComponent(runId)}`),
+  audienceAiResults: (jobId: string, postId: string, runId: string, module: AudienceAiResultsModule = 'analysis', offset = 0, limit = 100) => request<AudienceAiResultsResponse>(`${audienceAiPath(jobId, postId)}/runs/${encodeURIComponent(runId)}/results?${new URLSearchParams({ module, offset: String(offset), limit: String(limit) })}`),
+  audienceAiEventsUrl: (jobId: string, postId: string) => `${audienceAiPath(jobId, postId)}/events`,
+  audienceCommentAnchor: (jobId: string, postId: string, commentId: string) => request<AudienceAiAnchor>(`/api/jobs/${encodeURIComponent(jobId)}/audience/posts/${encodeURIComponent(postId)}/comments/${encodeURIComponent(commentId)}/anchor`),
+  audienceUserAnchor: (jobId: string, postId: string, userId: string) => request<AudienceAiAnchor>(`/api/jobs/${encodeURIComponent(jobId)}/audience/posts/${encodeURIComponent(postId)}/users/${encodeURIComponent(userId)}/anchor`),
   expansion: (id: string, kind: 'users' | 'posts' | 'comments' | 'relations' = 'users', offset = 0, limit = 50, filters: { round?: string; status?: string; seed?: string } = {}) =>
     request<ExpansionWorkspaceState>(`/api/jobs/${encodeURIComponent(id)}/expansion?${new URLSearchParams({ kind, offset: String(offset), limit: String(limit), ...(filters.round ? { round: filters.round } : {}), ...(filters.status ? { status: filters.status } : {}), ...(filters.seed ? { seed: filters.seed } : {}) })}`),
   startExpansion: (id: string, seedPostIds: string[], config: ExpansionConfig) => request<ExpansionActionResponse>(`/api/jobs/${encodeURIComponent(id)}/expansion/start`, {
@@ -149,4 +176,8 @@ export const api = {
     }
     return () => stream.close()
   },
+}
+
+function audienceAiPath(jobId: string, postId: string) {
+  return `/api/jobs/${encodeURIComponent(jobId)}/audience/posts/${encodeURIComponent(postId)}/ai`
 }

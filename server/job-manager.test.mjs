@@ -50,6 +50,15 @@ function waitForEnd(manager, id, timeoutMs = 3000) {
   });
 }
 
+async function waitForCondition(predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error('Timed out waiting for condition');
+}
+
 test('audience partial completion keeps attempted coverage separate from strict completion', () => {
   const job = { progress: 0 };
 
@@ -80,6 +89,12 @@ test('audience rate limits expose automatic backoff, recovery, and exhaustion st
   assert.equal(job.rateLimit.retryAfterSeconds, 10);
   assert.match(job.progressLabel, /剩余 10 秒/);
 
+  assert.equal(updateProgressFromLog(job, 'AUDIENCE_RATE_LIMIT manual_probe attempt=2/5; skipping remaining cooldown'), true);
+  assert.equal(job.progressPhase, 'rate_limit_probe');
+  assert.equal(job.rateLimit.status, 'waiting');
+  assert.equal(job.rateLimit.retryAfterSeconds, 0);
+  assert.equal(job.rateLimit.recoveryAction, 'manual_probe');
+
   assert.equal(updateProgressFromLog(job, 'AUDIENCE_RATE_LIMIT cleared retry=2/5; resuming'), true);
   assert.equal(job.rateLimit.status, 'cleared');
   assert.equal(job.progressPhase, 'audience_comments');
@@ -88,6 +103,168 @@ test('audience rate limits expose automatic backoff, recovery, and exhaustion st
   assert.equal(job.rateLimit.status, 'stopped');
   assert.equal(job.progressPhase, 'rate_limited');
   assert.equal(job.rateLimit.recoveryAction, 'wait_then_resume');
+});
+
+test('manual rate-limit recovery signals a running audience collector without replacing its checkpoint', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-rate-limit-manual-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260801090000-a11a0001';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1' },
+  ]), 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1', title: 'Saved post' },
+  ]), 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'incomplete',
+    outputDir,
+    params: { analysisMode: 'general', keyword: 'saved-content' },
+  }]), 'utf8');
+
+  const child = createFakeChild(81001);
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => child,
+  });
+
+  try {
+    await manager.initialize();
+    const started = await manager.resume(jobId, {
+      scope: 'audience',
+      params: validateRunRequest({
+        analysisMode: 'general',
+        keyword: 'saved-content',
+        mode: 'resume',
+        resumeFromJobId: jobId,
+        collectAudience: true,
+        audienceOnly: true,
+        checkOnly: false,
+      }),
+    });
+    await waitForJob(manager, started.id, (job) => job.status === 'running');
+    child.stdout.write('AUDIENCE_RATE_LIMIT retry=1/5 wait=30s; checkpoint preserved\n');
+    await waitForJob(manager, jobId, (job) => job.rateLimit?.status === 'waiting');
+
+    const recovery = await manager.signalRateLimitRecovery(jobId);
+    assert.equal(recovery.signaled, true);
+    assert.equal(recovery.job.id, jobId);
+    assert.equal(manager.list().length, 1);
+    assert.match(
+      await readFile(path.join(outputDir, '.rate-limit-recover.request'), 'utf8'),
+      /^\d{4}-\d{2}-\d{2}T/,
+    );
+
+    child.stdout.write('AUDIENCE_RATE_LIMIT manual_probe attempt=1/5; skipping remaining cooldown\n');
+    await waitForJob(manager, jobId, (job) => job.progressPhase === 'rate_limit_probe');
+    assert.equal(manager.get(jobId).rateLimit.recoveryAction, 'manual_probe');
+
+    const ended = waitForEnd(manager, jobId);
+    child.stdout.write('AUDIENCE_RATE_LIMIT cleared retry=1/5; resuming\n');
+    child.emit('close', 0, null);
+    await ended;
+    assert.equal(manager.get(jobId).status, 'completed');
+    assert.equal(manager.get(jobId).rateLimit.status, 'cleared');
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('exhausted audience rate limits automatically resume the same task from its checkpoint', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-rate-limit-auto-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260801091000-a1700001';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1' },
+  ]), 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1', title: 'Saved post' },
+  ]), 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'incomplete',
+    outputDir,
+    params: { analysisMode: 'general', keyword: 'saved-content' },
+  }]), 'utf8');
+
+  const children = [createFakeChild(81002), createFakeChild(81003)];
+  let spawnCount = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => children[spawnCount++],
+    rateLimitRecovery: {
+      enabled: true,
+      initialDelayMs: 10,
+      maxDelayMs: 20,
+      maxAttempts: 2,
+      busyDelayMs: 5,
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const first = await manager.resume(jobId, {
+      scope: 'audience',
+      params: validateRunRequest({
+        analysisMode: 'general',
+        keyword: 'saved-content',
+        mode: 'resume',
+        resumeFromJobId: jobId,
+        collectAudience: true,
+        audienceOnly: true,
+        checkOnly: false,
+      }),
+    });
+    await waitForJob(manager, first.id, (job) => job.status === 'running');
+    const firstEnded = waitForEnd(manager, jobId);
+    children[0].stdout.write('AUDIENCE_RATE_LIMIT exhausted retries=5; checkpoint preserved\n');
+    children[0].emit('close', 1, null);
+    await firstEnded;
+
+    const scheduled = manager.get(jobId);
+    assert.equal(scheduled.status, 'failed');
+    assert.equal(scheduled.rateLimit.status, 'scheduled');
+    assert.equal(scheduled.rateLimit.autoRecoveryEnabled, true);
+    assert.equal(scheduled.rateLimit.autoResumeAttempt, 0);
+    assert.equal(manager.list().length, 1);
+
+    const automaticallyResumed = await waitForJob(
+      manager,
+      jobId,
+      (job) => job.status === 'running' && job.rateLimit?.autoResumeAttempt === 1,
+    );
+    await waitForCondition(() => spawnCount === 2);
+    assert.equal(spawnCount, 2);
+    assert.equal(automaticallyResumed.id, jobId);
+    assert.equal(automaticallyResumed.outputDir, outputDir);
+    assert.equal(automaticallyResumed.attempts.at(-1).requestedBy, 'rate_limit_auto_recovery');
+    assert.equal(automaticallyResumed.attempts.at(-1).resumeScope, 'audience');
+
+    const secondEnded = waitForEnd(manager, jobId);
+    children[1].stdout.write('AUDIENCE_RATE_LIMIT cleared retry=1/5; resuming\n');
+    children[1].stdout.write('AUDIENCE_PROGRESS posts=1/1 comments=3 users=2 profiles=2/2 processed=1/1 phase=comments\n');
+    children[1].emit('close', 0, null);
+    await secondEnded;
+    const completed = manager.get(jobId);
+    assert.equal(completed.status, 'completed');
+    assert.equal(completed.rateLimit.status, 'cleared');
+    assert.equal(completed.resumeCount, 2);
+    assert.equal(manager.list().length, 1);
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test('audience profile catch-up logs expose cumulative and current-batch progress', () => {

@@ -34,12 +34,14 @@ export class DataLifecycleService {
   constructor({
     manager,
     profileStore,
+    audienceAi = null,
     retentionPath,
     auditPath,
     now = () => new Date(),
   }) {
     this.manager = manager;
     this.profileStore = profileStore;
+    this.audienceAi = audienceAi;
     this.retentionPath = retentionPath;
     this.auditPath = auditPath;
     this.now = now;
@@ -364,12 +366,14 @@ export class DataLifecycleService {
       let removed = false;
       try {
         await this.manager.quiesceForDeletion(job.id, { rejectActive });
+        await this.audienceAi?.quiesceJob?.(job.id, { rejectActive });
         await this.manager.detachJobReferences(job.id);
         await safeRemoveDirectory(this.manager.dataDir, jobDirectory(this.manager.dataDir, job));
         await this.manager.removeJobRecord(job.id);
         removed = true;
         return deletionResult(plan);
       } finally {
+        this.audienceAi?.releaseJobQuiesce?.(job.id);
         if (!removed) this.manager.releaseDeletionIntent?.(job.id);
       }
     }
@@ -398,11 +402,15 @@ export class DataLifecycleService {
     const jobs = [...this.manager.jobs];
     let jobsRemoved = false;
     try {
-      for (const job of jobs) await this.manager.quiesceForDeletion(job.id);
+      for (const job of jobs) {
+        await this.manager.quiesceForDeletion(job.id);
+        await this.audienceAi?.quiesceJob?.(job.id);
+      }
       for (const job of jobs) await safeRemoveDirectory(this.manager.dataDir, jobDirectory(this.manager.dataDir, job));
       await this.manager.removeJobRecords(jobs.map((job) => job.id));
       jobsRemoved = true;
     } finally {
+      for (const job of jobs) this.audienceAi?.releaseJobQuiesce?.(job.id);
       if (!jobsRemoved) for (const job of jobs) this.manager.releaseDeletionIntent?.(job.id);
     }
     const profiles = await this.profileStore.list();

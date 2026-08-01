@@ -190,6 +190,29 @@ def test_rate_limit_recovery_exhaustion_preserves_resumable_state(capsys):
     assert "AUDIENCE_RATE_LIMIT exhausted retries=2" in capsys.readouterr().out
 
 
+def test_rate_limit_manual_request_skips_the_remaining_cooldown(tmp_path, capsys):
+    page = FakeRateLimitPage(clear_after=1)
+    request_path = tmp_path / ".rate-limit-recover.request"
+    request_path.write_text("recover\n", encoding="utf-8")
+    sleep_calls = []
+
+    cleared, reason = _wait_for_rate_limit_recovery(
+        page,
+        max_retries=2,
+        initial_delay_seconds=30,
+        max_delay_seconds=60,
+        manual_recovery_path=request_path,
+        sleep=sleep_calls.append,
+    )
+
+    assert cleared is True
+    assert reason == ""
+    assert page.reload_count == 1
+    assert sleep_calls == [1]
+    assert request_path.exists() is False
+    assert "AUDIENCE_RATE_LIMIT manual_probe attempt=1/2" in capsys.readouterr().out
+
+
 def test_compact_count_supports_common_xiaohongshu_units():
     assert compact_count("1.2万") == 12000
     assert compact_count("3k") == 3000

@@ -469,12 +469,19 @@ def _candidate_name(profile: dict[str, Any]) -> str:
     return "候选人"
 
 
-def load_candidate_evidence(profile: dict[str, Any]) -> list[dict[str, str]]:
+def load_candidate_evidence(profile: dict[str, Any]) -> list[dict[str, Any]]:
     explicit = profile.get("evidence_items")
     if isinstance(explicit, list):
         result = []
         for index, item in enumerate(explicit, start=1):
             if not isinstance(item, dict):
+                continue
+            raw_confidence = item.get("confidence")
+            try:
+                confidence = int(float(str(raw_confidence))) if raw_confidence is not None else None
+            except (TypeError, ValueError):
+                confidence = 0
+            if confidence is not None and confidence < 75:
                 continue
             detail = _text(item.get("detail") or item.get("description") or item.get("text"))
             if not detail:
@@ -485,12 +492,19 @@ def load_candidate_evidence(profile: dict[str, Any]) -> list[dict[str, str]]:
                     "category": _text(item.get("category")) or "evidence",
                     "label": _text(item.get("label") or item.get("title")) or detail[:36],
                     "detail": detail,
+                    "first_person_claim": _text(item.get("first_person_claim")),
+                    "organization": _text(item.get("organization")),
+                    "period": _text(item.get("period")),
+                    "skills": item.get("skills") if isinstance(item.get("skills"), list) else [],
+                    "outcomes": item.get("outcomes") if isinstance(item.get("outcomes"), list) else [],
                     "source": _text(item.get("source") or item.get("url")),
+                    "source_evidence": _text(item.get("evidence")),
+                    "confidence": confidence if confidence is not None else 0,
                 }
             )
         return result
 
-    result: list[dict[str, str]] = []
+    result: list[dict[str, Any]] = []
     sections = ("education", "experience", "experiences", "projects", "github_projects", "skills")
     for section in sections:
         value = profile.get(section)
@@ -578,12 +592,15 @@ def _expand_role_target(target: str) -> str:
 def _is_writable_evidence(item: dict[str, Any]) -> bool:
     category = _text(item.get("category")).lower()
     detail = _text(item.get("detail"))
-    if category in NON_NARRATIVE_EVIDENCE_CATEGORIES or len(detail) < 20:
+    first_person_claim = _text(item.get("first_person_claim"))
+    verified_v2 = bool(first_person_claim.startswith("我") and _text(item.get("source_evidence")))
+    minimum_length = 8 if verified_v2 else 20
+    if category in NON_NARRATIVE_EVIDENCE_CATEGORIES or len(detail) < minimum_length:
         return False
     return bool(
         re.search(
             r"(?:负责|搭建|分析|整理|优化|推进|开展|撰写|输出|设计|协同|完成|支持|支撑|运营|监测|调研|抓取|策划|对接|访谈|梳理|促成)",
-            detail,
+            f"{detail} {first_person_claim}",
         )
     )
 
@@ -743,6 +760,10 @@ class OutreachWriterAgent:
         if result and common_length >= 4:
             result = result[common_length:].lstrip("，、； ")
         summary = "；".join(filter(None, (action, result)))
+        if not summary:
+            claim = _text(item.get("first_person_claim")).strip("，。； ")
+            if claim.startswith("我"):
+                return re.sub(r"^我(?:曾经|曾)?", "", claim).strip()
         return summary.rstrip("，。；")
 
     @staticmethod
@@ -907,6 +928,10 @@ class OutreachWriterAgent:
 
         evidence_lines = []
         for item in writing_evidence:
+            first_person_claim = _text(item.get("first_person_claim")).strip("，。； ")
+            if first_person_claim.startswith("我"):
+                evidence_lines.append(f"{first_person_claim}。")
+                continue
             summary = self._evidence_sentence(item, role_target)
             if summary:
                 evidence_lines.append(f"{self._evidence_lead(item)}{summary}。")

@@ -30,7 +30,17 @@ _LOCAL_IMAGE_TOTAL_MAX_BYTES = 20 * 1024 * 1024
 
 
 class AIProvider:
-    def __init__(self, provider: str = "", api_key: str = "", base_url: str = "", model: str = "", wire_api: str = "", timeout: int | None = None):
+    def __init__(
+        self,
+        provider: str = "",
+        api_key: str = "",
+        base_url: str = "",
+        model: str = "",
+        wire_api: str = "",
+        timeout: int | None = None,
+        model_context_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ):
         self.provider = (provider or os.environ.get("XHS_AI_PROVIDER") or "codex").strip().lower()
         self.api_key = api_key or os.environ.get("XHS_AI_API_KEY", "")
         self.base_url = (base_url or os.environ.get("XHS_AI_BASE_URL", "")).rstrip("/")
@@ -42,6 +52,24 @@ class AIProvider:
             self.timeout = max(30, int(configured_timeout))
         except (TypeError, ValueError):
             self.timeout = 600
+        configured_context = (
+            model_context_tokens
+            if model_context_tokens is not None
+            else os.environ.get("XHS_AI_MODEL_CONTEXT_TOKENS", "")
+        )
+        try:
+            self.model_context_tokens = max(4_096, min(int(configured_context), 131_072))
+        except (TypeError, ValueError):
+            self.model_context_tokens = 0
+        configured_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else os.environ.get("XHS_AI_MAX_OUTPUT_TOKENS", "4096")
+        )
+        try:
+            self.max_output_tokens = max(256, min(int(configured_output_tokens), 16_384))
+        except (TypeError, ValueError):
+            self.max_output_tokens = 4_096
         self.last_request_used_images = False
         self.last_request_model = ""
         self._vision_model_cache: str | None = None
@@ -239,12 +267,15 @@ class AIProvider:
                     "\nThe previous response was invalid or incomplete JSON. "
                     "Regenerate the complete object from the original input and schema."
                 )
+            options = {"temperature": 0, "num_predict": self.max_output_tokens}
+            if self.model_context_tokens:
+                options["num_ctx"] = self.model_context_tokens
             payload = {
                 "model": selected_model,
                 "stream": False,
                 "think": False,
                 "format": schema,
-                "options": {"temperature": 0, "num_predict": 4096},
+                "options": options,
                 "messages": [
                     {"role": "system", "content": system},
                     attempt_message,

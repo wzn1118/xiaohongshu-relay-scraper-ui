@@ -19,6 +19,7 @@ const ALLOWED_KEYS = new Set([
   'completeMissingOnly',
   'collectAudience',
   'audienceOnly',
+  'discoverMore',
   'skipPostprocess',
   'noAutoAttach',
   'checkOnly',
@@ -98,6 +99,10 @@ export function validateRunRequest(value) {
   if (audienceOnly && (analysisMode !== 'general' || !resumeFromJobId || mode !== 'resume')) {
     throw fieldError('audienceOnly', 'requires_general_resume_source');
   }
+  const discoverMore = booleanField(value.discoverMore, 'discoverMore', false);
+  if (discoverMore && (analysisMode !== 'general' || !resumeFromJobId || mode !== 'resume')) {
+    throw fieldError('discoverMore', 'requires_general_resume_source');
+  }
   const collectAudience = analysisMode === 'general'
     ? booleanField(value.collectAudience, 'collectAudience', true)
     : false;
@@ -144,6 +149,7 @@ export function validateRunRequest(value) {
     completeMissingOnly,
     collectAudience: collectAudience || audienceOnly || expansion.enabled,
     audienceOnly,
+    discoverMore,
     skipPostprocess: booleanField(value.skipPostprocess, 'skipPostprocess', false),
     noAutoAttach: booleanField(value.noAutoAttach, 'noAutoAttach', true),
     checkOnly: booleanField(value.checkOnly, 'checkOnly', false),
@@ -192,6 +198,20 @@ export function validateExpansionCancelRequest(value) {
   const unknown = Object.keys(value);
   if (unknown.length) throw new ValidationError('Unsupported expansion cancel parameters.', unknown.map((field) => ({ field, reason: 'not_allowed' })));
   return Object.freeze({});
+}
+
+export function validateAudienceGrowthRequest(value) {
+  if (!isPlainObject(value)) throw new ValidationError('Request body must be a JSON object.');
+  const unknown = Object.keys(value).filter((key) => key !== 'maxScrolls');
+  if (unknown.length) {
+    throw new ValidationError(
+      'Unsupported audience growth parameters.',
+      unknown.map((field) => ({ field, reason: 'not_allowed' })),
+    );
+  }
+  return Object.freeze({
+    maxScrolls: integerField(value.maxScrolls, 'maxScrolls', 60, 1, 100),
+  });
 }
 
 function expansionField(value) {
@@ -310,6 +330,7 @@ export function buildRunnerArgs(params, outputDir, execution = null) {
     args.push('--expansion-config-json', JSON.stringify(params.expansion));
   }
   if (params.audienceOnly) args.push('--audience-only');
+  if (params.discoverMore) args.push('--discover-more');
   if (params.skipPostprocess) args.push('--skip-postprocess');
   if (params.noAutoAttach) args.push('--no-auto-attach');
   if (params.checkOnly) args.push('--check-only');

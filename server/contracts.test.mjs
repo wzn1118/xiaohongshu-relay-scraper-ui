@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { artifactId, artifactPathFromId, assertPathInside } from './lib/artifacts.mjs';
-import { ValidationError, buildRunnerArgs, validateExpansionCancelRequest, validateExpansionResumeRequest, validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
+import { ValidationError, buildRunnerArgs, validateAudienceGrowthRequest, validateExpansionCancelRequest, validateExpansionResumeRequest, validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
 
 test('validateRunRequest applies bounded production defaults', () => {
   const result = validateRunRequest({});
@@ -204,6 +204,24 @@ test('buildRunnerArgs only emits the normalized whitelist', () => {
   assert.equal(args[args.indexOf('--random-delay-min-seconds') + 1], '0.8');
   assert.equal(args[args.indexOf('--random-delay-max-seconds') + 1], '2.4');
   assert.equal(args.some((arg) => /[;&|]/.test(arg)), false);
+});
+
+test('audience growth requests are bounded and emit a dedicated runner flag', () => {
+  assert.deepEqual(validateAudienceGrowthRequest({}), { maxScrolls: 60 });
+  assert.deepEqual(validateAudienceGrowthRequest({ maxScrolls: 100 }), { maxScrolls: 100 });
+  assert.throws(() => validateAudienceGrowthRequest({ maxScrolls: 101 }), ValidationError);
+  assert.throws(() => validateAudienceGrowthRequest({ maxScrolls: 60, unknown: true }), ValidationError);
+
+  const params = validateRunRequest({
+    analysisMode: 'general',
+    mode: 'resume',
+    resumeFromJobId: '20260728034820-6b942873',
+    collectAudience: true,
+    discoverMore: true,
+  });
+  const args = buildRunnerArgs(params, path.resolve('output'));
+  assert.equal(args.includes('--discover-more'), true);
+  assert.equal(args.includes('--audience-only'), false);
 });
 
 test('buildRunnerArgs emits the isolated audience resume mode', () => {

@@ -4,8 +4,10 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,6 +115,7 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser.add_argument("--complete-missing-only", action="store_true")
     parser.add_argument("--collect-audience", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--audience-only", action="store_true")
+    parser.add_argument("--discover-more", action="store_true")
     parser.add_argument("--expansion-config-json", default="")
     parser.add_argument("--upstream-runner", default="")
     parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
@@ -186,6 +189,28 @@ def add_option_once(arguments: list[str], name: str, value: str) -> list[str]:
     if option_value(arguments, name):
         return list(arguments)
     return [*arguments, name, value]
+
+
+def replace_option(arguments: list[str], name: str, value: str) -> list[str]:
+    rewritten: list[str] = []
+    skip_next = False
+    for argument in arguments:
+        if skip_next:
+            skip_next = False
+            continue
+        if argument == name:
+            skip_next = True
+            continue
+        if argument.startswith(f"{name}="):
+            continue
+        rewritten.append(argument)
+    return [*rewritten, name, value]
+
+
+def replace_collection_mode(arguments: list[str], mode: str) -> list[str]:
+    if mode not in {"--fresh", "--resume"}:
+        raise ValueError("collection mode must be --fresh or --resume")
+    return [argument for argument in arguments if argument not in {"--fresh", "--resume"}] + [mode]
 
 
 def resolve_project_path(value: str) -> Path:
@@ -420,6 +445,44 @@ def merge_and_persist_analysis(
     return target_note_ids, reused
 
 
+def body_collection_deferred_reason(body_summary: dict[str, Any] | None) -> str:
+    if not isinstance(body_summary, dict):
+        return ""
+    try:
+        missing_bodies = max(0, int(body_summary.get("missingBodies") or 0))
+    except (TypeError, ValueError):
+        missing_bodies = 0
+    if missing_bodies == 0:
+        return ""
+
+    stop_reason = str(body_summary.get("stopReason") or "").strip()
+    if stop_reason:
+        return stop_reason
+    rate_limit = body_summary.get("rateLimit")
+    if isinstance(rate_limit, dict) and rate_limit.get("status") == "stopped":
+        return "rate_limited"
+    security_verification = body_summary.get("securityVerification")
+    if isinstance(security_verification, dict) and security_verification.get("status") == "timed_out":
+        return "security_verification_timeout"
+    return "missing_bodies"
+
+
+def mark_ai_deferred(payload: dict[str, Any], body_summary: dict[str, Any] | None) -> str:
+    reason = body_collection_deferred_reason(body_summary)
+    if not reason:
+        return ""
+    runtime = payload.get("codex_runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    payload["codex_runtime"] = {
+        **runtime,
+        "status": "deferred_missing_bodies",
+        "reason": reason,
+        "missing_bodies": int((body_summary or {}).get("missingBodies") or 0),
+    }
+    return reason
+
+
 def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any] | None = None) -> dict[str, Any]:
     gate = payload["quality_gate"]
     records = payload["records"]
@@ -451,6 +514,7 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
     )
     runtime = payload.get("codex_runtime", {})
     task_mode = "general" if payload.get("analysis_mode") == "general" else "job"
+    ai_deferred = runtime.get("status") == "deferred_missing_bodies"
     partial_analysis = bool(
         body_summary.get("transitionedToAnalysis")
         or int(body_summary.get("missingBodies") or 0) > 0
@@ -482,14 +546,14 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         {"index": 3, "total": 8, "id": "keyword-blueprint-agent" if task_mode == "general" else "profile-memory-agent", "label": "keyword-blueprint" if task_mode == "general" else "background-memory", "status": "completed"},
         {"index": 4, "total": 8, "id": "image-content-agent" if task_mode == "general" else "application-info-agent", "label": "image-and-content" if task_mode == "general" else "responsibilities-requirements-and-routes", "status": "completed"},
         {"index": 5, "total": 8, "id": "dynamic-module-agent" if task_mode == "general" else "capability-agent", "label": "dynamic-modules" if task_mode == "general" else "job-capabilities", "status": "completed"},
-        {"index": 6, "total": 8, "id": "content-analysis-agent" if task_mode == "general" else "ai-writer-agent", "label": "ai-content-analysis" if task_mode == "general" else "per-link-outreach", "status": runtime.get("status", "disabled")},
-        {"index": 7, "total": 8, "id": "content-quality-agent" if task_mode == "general" else "employer-review-agent", "label": "content-quality-check" if task_mode == "general" else "score-and-rewrite", "status": runtime.get("status", "disabled")},
+        {"index": 6, "total": 8, "id": "content-analysis-agent" if task_mode == "general" else "ai-writer-agent", "label": "ai-content-analysis" if task_mode == "general" else "per-link-outreach", "status": "deferred" if ai_deferred else runtime.get("status", "disabled")},
+        {"index": 7, "total": 8, "id": "content-quality-agent" if task_mode == "general" else "employer-review-agent", "label": "content-quality-check" if task_mode == "general" else "score-and-rewrite", "status": "deferred" if ai_deferred else runtime.get("status", "disabled")},
         {
             "index": 8,
             "total": 8,
             "id": "quality-gate-agent",
             "label": "quality-gate-and-artifacts",
-            "status": "passed" if gate["passed"] else "failed",
+            "status": "pending" if ai_deferred else "passed" if gate["passed"] else "failed",
         },
     ]
     return {
@@ -521,8 +585,9 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         "generationCoveragePercent": round((application_copy / len(records)) * 100, 2) if records else 100.0,
         "applicationDetailsExtracted": contacts + routes + responsibilities + requirements,
         "codexRuntime": runtime,
+        "qualityPending": ai_deferred,
         "checks": gate["checks"],
-        "issues": gate["issues"],
+        "issues": [] if ai_deferred else gate["issues"],
         "agentStages": agent_stages,
         "discovered": int(body_summary.get("cardsDiscovered", gate["discovered_count"])),
         "bodyAttempted": int(body_summary.get("bodyAttempted", gate["body_count"])),
@@ -706,6 +771,60 @@ def discovery_checkpoint(output_dir: Path) -> dict[str, Any]:
     }
 
 
+def card_identity_keys(card: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    note_id = str(card.get("note_id") or "").strip()
+    note_url = str(card.get("note_url") or "").strip()
+    if note_id:
+        keys.append(f"id:{note_id}")
+    if note_url:
+        canonical_url = note_url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+        if canonical_url:
+            keys.append(f"url:{canonical_url}")
+    return keys
+
+
+def merge_discovered_cards(
+    existing_cards: list[dict[str, Any]],
+    discovered_cards: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    identities: dict[str, int] = {}
+
+    for source in [*existing_cards, *discovered_cards]:
+        candidate = dict(source)
+        keys = card_identity_keys(candidate)
+        matched_index = next((identities[key] for key in keys if key in identities), None)
+        if matched_index is None:
+            matched_index = len(merged)
+            merged.append(candidate)
+        else:
+            current = merged[matched_index]
+            for field, value in candidate.items():
+                if current.get(field) in (None, "", [], {}) and value not in (None, "", [], {}):
+                    current[field] = value
+        for key in card_identity_keys(merged[matched_index]):
+            identities[key] = matched_index
+        for key in keys:
+            identities[key] = matched_index
+
+    return merged
+
+
+def merge_discovery_growth(output_dir: Path, growth_dir: Path) -> dict[str, int]:
+    cards_path = output_dir / "xiaohongshu_cards_latest.json"
+    existing_cards = load_json_array(cards_path)
+    discovered_cards = load_json_array(growth_dir / "xiaohongshu_cards_latest.json")
+    merged_cards = merge_discovered_cards(existing_cards, discovered_cards)
+    atomic_json(cards_path, merged_cards)
+    return {
+        "existing": len(existing_cards),
+        "discovered": len(discovered_cards),
+        "added": max(0, len(merged_cards) - len(existing_cards)),
+        "total": len(merged_cards),
+    }
+
+
 def run_discovery_process(
     command: list[str],
     *,
@@ -846,11 +965,16 @@ def main_stateful(
     checkpoint_fallback = False
     discovery_ran = False
 
-    if state.should_run("discovery"):
+    force_discovery = bool(wrapper.discover_more)
+    if state.should_run("discovery", force=force_discovery):
         discovery_ran = True
         state.start_stage("discovery")
         try:
-            print("[coverage-agent] discovering all job cards before guarded body collection", flush=True)
+            print(
+                "[coverage-agent] discovering more latest cards" if force_discovery
+                else "[coverage-agent] discovering all job cards before guarded body collection",
+                flush=True,
+            )
             scrape_arguments = add_flag_once(unlimited_arguments, "--skip-postprocess")
             scrape_arguments = add_flag_once(scrape_arguments, "--cards-only")
             scrape_arguments = add_option_once(
@@ -858,11 +982,31 @@ def main_stateful(
                 "--security-verification-timeout-seconds",
                 str(wrapper.security_verification_timeout_seconds),
             )
-            return_code = run_discovery_process(
-                [sys.executable, str(upstream), *scrape_arguments],
-                output_dir=output_dir,
-                state=state,
-            )
+            if force_discovery:
+                growth_dir = Path(tempfile.mkdtemp(prefix=".discovery-growth-", dir=output_dir.parent))
+                try:
+                    growth_arguments = replace_option(scrape_arguments, "--output-dir", str(growth_dir))
+                    growth_arguments = replace_collection_mode(growth_arguments, "--fresh")
+                    return_code = run_discovery_process(
+                        [sys.executable, str(upstream), *growth_arguments],
+                        output_dir=None,
+                        state=None,
+                    )
+                    growth = merge_discovery_growth(output_dir, growth_dir)
+                    print(
+                        "DISCOVERY_GROWTH "
+                        f"existing={growth['existing']} discovered={growth['discovered']} "
+                        f"added={growth['added']} total={growth['total']}",
+                        flush=True,
+                    )
+                finally:
+                    shutil.rmtree(growth_dir, ignore_errors=True)
+            else:
+                return_code = run_discovery_process(
+                    [sys.executable, str(upstream), *scrape_arguments],
+                    output_dir=output_dir,
+                    state=state,
+                )
             scrape_failed = return_code != 0
             discovery = discovery_checkpoint(output_dir)
             discovery_status = (
@@ -971,6 +1115,7 @@ def main_stateful(
     only_incomplete = resume_in_place or state.resume_scope != "full"
     previous_application = load_application_checkpoint(output_dir) if only_incomplete else None
     payload: dict[str, Any] | None = load_application_checkpoint(output_dir)
+    deferred_reason = ""
     analysis_ran = state.should_run("analysis", force=body_ran)
     if analysis_ran:
         state.start_stage("analysis")
@@ -1002,11 +1147,19 @@ def main_stateful(
             )
             if only_incomplete:
                 print(f"COMPLETE_MISSING targets={len(target_note_ids)} reused={reused}", flush=True)
+            deferred_reason = mark_ai_deferred(payload, body_summary)
+            if deferred_reason:
+                write_pipeline_artifacts(output_dir, payload)
+                print(
+                    f"AI_DEFERRED reason={deferred_reason} "
+                    f"missing={int(body_summary.get('missingBodies') or 0)}",
+                    flush=True,
+                )
             state.checkpoint_analysis(payload)
 
             emit_stage(2, "time-normalization")
             emit_stage(3, "keyword-blueprint" if wrapper.analysis_mode == "general" else "background-memory")
-            if wrapper.codex_runtime:
+            if wrapper.codex_runtime and not deferred_reason:
                 def checkpoint_ai_progress(
                     completed_count: int,
                     total: int,
@@ -1050,8 +1203,8 @@ def main_stateful(
             if wrapper.analysis_mode == "general":
                 emit_stage(4, "image-and-content")
                 emit_stage(5, "dynamic-modules")
-                emit_stage(6, "ai-content-analysis", payload["codex_runtime"]["status"])
-                emit_stage(7, "content-quality-check", "passed" if payload["quality_gate"].get("passed") else "failed")
+                emit_stage(6, "ai-content-analysis", "deferred" if deferred_reason else payload["codex_runtime"]["status"])
+                emit_stage(7, "content-quality-check", "deferred" if deferred_reason else "passed" if payload["quality_gate"].get("passed") else "failed")
                 remaining_analysis = sum(
                     1 for item in payload.get("records", [])
                     if isinstance(item, dict) and record_needs_content_completion(item)
@@ -1059,16 +1212,17 @@ def main_stateful(
             else:
                 emit_stage(4, "application-info")
                 emit_stage(5, "job-capabilities")
-                emit_stage(6, "ai-outreach", payload["codex_runtime"]["status"])
-                emit_stage(7, "employer-score-and-rewrite", "passed" if payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
+                emit_stage(6, "ai-outreach", "deferred" if deferred_reason else payload["codex_runtime"]["status"])
+                emit_stage(7, "employer-score-and-rewrite", "deferred" if deferred_reason else "passed" if payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
                 remaining_analysis = sum(
                     1 for item in payload.get("records", [])
                     if isinstance(item, dict) and record_needs_completion(item)
                 )
-            analysis_status = "completed" if remaining_analysis == 0 else "partial"
+            analysis_status = "blocked" if deferred_reason else "completed" if remaining_analysis == 0 else "partial"
             state.checkpoint_analysis(payload, status=analysis_status)
             state.finish_stage("analysis", analysis_status, {
                 "remainingCount": remaining_analysis,
+                "stopReason": deferred_reason,
             })
         except BaseException as error:
             fail_state_stage(state, "analysis", error)
@@ -1079,17 +1233,24 @@ def main_stateful(
             flush=True,
         )
 
+    if payload is not None and not deferred_reason:
+        runtime = payload.get("codex_runtime")
+        if isinstance(runtime, dict) and runtime.get("status") == "deferred_missing_bodies":
+            deferred_reason = str(runtime.get("reason") or body_collection_deferred_reason(body_summary))
+
     if payload is not None:
         gate = payload.get("quality_gate") if isinstance(payload.get("quality_gate"), dict) else {}
         print(
             "[quality-gate] "
             f"discovered={gate.get('discovered_count', 0)} records={gate.get('record_count', 0)} "
-            f"full_bodies={gate.get('body_count', 0)} status={'PASS' if gate.get('passed') else 'FAIL'}",
+            f"full_bodies={gate.get('body_count', 0)} "
+            f"status={'DEFERRED' if deferred_reason else 'PASS' if gate.get('passed') else 'FAIL'}",
             flush=True,
         )
-        for issue in gate.get("issues", []):
-            if isinstance(issue, dict):
-                print(f"[quality-gate] {issue.get('message', '')}", flush=True)
+        if not deferred_reason:
+            for issue in gate.get("issues", []):
+                if isinstance(issue, dict):
+                    print(f"[quality-gate] {issue.get('message', '')}", flush=True)
 
     audience_summary = load_json_object(output_dir / "audience-summary.json") or None
     audience_ran = False
@@ -1156,8 +1317,8 @@ def main_stateful(
             atomic_json(output_dir / "workflow-summary.json", summary)
             gate_passed = bool(payload and payload.get("quality_gate", {}).get("passed"))
             audience_passed = audience_summary is None or audience_summary.get("status") == "complete"
-            passed = gate_passed and audience_passed if payload is not None else audience_passed
-            emit_stage(8, "quality-gate-and-artifacts", "passed" if passed else "failed")
+            passed = not deferred_reason and gate_passed and audience_passed if payload is not None else audience_passed
+            emit_stage(8, "quality-gate-and-artifacts", "pending" if deferred_reason else "passed" if passed else "failed")
             manifest_path = write_project_manifest(output_dir, summary)
             finish_artifact_state(state, output_dir, manifest_path)
         except BaseException as error:
@@ -1337,9 +1498,17 @@ def main(arguments: list[str] | None = None) -> int:
     )
     if wrapper.complete_missing_only:
         print(f"COMPLETE_MISSING targets={len(target_note_ids)} reused={reused}", flush=True)
+    deferred_reason = mark_ai_deferred(result.payload, body_summary)
+    if deferred_reason:
+        write_pipeline_artifacts(output_dir, result.payload)
+        print(
+            f"AI_DEFERRED reason={deferred_reason} "
+            f"missing={int(body_summary.get('missingBodies') or 0)}",
+            flush=True,
+        )
     emit_stage(2, "time-normalization")
     emit_stage(3, "keyword-blueprint" if wrapper.analysis_mode == "general" else "background-memory")
-    if wrapper.codex_runtime:
+    if wrapper.codex_runtime and not deferred_reason:
         def checkpoint_ai_progress(completed: int, total: int, status: str, _record: dict[str, Any]) -> None:
             if completed % 5 == 0 or completed == total or status != "skipped":
                 print(f"AI_RECORD {completed}/{total} {status}", flush=True)
@@ -1376,22 +1545,24 @@ def main(arguments: list[str] | None = None) -> int:
     if wrapper.analysis_mode == "general":
         emit_stage(4, "image-and-content")
         emit_stage(5, "dynamic-modules")
-        emit_stage(6, "ai-content-analysis", result.payload["codex_runtime"]["status"])
-        emit_stage(7, "content-quality-check", "passed" if result.payload["quality_gate"].get("passed") else "failed")
+        emit_stage(6, "ai-content-analysis", "deferred" if deferred_reason else result.payload["codex_runtime"]["status"])
+        emit_stage(7, "content-quality-check", "deferred" if deferred_reason else "passed" if result.payload["quality_gate"].get("passed") else "failed")
     else:
         emit_stage(4, "application-info")
         emit_stage(5, "job-capabilities")
-        emit_stage(6, "ai-outreach", result.payload["codex_runtime"]["status"])
-        emit_stage(7, "employer-score-and-rewrite", "passed" if result.payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
+        emit_stage(6, "ai-outreach", "deferred" if deferred_reason else result.payload["codex_runtime"]["status"])
+        emit_stage(7, "employer-score-and-rewrite", "deferred" if deferred_reason else "passed" if result.payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
     gate = result.payload["quality_gate"]
     print(
         "[quality-gate] "
         f"discovered={gate['discovered_count']} records={gate['record_count']} "
-        f"full_bodies={gate['body_count']} status={'PASS' if gate['passed'] else 'FAIL'}",
+        f"full_bodies={gate['body_count']} "
+        f"status={'DEFERRED' if deferred_reason else 'PASS' if gate['passed'] else 'FAIL'}",
         flush=True,
     )
-    for issue in gate["issues"]:
-        print(f"[quality-gate] {issue['message']}", flush=True)
+    if not deferred_reason:
+        for issue in gate["issues"]:
+            print(f"[quality-gate] {issue['message']}", flush=True)
     audience_summary: dict[str, Any] | None = None
     if wrapper.analysis_mode == "general" and wrapper.collect_audience:
         collection_stop_reason = str(body_summary.get("stopReason") or "")
@@ -1417,8 +1588,8 @@ def main(arguments: list[str] | None = None) -> int:
         if audience_summary.get("status") != "complete":
             summary["status"] = "completed_partial"
     atomic_json(output_dir / "workflow-summary.json", summary)
-    result.passed = bool(gate["passed"] and (audience_summary is None or audience_summary.get("status") == "complete"))
-    emit_stage(8, "quality-gate-and-artifacts", "passed" if result.passed else "failed")
+    result.passed = bool(not deferred_reason and gate["passed"] and (audience_summary is None or audience_summary.get("status") == "complete"))
+    emit_stage(8, "quality-gate-and-artifacts", "pending" if deferred_reason else "passed" if result.passed else "failed")
     write_project_manifest(output_dir, summary)
     return 0 if result.passed else 3
 

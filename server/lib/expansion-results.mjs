@@ -20,6 +20,7 @@ export async function readExpansionSeeds(outputDir) {
       title: String(post.title || '未命名帖子'),
       author: post.author || {},
       url,
+      coverUrl: String(post.cover_url || ''),
       available: !unavailableReason,
       unavailableReason,
       contentStatus: url ? 'complete' : 'partial',
