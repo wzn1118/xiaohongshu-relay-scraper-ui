@@ -205,8 +205,8 @@ test('exhausted audience rate limits automatically resume the same task from its
     spawnImpl: () => children[spawnCount++],
     rateLimitRecovery: {
       enabled: true,
-      initialDelayMs: 10,
-      maxDelayMs: 20,
+      initialDelayMs: 250,
+      maxDelayMs: 250,
       maxAttempts: 2,
       busyDelayMs: 5,
     },
