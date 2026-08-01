@@ -190,6 +190,46 @@ def test_rate_limit_recovery_exhaustion_preserves_resumable_state(capsys):
     assert "AUDIENCE_RATE_LIMIT exhausted retries=2" in capsys.readouterr().out
 
 
+def test_main_records_user_cancellation_as_cancelled_stage(tmp_path, monkeypatch):
+    transitions = []
+
+    class State:
+        def should_run(self, _stage):
+            return True
+
+        def start_stage(self, stage):
+            transitions.append(("start", stage))
+
+        def finish_stage(self, stage, status, patch):
+            transitions.append(("finish", stage, status, patch))
+
+    monkeypatch.setattr(
+        audience_collection,
+        "open_workflow_state_from_args",
+        lambda _options, _output_dir: State(),
+    )
+    monkeypatch.setattr(
+        audience_collection,
+        "collect_audience",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        audience_collection.main(["--output-dir", str(tmp_path)])
+
+    assert transitions == [
+        ("start", "audience"),
+        (
+            "finish",
+            "audience",
+            "cancelled",
+            {
+                "failureCode": "user_cancelled",
+                "failureMessage": "",
+                "stopReason": "user_cancelled",
+            },
+        ),
+    ]
 def test_rate_limit_manual_request_skips_the_remaining_cooldown(tmp_path, capsys):
     page = FakeRateLimitPage(clear_after=1)
     request_path = tmp_path / ".rate-limit-recover.request"

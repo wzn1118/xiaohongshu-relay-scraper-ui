@@ -290,6 +290,15 @@ function normalizeSummary(value, posts, comments, users) {
     postCoveragePercent: posts.length ? (postsComplete / posts.length) * 100 : 0,
     postAttemptPercent: posts.length ? (postsAttempted / posts.length) * 100 : 0,
     profileCoveragePercent: users.length ? (profilesComplete / users.length) * 100 : 0,
+    checkpointSchemaVersion: Number(source.checkpointSchemaVersion || 1),
+    resumeStrategyCounts: isRecord(source.resumeStrategyCounts)
+      ? source.resumeStrategyCounts
+      : {},
+    repeatedRequests: numericCount(source.repeatedRequests) ?? 0,
+    duplicateCommentsSeen: numericCount(source.duplicateCommentsSeen) ?? 0,
+    performancePenalty: Number.isFinite(Number(source.performancePenalty))
+      ? Number(source.performancePenalty)
+      : 0,
     stopReason: String(source.stopReason || ''),
     generatedAt: String(source.generatedAt || ''),
   };

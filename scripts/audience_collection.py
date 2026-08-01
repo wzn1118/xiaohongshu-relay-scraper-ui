@@ -24,6 +24,41 @@ try:
 except ModuleNotFoundError:
     from scripts.artifact_io import atomic_write_json
 
+try:
+    from audience_resume import (
+        apply_response_checkpoint,
+        checkpoint_metrics,
+        choose_resume_strategy,
+        exact_resume_supported,
+        initialize_post_checkpoint,
+        initialize_user_checkpoint,
+        mark_post_attempt,
+        mark_user_attempt,
+        refresh_post_counts,
+        resolve_anchor_observation,
+        response_page_event,
+        set_post_terminal,
+        set_resume_strategy,
+        set_user_terminal,
+    )
+except ModuleNotFoundError:
+    from scripts.audience_resume import (
+        apply_response_checkpoint,
+        checkpoint_metrics,
+        choose_resume_strategy,
+        exact_resume_supported,
+        initialize_post_checkpoint,
+        initialize_user_checkpoint,
+        mark_post_attempt,
+        mark_user_attempt,
+        refresh_post_counts,
+        resolve_anchor_observation,
+        response_page_event,
+        set_post_terminal,
+        set_resume_strategy,
+        set_user_terminal,
+    )
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_UPSTREAM_SCRAPER = PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scripts/scrape_xiaohongshu_search.py"
@@ -598,6 +633,9 @@ def invalidate_legacy_profile_snapshot(user: dict[str, Any]) -> bool:
     ]
     user["enrichment_status"] = "pending"
     user["access_status"] = "profile_refresh_required"
+    user["profile_status"] = "not_started"
+    user["failure_code"] = "profile_refresh_required"
+    user["recoverable"] = True
     return True
 
 
@@ -916,8 +954,12 @@ def _dom_comments(page: Any, post_id: str, note_url: str) -> list[dict[str, Any]
     return records
 
 
-def _click_more_replies(page: Any) -> int:
+def _click_more_replies(
+    page: Any,
+    completed_comment_ids: set[str] | None = None,
+) -> int:
     clicked = 0
+    completed = completed_comment_ids or set()
     try:
         candidates = page.get_by_text(MORE_REPLY_PATTERN).all()
     except Exception:  # noqa: BLE001
@@ -926,6 +968,18 @@ def _click_more_replies(page: Any) -> int:
     # spend minutes retrying the same controls before progress is evaluated.
     for candidate in candidates[:20]:
         try:
+            if completed:
+                try:
+                    root_comment_id = candidate.evaluate(
+                        """node => {
+                          const root = node.closest('[data-comment-id], [id]');
+                          return root?.getAttribute('data-comment-id') || root?.id || '';
+                        }"""
+                    )
+                except Exception:  # noqa: BLE001
+                    root_comment_id = ""
+                if clean_text(root_comment_id, 200) in completed:
+                    continue
             if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
                 candidate.click(timeout=1200)
                 clicked += 1
@@ -1194,22 +1248,25 @@ def audience_posts_to_supplement(
     allowed_post_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return resumable posts, prioritizing untouched checkpoints."""
-    resumable = [
-        post
-        for post in posts
-        if (
-            clean_text(post.get("status"), 40).casefold() in RESUMABLE_AUDIENCE_POST_STATUSES
-            and (
-                allowed_post_ids is None
-                or clean_text(post.get("post_id"), 200) in allowed_post_ids
-            )
-        )
-    ]
+    resumable = []
+    for post in posts:
+        initialize_post_checkpoint(post)
+        detailed_status = clean_text(post.get("comment_status"), 80).casefold()
+        legacy_status = clean_text(post.get("status"), 40).casefold()
+        should_resume = detailed_status != "complete_reachable"
+        if detailed_status == "failed" and post.get("recoverable") is False:
+            should_resume = False
+        if legacy_status not in RESUMABLE_AUDIENCE_POST_STATUSES and detailed_status == "not_started":
+            should_resume = False
+        if allowed_post_ids is not None and clean_text(post.get("post_id"), 200) not in allowed_post_ids:
+            should_resume = False
+        if should_resume:
+            resumable.append(post)
 
     def resume_priority(post: dict[str, Any]) -> int:
-        status = normalize_audience_post_status(post)
-        reason = clean_text(post.get("failure_reason"), 120).casefold()
-        if status == "pending":
+        status = clean_text(post.get("comment_status"), 80).casefold()
+        reason = clean_text(post.get("stop_reason") or post.get("failure_reason"), 120).casefold()
+        if status == "not_started":
             return 0
         if "rate_limit" in reason or "security_verification" in reason:
             return 2
@@ -1474,11 +1531,16 @@ def _collect_audience_impl(
 
     source_posts = _post_source(content_insight_records)
     posts = merge_audience_posts(source_posts, existing_posts, comments_by_id.values())
+    runtime_attempt_id = attempt_id or f"audience-{os.getpid()}-{int(time.time() * 1000)}"
+    for post in posts:
+        initialize_post_checkpoint(post)
     for post in posts:
         author = post.get("author") if isinstance(post.get("author"), dict) else None
         if not author or not author.get("user_id"):
             continue
         users_by_id[author["user_id"]] = merge_user(users_by_id.get(author["user_id"]), author)
+    for user in users_by_id.values():
+        initialize_user_checkpoint(user)
 
     legacy_profile_refresh_ids = [
         user_id
@@ -1489,23 +1551,29 @@ def _collect_audience_impl(
     stop_reason = ""
     profile_stop_reason = ""
 
-    def absorb(comment: dict[str, Any]) -> None:
+    def absorb(comment: dict[str, Any]) -> bool:
+        is_new = comment["comment_id"] not in comments_by_id
         merged_comment = merge_comment(comments_by_id.get(comment["comment_id"]), comment)
         comments_by_id[comment["comment_id"]] = merged_comment
         user = merged_comment["user"]
         user_id = user["user_id"]
         merged = merge_user(users_by_id.get(user_id), user)
         merged["post_ids"] = list(dict.fromkeys([*merged.get("post_ids", []), merged_comment["post_id"]]))
+        initialize_user_checkpoint(merged)
         users_by_id[user_id] = merged
+        return is_new
 
     def checkpoint() -> dict[str, Any]:
         comments = sorted(comments_by_id.values(), key=lambda item: (item.get("post_id", ""), item.get("collected_at", ""), item.get("comment_id", "")))
+        for post in posts:
+            refresh_post_counts(post, comments)
         comment_counts_by_user: dict[str, int] = {}
         for item in comments:
             user_id = clean_text(item.get("user", {}).get("user_id"), 200)
             if user_id:
                 comment_counts_by_user[user_id] = comment_counts_by_user.get(user_id, 0) + 1
         for user in users_by_id.values():
+            initialize_user_checkpoint(user)
             checkpoint_count = comment_counts_by_user.get(clean_text(user.get("user_id"), 200), 0)
             user["comment_count"] = max(compact_count(user.get("comment_count")) or 0, checkpoint_count)
         users = sorted(users_by_id.values(), key=lambda item: (-int(item.get("comment_count") or 0), item.get("display_name", "")))
@@ -1515,6 +1583,7 @@ def _collect_audience_impl(
         atomic_json(posts_path, posts)
         atomic_json(failures_path, failures[-1000:])
         summary = _summary(posts, comments, users, stop_reason or profile_stop_reason)
+        summary.update(checkpoint_metrics(posts))
         atomic_json(summary_path, summary)
         if progress_callback is not None:
             progress_callback({
@@ -1545,6 +1614,8 @@ def _collect_audience_impl(
     )
 
     upstream = load_upstream(upstream_scraper)
+    resume_comment_cursor = getattr(upstream, "resume_comment_cursor", None)
+    resume_reply_cursor = getattr(upstream, "resume_reply_cursor", None)
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as playwright:
@@ -1634,10 +1705,13 @@ def _collect_audience_impl(
 
             def enrich_profile(user: dict[str, Any], *, phase: str) -> bool:
                 nonlocal profile_stop_reason
-                user["last_attempt_at"] = utc_now()
+                if initialize_user_checkpoint(user).get("profile_status") == "complete_reachable":
+                    return True
+                mark_user_attempt(user, runtime_attempt_id)
                 if not user.get("profile_url"):
                     user["enrichment_status"] = "partial"
                     user["access_status"] = "profile_url_missing"
+                    set_user_terminal(user, "partial_limit", "profile_url_missing")
                     return False
                 for attempt in range(2):
                     active_page = ensure_live_page(force_reconnect=attempt > 0)
@@ -1653,12 +1727,22 @@ def _collect_audience_impl(
                             profile_stop_reason = challenge
                             user["enrichment_status"] = "partial"
                             user["access_status"] = challenge
+                            set_user_terminal(
+                                user,
+                                "partial_verification" if challenge == "security_verification_timeout" else "blocked",
+                                challenge,
+                            )
                             print(
                                 f"AUDIENCE_PROFILE_LIMIT reason={challenge}; comments continue and profile checkpoint preserved",
                                 flush=True,
                             )
                             return False
                         parsed = parse_profile_snapshot(_profile_snapshot(active_page), user)
+                        set_user_terminal(
+                            parsed,
+                            "complete_reachable" if parsed.get("enrichment_status") == "complete" else "partial_limit",
+                            "" if parsed.get("enrichment_status") == "complete" else str(parsed.get("access_status") or "profile_partial"),
+                        )
                         users_by_id[user["user_id"]] = parsed
                         return parsed.get("enrichment_status") == "complete"
                     except Exception as error:  # noqa: BLE001
@@ -1667,6 +1751,7 @@ def _collect_audience_impl(
                         user["enrichment_status"] = "partial"
                         user["access_status"] = "profile_error"
                         user["last_enriched_at"] = utc_now()
+                        set_user_terminal(user, "failed", "profile_error", recoverable=True)
                         failures.append({
                             "user_id": user["user_id"],
                             "phase": phase,
@@ -1681,7 +1766,14 @@ def _collect_audience_impl(
                     item.get("post_id") for item in comments_by_id.values() if item.get("post_id")
                 }
                 return sorted(
-                    [item for item in users_by_id.values() if item.get("enrichment_status") != "complete"],
+                    [
+                        item for item in users_by_id.values()
+                        if initialize_user_checkpoint(item).get("profile_status") != "complete_reachable"
+                        and not (
+                            item.get("profile_status") == "failed"
+                            and item.get("recoverable") is False
+                        )
+                    ],
                     key=lambda item: (
                         0 if item.get("profile_url") else 1,
                         0 if "author" in item.get("roles", []) and commented_post_ids.intersection(item.get("post_ids", [])) else
@@ -1718,14 +1810,32 @@ def _collect_audience_impl(
                     time.sleep(max(0.0, note_delay_seconds))
 
             for post_index, post in enumerate(target_posts, start=1):
-                post["last_attempt_at"] = utc_now()
+                exact_cursor_supported = exact_resume_supported(
+                    post,
+                    comment_cursor_supported=callable(resume_comment_cursor),
+                    reply_cursor_supported=callable(resume_reply_cursor),
+                )
+                strategy, fallback_reason = choose_resume_strategy(
+                    post,
+                    exact_cursor_supported=exact_cursor_supported,
+                )
+                if not strategy:
+                    continue
+                saved_anchor = clean_text(post.get("last_visible_comment_id"), 200)
+                set_resume_strategy(post, strategy, fallback_reason)
+                mark_post_attempt(post, runtime_attempt_id)
+                checkpoint()
                 if not clean_text(post.get("note_url"), 2000):
-                    post["status"] = "partial"
-                    post["failure_reason"] = "checkpoint_note_url_missing"
+                    set_post_terminal(
+                        post,
+                        "failed",
+                        "checkpoint_note_url_missing",
+                        recoverable=False,
+                    )
                     failures.append({
                         "post_id": post["post_id"],
                         "phase": "comments",
-                        "reason": post["failure_reason"],
+                        "reason": "checkpoint_note_url_missing",
                         "at": utc_now(),
                     })
                     progress_summary = checkpoint()
@@ -1738,6 +1848,17 @@ def _collect_audience_impl(
                     )
                     continue
                 response_payloads.clear()
+                processed_response_count = 0
+                existing_comment_ids = set(comments_by_id)
+                observed_comment_ids: set[str] = set()
+                saved_reply_thread_ids = {
+                    comment_id
+                    for comment_id, thread in post.get("reply_threads", {}).items()
+                    if isinstance(thread, dict)
+                    and thread.get("reply_status") != "complete_reachable"
+                    and clean_text(thread.get("reply_cursor"), 1000)
+                }
+                requested_reply_cursors: set[str] = set()
                 before = len([item for item in comments_by_id.values() if item.get("post_id") == post["post_id"]])
                 try:
                     page = ensure_live_page()
@@ -1745,36 +1866,162 @@ def _collect_audience_impl(
                     page.wait_for_timeout(1200)
                     challenge = _challenge_status(f"{page.url}\n{_body_text(page)}")
                     if challenge:
+                        set_post_terminal(
+                            post,
+                            "partial_verification" if challenge == "security_verification" else "blocked",
+                            challenge,
+                        )
+                        checkpoint()
                         cleared, reason = recover_access(page, challenge)
                         if not cleared:
                             stop_reason = reason
-                            post["status"] = "partial"
-                            post["failure_reason"] = reason
+                            set_post_terminal(
+                                post,
+                                "partial_verification" if "verification" in reason else "blocked",
+                                reason,
+                            )
                             checkpoint()
                             break
+                        mark_post_attempt(post, runtime_attempt_id)
+
+                    if post.get("resume_strategy") == "exact_cursor":
+                        try:
+                            exact_resumed = bool(resume_comment_cursor(
+                                page=page,
+                                post_id=post["post_id"],
+                                note_url=post["note_url"],
+                                cursor=post.get("comment_cursor"),
+                            ))
+                        except Exception as error:  # noqa: BLE001
+                            exact_resumed = False
+                            failures.append({
+                                "post_id": post["post_id"],
+                                "phase": "cursor_resume",
+                                "reason": clean_text(error, 1000),
+                                "at": utc_now(),
+                            })
+                        if not exact_resumed:
+                            fallback = "anchor_comment" if saved_anchor else "rescan_dedupe"
+                            set_resume_strategy(
+                                post,
+                                fallback,
+                                "exact_cursor_driver_failed",
+                            )
+                            checkpoint()
 
                     unchanged = 0
                     previous_count = -1
                     explicit_exhausted = False
                     api_exhausted = False
+                    anchor_pending = post.get("resume_strategy") == "anchor_comment"
                     for _round in range(200):
-                        clicked = _click_more_replies(page)
-                        for _response_url, payload in list(response_payloads):
-                            for comment in extract_comments_from_payload(payload, post_id=post["post_id"], note_url=post["note_url"]):
+                        exact_reply_threads: set[str] = set()
+                        if post.get("resume_strategy") == "exact_cursor":
+                            for comment_id in saved_reply_thread_ids:
+                                thread = post.get("reply_threads", {}).get(comment_id, {})
+                                if thread.get("reply_status") == "complete_reachable":
+                                    continue
+                                reply_cursor = clean_text(thread.get("reply_cursor"), 1000)
+                                request_key = f"{comment_id}:{reply_cursor}"
+                                if not reply_cursor or request_key in requested_reply_cursors:
+                                    exact_reply_threads.add(comment_id)
+                                    continue
+                                try:
+                                    reply_resumed = bool(resume_reply_cursor(
+                                        page=page,
+                                        post_id=post["post_id"],
+                                        comment_id=comment_id,
+                                        cursor=reply_cursor,
+                                    ))
+                                except Exception as error:  # noqa: BLE001
+                                    reply_resumed = False
+                                    failures.append({
+                                        "post_id": post["post_id"],
+                                        "comment_id": comment_id,
+                                        "phase": "reply_cursor_resume",
+                                        "reason": clean_text(error, 1000),
+                                        "at": utc_now(),
+                                    })
+                                if reply_resumed:
+                                    requested_reply_cursors.add(request_key)
+                                    exact_reply_threads.add(comment_id)
+                                    checkpoint()
+                                else:
+                                    fallback_strategy = (
+                                        "anchor_comment" if saved_anchor else "rescan_dedupe"
+                                    )
+                                    set_resume_strategy(
+                                        post,
+                                        fallback_strategy,
+                                        "reply_cursor_driver_failed",
+                                    )
+                                    anchor_pending = bool(saved_anchor)
+                                    checkpoint()
+                                    break
+                        completed_reply_threads = {
+                            comment_id
+                            for comment_id, thread in post.get("reply_threads", {}).items()
+                            if isinstance(thread, dict)
+                            and thread.get("reply_status") == "complete_reachable"
+                        }
+                        completed_reply_threads.update(exact_reply_threads)
+                        clicked = 0 if anchor_pending else _click_more_replies(
+                            page,
+                            completed_reply_threads,
+                        )
+                        new_responses = list(response_payloads[processed_response_count:])
+                        processed_response_count += len(new_responses)
+                        visible_comment_ids: list[str] = []
+                        for response_url, payload in new_responses:
+                            extracted = extract_comments_from_payload(
+                                payload,
+                                post_id=post["post_id"],
+                                note_url=post["note_url"],
+                            )
+                            for comment in extracted:
                                 absorb(comment)
-                        for comment in _dom_comments(page, post["post_id"], post["note_url"]):
+                                visible_comment_ids.append(comment["comment_id"])
+                            event = response_page_event(response_url, payload)
+                            if event is not None:
+                                apply_response_checkpoint(
+                                    post,
+                                    event,
+                                    extracted,
+                                    existing_comment_ids=existing_comment_ids,
+                                    observed_comment_ids=observed_comment_ids,
+                                    attempt_id=runtime_attempt_id,
+                                )
+                                checkpoint()
+                        dom_comments = _dom_comments(page, post["post_id"], post["note_url"])
+                        for comment in dom_comments:
                             absorb(comment)
+                            visible_comment_ids.append(comment["comment_id"])
+                        if anchor_pending and resolve_anchor_observation(
+                            post,
+                            visible_comment_ids,
+                            anchor_id=saved_anchor,
+                        ):
+                            anchor_pending = False
+                            checkpoint()
                         current_count = len([item for item in comments_by_id.values() if item.get("post_id") == post["post_id"]])
                         scroll = _scroll_comments(page)
                         page.wait_for_timeout(650)
                         body = _body_text(page)
                         challenge = _challenge_status(f"{page.url}\n{body}")
                         if challenge:
+                            set_post_terminal(
+                                post,
+                                "partial_verification" if challenge == "security_verification" else "blocked",
+                                challenge,
+                            )
+                            checkpoint()
                             cleared, reason = recover_access(page, challenge)
                             if not cleared:
                                 stop_reason = reason
                                 break
                             response_payloads.clear()
+                            processed_response_count = 0
+                            mark_post_attempt(post, runtime_attempt_id)
                             unchanged = 0
                             previous_count = -1
                             continue
@@ -1793,30 +2040,43 @@ def _collect_audience_impl(
                         if scroll.get("height", 0) <= scroll.get("client", 0) and clicked == 0 and unchanged >= 2:
                             break
 
+                    if anchor_pending:
+                        resolve_anchor_observation(
+                            post,
+                            (),
+                            anchor_id=saved_anchor,
+                            scan_finished=True,
+                        )
+
                     collected = len([item for item in comments_by_id.values() if item.get("post_id") == post["post_id"]])
                     expected = post.get("expected_comment_count")
                     expected_met = expected is not None and collected >= int(expected)
                     unknown_exhausted = expected is None and explicit_exhausted
-                    post["collected_comment_count"] = collected
-                    post["top_level_count"] = sum(1 for item in comments_by_id.values() if item.get("post_id") == post["post_id"] and not item.get("parent_comment_id"))
-                    post["reply_count"] = collected - post["top_level_count"]
+                    refresh_post_counts(post, comments_by_id.values())
                     post["unique_user_count"] = len({item.get("user", {}).get("user_id") for item in comments_by_id.values() if item.get("post_id") == post["post_id"]})
                     post["last_collected_at"] = utc_now()
                     if stop_reason:
-                        post["status"] = "partial"
-                        post["failure_reason"] = stop_reason
+                        terminal_status = (
+                            "partial_verification" if "verification" in stop_reason
+                            else "partial_timeout" if "timeout" in stop_reason
+                            else "partial_cancelled" if "cancel" in stop_reason
+                            else "blocked" if "rate" in stop_reason
+                            else "partial_limit"
+                        )
+                        set_post_terminal(post, terminal_status, stop_reason)
                     elif expected_met:
-                        post["status"] = "complete"
+                        set_post_terminal(post, "complete_reachable")
                         post["completion_basis"] = "expected_count"
-                        post["failure_reason"] = ""
                     elif unknown_exhausted:
-                        post["status"] = "complete"
+                        set_post_terminal(post, "complete_reachable")
                         post["completion_basis"] = "api_exhausted" if api_exhausted else "ui_exhausted"
-                        post["failure_reason"] = ""
                     else:
-                        post["status"] = "partial"
                         post["completion_basis"] = "checkpoint"
-                        post["failure_reason"] = f"expected_{expected}_collected_{collected}" if expected is not None else "comment_list_not_proven_complete"
+                        set_post_terminal(
+                            post,
+                            "partial_limit",
+                            f"expected_{expected}_collected_{collected}" if expected is not None else "comment_list_not_proven_complete",
+                        )
                     if collected == before and post["status"] != "complete":
                         failures.append({"post_id": post["post_id"], "phase": "comments", "reason": post["failure_reason"], "at": utc_now()})
                     progress_summary = checkpoint()
@@ -1829,9 +2089,17 @@ def _collect_audience_impl(
                     if stop_reason:
                         break
                     time.sleep(max(0.0, note_delay_seconds))
+                except KeyboardInterrupt:
+                    set_post_terminal(post, "partial_cancelled", "user_cancelled")
+                    checkpoint()
+                    raise
                 except Exception as error:  # noqa: BLE001
-                    post["status"] = "partial"
-                    post["failure_reason"] = clean_text(error, 1000)
+                    set_post_terminal(
+                        post,
+                        "failed",
+                        clean_text(error, 1000),
+                        recoverable=True,
+                    )
                     failures.append({"post_id": post["post_id"], "phase": "comments", "reason": post["failure_reason"], "at": utc_now()})
                     progress_summary = checkpoint()
                     print(
@@ -1939,6 +2207,8 @@ def collect_audience(
             ),
         )
     except BaseException as error:
+        if isinstance(error, KeyboardInterrupt):
+            raise
         if manifest_path is not None and readthrough_manifest is not None:
             rollback_errors = _rollback_readthrough_target(
                 resolved_output_dir,
@@ -2010,9 +2280,11 @@ def main(arguments: list[str] | None = None) -> int:
     except BaseException as error:
         if state is not None:
             try:
-                state.finish_stage("audience", "failed", {
-                    "failureCode": type(error).__name__,
+                cancelled = isinstance(error, KeyboardInterrupt)
+                state.finish_stage("audience", "cancelled" if cancelled else "failed", {
+                    "failureCode": "user_cancelled" if cancelled else type(error).__name__,
                     "failureMessage": str(error)[:1000],
+                    "stopReason": "user_cancelled" if cancelled else "",
                 })
             except BaseException:
                 pass

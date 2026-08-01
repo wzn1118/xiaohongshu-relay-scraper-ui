@@ -39,8 +39,10 @@ ANALYSIS_RECORD_STATUSES = frozenset((
     "not_started", "running", "partial", "completed", "failed", "blocked",
 ))
 AUDIENCE_ENTRY_STATUSES = frozenset((
-    "pending", "partial", "complete", "failed", "blocked",
+    "not_started", "running", "complete_reachable", "partial_limit",
+    "partial_timeout", "partial_verification", "partial_cancelled", "blocked", "failed",
 ))
+AUDIENCE_REPLY_STATUSES = AUDIENCE_ENTRY_STATUSES
 STATE_LOCK_TIMEOUT_SECONDS = 10.0
 STATE_LOCK_RETRY_SECONDS = 0.05
 STATE_LOCK_STALE_SECONDS = 30.0
@@ -336,7 +338,9 @@ def _empty_stages() -> dict[str, dict[str, Any]]:
         },
         "audience": {
             "status": "not_started",
+            "checkpointSchemaVersion": 1,
             "posts": {},
+            "replyThreads": {},
             "users": {},
             "postsTotal": 0,
             "postsCompleted": 0,
@@ -422,6 +426,10 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
             stage["users"] = _normalize_ledger(
                 stage.get("users"),
                 _normalize_audience_user,
+            )
+            stage["replyThreads"] = _normalize_ledger(
+                stage.get("replyThreads"),
+                _normalize_audience_reply_thread,
             )
             posts = stage.get("posts") if isinstance(stage.get("posts"), dict) else {}
             users = stage.get("users") if isinstance(stage.get("users"), dict) else {}
@@ -512,19 +520,31 @@ def _normalize_analysis_record(value: dict[str, Any]) -> dict[str, Any]:
 
 def _normalize_audience_post(value: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(value)
-    status = normalized.get("commentStatus") or normalized.get("status") or "pending"
-    normalized["commentStatus"] = (
-        "complete" if status in {"completed", "succeeded"} else status
-    )
-    normalized["attemptCount"] = normalized.get("attemptCount", 0)
+    status = normalized.get("commentStatus") or normalized.get("comment_status") or normalized.get("status") or "not_started"
+    normalized["commentStatus"] = _normalize_audience_status(status)
+    normalized["attemptCount"] = normalized.get("attemptCount", normalized.get("attempt_count", 0))
     normalized["commentsCollected"] = normalized.get(
         "commentsCollected",
-        normalized.get("collected_comment_count", 0),
+        normalized.get("comments_collected", normalized.get("collected_comment_count", 0)),
     )
     normalized["repliesCollected"] = normalized.get(
         "repliesCollected",
-        normalized.get("reply_count", 0),
+        normalized.get("replies_collected", normalized.get("reply_count", 0)),
     )
+    normalized["commentCursor"] = normalized.get("commentCursor", normalized.get("comment_cursor", ""))
+    normalized["commentPage"] = normalized.get("commentPage", normalized.get("comment_page", 0))
+    normalized["replyCursor"] = normalized.get("replyCursor", normalized.get("reply_cursor", ""))
+    normalized["hasMoreComments"] = bool(normalized.get("hasMoreComments", normalized.get("has_more_comments", True)))
+    normalized["lastVisibleCommentId"] = str(normalized.get("lastVisibleCommentId") or normalized.get("last_visible_comment_id") or "")
+    normalized["lastSuccessfulCursor"] = str(normalized.get("lastSuccessfulCursor") or normalized.get("last_successful_cursor") or "")
+    normalized["resumeStrategy"] = str(normalized.get("resumeStrategy") or normalized.get("resume_strategy") or "")
+    normalized["fallbackReason"] = str(normalized.get("fallbackReason") or normalized.get("fallback_reason") or "")
+    normalized["repeatedRequests"] = normalized.get("repeatedRequests", normalized.get("repeated_requests", 0))
+    normalized["duplicateCommentsSeen"] = normalized.get("duplicateCommentsSeen", normalized.get("duplicate_comments_seen", 0))
+    normalized["resumedFromAnchor"] = str(normalized.get("resumedFromAnchor") or normalized.get("resumed_from_anchor") or "")
+    normalized["performancePenalty"] = normalized.get("performancePenalty", normalized.get("performance_penalty", 0))
+    normalized["recoverable"] = bool(normalized.get("recoverable", normalized["commentStatus"] != "complete_reachable"))
+    normalized["stopReason"] = str(normalized.get("stopReason") or normalized.get("stop_reason") or normalized.get("failure_reason") or "")
     return normalized
 
 
@@ -537,11 +557,36 @@ def _normalize_audience_user(value: dict[str, Any]) -> dict[str, Any]:
         or normalized.get("status")
         or "pending"
     )
-    normalized["profileStatus"] = (
-        "complete" if status in {"completed", "succeeded"} else status
-    )
-    normalized["attemptCount"] = normalized.get("attemptCount", 0)
+    normalized["profileStatus"] = _normalize_audience_status(status)
+    normalized["attemptCount"] = normalized.get("attemptCount", normalized.get("profile_attempt_count", 0))
+    normalized["userPostCursor"] = str(normalized.get("userPostCursor") or normalized.get("user_post_cursor") or "")
+    normalized["failureCode"] = str(normalized.get("failureCode") or normalized.get("failure_code") or normalized.get("access_status") or "")
+    normalized["recoverable"] = bool(normalized.get("recoverable", normalized["profileStatus"] != "complete_reachable"))
     return normalized
+
+
+def _normalize_audience_reply_thread(value: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(value)
+    status = normalized.get("replyStatus") or normalized.get("reply_status") or "not_started"
+    normalized["replyStatus"] = _normalize_audience_status(status)
+    normalized["commentId"] = str(normalized.get("commentId") or normalized.get("comment_id") or "")
+    normalized["replyCursor"] = str(normalized.get("replyCursor") or normalized.get("reply_cursor") or "")
+    normalized["hasMoreReplies"] = bool(normalized.get("hasMoreReplies", normalized.get("has_more_replies", True)))
+    normalized["repliesCollected"] = normalized.get("repliesCollected", normalized.get("replies_collected", 0))
+    normalized["attemptCount"] = normalized.get("attemptCount", normalized.get("attempt_count", 0))
+    return normalized
+
+
+def _normalize_audience_status(value: Any) -> str:
+    status = str(value or "not_started")
+    return {
+        "pending": "not_started",
+        "partial": "partial_limit",
+        "complete": "complete_reachable",
+        "completed": "complete_reachable",
+        "succeeded": "complete_reachable",
+        "cancelled": "partial_cancelled",
+    }.get(status, status)
 
 
 def _body_record_is_completed(record: Any) -> bool:
@@ -557,13 +602,13 @@ def _analysis_record_is_completed(record: Any) -> bool:
 def _post_is_completed(post: Any) -> bool:
     return isinstance(post, dict) and (
         post.get("commentStatus") or post.get("status")
-    ) == "complete"
+    ) == "complete_reachable"
 
 
 def _user_is_completed(user: Any) -> bool:
     return isinstance(user, dict) and (
         user.get("profileStatus") or user.get("enrichmentStatus") or user.get("status")
-    ) == "complete"
+    ) == "complete_reachable"
 
 
 def _require_ledger(value: Any, field_name: str) -> None:
@@ -619,6 +664,7 @@ def _validate_analysis_records(records: dict[str, dict[str, Any]]) -> None:
 
 def _validate_audience_entries(
     posts: dict[str, dict[str, Any]],
+    reply_threads: dict[str, dict[str, Any]],
     users: dict[str, dict[str, Any]],
 ) -> None:
     for post in posts.values():
@@ -626,8 +672,19 @@ def _validate_audience_entries(
             raise WorkflowStateError("Workflow-state audience post has an invalid status")
         _require_non_negative_entry_integers(
             post,
-            ("attemptCount", "commentsCollected", "repliesCollected"),
+            (
+                "attemptCount", "commentPage", "commentsCollected", "repliesCollected",
+                "repeatedRequests", "duplicateCommentsSeen",
+            ),
             "audience post",
+        )
+    for thread in reply_threads.values():
+        if thread.get("replyStatus") not in AUDIENCE_REPLY_STATUSES:
+            raise WorkflowStateError("Workflow-state audience reply thread has an invalid status")
+        _require_non_negative_entry_integers(
+            thread,
+            ("attemptCount", "repliesCollected"),
+            "audience reply thread",
         )
     for user in users.values():
         if user.get("profileStatus") not in AUDIENCE_ENTRY_STATUSES:
@@ -842,8 +899,9 @@ class WorkflowStateSession:
             return
         if stage_name == "audience":
             _require_ledger(stage.get("posts"), "audience.posts")
+            _require_ledger(stage.get("replyThreads"), "audience.replyThreads")
             _require_ledger(stage.get("users"), "audience.users")
-            _validate_audience_entries(stage["posts"], stage["users"])
+            _validate_audience_entries(stage["posts"], stage["replyThreads"], stage["users"])
             _require_non_negative_integers(
                 stage,
                 ("postsTotal", "postsCompleted", "usersTotal", "usersCompleted"),
@@ -1143,6 +1201,7 @@ class WorkflowStateSession:
         def mutate(next_state: dict[str, Any]) -> None:
             stage = next_state.setdefault("stages", {}).setdefault("audience", {})
             post_ledger = stage.setdefault("posts", {})
+            reply_thread_ledger = stage.setdefault("replyThreads", {})
             user_ledger = stage.setdefault("users", {})
             for post in posts:
                 post_id = str(post.get("post_id") or "").strip()
@@ -1151,23 +1210,60 @@ class WorkflowStateSession:
                 previous = post_ledger.get(post_id) if isinstance(post_ledger.get(post_id), dict) else {}
                 entry = copy.deepcopy(previous)
                 last_attempt_at = post.get("last_attempt_at") or post.get("last_collected_at")
-                if entry.get("lastAttemptId") != self.attempt_id and last_attempt_at:
+                artifact_attempt_count = int(post.get("attempt_count") or 0)
+                if artifact_attempt_count:
+                    entry["attemptCount"] = max(int(entry.get("attemptCount") or 0), artifact_attempt_count)
+                    entry["lastAttemptId"] = str(post.get("last_attempt_id") or self.attempt_id)
+                elif entry.get("lastAttemptId") != self.attempt_id and last_attempt_at:
                     entry["attemptCount"] = int(entry.get("attemptCount") or 0) + 1
                     entry["lastAttemptId"] = self.attempt_id
-                collected = int(post.get("collected_comment_count") or 0)
-                comment_status = str(post.get("status") or "pending")
+                collected = int(post.get("comments_collected", post.get("collected_comment_count")) or 0)
+                comment_status = _normalize_audience_status(
+                    post.get("comment_status") or post.get("status") or "not_started"
+                )
                 entry.update({
                     "postId": post_id,
                     "commentStatus": comment_status,
-                    "commentCursor": post.get("comment_cursor"),
-                    "replyCursor": post.get("reply_cursor"),
-                    "hasMore": comment_status != "complete",
+                    "commentCursor": str(post.get("comment_cursor") or ""),
+                    "commentPage": int(post.get("comment_page") or 0),
+                    "replyCursor": str(post.get("reply_cursor") or ""),
+                    "hasMoreComments": bool(post.get("has_more_comments", comment_status != "complete_reachable")),
                     "commentsCollected": collected,
-                    "repliesCollected": int(post.get("reply_count") or 0),
-                    "stopReason": str(post.get("failure_reason") or ""),
+                    "repliesCollected": int(post.get("replies_collected", post.get("reply_count")) or 0),
+                    "lastVisibleCommentId": str(post.get("last_visible_comment_id") or ""),
+                    "lastSuccessfulCursor": str(post.get("last_successful_cursor") or ""),
+                    "resumeStrategy": str(post.get("resume_strategy") or ""),
+                    "fallbackReason": str(post.get("fallback_reason") or ""),
+                    "repeatedRequests": int(post.get("repeated_requests") or 0),
+                    "duplicateCommentsSeen": int(post.get("duplicate_comments_seen") or 0),
+                    "resumedFromAnchor": str(post.get("resumed_from_anchor") or ""),
+                    "performancePenalty": float(post.get("performance_penalty") or 0),
+                    "recoverable": bool(post.get("recoverable", comment_status != "complete_reachable")),
+                    "stopReason": str(post.get("stop_reason") or post.get("failure_reason") or ""),
                     "lastAttemptAt": last_attempt_at or entry.get("lastAttemptAt"),
+                    "updatedAt": post.get("updated_at") or now,
                 })
                 post_ledger[post_id] = entry
+                reply_threads = post.get("reply_threads")
+                if isinstance(reply_threads, dict):
+                    for comment_id, thread in reply_threads.items():
+                        if not isinstance(thread, dict):
+                            continue
+                        thread_key = f"{post_id}:{comment_id}"
+                        previous_thread = reply_thread_ledger.get(thread_key)
+                        thread_entry = copy.deepcopy(previous_thread) if isinstance(previous_thread, dict) else {}
+                        thread_entry.update({
+                            "postId": post_id,
+                            "commentId": str(thread.get("comment_id") or comment_id),
+                            "replyStatus": _normalize_audience_status(thread.get("reply_status") or "not_started"),
+                            "replyCursor": str(thread.get("reply_cursor") or ""),
+                            "hasMoreReplies": bool(thread.get("has_more_replies", True)),
+                            "repliesCollected": int(thread.get("replies_collected") or 0),
+                            "attemptCount": int(thread.get("attempt_count") or 0),
+                            "lastAttemptId": str(thread.get("last_attempt_id") or ""),
+                            "updatedAt": thread.get("updated_at") or now,
+                        })
+                        reply_thread_ledger[thread_key] = thread_entry
             for user in users:
                 user_id = str(user.get("user_id") or "").strip()
                 if not user_id:
@@ -1175,14 +1271,24 @@ class WorkflowStateSession:
                 previous = user_ledger.get(user_id) if isinstance(user_ledger.get(user_id), dict) else {}
                 entry = copy.deepcopy(previous)
                 last_attempt_at = user.get("last_attempt_at") or user.get("last_enriched_at")
-                if entry.get("lastAttemptId") != self.attempt_id and last_attempt_at:
+                artifact_attempt_count = int(user.get("profile_attempt_count") or 0)
+                if artifact_attempt_count:
+                    entry["attemptCount"] = max(int(entry.get("attemptCount") or 0), artifact_attempt_count)
+                    entry["lastAttemptId"] = str(user.get("last_profile_attempt_id") or self.attempt_id)
+                elif entry.get("lastAttemptId") != self.attempt_id and last_attempt_at:
                     entry["attemptCount"] = int(entry.get("attemptCount") or 0) + 1
                     entry["lastAttemptId"] = self.attempt_id
+                profile_status = _normalize_audience_status(
+                    user.get("profile_status") or user.get("enrichment_status") or "not_started"
+                )
                 entry.update({
                     "userId": user_id,
-                    "profileStatus": str(user.get("enrichment_status") or "pending"),
+                    "profileStatus": profile_status,
+                    "userPostCursor": str(user.get("user_post_cursor") or ""),
                     "lastAttemptAt": last_attempt_at or entry.get("lastAttemptAt"),
-                    "failureCode": str(user.get("access_status") or ""),
+                    "failureCode": str(user.get("failure_code") or user.get("access_status") or ""),
+                    "recoverable": bool(user.get("recoverable", profile_status != "complete_reachable")),
+                    "updatedAt": user.get("updated_at") or now,
                 })
                 user_ledger[user_id] = entry
             posts_completed = sum(
@@ -1193,6 +1299,7 @@ class WorkflowStateSession:
             )
             stage.update({
                 "status": status,
+                "checkpointSchemaVersion": int(summary.get("checkpointSchemaVersion") or 1),
                 "attemptId": self.attempt_id,
                 "lastCheckpointAt": now,
                 "stopReason": str(summary.get("stopReason") or ""),
@@ -1200,6 +1307,10 @@ class WorkflowStateSession:
                 "postsCompleted": posts_completed,
                 "usersTotal": len(user_ledger),
                 "usersCompleted": users_completed,
+                "resumeStrategyCounts": copy.deepcopy(summary.get("resumeStrategyCounts") or {}),
+                "repeatedRequests": int(summary.get("repeatedRequests") or 0),
+                "duplicateCommentsSeen": int(summary.get("duplicateCommentsSeen") or 0),
+                "performancePenalty": float(summary.get("performancePenalty") or 0),
             })
 
         return self._update(mutate)

@@ -22,7 +22,10 @@ const BODY_RECORD_STATUSES = new Set([
   'discovered', 'queued', 'attempted', 'succeeded', 'failed', 'not_attempted', 'blocked', 'cancelled',
 ]);
 const ANALYSIS_RECORD_STATUSES = new Set(['not_started', 'running', 'partial', 'completed', 'failed', 'blocked']);
-const AUDIENCE_ENTRY_STATUSES = new Set(['pending', 'partial', 'complete', 'failed', 'blocked']);
+const AUDIENCE_ENTRY_STATUSES = new Set([
+  'not_started', 'running', 'complete_reachable', 'partial_limit', 'partial_timeout',
+  'partial_verification', 'partial_cancelled', 'blocked', 'failed',
+]);
 
 export function workflowStatePath(outputDir) {
   return path.join(path.dirname(path.resolve(outputDir)), 'workflow-state.json');
@@ -68,7 +71,9 @@ export function emptyWorkflowStages() {
     },
     audience: {
       status: 'not_started',
+      checkpointSchemaVersion: 1,
       posts: {},
+      replyThreads: {},
       users: {},
       postsTotal: 0,
       postsCompleted: 0,
@@ -242,6 +247,7 @@ function normalizeWorkflowState(value) {
     }
     if (stageName === 'audience') {
       stage.posts = normalizeLedger(stage.posts, normalizeAudiencePost);
+      stage.replyThreads = normalizeLedger(stage.replyThreads, normalizeAudienceReplyThread);
       stage.users = normalizeLedger(stage.users, normalizeAudienceUser);
       const posts = isPlainObject(stage.posts) ? stage.posts : {};
       const users = isPlainObject(stage.users) ? stage.users : {};
@@ -322,8 +328,9 @@ function validateStageShape(stageName, stage, filePath) {
   }
   if (stageName === 'audience') {
     validateLedger(stage.posts, filePath, 'stage_audience_posts');
+    validateLedger(stage.replyThreads, filePath, 'stage_audience_replyThreads');
     validateLedger(stage.users, filePath, 'stage_audience_users');
-    validateAudienceEntries(stage.posts, stage.users, filePath);
+    validateAudienceEntries(stage.posts, stage.replyThreads, stage.users, filePath);
     validateNonNegativeIntegers(
       stage,
       ['postsTotal', 'postsCompleted', 'usersTotal', 'usersCompleted'],
@@ -384,16 +391,30 @@ function validateAnalysisRecords(records, filePath) {
   }
 }
 
-function validateAudienceEntries(posts, users, filePath) {
+function validateAudienceEntries(posts, replyThreads, users, filePath) {
   for (const post of Object.values(posts)) {
     if (!AUDIENCE_ENTRY_STATUSES.has(post.commentStatus)) {
       throw invalidState(filePath, 'stage_audience_post_status_invalid');
     }
     validateEntryNonNegativeIntegers(
       post,
-      ['attemptCount', 'commentsCollected', 'repliesCollected'],
+      [
+        'attemptCount', 'commentPage', 'commentsCollected', 'repliesCollected',
+        'repeatedRequests', 'duplicateCommentsSeen',
+      ],
       filePath,
       'stage_audience_post',
+    );
+  }
+  for (const thread of Object.values(replyThreads)) {
+    if (!AUDIENCE_ENTRY_STATUSES.has(thread.replyStatus)) {
+      throw invalidState(filePath, 'stage_audience_reply_thread_status_invalid');
+    }
+    validateEntryNonNegativeIntegers(
+      thread,
+      ['attemptCount', 'repliesCollected'],
+      filePath,
+      'stage_audience_reply_thread',
     );
   }
   for (const user of Object.values(users)) {
@@ -500,29 +521,68 @@ function normalizeAnalysisRecord(value) {
 }
 
 function normalizeAudiencePost(value) {
-  let commentStatus = value.commentStatus || value.status || 'pending';
-  if (commentStatus === 'completed' || commentStatus === 'succeeded') commentStatus = 'complete';
+  const commentStatus = normalizeAudienceStatus(value.commentStatus || value.comment_status || value.status);
   return {
     ...value,
     commentStatus,
-    attemptCount: value.attemptCount ?? 0,
-    commentsCollected: value.commentsCollected ?? value.collected_comment_count ?? 0,
-    repliesCollected: value.repliesCollected ?? value.reply_count ?? 0,
+    attemptCount: value.attemptCount ?? value.attempt_count ?? 0,
+    commentCursor: value.commentCursor ?? value.comment_cursor ?? '',
+    commentPage: value.commentPage ?? value.comment_page ?? 0,
+    replyCursor: value.replyCursor ?? value.reply_cursor ?? '',
+    hasMoreComments: value.hasMoreComments ?? value.has_more_comments ?? true,
+    commentsCollected: value.commentsCollected ?? value.comments_collected ?? value.collected_comment_count ?? 0,
+    repliesCollected: value.repliesCollected ?? value.replies_collected ?? value.reply_count ?? 0,
+    lastVisibleCommentId: String(value.lastVisibleCommentId || value.last_visible_comment_id || ''),
+    lastSuccessfulCursor: String(value.lastSuccessfulCursor || value.last_successful_cursor || ''),
+    resumeStrategy: String(value.resumeStrategy || value.resume_strategy || ''),
+    fallbackReason: String(value.fallbackReason || value.fallback_reason || ''),
+    repeatedRequests: value.repeatedRequests ?? value.repeated_requests ?? 0,
+    duplicateCommentsSeen: value.duplicateCommentsSeen ?? value.duplicate_comments_seen ?? 0,
+    resumedFromAnchor: String(value.resumedFromAnchor || value.resumed_from_anchor || ''),
+    performancePenalty: value.performancePenalty ?? value.performance_penalty ?? 0,
+    recoverable: value.recoverable ?? commentStatus !== 'complete_reachable',
+    stopReason: String(value.stopReason || value.stop_reason || value.failure_reason || ''),
   };
 }
 
 function normalizeAudienceUser(value) {
-  let profileStatus = value.profileStatus
+  const profileStatus = normalizeAudienceStatus(value.profileStatus
     || value.enrichmentStatus
     || value.enrichment_status
     || value.status
-    || 'pending';
-  if (profileStatus === 'completed' || profileStatus === 'succeeded') profileStatus = 'complete';
+    || 'not_started');
   return {
     ...value,
     profileStatus,
-    attemptCount: value.attemptCount ?? 0,
+    attemptCount: value.attemptCount ?? value.profile_attempt_count ?? 0,
+    userPostCursor: String(value.userPostCursor || value.user_post_cursor || ''),
+    failureCode: String(value.failureCode || value.failure_code || value.access_status || ''),
+    recoverable: value.recoverable ?? profileStatus !== 'complete_reachable',
   };
+}
+
+function normalizeAudienceReplyThread(value) {
+  return {
+    ...value,
+    commentId: String(value.commentId || value.comment_id || ''),
+    replyStatus: normalizeAudienceStatus(value.replyStatus || value.reply_status),
+    replyCursor: String(value.replyCursor || value.reply_cursor || ''),
+    hasMoreReplies: value.hasMoreReplies ?? value.has_more_replies ?? true,
+    repliesCollected: value.repliesCollected ?? value.replies_collected ?? 0,
+    attemptCount: value.attemptCount ?? value.attempt_count ?? 0,
+  };
+}
+
+function normalizeAudienceStatus(value) {
+  const status = String(value || 'not_started');
+  return {
+    pending: 'not_started',
+    partial: 'partial_limit',
+    complete: 'complete_reachable',
+    completed: 'complete_reachable',
+    succeeded: 'complete_reachable',
+    cancelled: 'partial_cancelled',
+  }[status] || status;
 }
 
 function bodyRecordIsCompleted(record) {
@@ -534,11 +594,12 @@ function analysisRecordIsCompleted(record) {
 }
 
 function postIsCompleted(post) {
-  return isPlainObject(post) && (post.commentStatus || post.status) === 'complete';
+  return isPlainObject(post) && normalizeAudienceStatus(post.commentStatus || post.status) === 'complete_reachable';
 }
 
 function userIsCompleted(user) {
-  return isPlainObject(user) && (user.profileStatus || user.enrichmentStatus || user.status) === 'complete';
+  return isPlainObject(user)
+    && normalizeAudienceStatus(user.profileStatus || user.enrichmentStatus || user.status) === 'complete_reachable';
 }
 
 function invalidState(filePath, reason) {
