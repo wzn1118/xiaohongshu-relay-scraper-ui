@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
+import { expect, test, type Page, type Request, type Route } from '@playwright/test'
 import { draftContentHash } from '../../src/draft-state.mjs'
 
 const candidateProfile = {
@@ -145,31 +145,163 @@ function results(jobId: string) {
   }
 }
 
+type AttachmentUploadRequest = {
+  contentType: string
+  filename: string
+  fileText: string
+  noteId: string
+  source: string
+  selected: string
+  draftId: string
+  draftVersion: string
+}
+
+type ProfileAttachmentRequest = {
+  noteId: string
+  profileId: string
+  sourceFile: string
+  selected: boolean
+  draftId: string
+  draftVersion: number
+}
+
+type ArtifactAttachmentRequest = {
+  noteId: string
+  artifactId: string
+  displayName: string
+  selected: boolean
+  draftId: string
+  draftVersion: number
+  contentHash: string
+}
+
+type CoverLetterAttachmentRequest = {
+  noteId: string
+  selected: boolean
+  draftId: string
+  draftVersion: number
+  contentHash: string
+}
+
+type PreviewRequest = {
+  noteId: string
+  to: string
+  attachmentIds: string[]
+  draftId: string
+  version: number
+}
+
+type SendRequest = PreviewRequest & {
+  outreach: typeof baseDraft
+  previewRevision: string
+  attachmentBundleHash: string
+  idempotencyKey: string
+}
+
+type QualityRequest = {
+  noteId: string
+  draftId: string
+  version: number
+  attachmentIds: string[]
+  aiSessionId?: string
+  applicationContext: {
+    channel: 'email' | 'direct_message'
+    contactStage: 'first_contact' | 'follow_up'
+    tone: 'formal' | 'natural' | 'concise'
+    resumeAttached: boolean
+    coverLetterAttached: boolean
+    recipientType: string
+  }
+}
+
+type DraftRequest = {
+  noteId: string
+  outreach: typeof baseDraft
+  draftId: string
+  baseVersion: number
+  applicationContext: QualityRequest['applicationContext']
+}
+
 type ApiState = {
   draftRequests: number
+  draftPayloads: DraftRequest[]
   saveDelayMs: number
   saveFails: boolean
   qualityFails: boolean
+  qualityPayloads: QualityRequest[]
   createdJobs: number
   resumeRequests: number
+  emailConfigured: boolean
+  previewRequests: number
+  sendRequests: number
+  attachmentUploads: number
+  attachmentUploadDelayMs: number
+  attachmentUploadRequests: AttachmentUploadRequest[]
+  profileAttachmentRequests: ProfileAttachmentRequest[]
+  artifactAttachmentRequests: ArtifactAttachmentRequest[]
+  coverLetterAttachmentRequests: CoverLetterAttachmentRequest[]
+  jobArtifacts: Array<{ id: string; name: string; size: number; type: string }>
+  previewPayloads: PreviewRequest[]
+  sendPayloads: SendRequest[]
+  attachmentSelectionUpdates: Array<{ attachmentId: string; selected: boolean }>
+  attachmentDeletes: string[]
+  resultDelivery: Record<string, unknown> | null
 }
 
 async function fulfillJson(route: Route, body: unknown, status = 200) {
   await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
 }
 
+function multipartField(body: string, name: string) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`name="${escaped}"\\r?\\n\\r?\\n([^\\r\\n]*)`).exec(body)?.[1] || ''
+}
+
+function readMultipartUpload(request: Request): AttachmentUploadRequest {
+  const contentType = request.headers()['content-type'] || ''
+  const body = request.postDataBuffer()?.toString('utf8') || ''
+  return {
+    contentType,
+    filename: /name="file"; filename="([^"]+)"/.exec(body)?.[1] || '',
+    fileText: /name="file"; filename="[^"]+"\r?\nContent-Type:[^\r\n]+\r?\n\r?\n([\s\S]*?)\r?\n--/.exec(body)?.[1] || '',
+    noteId: multipartField(body, 'noteId'),
+    source: multipartField(body, 'source'),
+    selected: multipartField(body, 'selected'),
+    draftId: multipartField(body, 'draftId'),
+    draftVersion: multipartField(body, 'draftVersion'),
+  }
+}
+
 async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
   const state: ApiState = {
     draftRequests: 0,
+    draftPayloads: [],
     saveDelayMs: 0,
     saveFails: false,
     qualityFails: false,
+    qualityPayloads: [],
     createdJobs: 0,
     resumeRequests: 0,
+    emailConfigured: false,
+    previewRequests: 0,
+    sendRequests: 0,
+    attachmentUploads: 0,
+    attachmentUploadDelayMs: 0,
+    attachmentUploadRequests: [],
+    profileAttachmentRequests: [],
+    artifactAttachmentRequests: [],
+    coverLetterAttachmentRequests: [],
+    jobArtifacts: [],
+    previewPayloads: [],
+    sendPayloads: [],
+    attachmentSelectionUpdates: [],
+    attachmentDeletes: [],
+    resultDelivery: null,
     ...overrides,
   }
   const jobs = [job('job-a', '任务甲'), job('job-b', '任务乙', 'failed')]
   const savedDrafts = new Map<string, { contentHash: string; version: number }>()
+  const attachments = new Map<string, Array<Record<string, unknown>>>()
 
   await page.addInitScript((profile) => {
     localStorage.setItem('xhs-candidate-application-profile', JSON.stringify(profile))
@@ -181,7 +313,7 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     const path = url.pathname
     const method = request.method()
 
-    if (path === '/api/health') return fulfillJson(route, { ok: true, runnerAvailable: true, emailDelivery: { configured: false, from: '', authMode: 'none' } })
+    if (path === '/api/health') return fulfillJson(route, { ok: true, runnerAvailable: true, emailDelivery: { configured: state.emailConfigured, from: state.emailConfigured ? 'sender@example.test' : '', authMode: state.emailConfigured ? 'login' : 'none' } })
     if (path === '/api/jobs' && method === 'GET') return fulfillJson(route, jobs)
     if (path === '/api/jobs' && method === 'POST') {
       state.createdJobs += 1
@@ -189,7 +321,7 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     }
     if (path === '/api/relay/config') return fulfillJson(route, { port: 18800, profile: 'openclaw', autoConnect: true })
     if (path === '/api/relay/status') return fulfillJson(route, { running: true, cdpReady: true, ready: true, authenticated: true, tabs: 1, xiaohongshuTabs: 1, port: 18800, profile: 'openclaw' })
-    if (path === '/api/email/config') return fulfillJson(route, { provider: 'custom', host: '', port: 465, secure: true, requireTls: false, auth: 'login', authMode: 'login', user: '', from: '', hasPassword: false, oauth: { tenant: '', clientId: '', scope: '', hasClientSecret: false, hasRefreshToken: false }, configured: false, verified: false, maskedFrom: '' })
+    if (path === '/api/email/config') return fulfillJson(route, { provider: 'custom', host: state.emailConfigured ? 'smtp.example.test' : '', port: 465, secure: true, requireTls: false, auth: 'login', authMode: 'login', user: state.emailConfigured ? 'sender@example.test' : '', from: state.emailConfigured ? 'sender@example.test' : '', hasPassword: state.emailConfigured, oauth: { tenant: '', clientId: '', scope: '', hasClientSecret: false, hasRefreshToken: false }, configured: state.emailConfigured, verified: state.emailConfigured, maskedFrom: state.emailConfigured ? 's***@example.test' : '' })
     if (path === '/api/ai/providers') return fulfillJson(route, [{ id: 'codex', label: 'Codex', baseUrl: 'http://127.0.0.1', model: 'test-model', models: ['test-model'], requiresKey: false, wireApi: 'responses', configured: true, hasApiKey: true }])
     if (path === '/api/ai/local-models') return fulfillJson(route, { runtime: { ready: false, endpoint: '', message: 'not used' }, catalog: [], installedModels: [], install: null, fetchedAt: '2026-08-01T08:00:00.000Z' })
     if (path === '/api/ai/sessions' && method === 'POST') return fulfillJson(route, { id: 'session-1', provider: 'codex', model: 'test-model', baseUrl: 'http://127.0.0.1', wireApi: 'responses', configured: true, expiresAt: '2026-08-02T08:00:00.000Z' })
@@ -199,8 +331,170 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     ])
 
     const resultMatch = path.match(/^\/api\/jobs\/([^/]+)\/results$/)
-    if (resultMatch) return fulfillJson(route, results(resultMatch[1]))
-    if (/^\/api\/jobs\/[^/]+\/artifacts$/.test(path)) return fulfillJson(route, [])
+    if (resultMatch) {
+      const payload = results(resultMatch[1])
+      return fulfillJson(route, state.resultDelivery
+        ? { ...payload, items: payload.items.map((item, index) => index === 0 ? { ...item, delivery: state.resultDelivery } : item) }
+        : payload)
+    }
+    const attachmentCollectionMatch = path.match(/^\/api\/jobs\/([^/]+)\/application-attachments$/)
+    if (attachmentCollectionMatch && method === 'GET') {
+      const noteId = url.searchParams.get('noteId') || ''
+      const items = attachments.get(noteId) || []
+      const selected = items.filter((item) => item.selected)
+      return fulfillJson(route, {
+        schemaVersion: 1,
+        revision: items.length,
+        noteId,
+        attachments: items,
+        selectedSummary: { count: selected.length, totalBytes: selected.reduce((sum, item) => sum + Number(item.size || 0), 0) },
+        limits: { maxFiles: 5, maxFileBytes: 10 * 1024 * 1024, maxTotalBytes: 20 * 1024 * 1024 },
+      })
+    }
+    if (attachmentCollectionMatch && method === 'POST') {
+      const captured = readMultipartUpload(request)
+      state.attachmentUploadRequests.push(captured)
+      if (!captured.contentType.startsWith('multipart/form-data; boundary=')
+        || !captured.filename
+        || !captured.noteId
+        || !captured.source) {
+        return fulfillJson(route, { error: 'invalid multipart fixture request' }, 400)
+      }
+      if (state.attachmentUploadDelayMs) {
+        await new Promise((resolve) => setTimeout(resolve, state.attachmentUploadDelayMs))
+      }
+      const noteId = captured.noteId
+      const now = '2026-08-01T08:02:00.000Z'
+      state.attachmentUploads += 1
+      const sequence = state.attachmentUploads
+      const displayName = captured.filename
+      const attachment = {
+        attachmentId: `attachment-pdf-${sequence}`, jobId: attachmentCollectionMatch[1], noteId,
+        originalName: displayName, displayName, extension: '.pdf', mediaType: 'application/pdf',
+        size: 31 + sequence, sha256: String(sequence).repeat(64), source: captured.source, createdAt: now, updatedAt: now,
+        status: 'ready', validationStatus: 'passed', validationError: '', selected: true,
+        generatedFrom: '', draftId: captured.draftId, draftVersion: Number(captured.draftVersion),
+      }
+      const items = [...(attachments.get(noteId) || []), attachment]
+      attachments.set(noteId, items)
+      return fulfillJson(route, { attachment, duplicate: false, revision: items.length }, 201)
+    }
+    const profileAttachmentMatch = path.match(/^\/api\/jobs\/([^/]+)\/application-attachments\/from-profile$/)
+    if (profileAttachmentMatch && method === 'POST') {
+      const payload = request.postDataJSON() as ProfileAttachmentRequest
+      state.profileAttachmentRequests.push(payload)
+      if (!payload.noteId || !payload.profileId || !payload.sourceFile || payload.selected !== true) {
+        return fulfillJson(route, { error: 'invalid profile attachment fixture request' }, 400)
+      }
+      const now = '2026-08-01T08:02:00.000Z'
+      const sequence = state.profileAttachmentRequests.length
+      const displayName = payload.sourceFile.split(/[\\/]/).pop() || payload.sourceFile
+      const attachment = {
+        attachmentId: `attachment-profile-${sequence}`, jobId: profileAttachmentMatch[1], noteId: payload.noteId,
+        originalName: displayName, displayName, extension: '.pdf', mediaType: 'application/pdf',
+        size: 4_096, sha256: 'a'.repeat(64), source: 'candidate_profile', createdAt: now, updatedAt: now,
+        status: 'ready', validationStatus: 'passed', validationError: '', selected: true,
+        generatedFrom: payload.sourceFile, draftId: payload.draftId, draftVersion: payload.draftVersion,
+      }
+      const items = [...(attachments.get(payload.noteId) || []), attachment]
+      attachments.set(payload.noteId, items)
+      return fulfillJson(route, { attachment, duplicate: false, revision: items.length }, 201)
+    }
+    const artifactAttachmentMatch = path.match(/^\/api\/jobs\/([^/]+)\/application-attachments\/from-artifact$/)
+    if (artifactAttachmentMatch && method === 'POST') {
+      const payload = request.postDataJSON() as ArtifactAttachmentRequest
+      state.artifactAttachmentRequests.push(payload)
+      const artifact = state.jobArtifacts.find((item) => item.id === payload.artifactId)
+      if (!artifact || !payload.noteId || payload.selected !== true) {
+        return fulfillJson(route, { error: 'invalid artifact attachment fixture request' }, 400)
+      }
+      const now = '2026-08-01T08:02:00.000Z'
+      const attachment = {
+        attachmentId: `attachment-artifact-${state.artifactAttachmentRequests.length}`, jobId: artifactAttachmentMatch[1], noteId: payload.noteId,
+        originalName: artifact.name, displayName: payload.displayName || artifact.name, extension: '.pdf', mediaType: 'application/pdf',
+        size: artifact.size, sha256: 'c'.repeat(64), source: 'job_artifact', createdAt: now, updatedAt: now,
+        status: 'ready', validationStatus: 'passed', validationError: '', selected: true,
+        generatedFrom: `artifact:${payload.artifactId}`, draftId: payload.draftId, draftVersion: payload.draftVersion,
+      }
+      const items = [...(attachments.get(payload.noteId) || []), attachment]
+      attachments.set(payload.noteId, items)
+      return fulfillJson(route, { attachment, duplicate: false, revision: items.length }, 201)
+    }
+    const coverLetterAttachmentMatch = path.match(/^\/api\/jobs\/([^/]+)\/application-attachments\/from-cover-letter$/)
+    if (coverLetterAttachmentMatch && method === 'POST') {
+      const payload = request.postDataJSON() as CoverLetterAttachmentRequest
+      state.coverLetterAttachmentRequests.push(payload)
+      const saved = savedDrafts.get(payload.noteId)
+      if (!payload.noteId || !payload.draftId || payload.selected !== true || !saved || saved.version !== payload.draftVersion || saved.contentHash !== payload.contentHash) {
+        return fulfillJson(route, { error: 'stale cover letter fixture request' }, 409)
+      }
+      const now = '2026-08-01T08:02:00.000Z'
+      const displayName = '岗位 A1-Cover-Letter.txt'
+      const attachment = {
+        attachmentId: `attachment-cover-letter-${state.coverLetterAttachmentRequests.length}`, jobId: coverLetterAttachmentMatch[1], noteId: payload.noteId,
+        originalName: displayName, displayName, extension: '.txt', mediaType: 'text/plain',
+        size: saved.contentHash.length, sha256: 'd'.repeat(64), source: 'generated_cover_letter', createdAt: now, updatedAt: now,
+        status: 'ready', validationStatus: 'passed', validationError: '', selected: true,
+        generatedFrom: `draft:${payload.draftId}:v${payload.draftVersion}`, draftId: payload.draftId, draftVersion: payload.draftVersion,
+      }
+      const items = [...(attachments.get(payload.noteId) || []), attachment]
+      attachments.set(payload.noteId, items)
+      return fulfillJson(route, { attachment, duplicate: false, revision: items.length }, 201)
+    }
+    const attachmentItemMatch = path.match(/^\/api\/jobs\/([^/]+)\/application-attachments\/([^/]+)$/)
+    if (attachmentItemMatch && method === 'PATCH') {
+      const noteId = `${attachmentItemMatch[1]}-note-1`
+      const payload = request.postDataJSON() as { selected?: boolean }
+      const item = (attachments.get(noteId) || []).find((candidate) => candidate.attachmentId === attachmentItemMatch[2])
+      if (item && typeof payload.selected === 'boolean') {
+        item.selected = payload.selected
+        state.attachmentSelectionUpdates.push({ attachmentId: attachmentItemMatch[2], selected: payload.selected })
+      }
+      return fulfillJson(route, { attachment: item, revision: 2 })
+    }
+    if (attachmentItemMatch && method === 'DELETE') {
+      const noteId = `${attachmentItemMatch[1]}-note-1`
+      state.attachmentDeletes.push(attachmentItemMatch[2])
+      attachments.set(noteId, (attachments.get(noteId) || []).filter((candidate) => candidate.attachmentId !== attachmentItemMatch[2]))
+      return fulfillJson(route, { attachmentId: attachmentItemMatch[2], deleted: true, revision: 2 })
+    }
+    if (/^\/api\/jobs\/[^/]+\/application-attachments\/[^/]+\/content$/.test(path)) {
+      return route.fulfill({ status: 200, contentType: 'application/pdf', body: Buffer.from('%PDF-1.7\nfixture\n') })
+    }
+    if (/^\/api\/jobs\/[^/]+\/send-email\/preview$/.test(path) && method === 'POST') {
+      state.previewRequests += 1
+      const payload = request.postDataJSON() as PreviewRequest
+      state.previewPayloads.push(payload)
+      const selected = (attachments.get(payload.noteId) || []).filter((item) => payload.attachmentIds.includes(String(item.attachmentId)))
+      return fulfillJson(route, {
+        recipient: payload.to, from: 'sender@example.test', replyTo: 'candidate@example.test',
+        subject: baseDraft.email_subject, text: baseDraft.email_body, htmlPreview: `<p>${baseDraft.email_body}</p>`,
+        draftId: payload.draftId, draftVersion: payload.version,
+        quality: {
+          ...application(payload.noteId, '岗位 A1').draftVersion,
+          checkedAt: '2026-08-01T08:01:30.000Z',
+          evaluation: { score: 95, passed: true, attempts: 1, threshold: 90, strengths: [], problems: [], rubric: {} },
+        },
+        attachmentSummary: { count: selected.length, totalBytes: selected.reduce((sum, item) => sum + Number(item.size || 0), 0), attachments: selected.map((item) => ({ attachmentId: item.attachmentId, filename: item.displayName, mediaType: item.mediaType, size: item.size, sha256: item.sha256 })) },
+        attachmentBundleHash: 'b'.repeat(64), previewRevision: 'preview-revision-1', warnings: [], readiness: 'ready', estimatedMessageSize: 2048,
+      })
+    }
+    if (/^\/api\/jobs\/[^/]+\/send-email$/.test(path) && method === 'POST') {
+      state.sendRequests += 1
+      const payload = request.postDataJSON() as SendRequest
+      state.sendPayloads.push(payload)
+      if (payload.previewRevision !== 'preview-revision-1'
+        || payload.idempotencyKey !== payload.previewRevision
+        || payload.attachmentBundleHash !== 'b'.repeat(64)) {
+        return fulfillJson(route, { error: 'preview contract missing' }, 409)
+      }
+      return fulfillJson(route, {
+        noteId: payload.noteId, outreach: payload.outreach,
+        draftVersion: application(payload.noteId, '岗位 A1').draftVersion,
+        delivery: { action: 'email_sent', email: { sentAt: '2026-08-01T08:03:00.000Z' }, sendAudit: [] },
+      })
+    }
+    if (/^\/api\/jobs\/[^/]+\/artifacts$/.test(path)) return fulfillJson(route, state.jobArtifacts)
     if (/^\/api\/jobs\/[^/]+\/resume$/.test(path) && method === 'POST') {
       state.resumeRequests += 1
       return fulfillJson(route, { ...jobs[1], status: 'resuming' })
@@ -210,7 +504,8 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     }
     if (/^\/api\/jobs\/[^/]+\/draft\/quality$/.test(path) && method === 'POST') {
       if (state.qualityFails) return fulfillJson(route, { error: 'mock quality check failed' }, 500)
-      const payload = request.postDataJSON() as { noteId: string; draftId: string; version: number }
+      const payload = request.postDataJSON() as QualityRequest
+      state.qualityPayloads.push(payload)
       const current = application(payload.noteId, '质量检查结果')
       const saved = savedDrafts.get(payload.noteId)
       const contentHash = saved?.contentHash || current.draftVersion.contentHash
@@ -229,9 +524,12 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
       state.draftRequests += 1
       if (state.saveDelayMs) await new Promise((resolve) => setTimeout(resolve, state.saveDelayMs))
       if (state.saveFails) return fulfillJson(route, { error: 'mock save failed' }, 500)
-      const payload = request.postDataJSON() as { noteId: string; outreach: typeof baseDraft; draftId: string; baseVersion: number }
-      const nextVersion = payload.baseVersion + 1
+      const payload = request.postDataJSON() as DraftRequest
+      state.draftPayloads.push(payload)
       const contentHash = draftContentHash(payload.outreach)
+      const nextVersion = JSON.stringify(payload.outreach) === JSON.stringify(baseDraft)
+        ? payload.baseVersion
+        : payload.baseVersion + 1
       savedDrafts.set(payload.noteId, { contentHash, version: nextVersion })
       return fulfillJson(route, {
         noteId: payload.noteId,
@@ -253,7 +551,7 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     return fulfillJson(route, {})
   })
 
-  await page.goto('/')
+  await page.goto('/', { waitUntil: 'domcontentloaded' })
   await expect(page.getByRole('button', { name: '查看岗位：岗位 A1' })).toBeVisible()
   await expect(page.getByLabel('私信文案')).toHaveValue(baseDraft.greeting)
   return state
@@ -377,7 +675,7 @@ test('保存成功但质量复核未完成时明确标记质量失效', async ({
   const state = await mockApi(page, { qualityFails: true })
   await dirtyGreeting(page, ' 等待质量复核')
   await page.getByRole('button', { name: '保存修改' }).click()
-  await expect(page.getByRole('button', { name: '质量已失效' })).toBeVisible()
+  await expect(page.getByRole('button', { name: '重新质量检查' })).toBeVisible()
   await expect(page.getByText('投递文案已保存，但质量复检未完成')).toBeVisible()
   expect(state.draftRequests).toBe(1)
 })
@@ -413,6 +711,268 @@ test('无修改时岗位和任务切换不弹窗', async ({ page }) => {
   await page.getByRole('row', { name: /任务乙/ }).click()
   await expect(page.getByRole('button', { name: '查看岗位：岗位 B1' })).toBeVisible()
   await expect(page.getByRole('alertdialog')).toHaveCount(0)
+})
+
+test('从当前候选人档案选择简历并管理发送选择', async ({ page }) => {
+  const state = await mockApi(page)
+  const workspace = page.getByRole('region', { name: '投递附件' })
+  const profileSource = page.getByLabel('选择候选人资料附件')
+
+  await expect(profileSource).toHaveValue('resume.pdf')
+  await page.getByRole('button', { name: '加入简历' }).click()
+
+  const row = workspace.locator('.attachment-list li').filter({ hasText: 'resume.pdf' })
+  await expect(row).toBeVisible()
+  await expect(row).toContainText('候选人资料')
+  await expect(page.getByText('1 / 5 个')).toBeVisible()
+  await expect(page.getByRole('link', { name: '预览 resume.pdf' })).toHaveAttribute('href', /application-attachments\/attachment-profile-1\/content$/)
+  await expect(page.getByRole('link', { name: '下载 resume.pdf' })).toHaveAttribute('download', 'resume.pdf')
+  expect(state.profileAttachmentRequests).toEqual([{
+    noteId: 'job-a-note-1',
+    profileId: 'profile-a',
+    sourceFile: 'resume.pdf',
+    selected: true,
+    draftId: 'draft-job-a-note-1',
+    draftVersion: 1,
+  }])
+
+  const selected = row.locator('input[type="checkbox"]')
+  await expect(selected).toBeChecked()
+  await selected.click()
+  await expect(selected).not.toBeChecked()
+  await expect(page.getByText('0 / 5 个')).toBeVisible()
+  await selected.click()
+  await expect(selected).toBeChecked()
+  await expect(page.getByText('1 / 5 个')).toBeVisible()
+  expect(state.attachmentSelectionUpdates).toEqual([
+    { attachmentId: 'attachment-profile-1', selected: false },
+    { attachmentId: 'attachment-profile-1', selected: true },
+  ])
+
+  await page.getByRole('button', { name: '删除 resume.pdf' }).click()
+  await expect(page.getByText('尚未添加附件；附件集合变化后需要重新执行质量检查。')).toBeVisible()
+  expect(state.attachmentDeletes).toEqual(['attachment-profile-1'])
+})
+
+test('任务产物通过专用引用加入附件并保留来源与草稿版本', async ({ page }) => {
+  const state = await mockApi(page, {
+    jobArtifacts: [{ id: 'artifact-report-1', name: '岗位分析报告.pdf', size: 12_345, type: 'application/pdf' }],
+  })
+
+  await page.getByLabel('选择任务产物').selectOption('artifact-report-1')
+  await page.getByRole('button', { name: '加入', exact: true }).click()
+  await expect(page.getByText('任务产物已加入附件：岗位分析报告.pdf')).toBeVisible()
+  const row = page.getByRole('region', { name: '投递附件' }).locator('.attachment-list li').filter({ hasText: '岗位分析报告.pdf' })
+  await expect(row).toContainText('任务产物')
+
+  expect(state.artifactAttachmentRequests).toEqual([{
+    noteId: 'job-a-note-1',
+    artifactId: 'artifact-report-1',
+    displayName: '岗位分析报告.pdf',
+    selected: true,
+    draftId: 'draft-job-a-note-1',
+    draftVersion: 1,
+    contentHash: draftContentHash(baseDraft),
+  }])
+  expect(state.attachmentUploadRequests).toHaveLength(0)
+  expect(state.attachmentUploads).toBe(0)
+  await expect(page.getByRole('button', { name: '导出 Cover Letter' })).toBeDisabled()
+})
+
+test('上传替换附件后必须核对完整预览和质量结果再发送，移动端无横向溢出', async ({ page }) => {
+  test.setTimeout(60_000)
+  await page.setViewportSize({ width: 390, height: 844 })
+  const state = await mockApi(page, { emailConfigured: true, attachmentUploadDelayMs: 700 })
+
+  await page.locator('.attachment-file-input').setInputFiles({
+    name: '中文简历.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.7\nfixture resume\n%%EOF\n', 'utf8'),
+  })
+
+  await expect(page.getByText('正在校验并保存')).toBeVisible()
+  await expect(page.getByLabel('邮件正文')).toHaveValue(baseDraft.email_body)
+  await expect(page.getByRole('heading', { name: '岗位 A1' })).toBeVisible()
+  await expect(page.getByText('中文简历.pdf')).toBeVisible()
+  await expect(page.getByText('1 / 5 个')).toBeVisible()
+  await expect(page.getByLabel('邮件正文')).toHaveValue(baseDraft.email_body)
+  await expect(page.getByRole('heading', { name: '岗位 A1' })).toBeVisible()
+  await expect(page.getByRole('link', { name: '预览 中文简历.pdf' })).toHaveAttribute('href', /application-attachments\/attachment-pdf-1\/content$/)
+  await expect(page.getByRole('link', { name: '下载 中文简历.pdf' })).toHaveAttribute('download', '中文简历.pdf')
+  expect(state.attachmentUploadRequests[0]).toEqual({
+    contentType: expect.stringMatching(/^multipart\/form-data; boundary=/),
+    filename: '中文简历.pdf',
+    fileText: '%PDF-1.7\nfixture resume\n%%EOF\n',
+    noteId: 'job-a-note-1',
+    source: 'uploaded',
+    selected: 'true',
+    draftId: 'draft-job-a-note-1',
+    draftVersion: '1',
+  })
+
+  await page.getByRole('button', { name: '替换 中文简历.pdf' }).click()
+  await page.locator('.attachment-file-input').setInputFiles({
+    name: '新版中文简历.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.7\nreplacement resume\n%%EOF\n', 'utf8'),
+  })
+  await expect(page.getByText('正在校验并保存')).toBeVisible()
+  await expect(page.getByLabel('邮件正文')).toHaveValue(baseDraft.email_body)
+  await expect(page.getByText('新版中文简历.pdf')).toBeVisible()
+  await expect(page.getByText('中文简历.pdf', { exact: true })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: '预览 新版中文简历.pdf' })).toHaveAttribute('href', /application-attachments\/attachment-pdf-2\/content$/)
+  await expect(page.getByLabel('邮件正文')).toHaveValue(baseDraft.email_body)
+  expect(state.attachmentUploadRequests[1]).toMatchObject({
+    filename: '新版中文简历.pdf',
+    noteId: 'job-a-note-1',
+    source: 'uploaded',
+    selected: 'true',
+    draftId: 'draft-job-a-note-1',
+    draftVersion: '1',
+  })
+  expect(state.attachmentDeletes).toContain('attachment-pdf-1')
+
+  const qualityButton = page.getByRole('button', { name: /质量检查/ })
+  await expect(qualityButton).toBeVisible()
+  await expect(page.getByRole('button', { name: '预览并发送' })).toBeDisabled()
+  await qualityButton.click()
+  await expect(page.getByRole('button', { name: '已保存' })).toBeVisible()
+  expect(state.qualityPayloads).toEqual([{
+    noteId: 'job-a-note-1',
+    draftId: 'draft-job-a-note-1',
+    version: 1,
+    attachmentIds: ['attachment-pdf-2'],
+    aiSessionId: 'session-1',
+    applicationContext: {
+      channel: 'email',
+      contactStage: 'first_contact',
+      tone: 'natural',
+      resumeAttached: true,
+      coverLetterAttached: false,
+      recipientType: 'recruiter',
+    },
+  }])
+
+  await page.getByRole('button', { name: '预览并发送' }).click()
+  const preview = page.getByRole('dialog', { name: '邮件发送预览' })
+  await expect(preview).toBeVisible()
+  await expect(preview).toContainText('recruiter@example.test')
+  await expect(preview).toContainText('sender@example.test')
+  await expect(preview).toContainText(baseDraft.email_subject)
+  await expect(preview).toContainText(baseDraft.email_body)
+  await expect(preview).toContainText('新版中文简历.pdf')
+  await expect(preview).toContainText('最近一次质量检查')
+  await expect(preview).toContainText('已通过 · 95 / 100 · 草稿 v1')
+  expect(state.sendRequests).toBe(0)
+  expect(state.previewPayloads).toEqual([{
+    noteId: 'job-a-note-1',
+    to: 'recruiter@example.test',
+    attachmentIds: ['attachment-pdf-2'],
+    draftId: 'draft-job-a-note-1',
+    version: 1,
+  }])
+
+  const overflow = await page.evaluate(() => {
+    const dialog = document.querySelector<HTMLElement>('.email-preview-dialog')
+    const content = document.querySelector<HTMLElement>('.email-preview-content')
+    return {
+      document: document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+      dialog: Boolean(dialog && dialog.scrollWidth <= dialog.clientWidth + 1),
+      content: Boolean(content && content.scrollWidth <= content.clientWidth + 1),
+    }
+  })
+  expect(overflow).toEqual({ document: true, dialog: true, content: true })
+
+  await page.getByRole('button', { name: '确认发送' }).click()
+  await expect(preview).toHaveCount(0)
+  await expect(page.getByText('邮件已发送至 recruiter@example.test')).toBeVisible()
+  expect(state.sendPayloads).toEqual([{
+    noteId: 'job-a-note-1',
+    to: 'recruiter@example.test',
+    outreach: baseDraft,
+    attachmentIds: ['attachment-pdf-2'],
+    previewRevision: 'preview-revision-1',
+    attachmentBundleHash: 'b'.repeat(64),
+    idempotencyKey: 'preview-revision-1',
+    draftId: 'draft-job-a-note-1',
+    version: 1,
+  }])
+  await page.getByRole('button', { name: '删除 新版中文简历.pdf' }).click()
+  await expect(page.getByText('尚未添加附件；附件集合变化后需要重新执行质量检查。')).toBeVisible()
+  await expect(page.getByLabel('邮件正文')).toHaveValue(baseDraft.email_body)
+  expect(state.previewRequests).toBe(1)
+  expect(state.sendRequests).toBe(1)
+  expect(state.attachmentUploads).toBe(2)
+})
+
+test('投递语气和既有路线组成明确上下文并随保存复检请求提交', async ({ page }) => {
+  const state = await mockApi(page)
+  const context = page.getByLabel('投递上下文')
+  const tone = page.getByLabel('投递语气')
+
+  await expect(tone).toHaveValue('natural')
+  await expect(context).toContainText('邮件')
+  await expect(context).toContainText('首次联系 · 招聘方 · 未附简历 · 未附 Cover Letter')
+
+  await tone.selectOption('formal')
+  const qualityButton = page.locator('.draft-toolbar button')
+  await expect(qualityButton).toHaveText('重新质量检查')
+  await expect(qualityButton).toBeEnabled()
+  await qualityButton.click()
+  await expect(page.getByRole('button', { name: '已保存' })).toBeVisible()
+
+  const expectedContext = {
+    channel: 'email',
+    contactStage: 'first_contact',
+    tone: 'formal',
+    resumeAttached: false,
+    coverLetterAttached: false,
+    recipientType: 'recruiter',
+  }
+  expect(state.draftPayloads).toHaveLength(1)
+  expect(state.draftPayloads[0].applicationContext).toEqual(expectedContext)
+  expect(state.qualityPayloads).toHaveLength(1)
+  expect(state.qualityPayloads[0].applicationContext).toEqual(expectedContext)
+})
+
+test('Cover Letter 脏稿禁止导出，保存后按对应版本和内容生成附件', async ({ page }) => {
+  const state = await mockApi(page)
+  const changed = `${baseDraft.cover_letter} 这是保存后的定稿。`
+  const exportButton = page.getByRole('button', { name: '导出 Cover Letter' })
+
+  await page.getByLabel('Cover Letter').fill(changed)
+  await expect(exportButton).toBeDisabled()
+  await page.waitForTimeout(100)
+  expect(state.attachmentUploads).toBe(0)
+  expect(state.coverLetterAttachmentRequests).toHaveLength(0)
+
+  await page.getByRole('button', { name: '保存修改' }).click()
+  await expect(page.getByRole('button', { name: '已保存' })).toBeVisible()
+  await expect(exportButton).toBeEnabled()
+  await exportButton.click()
+  await expect(page.getByText('Cover Letter 已导出并加入附件')).toBeVisible()
+
+  expect(state.coverLetterAttachmentRequests).toEqual([{
+    noteId: 'job-a-note-1',
+    selected: true,
+    draftId: 'draft-job-a-note-1',
+    draftVersion: 2,
+    contentHash: draftContentHash({ ...baseDraft, cover_letter: changed }),
+  }])
+  expect(state.attachmentUploadRequests).toHaveLength(0)
+  expect(state.attachmentUploads).toBe(0)
+  await expect(exportButton).toBeDisabled()
+})
+
+test('服务端 unknown 投递状态按原值语义展示', async ({ page }) => {
+  await mockApi(page, {
+    resultDelivery: {
+      action: 'email_unknown',
+      updatedAt: '2026-08-01T08:03:00.000Z',
+      email: { status: 'unknown', to: 'recruiter@example.test' },
+    },
+  })
+  await expect(page.getByText('发送结果待确认', { exact: true })).toBeVisible()
 })
 
 for (const viewport of [

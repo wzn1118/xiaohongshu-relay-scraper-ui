@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -9,12 +10,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from ai_application_workflow import (  # noqa: E402
+    _application_copy_source_hash,
+    _apply_application_copy_source_state,
     _deterministic_ocr_role,
     _deterministic_problems,
     _evaluate,
     _finalize_local_draft,
+    _human_quality_dimensions,
     _merge_feedback,
     _normalize_external_url,
+    _write,
     enrich_general_payload,
     enrich_payload,
     record_needs_completion,
@@ -166,6 +171,24 @@ class GeneralContentProvider:
                 ],
             }
         raise AssertionError(f"Unexpected schema: {required}")
+
+
+class CapturingWriterProvider:
+    provider = "fixture"
+
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+
+    def generate_json(self, _system, user, _schema, image_urls=None):
+        self.payloads.append(json.loads(user))
+        return {
+            "greeting": "您好，我想了解这个岗位。",
+            "email_subject": "数据分析实习申请｜候选人｜SQL",
+            "email_body": "您好，我想申请数据分析实习。我曾在 SQL 项目中完成报表分析，希望进一步沟通岗位情况。",
+            "cover_letter": "您好，我想申请数据分析实习，并进一步介绍 SQL 项目经历。",
+            "used_evidence_ids": ["evidence-1"],
+            "capability_matches": [],
+        }
 
 
 class ImageApplicationProvider(FakeProvider):
@@ -419,7 +442,255 @@ class AiApplicationWorkflowTests(unittest.TestCase):
 
         self.assertTrue(draft["greeting"].startswith("您好，我是Candidate Name"))
         self.assertIn("每周可实习5天", draft["greeting"])
-        self.assertEqual(draft["email_subject"], "应聘数据分析实习｜Candidate Name｜每周可实习5天")
+        self.assertEqual(draft["email_subject"], "数据分析实习申请｜Candidate Name")
+
+    def test_human_quality_reports_all_dimensions_and_ai_cliches(self) -> None:
+        dimensions = _human_quality_dimensions(
+            {
+                "greeting": "您好，我深感荣幸，希望申请数据分析实习。",
+                "email_subject": "求职申请",
+                "email_body": "您好，我深感荣幸，并相信自己能完美契合岗位、赋能团队、形成闭环。",
+                "cover_letter": "我深感荣幸，并相信自己能完美契合岗位。",
+            },
+            {"role_name": "数据分析实习", "responsibilities": [], "requirements": []},
+            [],
+            {"name": "测试用户"},
+        )
+
+        self.assertEqual(set(dimensions), {
+            "factual_grounding", "specificity", "relevance", "naturalness", "brevity",
+            "tone", "repetition", "attachment_consistency", "call_to_action", "ai_cliche_score",
+        })
+        self.assertFalse(dimensions["ai_cliche_score"]["passed"])
+        self.assertTrue(dimensions["ai_cliche_score"]["problems"])
+        self.assertTrue(dimensions["ai_cliche_score"]["suggestedFix"])
+        for dimension in dimensions.values():
+            self.assertEqual(set(dimension), {"score", "passed", "problems", "evidence", "suggestedFix"})
+            self.assertIsInstance(dimension["score"], int)
+            self.assertIsInstance(dimension["passed"], bool)
+            self.assertIsInstance(dimension["problems"], list)
+            self.assertIsInstance(dimension["evidence"], list)
+            self.assertIsInstance(dimension["suggestedFix"], str)
+
+    def test_writer_contract_preserves_each_supported_application_tone(self) -> None:
+        provider = CapturingWriterProvider()
+        for tone in ("formal", "natural", "concise"):
+            _write(
+                provider,
+                {"role_name": "数据分析实习"},
+                [{"id": "evidence-1", "label": "SQL 项目", "detail": "完成报表分析"}],
+                None,
+                [],
+                {"name": "候选人"},
+                {
+                    "channel": "email",
+                    "contactStage": "follow_up",
+                    "tone": tone,
+                    "resumeAttached": True,
+                    "coverLetterAttached": tone == "formal",
+                    "recipientType": "hiring_manager",
+                },
+            )
+
+        contexts = [payload["application_context"] for payload in provider.payloads]
+        self.assertEqual([item["tone"] for item in contexts], ["formal", "natural", "concise"])
+        self.assertTrue(all(item["contactStage"] == "follow_up" for item in contexts))
+        self.assertTrue(all(item["resumeAttached"] for item in contexts))
+        self.assertEqual(contexts[0]["recipientType"], "hiring_manager")
+
+    def test_human_quality_detects_peer_similarity_and_repeated_contact(self) -> None:
+        email = (
+            "您好，我想申请数据分析实习。我在 SQL 项目中完成报表分析，并根据复盘结果整理后续动作。"
+            "这段经历让我能快速理解当前岗位的数据工作。我的邮箱是 candidate@example.test，"
+            "期待通过 candidate@example.test 与您进一步沟通面试安排。"
+        )
+        dimensions = _human_quality_dimensions(
+            {
+                "email_subject": "数据分析实习申请｜候选人｜SQL",
+                "email_body": email,
+                "cover_letter": "",
+                "used_evidence_ids": ["evidence-1"],
+            },
+            {"role_name": "数据分析实习"},
+            [{"id": "evidence-1", "label": "SQL 项目", "detail": "完成报表分析并整理后续动作"}],
+            attachment_context={
+                "peerDrafts": [{"noteId": "note-2", "emailBody": email.replace("当前岗位", "这个岗位")}],
+            },
+        )
+
+        problems = dimensions["repetition"]["problems"]
+        self.assertTrue(any("高度雷同" in problem for problem in problems))
+        self.assertTrue(any("联系方式重复" in problem for problem in problems))
+
+    def test_attachment_consistency_uses_selected_attachment_context(self) -> None:
+        draft = {
+            "email_subject": "数据分析实习申请",
+            "email_body": "简历随信附上，期待进一步沟通。",
+            "cover_letter": "",
+            "used_evidence_ids": [],
+        }
+        missing = _human_quality_dimensions(draft, {}, [], attachment_context={"attachments": []})
+        self.assertFalse(missing["attachment_consistency"]["passed"])
+        self.assertTrue(any("没有选择附件" in problem for problem in missing["attachment_consistency"]["problems"]))
+
+        selected = _human_quality_dimensions(draft, {}, [], attachment_context={
+            "attachmentIds": ["resume-1"],
+            "attachments": [{
+                "attachmentId": "resume-1",
+                "displayName": "张三简历.pdf",
+                "source": "candidate_profile",
+                "status": "ready",
+                "validationStatus": "valid",
+            }],
+        })
+        self.assertTrue(selected["attachment_consistency"]["passed"])
+        self.assertEqual(selected["attachment_consistency"]["evidence"], ["张三简历.pdf"])
+
+        unmentioned = _human_quality_dimensions(
+            {**draft, "email_body": "感谢阅读，期待进一步沟通。"},
+            {},
+            [],
+            attachment_context={"attachments": [{
+                "attachmentId": "resume-1",
+                "displayName": "张三简历.pdf",
+                "source": "generated_resume",
+                "status": "ready",
+                "validationStatus": "valid",
+            }]},
+        )
+        self.assertFalse(unmentioned["attachment_consistency"]["passed"])
+        self.assertTrue(any("没有说明附件" in problem for problem in unmentioned["attachment_consistency"]["problems"]))
+
+        explicitly_empty = _human_quality_dimensions(
+            draft,
+            {},
+            [],
+            attachment_context={
+                "attachmentIds": [],
+                "attachments": [{
+                    "attachmentId": "resume-1",
+                    "displayName": "张三简历.pdf",
+                    "source": "generated_resume",
+                    "status": "ready",
+                    "validationStatus": "valid",
+                }],
+            },
+        )
+        self.assertFalse(explicitly_empty["attachment_consistency"]["passed"])
+        self.assertTrue(any("没有选择附件" in problem for problem in explicitly_empty["attachment_consistency"]["problems"]))
+
+    def test_application_copy_source_hash_preserves_legacy_copy_and_marks_changes(self) -> None:
+        original_copy = {
+            "greeting": "您好，我是候选人。",
+            "email_subject": "数据分析实习申请｜候选人",
+            "email_body": "这是一封已经由用户确认的邮件正文。",
+            "cover_letter": "这是一封已经由用户确认的求职信。",
+        }
+        record = {
+            "note_id": "note-1",
+            "title": "数据分析实习",
+            "body": "负责业务数据分析。",
+            "outreach": dict(original_copy),
+        }
+        source_hash = _application_copy_source_hash(record, {"name": "候选人"})
+        self.assertEqual(
+            source_hash,
+            _application_copy_source_hash(
+                record,
+                {"name": "候选人", "school": "", "major": None},
+            ),
+        )
+        self.assertEqual(_apply_application_copy_source_state(record, source_hash), "legacy_inferred")
+        self.assertEqual(record["outreach"]["sourceHash"], source_hash)
+        self.assertTrue(record["outreach"]["legacySourceHashInferred"])
+        self.assertFalse(record["outreach"]["sourceReviewRequired"])
+        self.assertEqual(
+            {field: record["outreach"][field] for field in original_copy},
+            original_copy,
+        )
+        self.assertEqual(_apply_application_copy_source_state(record, source_hash), "current")
+
+        record["body"] = "负责业务数据分析，并维护指标体系。"
+        changed_hash = _application_copy_source_hash(record, {"name": "候选人"})
+        self.assertNotEqual(source_hash, changed_hash)
+        self.assertEqual(_apply_application_copy_source_state(record, changed_hash), "changed")
+        self.assertTrue(record["outreach"]["sourceReviewRequired"])
+        self.assertEqual(record["outreach"]["runtime_status"], "source_changed_needs_review")
+        self.assertEqual(
+            {field: record["outreach"][field] for field in original_copy},
+            original_copy,
+        )
+
+    def test_explicit_application_context_participates_in_source_hash(self) -> None:
+        record = {"note_id": "note-context", "title": "数据分析实习", "body": "负责数据分析。"}
+        legacy_hash = _application_copy_source_hash(record, {"name": "候选人"})
+        record["applicationContext"] = {"tone": "formal", "contactStage": "first_contact"}
+        formal_hash = _application_copy_source_hash(record, {"name": "候选人"})
+        record["applicationContext"] = {"tone": "concise", "contactStage": "first_contact"}
+        concise_hash = _application_copy_source_hash(record, {"name": "候选人"})
+
+        self.assertNotEqual(legacy_hash, formal_hash)
+        self.assertNotEqual(formal_hash, concise_hash)
+
+    def test_enrichment_does_not_regenerate_unchanged_or_changed_existing_copy(self) -> None:
+        copy_fields = {
+            "greeting": "您好，我是候选人。",
+            "email_subject": "数据分析实习申请｜候选人",
+            "email_body": "我曾完成数据分析项目，期待进一步沟通。",
+            "cover_letter": "主题：数据分析实习申请\n尊敬的招聘负责人：\n此致\n敬礼",
+        }
+        record = {
+            "note_id": "note-existing",
+            "title": "数据分析实习",
+            "body": "负责业务数据分析。",
+            "outreach": dict(copy_fields),
+        }
+        payload = {"quality_gate": {"passed": True, "checks": {}, "issues": []}, "records": [record]}
+        provider = FakeProvider()
+        first = enrich_payload(payload, {"candidate_application": {"name": "候选人"}}, provider=provider)
+        self.assertEqual(first.processed, 0)
+        self.assertEqual(first.skipped, 1)
+        self.assertEqual(provider.writer_calls, 0)
+        self.assertEqual({field: record["outreach"][field] for field in copy_fields}, copy_fields)
+
+        record["body"] = "负责业务数据分析，并维护指标体系。"
+        second = enrich_payload(payload, {"candidate_application": {"name": "候选人"}}, provider=provider)
+        self.assertEqual(second.processed, 0)
+        self.assertTrue(record["outreach"]["sourceReviewRequired"])
+        self.assertEqual({field: record["outreach"][field] for field in copy_fields}, copy_fields)
+
+    def test_idempotent_rerun_preserves_existing_quality_gate(self) -> None:
+        record = {
+            "note_id": "note-ready",
+            "title": "数据分析实习",
+            "body": "负责业务数据分析。",
+            "outreach": {
+                "greeting": "您好，我是候选人。",
+                "email_subject": "数据分析实习申请｜候选人",
+                "email_body": "我曾完成数据分析项目，期待进一步沟通。",
+                "cover_letter": "主题：数据分析实习申请\n尊敬的招聘负责人：\n此致\n敬礼",
+            },
+            "job_card": {"role_name": "数据分析实习"},
+            "cover_letter_evaluation": {"score": 94, "passed": True},
+            "claim_validation": {"hardFactsPassed": True},
+        }
+        source_hash = _application_copy_source_hash(
+            record,
+            {"name": "候选人"},
+        )
+        record["outreach"]["sourceHash"] = source_hash
+        payload = {"quality_gate": {"passed": True, "checks": {}, "issues": []}, "records": [record]}
+
+        report = enrich_payload(
+            payload,
+            {"candidate_application": {"name": "候选人"}},
+            provider=FakeProvider(),
+        )
+
+        self.assertEqual(report.processed, 0)
+        self.assertTrue(payload["quality_gate"]["cover_letter_quality_passed"])
+        self.assertTrue(payload["quality_gate"]["checks"]["all_generated_claims_evidence_valid"])
+        self.assertTrue(payload["quality_gate"]["passed"])
 
     def test_quality_gate_rejects_polluted_private_message_salutation(self) -> None:
         evidence = [{
@@ -621,6 +892,7 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertEqual(report.passed, 1)
         self.assertEqual(provider.writer_calls, 2)
         self.assertEqual(record["cover_letter_evaluation"]["score"], 94)
+        self.assertEqual(len(record["cover_letter_evaluation"]["human_quality"]), 10)
         self.assertEqual(record["cover_letter_evaluation"]["attempts"], 2)
         self.assertTrue(record["cover_letter_evaluation"]["modelPassed"])
         self.assertEqual(record["claim_validation"]["schemaVersion"], 1)

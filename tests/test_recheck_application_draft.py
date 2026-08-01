@@ -40,7 +40,11 @@ def fixture_payload() -> dict:
         "draft": {
             "greeting": "Hello, I am Candidate.",
             "email_subject": "Application for Data intern",
-            "email_body": "I used SQL in a project and would welcome an interview.",
+            "email_body": (
+                "Hello, I am applying for the Data intern role. In my SQL project, I built a report "
+                "from the available data and documented the analysis clearly for review. I would "
+                "welcome an interview to discuss how I could support the team's data work."
+            ),
             "cover_letter": "Subject: Data intern\nDear hiring manager,\nI used SQL in a project.",
         },
         "candidateProfile": {"name": "Candidate"},
@@ -84,9 +88,81 @@ class RecheckApplicationDraftTests(unittest.TestCase):
         self.assertTrue(report["passed"])
         self.assertTrue({
             "score", "rubric", "strengths", "problems", "rewrite_instructions",
-            "threshold", "passed", "attempt", "attempts",
+            "threshold", "passed", "attempt", "attempts", "human_quality",
+            "sourceHash", "sourceHashStatus", "sourceReviewRequired",
+            "legacySourceHashInferred",
         }.issubset(report))
+        self.assertEqual(set(report["human_quality"]), {
+            "factual_grounding", "specificity", "relevance", "naturalness", "brevity",
+            "tone", "repetition", "attachment_consistency", "call_to_action", "ai_cliche_score",
+        })
+        for dimension in report["human_quality"].values():
+            self.assertEqual(set(dimension), {
+                "score", "passed", "problems", "evidence", "suggestedFix",
+            })
+            self.assertIsInstance(dimension["score"], int)
+            self.assertIsInstance(dimension["passed"], bool)
+            self.assertIsInstance(dimension["problems"], list)
+            self.assertIsInstance(dimension["evidence"], list)
+            self.assertIsInstance(dimension["suggestedFix"], str)
+        self.assertEqual(len(report["sourceHash"]), 64)
+        self.assertEqual(report["sourceHashStatus"], "legacy_inferred")
+        self.assertFalse(report["sourceReviewRequired"])
+        self.assertTrue(report["legacySourceHashInferred"])
         self.assertEqual(report["claim_validation"]["schemaVersion"], 1)
+
+    def test_attachment_mismatch_fails_quality_gate_without_rewriting_draft(self) -> None:
+        payload = fixture_payload()
+        payload["draft"]["email_body"] = (
+            "My resume is attached. I used SQL in a project and would welcome an interview."
+        )
+        payload["attachmentContext"] = {"attachments": []}
+        original = copy.deepcopy(payload)
+        evaluation = {
+            "score": 94,
+            "rubric": recheck._rubric_for_score(94),
+            "strengths": ["Grounded"],
+            "problems": [],
+            "rewrite_instructions": [],
+        }
+
+        with patch.object(recheck, "_evaluate", return_value=evaluation), patch.object(
+            recheck, "_deterministic_problems", return_value=[]
+        ):
+            report = recheck.evaluate_payload(payload, FakeProvider)
+
+        self.assertEqual(payload, original)
+        self.assertEqual(report["score"], 89)
+        self.assertFalse(report["passed"])
+        attachment = report["human_quality"]["attachment_consistency"]
+        self.assertFalse(attachment["passed"])
+        self.assertTrue(any("没有选择附件" in problem for problem in attachment["problems"]))
+        self.assertTrue(any("没有选择附件" in problem for problem in report["problems"]))
+
+    def test_changed_source_marks_old_draft_for_review_without_rewriting_it(self) -> None:
+        payload = fixture_payload()
+        payload["record"]["outreach"]["sourceHash"] = "0" * 64
+        original_draft = copy.deepcopy(payload["draft"])
+        evaluation = {
+            "score": 96,
+            "rubric": recheck._rubric_for_score(96),
+            "strengths": ["Grounded"],
+            "problems": [],
+            "rewrite_instructions": [],
+        }
+
+        with patch.object(recheck, "_evaluate", return_value=evaluation), patch.object(
+            recheck, "_deterministic_problems", return_value=[]
+        ):
+            report = recheck.evaluate_payload(payload, FakeProvider)
+
+        self.assertEqual(payload["draft"], original_draft)
+        self.assertEqual(report["score"], 89)
+        self.assertEqual(report["sourceHashStatus"], "changed")
+        self.assertTrue(report["sourceReviewRequired"])
+        self.assertFalse(report["legacySourceHashInferred"])
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("证据已变化" in problem for problem in report["problems"]))
 
     def test_deterministic_problem_caps_score_and_rebuilds_rubric(self) -> None:
         evaluation = {

@@ -347,8 +347,8 @@ class EvidenceClaimValidatorTests(unittest.TestCase):
         ):
             result = recheck.evaluate_payload(payload, lambda: object())
 
-        self.assertEqual(result["score"], 99)
-        self.assertTrue(result["modelPassed"])
+        self.assertEqual(result["score"], 89)
+        self.assertFalse(result["modelPassed"])
         self.assertFalse(result["passed"])
         self.assertEqual(result["claim_validation"]["status"], "failed")
 
