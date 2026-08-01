@@ -652,3 +652,23 @@ def test_expansion_artifacts_are_hashed_in_the_existing_manifest(tmp_path):
     for relative in required:
         assert entries[relative]["sha256"] == workflow.sha256(output / relative)
         assert len(entries[relative]["sha256"]) == 64
+
+
+def test_independent_workspace_does_not_materialize_audience_compatibility_files(tmp_path):
+    output = tmp_path / "independent" / "artifacts"
+    summary = collect_expansion(
+        output,
+        config=config(1),
+        adapter=FakeExpansionAdapter(comments_by_post={"seed": [comment("c1", "A")]}, posts_by_user={"A": []}),
+        seed_posts=[seed("seed")],
+        keyword="fixture",
+        attempt_id="independent",
+        materialize_audience_compat=False,
+    )
+
+    assert summary["status"] == "complete"
+    assert (output / "graph.json").exists()
+    assert not (output / "audience-summary.json").exists()
+    assert not (output / "audience-posts.json").exists()
+    assert not (output / "audience-comments.json").exists()
+    assert not (output / "audience-users.json").exists()

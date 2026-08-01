@@ -163,6 +163,37 @@ export function validateRunRequest(value) {
   });
 }
 
+export function validateExpansionStartRequest(value) {
+  if (!isPlainObject(value)) throw new ValidationError('Request body must be a JSON object.');
+  const unknown = Object.keys(value).filter((key) => !['seedPostIds', 'config'].includes(key));
+  if (unknown.length) throw new ValidationError('Unsupported expansion parameters.', unknown.map((field) => ({ field, reason: 'not_allowed' })));
+  if (!Array.isArray(value.seedPostIds) || value.seedPostIds.length < 1 || value.seedPostIds.length > 200) {
+    throw fieldError('seedPostIds', 'array_length_1_to_200');
+  }
+  const seedPostIds = [...new Set(value.seedPostIds.map((item) => {
+    if (typeof item !== 'string' || !/^[\p{L}\p{N}_.:-]{1,200}$/u.test(item.trim())) throw fieldError('seedPostIds', 'invalid_post_id');
+    return item.trim();
+  }))];
+  if (value.config !== undefined && !isPlainObject(value.config)) throw fieldError('config', 'must_be_object');
+  const config = expansionField({ ...(value.config || {}), enabled: true });
+  if (config.rounds < 1) throw fieldError('config.rounds', 'must_be_between_1_and_10');
+  return Object.freeze({ seedPostIds, config });
+}
+
+export function validateExpansionResumeRequest(value) {
+  if (!isPlainObject(value)) throw new ValidationError('Request body must be a JSON object.');
+  const unknown = Object.keys(value).filter((key) => key !== 'retryIncomplete');
+  if (unknown.length) throw new ValidationError('Unsupported expansion resume parameters.', unknown.map((field) => ({ field, reason: 'not_allowed' })));
+  return Object.freeze({ retryIncomplete: booleanField(value.retryIncomplete, 'retryIncomplete', false) });
+}
+
+export function validateExpansionCancelRequest(value) {
+  if (!isPlainObject(value)) throw new ValidationError('Request body must be a JSON object.');
+  const unknown = Object.keys(value);
+  if (unknown.length) throw new ValidationError('Unsupported expansion cancel parameters.', unknown.map((field) => ({ field, reason: 'not_allowed' })));
+  return Object.freeze({});
+}
+
 function expansionField(value) {
   const defaults = {
     enabled: false,

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { artifactId, artifactPathFromId, assertPathInside } from './lib/artifacts.mjs';
-import { ValidationError, buildRunnerArgs, validateRunRequest } from './lib/contracts.mjs';
+import { ValidationError, buildRunnerArgs, validateExpansionCancelRequest, validateExpansionResumeRequest, validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
 
 test('validateRunRequest applies bounded production defaults', () => {
   const result = validateRunRequest({});
@@ -233,6 +233,25 @@ test('buildRunnerArgs emits expansion configuration only when enabled', () => {
   const index = args.indexOf('--expansion-config-json');
   assert.ok(index > -1);
   assert.deepEqual(JSON.parse(args[index + 1]), enabled.expansion);
+});
+
+test('expansion workspace requests are strict, bounded, and deduplicate seeds', () => {
+  const request = validateExpansionStartRequest({
+    seedPostIds: ['post-1', 'post-1', 'post:2'],
+    config: { rounds: 3, maxUsersPerRound: 25 },
+  });
+  assert.deepEqual(request.seedPostIds, ['post-1', 'post:2']);
+  assert.equal(request.config.enabled, true);
+  assert.equal(request.config.rounds, 3);
+  assert.equal(request.config.maxUsersPerRound, 25);
+  assert.throws(() => validateExpansionStartRequest({ seedPostIds: [] }), ValidationError);
+  assert.throws(() => validateExpansionStartRequest({ seedPostIds: ['../escape'] }), ValidationError);
+  assert.throws(() => validateExpansionStartRequest({ seedPostIds: ['post-1'], config: 'bad' }), ValidationError);
+  assert.throws(() => validateExpansionStartRequest({ seedPostIds: ['post-1'], unexpected: true }), ValidationError);
+  assert.deepEqual(validateExpansionResumeRequest({ retryIncomplete: true }), { retryIncomplete: true });
+  assert.throws(() => validateExpansionResumeRequest({ retryIncomplete: true, seedPostIds: ['post-1'] }), ValidationError);
+  assert.deepEqual(validateExpansionCancelRequest({}), {});
+  assert.throws(() => validateExpansionCancelRequest({ force: true }), ValidationError);
 });
 
 test('buildRunnerArgs emits the complete workflow-state execution context', () => {

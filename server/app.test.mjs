@@ -51,7 +51,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     usersDiscovered: 1, profilesComplete: 1,
   }), 'utf8');
   await writeFile(path.join(outputDir, 'audience-posts.json'), JSON.stringify([
-    { post_id: 'n1', title: '内容运营实习', status: 'partial' },
+    { post_id: 'n1', title: '内容运营实习', note_url: 'https://www.xiaohongshu.com/explore/n1', status: 'partial' },
   ]), 'utf8');
   await writeFile(path.join(outputDir, 'audience-comments.json'), JSON.stringify([
     { comment_id: 'c1', post_id: 'n1', text: '请问还在招吗', user: { user_id: 'u1' } },
@@ -73,6 +73,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   };
   const startCalls = [];
   const resumeCalls = [];
+  const expansionCalls = [];
   const manager = {
     active: null,
     list: () => [],
@@ -87,6 +88,18 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       return { ...job, status: 'resuming', attemptId: 'attempt-2' };
     },
     cancel: async () => ({ found: true, job: { ...job, status: 'cancelled' }, changed: true }),
+    startExpansion: async (id, request) => {
+      expansionCalls.push(['start', id, request]);
+      return { job: { ...job, workflowSummary: { expansion: { runtimeStatus: 'running', seedPostIds: request.seedPostIds, config: request.config } } }, attemptId: 'expansion-1' };
+    },
+    resumeExpansion: async (id, request) => {
+      expansionCalls.push(['resume', id, request]);
+      return { job: { ...job, workflowSummary: { expansion: { runtimeStatus: 'running', seedPostIds: ['n1'], config: { rounds: 1 } } } }, attemptId: 'expansion-2' };
+    },
+    cancelExpansion: async (id) => {
+      expansionCalls.push(['cancel', id]);
+      return { changed: true, job: { ...job, workflowSummary: { expansion: { runtimeStatus: 'cancelled', seedPostIds: ['n1'], config: { rounds: 1 } } } } };
+    },
   };
   const config = {
     host: '127.0.0.1',
@@ -428,6 +441,31 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(audience.items[0].post_title, '内容运营实习');
     assert.equal(audience.items[0].user.display_name, '公开用户');
 
+    const expansion = await fetch(`${origin}/api/jobs/${job.id}/expansion`).then((response) => response.json());
+    assert.equal(expansion.available, true);
+    assert.equal(expansion.seeds[0].postId, 'n1');
+
+    const expansionStart = await fetch(`${origin}/api/jobs/${job.id}/expansion/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seedPostIds: ['n1'], config: { rounds: 1 } }),
+    });
+    assert.equal(expansionStart.status, 202);
+    assert.equal((await expansionStart.json()).job.id, job.id);
+    assert.deepEqual(expansionCalls[0].slice(0, 2), ['start', job.id]);
+
+    const foreignSeed = await fetch(`${origin}/api/jobs/${job.id}/expansion/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seedPostIds: ['foreign-post'], config: { rounds: 1 } }),
+    });
+    assert.equal(foreignSeed.status, 400);
+    assert.equal(expansionCalls.length, 1);
+
+    assert.equal((await fetch(`${origin}/api/jobs/${job.id}/expansion/resume`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"retryIncomplete":true}' })).status, 202);
+    assert.equal((await fetch(`${origin}/api/jobs/${job.id}/expansion/cancel`, { method: 'POST' })).status, 202);
+    assert.deepEqual(expansionCalls.map((item) => item[0]), ['start', 'resume', 'cancel']);
+
     const audienceResume = await fetch(`${origin}/api/jobs/${job.id}/audience/resume`, { method: 'POST' });
     assert.equal(audienceResume.status, 200);
     const audienceResumePayload = await audienceResume.json();
@@ -670,6 +708,7 @@ test('audience supplements read through queued checkpoints and resume from the l
     assert.equal(resumeCalls[1][1].params.resumeFromJobId, rootId);
     assert.equal(resumeCalls[1][1].params.keyword, 'original-content-query');
     assert.deepEqual(resumeCalls[1][1].resumeCheckpointJobIds, [rootId, childId]);
+
   } finally {
     await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     await rm(fixture, { recursive: true, force: true });

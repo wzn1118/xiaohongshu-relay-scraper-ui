@@ -75,6 +75,27 @@ export class JobManager {
       changed = migrateLegacyJob(job, this.dataDir, now) || changed;
       const state = await initializeWorkflowState(job.statePath, workflowStateFromJob(job));
       changed = applyWorkflowStateToJob(job, state) || changed;
+      const expansionWasInFlight = ['running', 'cancelling'].includes(job.workflowSummary?.expansion?.runtimeStatus);
+      if (expansionWasInFlight) {
+        try {
+          await this.recoverImpl({ ...job, pid: job.expansionPid || job.pid });
+        } catch (error) {
+          job.cleanupError = String(error?.message || error);
+        }
+        job.workflowSummary = {
+          ...(job.workflowSummary || {}),
+          expansion: {
+            ...job.workflowSummary.expansion,
+            runtimeStatus: 'interrupted',
+            status: 'interrupted',
+            stopReason: 'server_restart',
+            resumable: true,
+            finishedAt: now,
+          },
+        };
+        job.expansionPid = null;
+        changed = true;
+      }
       const activeAttempt = currentActiveAttempt(job);
       const wasInFlight = ['queued', 'resuming', 'running'].includes(job.status)
         || Boolean(state.activeAttemptId)
@@ -150,7 +171,11 @@ export class JobManager {
         job.checkpointAnalysisError = String(error?.message || error);
         changed = true;
       }
-      job.workflowSummary = await readWorkflowSummary(job.outputDir);
+      const persistedExpansion = job.workflowSummary?.expansion;
+      const diskSummary = await readWorkflowSummary(job.outputDir);
+      job.workflowSummary = persistedExpansion
+        ? { ...(diskSummary || {}), expansion: { ...(diskSummary?.expansion || {}), ...persistedExpansion } }
+        : diskSummary;
       job.artifactCount = await countArtifactFiles(job.outputDir);
     }
     if (changed) await this.persist();
@@ -346,7 +371,7 @@ export class JobManager {
         throw error;
       }
       const exposed = publicJob(job);
-      if (job.status === 'succeeded' && resumeScopeIsComplete(state, exposed, scope)) {
+      if (!options.forceCompleted && job.status === 'succeeded' && resumeScopeIsComplete(state, exposed, scope)) {
         throw jobError('JOB_ALREADY_COMPLETED', 'The task is already complete.');
       }
       if (!RESUMABLE_JOB_STATUSES.has(job.status) && job.status !== 'succeeded') {
@@ -456,6 +481,114 @@ export class JobManager {
     this.#emit(id, 'state', publicJob(job));
     await this.persist();
     return { found: true, job: publicJob(job), changed: true };
+  }
+
+  async startExpansion(id, { seedPostIds, config }) {
+    return this.#withJobLock('__active_runtime__', () => this.#withJobLock(id, async () => {
+      const job = this.getInternal(id);
+      if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+      if (job.params?.analysisMode !== 'general') throw jobError('EXPANSION_SOURCE_INVALID', 'Relationship expansion requires a content research task.');
+      if (this.active) {
+        const error = jobError('JOB_BUSY', 'A collection process is already running.');
+        error.activeJob = publicJob(this.active);
+        throw error;
+      }
+      const previous = job.workflowSummary?.expansion;
+      if (previous?.attemptId || previous?.seedPostIds?.length) {
+        throw jobError('EXPANSION_ALREADY_INITIALIZED', 'Relationship expansion already has persisted state; resume it instead.');
+      }
+      return this.#beginExpansion(job, { seedPostIds, config, kind: 'initial' });
+    }));
+  }
+
+  async resumeExpansion(id, { retryIncomplete = false } = {}) {
+    return this.#withJobLock('__active_runtime__', () => this.#withJobLock(id, async () => {
+      const job = this.getInternal(id);
+      if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+      if (this.active) {
+        const error = jobError('JOB_BUSY', 'A collection process is already running.');
+        error.activeJob = publicJob(this.active);
+        throw error;
+      }
+      const previous = job.workflowSummary?.expansion;
+      if (!previous?.seedPostIds?.length || !previous?.config) {
+        throw jobError('EXPANSION_NOT_RESUMABLE', 'Relationship expansion has no saved checkpoint to resume.');
+      }
+      if (['running', 'cancelling'].includes(previous.runtimeStatus)) {
+        throw jobError('EXPANSION_ALREADY_RUNNING', 'Relationship expansion is already running.');
+      }
+      return this.#beginExpansion(job, {
+        seedPostIds: previous.seedPostIds,
+        config: previous.config,
+        kind: retryIncomplete ? 'retry_incomplete' : 'resume',
+      });
+    }));
+  }
+
+  async cancelExpansion(id) {
+    const job = this.getInternal(id);
+    if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+    const expansion = job.workflowSummary?.expansion;
+    if (!expansion || !['running', 'cancelling'].includes(expansion.runtimeStatus)) {
+      return { changed: false, job: publicJob(job) };
+    }
+    const cancelRequestedAt = new Date().toISOString();
+    job.workflowSummary = {
+      ...(job.workflowSummary || {}),
+      expansion: { ...expansion, runtimeStatus: 'cancelling', cancelRequestedAt },
+    };
+    job.updatedAt = cancelRequestedAt;
+    await this.persist();
+    this.#emit(id, 'state', publicJob(job));
+    await writeFile(expansion.cancelPath, 'cancel\n', 'utf8');
+    return { changed: true, job: publicJob(job) };
+  }
+
+  async #beginExpansion(job, { seedPostIds, config, kind }) {
+    const now = new Date().toISOString();
+    const attemptId = `expansion-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const jobDir = path.dirname(job.outputDir);
+    const requestPath = path.join(jobDir, 'expansion-request.json');
+    const cancelPath = path.join(jobDir, 'expansion-cancel.request');
+    await unlink(cancelPath).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+    const request = {
+      outputDir: job.outputDir,
+      attemptId,
+      seedPostIds,
+      config,
+      keyword: job.params?.keyword || '',
+      relayPort: job.params?.relayPort || 18800,
+      gotoTimeoutMs: job.params?.gotoTimeoutMs || 15000,
+      noteDelaySeconds: job.params?.noteDelaySeconds || 1.2,
+      stableRounds: job.params?.stableRounds || 5,
+      cancelPath,
+    };
+    await writeJsonAtomically(requestPath, request);
+    const previous = job.workflowSummary && typeof job.workflowSummary === 'object' ? job.workflowSummary : {};
+    job.workflowSummary = {
+      ...previous,
+      expansion: {
+        ...(previous.expansion && typeof previous.expansion === 'object' ? previous.expansion : {}),
+        enabled: true,
+        runtimeStatus: 'running',
+        status: 'running',
+        action: kind,
+        attemptId,
+        seedPostIds,
+        config,
+        startedAt: now,
+        updatedAt: now,
+        finishedAt: null,
+        stopReason: '',
+        cancelPath,
+      },
+    };
+    job.updatedAt = now;
+    this.active = job;
+    await this.persist();
+    this.#emit(job.id, 'state', publicJob(job));
+    queueMicrotask(() => this.#runExpansion(job, requestPath));
+    return { job: publicJob(job), attemptId };
   }
 
   async quiesceForDeletion(id, { timeoutMs = 15000, rejectActive = false } = {}) {
@@ -620,7 +753,37 @@ export class JobManager {
 
   async shutdown() {
     const job = this.active;
-    if (!job || TERMINAL.has(job.status)) return { interrupted: false };
+    if (!job) return { interrupted: false };
+    const expansion = job.workflowSummary?.expansion;
+    if (TERMINAL.has(job.status) && ['running', 'cancelling'].includes(expansion?.runtimeStatus)) {
+      const settled = new Promise((resolve) => {
+        const unsubscribe = this.subscribe(job.id, (event) => {
+          if (event.type !== 'state' || ['running', 'cancelling'].includes(event.data?.workflowSummary?.expansion?.runtimeStatus)) return;
+          unsubscribe();
+          resolve(true);
+        });
+      });
+      job.expansionInterruptRequested = true;
+      await writeFile(expansion.cancelPath, 'cancel\n', 'utf8').catch(() => {});
+      const child = this.processes.get(job.id);
+      if (child) await this.terminateImpl(child);
+      const completed = await Promise.race([settled, new Promise((resolve) => setTimeout(() => resolve(false), 10000))]);
+      if (!completed) {
+        const now = new Date().toISOString();
+        job.workflowSummary = {
+          ...(job.workflowSummary || {}),
+          expansion: { ...expansion, runtimeStatus: 'interrupted', status: 'interrupted', stopReason: 'server_shutdown', resumable: true, finishedAt: now, updatedAt: now },
+        };
+        job.updatedAt = now;
+        job.expansionPid = null;
+        this.processes.delete(job.id);
+        if (this.active?.id === job.id) this.active = null;
+        await this.persist();
+        this.#emit(job.id, 'state', publicJob(job));
+      }
+      return { interrupted: true };
+    }
+    if (TERMINAL.has(job.status)) return { interrupted: false };
     const ended = new Promise((resolve) => {
       const unsubscribe = this.subscribe(job.id, (event) => {
         if (event.type === 'end') {
@@ -769,6 +932,90 @@ export class JobManager {
     const state = await this.#commitWorkflowState(job, { expectedRevision: job.revision });
     applyWorkflowStateToJob(job, state);
     return state;
+  }
+
+  async #runExpansion(job, requestPath) {
+    const logPath = path.join(path.dirname(job.outputDir), 'expansion.log');
+    const log = createWriteStream(logPath, { flags: 'a', encoding: 'utf8' });
+    const buffers = new Map();
+    const append = (stream, chunk) => {
+      const message = String(chunk);
+      log.write(message);
+      this.#emit(job.id, 'log', { stream, message, at: new Date().toISOString() });
+      const buffered = `${buffers.get(stream) || ''}${message}`;
+      const lines = buffered.split(/\r?\n/);
+      buffers.set(stream, lines.pop() || '');
+      if (lines.some((line) => updateProgressFromLog(job, line))) {
+        job.updatedAt = new Date().toISOString();
+        this.#emit(job.id, 'state', publicJob(job));
+        void this.persist();
+      }
+    };
+    let result = { code: null, error: null };
+    try {
+      append('system', `Starting expansion attempt ${job.workflowSummary?.expansion?.attemptId} inside task ${job.id}\n`);
+      const scriptPath = path.join(path.dirname(this.runnerPath), 'run_expansion_workspace.py');
+      const child = this.spawnImpl(this.pythonBin, [scriptPath, '--request-file', requestPath], {
+        cwd: path.dirname(this.runnerPath),
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: '1',
+          PYTHONUTF8: '1',
+          PYTHONIOENCODING: 'utf-8',
+          XHS_RELAY_CONNECT_TIMEOUT_MS: process.env.XHS_RELAY_CONNECT_TIMEOUT_MS || '60000',
+        },
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      job.expansionPid = child.pid || null;
+      this.processes.set(job.id, child);
+      child.stdout?.on('data', (chunk) => append('stdout', chunk));
+      child.stderr?.on('data', (chunk) => append('stderr', chunk));
+      this.#emit(job.id, 'state', publicJob(job));
+      result = await waitForChild(child);
+    } catch (error) {
+      result = { code: null, error };
+      append('stderr', `${String(error?.message || error)}\n`);
+    } finally {
+      for (const line of buffers.values()) {
+        if (line) updateProgressFromLog(job, line);
+      }
+      const diskSummary = await readWorkflowSummary(job.outputDir);
+      const previous = job.workflowSummary?.expansion || {};
+      const fromDisk = diskSummary?.expansion && typeof diskSummary.expansion === 'object' ? diskSummary.expansion : {};
+      const stopReason = String(fromDisk.stopReason || previous.stopReason || (previous.cancelRequestedAt ? 'user_cancelled' : result.error ? 'runner_error' : result.code === 2 ? 'invalid_seed' : 'runner_exit'));
+      const interrupted = Boolean(job.expansionInterruptRequested);
+      const runtimeStatus = interrupted ? 'interrupted' : expansionRuntimeStatus(fromDisk.status, stopReason, result);
+      const priorBusinessStatus = previous.status && !['running', 'cancelling'].includes(previous.status) ? previous.status : '';
+      const businessStatus = String(fromDisk.status || priorBusinessStatus || (runtimeStatus === 'completed' ? 'complete' : runtimeStatus));
+      const finishedAt = new Date().toISOString();
+      job.workflowSummary = {
+        ...(job.workflowSummary || {}),
+        ...diskSummary,
+        expansion: {
+          ...previous,
+          ...fromDisk,
+          runtimeStatus,
+          status: businessStatus,
+          stopReason: interrupted ? 'server_shutdown' : stopReason,
+          finishedAt,
+          updatedAt: finishedAt,
+          resumable: ['partial', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(runtimeStatus),
+          exitCode: result.code,
+          error: result.error ? String(result.error.message || result.error) : null,
+        },
+      };
+      job.expansionPid = null;
+      job.expansionInterruptRequested = false;
+      job.updatedAt = finishedAt;
+      job.artifactCount = await countArtifactFiles(job.outputDir);
+      this.processes.delete(job.id);
+      if (this.active?.id === job.id) this.active = null;
+      await this.persist();
+      this.#emit(job.id, 'state', publicJob(job));
+      await closeWriteStream(log);
+      queueMicrotask(() => this.#startNextQueued());
+    }
   }
 
   async #run(job) {
@@ -1086,6 +1333,15 @@ function jobError(code, message) {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+function expansionRuntimeStatus(summaryStatus, stopReason, result) {
+  if (stopReason === 'user_cancelled') return 'cancelled';
+  if (stopReason === 'verification_blocked') return 'blocked';
+  if (result?.error || ['relay_unavailable', 'fatal_error', 'runner_error', 'invalid_seed'].includes(stopReason)) return 'failed';
+  if (summaryStatus === 'complete') return 'completed';
+  if (stopReason === 'interrupted') return 'interrupted';
+  return 'partial';
 }
 
 function normalizeResumeScope(value) {
@@ -1599,41 +1855,42 @@ export function updateProgressFromLog(job, message) {
     const previousSummary = job.workflowSummary && typeof job.workflowSummary === 'object'
       ? job.workflowSummary
       : {};
-    const previousAudience = previousSummary.audience && typeof previousSummary.audience === 'object'
-      ? previousSummary.audience
+    const previousExpansion = previousSummary.expansion && typeof previousSummary.expansion === 'object'
+      ? previousSummary.expansion
       : {};
-    const previousRounds = Array.isArray(previousAudience.roundSummaries)
-      ? previousAudience.roundSummaries
+    const previousRounds = Array.isArray(previousExpansion.roundSummaries)
+      ? previousExpansion.roundSummaries
       : [];
     const roundSummaries = event === 'expansion_round_completed'
       ? [...previousRounds.filter((item) => Number(item?.roundIndex) !== Number(payload.roundIndex)), payload]
           .sort((left, right) => Number(left.roundIndex) - Number(right.roundIndex))
       : previousRounds;
-    const roundIndex = Number(payload.roundIndex ?? previousAudience.roundIndex ?? 0);
-    const maxRounds = Number(job.params?.expansion?.rounds ?? previousAudience.maxRounds ?? 0);
-    const audience = {
-      ...previousAudience,
+    const roundIndex = Number(payload.roundIndex ?? previousExpansion.roundIndex ?? 0);
+    const maxRounds = Number(previousExpansion.config?.rounds ?? job.params?.expansion?.rounds ?? previousExpansion.maxRounds ?? 0);
+    const eventBusinessStatus = event === 'expansion_blocked'
+      ? 'blocked'
+      : event === 'expansion_budget_reached'
+        ? 'partial'
+        : String(payload.status ?? previousExpansion.status ?? 'running');
+    const expansion = {
+      ...previousExpansion,
       enabled: true,
+      runtimeStatus: 'running',
       roundIndex,
       maxRounds,
-      completedRounds: Number(payload.completedRounds ?? previousAudience.completedRounds ?? 0),
-      frontierCount: Number(payload.frontierCount ?? previousAudience.frontierCount ?? 0),
-      stopReason: String(payload.stopReason ?? previousAudience.stopReason ?? ''),
-      status: String(payload.status ?? previousAudience.status ?? 'running'),
+      completedRounds: Number(payload.completedRounds ?? previousExpansion.completedRounds ?? 0),
+      frontierCount: Number(payload.frontierCount ?? previousExpansion.frontierCount ?? 0),
+      stopReason: String(payload.stopReason ?? (event === 'expansion_blocked' ? 'verification_blocked' : previousExpansion.stopReason) ?? ''),
+      status: eventBusinessStatus,
       counters: payload.counters && typeof payload.counters === 'object'
         ? payload.counters
-        : previousAudience.counters || {},
+        : previousExpansion.counters || {},
       roundSummaries,
+      lastCheckpointAt: new Date().toISOString(),
     };
     update({
-      progressPhase: 'audience_expansion',
-      progressLabel: `关系扩散采集：第 ${roundIndex} / ${maxRounds} 轮，待处理 ${audience.frontierCount} 位用户`,
-      progressCurrent: roundIndex,
-      progressTotal: maxRounds,
-      workflowSummary: { ...previousSummary, audience },
+      workflowSummary: { ...previousSummary, expansion },
     });
-    const denominator = Math.max(1, maxRounds + 1);
-    setProgress(Math.min(98, 88 + Math.round(((roundIndex + 1) / denominator) * 10)));
   }
 
   for (const match of message.matchAll(/AUDIENCE_RATE_LIMIT retry=(\d+)\/(\d+) wait=([\d.]+)s/gi)) {

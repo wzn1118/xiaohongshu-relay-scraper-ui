@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { JobManager, publicJob, updateProgressFromLog } from './job-manager.mjs';
-import { validateRunRequest } from './lib/contracts.mjs';
+import { validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
 import { emptyWorkflowStages } from './lib/workflow-state.mjs';
 
 function createFakeChild(pid) {
@@ -134,19 +134,72 @@ test('expansion log events update the existing SSE job state without replacing p
     job,
     'EXPANSION_EVENT expansion_frontier_updated {"roundIndex":1,"completedRounds":0,"frontierCount":3,"stopReason":"","status":"partial","counters":{"users":7,"posts":2,"comments":12}}',
   ), true);
-  assert.equal(job.progressPhase, 'audience_expansion');
-  assert.equal(job.progressCurrent, 1);
-  assert.equal(job.progressTotal, 2);
+  assert.equal(job.progressPhase, undefined);
+  assert.equal(job.progressCurrent, undefined);
+  assert.equal(job.progressTotal, undefined);
   assert.equal(job.workflowSummary.analysisMode, 'general');
-  assert.equal(job.workflowSummary.audience.frontierCount, 3);
-  assert.equal(job.workflowSummary.audience.counters.comments, 12);
+  assert.equal(job.workflowSummary.expansion.frontierCount, 3);
+  assert.equal(job.workflowSummary.expansion.counters.comments, 12);
 
   assert.equal(updateProgressFromLog(
     job,
     'EXPANSION_EVENT expansion_round_completed {"roundIndex":1,"frontierUserCount":3,"expandedUserCount":2,"stopReason":"round_completed"}',
   ), true);
-  assert.equal(job.workflowSummary.audience.roundSummaries.length, 1);
-  assert.equal(job.workflowSummary.audience.roundSummaries[0].expandedUserCount, 2);
+  assert.equal(job.workflowSummary.expansion.roundSummaries.length, 1);
+  assert.equal(job.workflowSummary.expansion.roundSummaries[0].expandedUserCount, 2);
+});
+
+test('relationship expansion runs inside the persisted task without creating history or changing its main status', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-expansion-in-place-'));
+  const id = 'content-task-1';
+  const outputDir = path.join(dataDir, 'jobs', id, 'artifacts');
+  const runnerPath = path.join(dataDir, 'scripts', 'run_project_workflow.py');
+  await mkdir(outputDir, { recursive: true });
+  await mkdir(path.dirname(runnerPath), { recursive: true });
+  await writeFile(runnerPath, '', 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id,
+    status: 'succeeded',
+    createdAt: new Date().toISOString(),
+    finishedAt: new Date().toISOString(),
+    outputDir,
+    logPath: path.join(dataDir, 'jobs', id, 'run.log'),
+    pid: null,
+    params: { analysisMode: 'general', keyword: 'fixture', relayPort: 18800 },
+    workflowSummary: { analysisMode: 'general', contentPostCount: 1 },
+  }]), 'utf8');
+  const child = createFakeChild(81234);
+  let spawnArgs = [];
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath,
+    spawnImpl: (_command, args) => { spawnArgs = args; return child; },
+    terminateImpl: async (target) => target.kill('SIGTERM'),
+  });
+
+  try {
+    await manager.initialize();
+    const parentStatus = manager.get(id).status;
+    const historyBefore = manager.list().map((job) => job.id);
+    const request = validateExpansionStartRequest({ seedPostIds: ['post-1'], config: { rounds: 1 } });
+    const started = await manager.startExpansion(id, request);
+    assert.equal(started.job.id, id);
+    assert.deepEqual(manager.list().map((job) => job.id), historyBefore);
+    assert.equal(manager.get(id).status, parentStatus);
+    assert.equal(manager.get(id).workflowSummary.expansion.runtimeStatus, 'running');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(spawnArgs[0], /run_expansion_workspace\.py$/);
+    const requestFile = JSON.parse(await readFile(path.join(dataDir, 'jobs', id, 'expansion-request.json'), 'utf8'));
+    assert.equal(requestFile.outputDir, outputDir);
+    assert.deepEqual(requestFile.seedPostIds, ['post-1']);
+    child.emit('close', 1, null);
+    await waitForJob(manager, id, (job) => job.workflowSummary?.expansion?.runtimeStatus !== 'running');
+    assert.equal(manager.get(id).status, parentStatus);
+    assert.deepEqual(manager.list().map((job) => job.id), historyBefore);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test('JobManager persists history and enforces a single active task', async () => {

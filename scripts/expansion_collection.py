@@ -578,6 +578,7 @@ class ExpansionOrchestrator:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        materialize_audience_compat: bool = True,
     ):
         self.output_dir = output_dir
         self.config = config
@@ -588,6 +589,7 @@ class ExpansionOrchestrator:
         self.progress_callback = progress_callback
         self.cancel_requested = cancel_requested or (lambda: False)
         self.monotonic = monotonic
+        self.materialize_audience_compat = materialize_audience_compat
         self.started = monotonic()
         self.store = ExpansionStore(output_dir.parent / "expansion-state.sqlite3")
         self.stop_reason = ""
@@ -1161,11 +1163,12 @@ class ExpansionOrchestrator:
         self._write_csv(self.output_dir / "posts.csv", posts)
         self._write_csv(self.output_dir / "comments.csv", comments)
         self._write_csv(self.output_dir / "relations.csv", relations)
-        atomic_write_json(self.output_dir / "audience-users.json", self._audience_users())
-        atomic_write_json(self.output_dir / "audience-posts.json", self._audience_posts())
-        atomic_write_json(self.output_dir / "audience-comments.json", [self._audience_comment(item) for item in comments])
-        atomic_write_json(self.output_dir / "audience-failures.json", [])
-        atomic_write_json(self.output_dir / "audience-summary.json", summary)
+        if self.materialize_audience_compat:
+            atomic_write_json(self.output_dir / "audience-users.json", self._audience_users())
+            atomic_write_json(self.output_dir / "audience-posts.json", self._audience_posts())
+            atomic_write_json(self.output_dir / "audience-comments.json", [self._audience_comment(item) for item in comments])
+            atomic_write_json(self.output_dir / "audience-failures.json", [])
+            atomic_write_json(self.output_dir / "audience-summary.json", summary)
         return summary
 
     @staticmethod
@@ -1241,6 +1244,7 @@ def collect_expansion(
     adapter: ExpansionAdapter | None = None,
     seed_posts: list[dict[str, Any]] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    materialize_audience_compat: bool = True,
 ) -> dict[str, Any]:
     expansion = ExpansionConfig.from_dict(config)
     if not expansion.enabled:
@@ -1256,5 +1260,6 @@ def collect_expansion(
         seed_posts=seed_posts if seed_posts is not None else _seed_posts(output_dir, checkpoint_dirs),
         keyword=keyword, attempt_id=attempt_id, progress_callback=progress_callback,
         cancel_requested=cancel_requested, monotonic=monotonic,
+        materialize_audience_compat=materialize_audience_compat,
     )
     return orchestrator.run()

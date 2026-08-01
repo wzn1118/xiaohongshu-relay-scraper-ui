@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -108,6 +108,17 @@ export const api = {
     return request<AudienceResultsResponse>(`/api/jobs/${encodeURIComponent(id)}/audience?${params}`)
   },
   resumeAudience: (id: string) => request<AudienceResumeResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/resume`, { method: 'POST' }),
+  expansion: (id: string, kind: 'users' | 'posts' | 'comments' | 'relations' = 'users', offset = 0, limit = 50, filters: { round?: string; status?: string; seed?: string } = {}) =>
+    request<ExpansionWorkspaceState>(`/api/jobs/${encodeURIComponent(id)}/expansion?${new URLSearchParams({ kind, offset: String(offset), limit: String(limit), ...(filters.round ? { round: filters.round } : {}), ...(filters.status ? { status: filters.status } : {}), ...(filters.seed ? { seed: filters.seed } : {}) })}`),
+  startExpansion: (id: string, seedPostIds: string[], config: ExpansionConfig) => request<ExpansionActionResponse>(`/api/jobs/${encodeURIComponent(id)}/expansion/start`, {
+    method: 'POST',
+    body: JSON.stringify({ seedPostIds, config }),
+  }),
+  resumeExpansion: (id: string, retryIncomplete = false) => request<ExpansionActionResponse>(`/api/jobs/${encodeURIComponent(id)}/expansion/resume`, {
+    method: 'POST',
+    body: JSON.stringify({ retryIncomplete }),
+  }),
+  cancelExpansion: (id: string) => request<ExpansionActionResponse>(`/api/jobs/${encodeURIComponent(id)}/expansion/cancel`, { method: 'POST', body: '{}' }),
   setDelivery: (jobId: string, noteId: string, action: 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | 'reset', draftVersion?: DraftVersionRef) =>
     request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/delivery`, { method: 'POST', body: JSON.stringify({ noteId, action, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
   saveDraft: (jobId: string, noteId: string, outreach: OutreachDraft, draftVersion?: DraftVersionRef) =>

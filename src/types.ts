@@ -57,6 +57,7 @@ export type RateLimitState = {
 export type Artifact = {
   id: string
   name: string
+  path?: string
   size: number
   modifiedAt?: string
   type?: string
@@ -548,6 +549,74 @@ export type AudienceResumeResponse = {
   readThroughJobIds?: string[]
   job: Job
   message: string
+}
+
+export type WorkspaceView = 'insights' | 'audience' | 'expansion'
+
+export type ExpansionRuntimeStatus = 'idle' | 'running' | 'cancelling' | 'completed' | 'partial' | 'failed' | 'blocked' | 'cancelled' | 'interrupted'
+
+export type ExpansionActionState = 'ready' | 'running' | 'resumable' | 'completed'
+
+export type ExpansionConfig = {
+  enabled?: boolean
+  rounds: number
+  includeReplies: boolean
+  maxReplyDepth: number
+  maxUsersPerRound: number
+  maxPostsPerUser: number
+  maxCommentsPerPost: number
+  maxTotalUsers: number
+  maxTotalPosts: number
+  maxTotalComments: number
+  timeBudgetMinutes: number
+  maxFailureCount: number
+  concurrency: 1
+  postSelectionStrategy: 'latest' | 'keyword_match' | 'top_engagement' | 'all_reachable'
+  schemaVersion: 1
+}
+
+export type ExpansionSeedPost = {
+  postId: string
+  title: string
+  author: Record<string, unknown>
+  url: string
+  available: boolean
+  unavailableReason: string
+  contentStatus: 'complete' | 'partial'
+  commentStatus: 'uncollected' | 'partial' | 'complete'
+  collectionReason: string
+  collectedComments: number
+  selected: boolean
+  expansionStatus: 'available' | 'expanding' | 'used'
+}
+
+export type ExpansionRoundSummary = Record<string, unknown> & { roundIndex?: number }
+
+export type ExpansionArtifact = Artifact
+
+export type ExpansionWorkspaceState = {
+  available: boolean
+  status: ExpansionRuntimeStatus
+  runtimeStatus: ExpansionRuntimeStatus
+  businessStatus: string
+  stopReason: string
+  resumable: boolean
+  hasResults: boolean
+  actionState: ExpansionActionState
+  summary: Record<string, unknown>
+  seeds: ExpansionSeedPost[]
+  config: ExpansionConfig | null
+  metrics: { rounds: number; currentRound: number; frontier: number; users: number; expandedUsers: number; posts: number; comments: number; duplicates: number; failures: number; remainingMinutes: number | null }
+  rounds: ExpansionRoundSummary[]
+  results: { kind: 'users' | 'posts' | 'comments' | 'relations'; total: number; offset: number; limit: number; items: Array<Record<string, unknown>>; filters: { round: string; status: string; seed: string } }
+  artifacts: ExpansionArtifact[]
+}
+
+export type ExpansionActionResponse = {
+  changed?: boolean
+  attemptId?: string
+  job: Job
+  expansion: ExpansionWorkspaceState
 }
 
 export type ProvenanceText = {

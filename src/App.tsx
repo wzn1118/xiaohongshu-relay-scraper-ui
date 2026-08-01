@@ -56,6 +56,7 @@ import {
 } from 'lucide-react'
 import { api } from './api'
 import { draftContentHash } from './draft-state.mjs'
+import { ExpansionWorkspace } from './ExpansionWorkspace'
 import { UnsavedDraftDialog } from './UnsavedDraftDialog'
 import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
 import type { DraftSaveRequest } from './useUnsavedDraftGuard'
@@ -91,6 +92,7 @@ import type {
   DataDeletionPreview,
   DataDeletionSpec,
   ResumeScope,
+  WorkspaceView,
 } from './types'
 
 const CANDIDATE_PROFILE_STORAGE_KEY = 'xhs-candidate-application-profile'
@@ -960,7 +962,7 @@ function GeneralResultsWorkspace({
   )
 }
 
-type GeneralResultModule = 'insights' | 'audience'
+type GeneralResultModule = WorkspaceView
 type HistoryScope = 'all' | AnalysisMode
 
 function audienceStatusLabel(status: AudienceResultsResponse['summary']['status']) {
@@ -1284,7 +1286,8 @@ function workspacePath(mode: AnalysisMode) {
 
 function generalResultModuleFromLocation(): GeneralResultModule {
   if (typeof window === 'undefined') return 'insights'
-  return new URLSearchParams(window.location.search).get('module') === 'audience' ? 'audience' : 'insights'
+  const module = new URLSearchParams(window.location.search).get('module')
+  return module === 'audience' || module === 'expansion' ? module : 'insights'
 }
 
 function audienceDataJobIdFromLocation() {
@@ -1447,6 +1450,7 @@ function App() {
   const draftSaveResponseRef = useRef(0)
   const audienceRequestRef = useRef(0)
   const audienceResultsRef = useRef<{ sourceJobId: string; value: AudienceResultsResponse } | null>(null)
+  const generalModuleScrollRef = useRef<Record<GeneralResultModule, number>>({ insights: 0, audience: 0, expansion: 0 })
   const relayGuideAutoOpened = useRef(false)
   const logConsole = useRef<HTMLDivElement | null>(null)
   const logEnd = useRef<HTMLDivElement | null>(null)
@@ -1576,6 +1580,8 @@ function App() {
   ), [draftGuard.requestTransition, performSwitchWorkspace])
 
   const performSwitchGeneralResultModule = useCallback((module: GeneralResultModule, preferredJobId = '') => {
+    const currentScroll = window.scrollY
+    generalModuleScrollRef.current[generalResultModule] = currentScroll
     setGeneralResultModule(module)
     const url = new URL(window.location.href)
     if (module === 'audience') {
@@ -1591,12 +1597,16 @@ function App() {
         setAudienceDataJobId(job.id)
         writeAudienceDataJobToLocation(job.id)
       })
+    } else if (module === 'expansion') {
+      url.searchParams.set('module', 'expansion')
+      url.searchParams.delete('job')
     } else {
       url.searchParams.delete('module')
       url.searchParams.delete('job')
     }
     window.history.replaceState({ ...(window.history.state || {}), generalResultModule: module }, '', `${url.pathname}${url.search}${url.hash}`)
-  }, [activeJob, audienceDataJobId, jobs])
+    window.requestAnimationFrame(() => window.scrollTo({ top: generalModuleScrollRef.current[module] || currentScroll }))
+  }, [activeJob, audienceDataJobId, generalResultModule, jobs])
 
   const switchGeneralResultModule = useCallback((module: GeneralResultModule, preferredJobId = '') => (
     draftGuard.requestTransition('离开当前结果页面', () => performSwitchGeneralResultModule(module, preferredJobId))
@@ -1646,12 +1656,15 @@ function App() {
       }
       const currentUrl = new URL(window.location.href)
       currentUrl.pathname = workspacePath(workspaceMode)
-      if (workspaceMode !== 'general' || generalResultModule !== 'audience') {
+      if (workspaceMode !== 'general' || generalResultModule === 'insights') {
         currentUrl.searchParams.delete('module')
         currentUrl.searchParams.delete('job')
-      } else {
+      } else if (generalResultModule === 'audience') {
         currentUrl.searchParams.set('module', 'audience')
         if (audienceDataJobId) currentUrl.searchParams.set('job', audienceDataJobId)
+      } else {
+        currentUrl.searchParams.set('module', 'expansion')
+        currentUrl.searchParams.delete('job')
       }
       window.history.pushState({ workspaceMode, generalResultModule }, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
       void draftGuard.requestTransition('浏览器返回', () => {
@@ -1674,13 +1687,6 @@ function App() {
 
   const updateRequest = <K extends keyof JobRequest>(key: K, value: JobRequest[K]) => {
     setRequest((current) => ({ ...current, [key]: value }))
-  }
-
-  const updateExpansion = <K extends keyof JobRequest['expansion']>(key: K, value: JobRequest['expansion'][K]) => {
-    setRequest((current) => ({
-      ...current,
-      expansion: { ...current.expansion, [key]: value },
-    }))
   }
 
   const updateCandidateProfile = <K extends keyof CandidateApplicationProfile>(key: K, value: CandidateApplicationProfile[K]) => {
@@ -2794,13 +2800,22 @@ function App() {
     return generation
   }, [applyEvent, loadJobs])
 
+  const activeExpansionRuntimeStatus = String(
+    activeJob?.workflowSummary?.expansion && typeof activeJob.workflowSummary.expansion === 'object'
+      ? (activeJob.workflowSummary.expansion as Record<string, unknown>).runtimeStatus || ''
+      : '',
+  )
+
   useEffect(() => {
-    if (!activeJob || !['queued', 'resuming', 'running'].includes(activeJob.status)) return
+    if (!activeJob) return
+    const taskIsActive = ['queued', 'resuming', 'running'].includes(activeJob.status)
+      || ['running', 'cancelling'].includes(activeExpansionRuntimeStatus)
+    if (!taskIsActive) return
     const generation = connectJob(activeJob)
     return () => {
       if (streamGeneration.current === generation) disconnectJobStream()
     }
-  }, [activeJob?.id, activeJob?.status, connectJob, disconnectJobStream])
+  }, [activeJob?.id, activeJob?.status, activeExpansionRuntimeStatus, connectJob, disconnectJobStream])
 
   const performRunJob = async (payload: JobRequest, sessionHint: AiSession | null = aiSession): Promise<Job | null> => {
     if (payload.mode === 'resume' || payload.resumeFromJobId) {
@@ -3360,6 +3375,7 @@ function App() {
   const terminalAnalysisReady = Boolean(activeJob && ['completed', 'incomplete'].includes(activeJob.status) && coverage)
   const activeAnalysisMode = workspaceMode
   const audienceModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'audience'
+  const expansionModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'expansion'
   const activeAgentStages = activeAnalysisMode === 'general' ? generalAgentStages : jobAgentStages
   const activeAgentIndex = terminalAnalysisReady
     ? activeAgentStages.length
@@ -3367,13 +3383,12 @@ function App() {
       ? activeAgentStages.reduce((last, stage, index) => stage.matcher.test(runningLog) ? index : last, 0)
       : -1
   const workflowSummary = activeJob?.workflowSummary || {}
-  const activeExpansion = Boolean(activeJob?.config?.expansion?.enabled)
-  const expansionSummary = activeExpansion && workflowSummary.audience && typeof workflowSummary.audience === 'object'
-    ? workflowSummary.audience as Record<string, unknown>
+  const expansionSummary = workflowSummary.expansion && typeof workflowSummary.expansion === 'object'
+    ? workflowSummary.expansion as Record<string, unknown>
     : null
-  const expansionCounters = expansionSummary?.counters && typeof expansionSummary.counters === 'object'
-    ? expansionSummary.counters as Record<string, unknown>
-    : null
+  const expansionRuntimeStatus = String(expansionSummary?.runtimeStatus || '')
+  const expansionStatus = expansionRuntimeStatus || String(expansionSummary?.status || 'idle')
+  const expansionStatusText = ({ idle: '未运行', running: `第 ${Number(expansionSummary?.roundIndex || 0)}/${Number((expansionSummary?.config as Record<string, unknown> | undefined)?.rounds || expansionSummary?.maxRounds || 0)} 轮`, cancelling: '正在停止', complete: '已完成', completed: '已完成', partial: '部分', failed: '失败', blocked: '已阻断', cancelled: '可继续', interrupted: '可继续' } as Record<string, string>)[expansionStatus] || expansionStatus
   const partialAnalysis = workflowSummary.analysisMode === 'security_timeout_partial'
   const securityVerification = (workflowSummary.securityVerification || {}) as Record<string, unknown>
   const securityStatus = activeJob?.securityRestriction?.status || String(securityVerification.status || '')
@@ -3648,7 +3663,7 @@ function App() {
   ]
 
   return (
-    <div className={`app-shell ${workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
+    <div className={`app-shell ${expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
       <aside className="side-rail">
         <div className="brand-mark" aria-label="继任工作台">继</div>
         <nav aria-label="主导航">
@@ -4072,22 +4087,6 @@ function App() {
                     <Toggle checked={request.analysisMode === 'general' || request.useCodexRuntime} onChange={(value) => request.analysisMode === 'job' && updateRequest('useCodexRuntime', value)} label={request.analysisMode === 'general' ? 'AI 动态内容模块' : 'AI 文案与评分'} description={request.analysisMode === 'general' ? '根据关键词、正文和图片逐链接生成栏目' : '逐链接写作、评分并自动重写'} />
                     <Toggle checked={request.noAutoAttach} onChange={(value) => updateRequest('noAutoAttach', value)} label="禁用自动附加" description="保持现有浏览器会话" />
                     <Toggle checked={request.skipPostprocess} onChange={(value) => updateRequest('skipPostprocess', value)} label="跳过结构化导出" description="仅保留原始抓取结果" />
-                    {request.analysisMode === 'general' && <Toggle checked={request.expansion.enabled} onChange={(value) => updateExpansion('enabled', value)} label="关系扩散采集" description="按公开互动关系在原任务内执行有界 BFS" />}
-                    {request.analysisMode === 'general' && request.expansion.enabled && <>
-                      <label className="field"><span>扩散轮数</span><input type="number" min="0" max="10" value={request.expansion.rounds} onChange={(event) => updateExpansion('rounds', Number(event.target.value))} /></label>
-                      <label className="field"><span>每轮最大用户</span><input type="number" min="1" max="1000" value={request.expansion.maxUsersPerRound} onChange={(event) => updateExpansion('maxUsersPerRound', Number(event.target.value))} /></label>
-                      <label className="field"><span>每用户最大帖子</span><input type="number" min="1" max="100" value={request.expansion.maxPostsPerUser} onChange={(event) => updateExpansion('maxPostsPerUser', Number(event.target.value))} /></label>
-                      <label className="field"><span>每帖最大评论</span><input type="number" min="1" max="5000" value={request.expansion.maxCommentsPerPost} onChange={(event) => updateExpansion('maxCommentsPerPost', Number(event.target.value))} /></label>
-                      <label className="field"><span>总用户预算</span><input type="number" min="1" max="100000" value={request.expansion.maxTotalUsers} onChange={(event) => updateExpansion('maxTotalUsers', Number(event.target.value))} /></label>
-                      <label className="field"><span>总帖子预算</span><input type="number" min="1" max="100000" value={request.expansion.maxTotalPosts} onChange={(event) => updateExpansion('maxTotalPosts', Number(event.target.value))} /></label>
-                      <label className="field"><span>总评论预算</span><input type="number" min="1" max="1000000" value={request.expansion.maxTotalComments} onChange={(event) => updateExpansion('maxTotalComments', Number(event.target.value))} /></label>
-                      <label className="field"><span>时间预算 min</span><input type="number" min="1" max="1440" value={request.expansion.timeBudgetMinutes} onChange={(event) => updateExpansion('timeBudgetMinutes', Number(event.target.value))} /></label>
-                      <label className="field"><span>失败预算</span><input type="number" min="1" max="1000" value={request.expansion.maxFailureCount} onChange={(event) => updateExpansion('maxFailureCount', Number(event.target.value))} /></label>
-                      <label className="field"><span>调度并发（Relay 单页）</span><input type="number" min="1" max="1" value={request.expansion.concurrency} onChange={(event) => updateExpansion('concurrency', Number(event.target.value))} /></label>
-                      <label className="field"><span>帖子选择</span><select value={request.expansion.postSelectionStrategy} onChange={(event) => updateExpansion('postSelectionStrategy', event.target.value as JobRequest['expansion']['postSelectionStrategy'])}><option value="latest">最新可见</option><option value="keyword_match">关键词优先</option><option value="top_engagement">互动优先</option><option value="all_reachable">当前会话可达</option></select></label>
-                      <Toggle checked={request.expansion.includeReplies} onChange={(value) => updateExpansion('includeReplies', value)} label="采集评论回复" description="回复深度与总评论预算同时生效" />
-                      {request.expansion.includeReplies && <label className="field"><span>最大回复深度</span><input type="number" min="0" max="10" value={request.expansion.maxReplyDepth} onChange={(event) => updateExpansion('maxReplyDepth', Number(event.target.value))} /></label>}
-                    </>}
                   </div>
                 )}
 
@@ -4125,7 +4124,6 @@ function App() {
                 <>
                   <div className="mission-title"><span>关键词</span><strong>{activeJob.keyword}</strong><small>#{activeJob.id.slice(0, 8)}</small></div>
                   <div className="scope-stamp"><Target size={15} /><span><strong>{activeAllMode ? '全量模式' : '历史限定任务'}</strong><small>{activeAllMode ? `最新优先 · 不限时间 · 完整执行 ${activeJob.config?.maxScrolls ?? '-'} 轮发现 · 单路节流采正文` : '历史任务按原检查点展示'}</small></span></div>
-                  {activeExpansion && <div className="scope-stamp"><Network size={15} /><span><strong>关系扩散 · 第 {Number(expansionSummary?.completedRounds || 0)} / {activeJob.config?.expansion?.rounds ?? 0} 轮</strong><small>待处理 {Number(expansionSummary?.frontierCount || 0)} 用户 · 累计 {Number(expansionCounters?.posts || 0)} 帖子 / {Number(expansionCounters?.comments || 0)} 评论 · {String(expansionSummary?.stopReason || '运行中')}</small></span></div>}
                   <div className={`progress-block outcome-${activeOutcome}`} aria-live="polite">
                     <div className="progress-heading">
                       <span className={['resuming', 'running'].includes(activeJob.status) ? 'live-progress-title active' : 'live-progress-title'}><i />实时进度<small>{progressAge}</small></span>
@@ -4238,19 +4236,30 @@ function App() {
             </div>
           </section>
 
-          <section className="panel results-panel" id="results" aria-label={audienceModuleActive ? '受众及用户界面结果' : activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
+          <section className="panel results-panel" id="results" aria-label={expansionModuleActive ? '关系扩散工作台' : audienceModuleActive ? '受众及用户界面结果' : activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
             <div className="panel-heading compact">
-              <div><span className="step-label">{audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
+              <div><span className="step-label">{expansionModuleActive ? 'RELATIONSHIP EXPANSION WORKSPACE' : audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{expansionModuleActive ? '关系扩散' : audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{expansionModuleActive ? <p className="result-heading-description">从当前任务已保存的帖子出发，多轮采集公开用户、帖子、评论与关系，并持续写回同一任务。</p> : audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
               <div className="result-heading-meta">
-                <span className={`runtime-badge ${audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{audienceModuleActive ? `全量评论流 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · ${String(codexRuntime?.status || '等待结果')}`}</span>
-                <span className="count-badge">{audienceModuleActive ? audienceResults?.total ?? 0 : results?.total ?? activeJob?.applicationCount ?? 0}</span>
+                <span className={`runtime-badge ${expansionStatus === 'completed' || audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{expansionModuleActive ? `多轮扩散 · ${expansionStatusText}` : audienceModuleActive ? `全量评论流 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · ${String(codexRuntime?.status || '等待结果')}`}</span>
+                <span className="count-badge">{expansionModuleActive ? Number((expansionSummary?.counters as Record<string, unknown> | undefined)?.users || 0) : audienceModuleActive ? audienceResults?.total ?? 0 : results?.total ?? activeJob?.applicationCount ?? 0}</span>
               </div>
             </div>
-            {activeAnalysisMode === 'general' && <nav className="general-result-tabs" aria-label="非岗位研究结果模块">
-              <button type="button" className={generalResultModule === 'insights' ? 'active' : ''} aria-current={generalResultModule === 'insights' ? 'page' : undefined} onClick={() => switchGeneralResultModule('insights')}><BookOpenCheck size={16} /><span>内容洞察</span><small>正文、图片与 AI 结构</small></button>
-              <button type="button" className={generalResultModule === 'audience' ? 'active' : ''} aria-current={generalResultModule === 'audience' ? 'page' : undefined} onClick={() => switchGeneralResultModule('audience')}><UsersRound size={16} /><span>受众及用户界面</span><small>评论、回复与用户卡</small></button>
+            {activeAnalysisMode === 'general' && <nav className="general-result-tabs" role="tablist" aria-label="非岗位研究结果模块" onKeyDown={(event) => {
+              if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+              const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+              const current = tabs.indexOf(document.activeElement as HTMLButtonElement)
+              const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length
+              event.preventDefault(); tabs[next]?.focus(); tabs[next]?.click()
+            }}>
+              <button type="button" role="tab" className={generalResultModule === 'insights' ? 'active' : ''} aria-selected={generalResultModule === 'insights'} onClick={() => switchGeneralResultModule('insights')}><BookOpenCheck size={16} /><span>内容洞察</span><small>正文、图片与 AI 结构</small></button>
+              <button type="button" role="tab" className={generalResultModule === 'audience' ? 'active' : ''} aria-selected={generalResultModule === 'audience'} onClick={() => switchGeneralResultModule('audience')}><UsersRound size={16} /><span>受众及用户界面</span><small>评论、回复与用户卡</small></button>
+              <button type="button" role="tab" className={generalResultModule === 'expansion' ? 'active' : ''} aria-selected={generalResultModule === 'expansion'} onClick={() => switchGeneralResultModule('expansion')}><Network size={16} /><span>关系扩散</span><small><b>多轮</b> · 用户、帖子与评论关系</small><i className={`module-state ${expansionStatus}`}>{expansionStatusText}</i></button>
             </nav>}
-            {audienceModuleActive ? <AudienceWorkspace
+            {activeAnalysisMode === 'general' && <ExpansionWorkspace job={activeJob} relay={relay} visible={expansionModuleActive} onJobUpdated={(job) => {
+              setActiveJob(job)
+              setJobs((current) => current.map((item) => item.id === job.id ? job : item))
+            }} onReturnInsights={() => switchGeneralResultModule('insights')} />}
+            {!expansionModuleActive && (audienceModuleActive ? <AudienceWorkspace
               results={audienceResults}
               loading={audienceLoading}
               task={trackedAudienceTask}
@@ -4429,7 +4438,7 @@ function App() {
                 ) : <div className="result-empty"><FileText size={28} /><strong>选择一个岗位查看详情</strong></div>}
               </div>
               </>
-            )}</>}
+            )}</>)}
           </section>
 
           <div className="secondary-grid">

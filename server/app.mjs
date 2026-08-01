@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { appendFile, mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
-import { ValidationError, validateRunRequest } from './lib/contracts.mjs';
+import { ValidationError, validateExpansionCancelRequest, validateExpansionResumeRequest, validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
 import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
 import { setupRelayRuntime } from './lib/relay-setup.mjs';
@@ -11,6 +11,7 @@ import { recoverRelay } from './lib/relay-recovery.mjs';
 import { createRelaySupervisor } from './lib/relay-supervisor.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 import { readAudienceResults } from './lib/audience-results.mjs';
+import { readExpansionSeeds, readExpansionSnapshot } from './lib/expansion-results.mjs';
 import {
   bindDraftQuality,
   currentDraftVersion,
@@ -463,6 +464,33 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (req.method === 'GET' && parts[3] === 'audience' && parts.length === 4) {
           return json(res, 200, await readAudienceSnapshot(manager, id, url.searchParams));
         }
+        if (req.method === 'GET' && parts[3] === 'expansion' && parts.length === 4) {
+          return json(res, 200, await readExpansionSnapshot(
+            internal.outputDir,
+            url.searchParams,
+            manager.get(id)?.workflowSummary?.expansion || {},
+          ));
+        }
+        if (req.method === 'POST' && parts[3] === 'expansion' && parts[4] === 'start' && parts.length === 5) {
+          const request = validateExpansionStartRequest(await readJsonBody(req, config.maxBodyBytes));
+          const ownedSeedIds = new Set((await readExpansionSeeds(internal.outputDir)).filter((item) => item.available).map((item) => item.postId));
+          const foreign = request.seedPostIds.filter((postId) => !ownedSeedIds.has(postId));
+          if (foreign.length) {
+            throw new ValidationError('Expansion seeds must belong to the current task.', foreign.map((postId) => ({ field: 'seedPostIds', reason: 'not_owned_by_task', value: postId })));
+          }
+          const result = await manager.startExpansion(id, request);
+          return json(res, 202, { ...result, expansion: await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}) });
+        }
+        if (req.method === 'POST' && parts[3] === 'expansion' && parts[4] === 'resume' && parts.length === 5) {
+          const request = validateExpansionResumeRequest(await readJsonBody(req, config.maxBodyBytes));
+          const result = await manager.resumeExpansion(id, request);
+          return json(res, 202, { ...result, expansion: await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}) });
+        }
+        if (req.method === 'POST' && parts[3] === 'expansion' && parts[4] === 'cancel' && parts.length === 5) {
+          validateExpansionCancelRequest(await readJsonBody(req, config.maxBodyBytes));
+          const result = await manager.cancelExpansion(id);
+          return json(res, 202, { ...result, expansion: await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}) });
+        }
         if (req.method === 'POST' && parts[3] === 'audience' && parts[4] === 'resume' && parts.length === 5) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           const resumeOptions = validateResumeRequest({ ...body, scope: 'audience' }, { fixedScope: 'audience' });
@@ -629,6 +657,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         'JOB_RECOVERY_INCOMPLETE',
         'AI_SESSION_UNAVAILABLE',
         'PROFILE_UNAVAILABLE',
+        'EXPANSION_SOURCE_INVALID',
+        'EXPANSION_ALREADY_INITIALIZED',
+        'EXPANSION_NOT_RESUMABLE',
+        'EXPANSION_ALREADY_RUNNING',
       ].includes(error.code)) {
         return json(res, 409, {
           ...errorBody(error.code, error.message),
