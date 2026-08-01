@@ -36,6 +36,14 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/playwright
+          if-no-files-found: ignore
+          retention-days: 7
 
   mailpit:
     runs-on: ubuntu-latest
