@@ -20,6 +20,17 @@ test('cached verified poster text remains incomplete until merged into official 
     job_card: { ...cached.job_card, enrichment_status: 'image_enriched' },
     application_info: { ...cached.application_info, requirements: [{ text: '香港院校在读' }] },
   }), false);
+  assert.equal(isIncompleteApplicationRecord({
+    ...cached,
+    body: '',
+    job_card: { ...cached.job_card, enrichment_status: 'image_enriched' },
+    application_info: { ...cached.application_info, requirements: [{ text: '香港院校在读' }] },
+    outreach: { runtime_status: 'image_enriched_missing_job_body' },
+  }), true);
+  assert.equal(isIncompleteApplicationRecord({
+    ...cached,
+    outreach: { runtime_status: 'quality_threshold_not_met' },
+  }), true);
 });
 
 test('general content completeness depends on AI modules and vision rather than job fields', () => {
@@ -219,6 +230,7 @@ test('one-click completion resumes the original task in place and repeated click
   const sourceParams = {
     analysisMode: 'job',
     keyword: '数据分析实习',
+    aiSessionId: '22222222-2222-4222-8222-222222222222',
     candidateProfile: {
       name: '候选人',
       school: '示例大学',
@@ -257,6 +269,16 @@ test('one-click completion resumes the original task in place and repeated click
   await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
     analysis_mode: 'job',
     keyword: sourceParams.keyword,
+    source_coverage: {
+      status: 'partial',
+      reason: 'missing_bodies',
+      targetCount: 3,
+      readyCount: 0,
+      pendingCount: 3,
+      totalRecordCount: 1,
+      fullBodyCount: 0,
+      statisticsSource: 'bodyCompletionLedger',
+    },
     records: [{
       note_id: 'missing-1',
       title: '数据分析实习生',
@@ -281,7 +303,7 @@ test('one-click completion resumes the original task in place and repeated click
 
   try {
     const origin = `http://127.0.0.1:${server.address().port}`;
-    const payload = JSON.stringify({ aiSessionId: '11111111-1111-4111-8111-111111111111' });
+    const payload = JSON.stringify({});
     const firstResponse = await fetch(`${origin}/api/jobs/${sourceId}/complete-missing`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -290,7 +312,7 @@ test('one-click completion resumes the original task in place and repeated click
     assert.equal(firstResponse.status, 202);
     const first = await firstResponse.json();
     assert.equal(first.action, 'started');
-    assert.equal(first.incompleteBefore, 1);
+    assert.equal(first.incompleteBefore, 3);
     assert.equal(first.job.id, sourceId);
     assert.equal(first.job.createdAt, sourceJob.createdAt);
     assert.equal(jobs.length, 1);
@@ -301,7 +323,8 @@ test('one-click completion resumes the original task in place and repeated click
     assert.equal(resumes[0][1].params.resumeFromJobId, sourceId);
     assert.equal(resumes[0][1].params.completeMissingOnly, true);
     assert.equal(resumes[0][1].params.searchSort, 'latest');
-    assert.equal(resumes[0][1].aiSessionId, '11111111-1111-4111-8111-111111111111');
+    assert.equal(resumes[0][1].params.aiSessionId, null);
+    assert.equal(resumes[0][1].aiSessionId, null);
 
     const secondResponse = await fetch(`${origin}/api/jobs/${sourceId}/complete-missing`, {
       method: 'POST',
@@ -376,7 +399,11 @@ test('application results hydrate images and filter the full result set by publi
   try {
     const all = await fetch(`${origin}/api/jobs/${id}/results?sort=newest`).then((response) => response.json());
     assert.deepEqual(all.items.map((item) => item.note_id), ['recent', 'old', 'unknown']);
-    assert.equal(all.filters.stats.incomplete, 1);
+    assert.equal(all.filters.stats.incomplete, 2);
+    assert.deepEqual(
+      all.items.filter(isIncompleteApplicationRecord).map((item) => item.note_id),
+      ['recent', 'unknown'],
+    );
     assert.equal(all.filters.stats.withImages, 1);
     assert.equal(all.items[0].media.images.length, 2);
 

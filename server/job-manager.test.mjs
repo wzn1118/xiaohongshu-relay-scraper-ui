@@ -267,6 +267,82 @@ test('exhausted audience rate limits automatically resume the same task from its
   }
 });
 
+test('body completion falls back from an inherited expired AI session but rejects an explicit expired session', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-body-ai-session-recovery-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260801110000-b0d10001';
+  const staleSessionId = '33333333-3333-4333-8333-333333333333';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1' },
+    { note_id: 'post-2', note_url: 'https://example.test/explore/post-2' },
+  ]), 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1', body: 'saved body' },
+  ]), 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'incomplete',
+    outputDir,
+    params: { analysisMode: 'job', keyword: 'data internship', aiSessionId: staleSessionId },
+  }]), 'utf8');
+
+  const child = createFakeChild(81004);
+  let spawnOptions = null;
+  let resolveCount = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: (_command, _args, options) => {
+      spawnOptions = options;
+      return child;
+    },
+    aiSessions: {
+      resolve: () => {
+        resolveCount += 1;
+        const error = new Error('expired');
+        error.code = 'AI_SESSION_EXPIRED';
+        throw error;
+      },
+    },
+  });
+
+  const params = validateRunRequest({
+    analysisMode: 'job',
+    keyword: 'data internship',
+    mode: 'resume',
+    resumeFromJobId: jobId,
+    completeMissingOnly: true,
+    checkOnly: false,
+    aiSessionId: staleSessionId,
+  });
+
+  try {
+    await manager.initialize();
+    await assert.rejects(
+      manager.resume(jobId, { scope: 'body_completion', params, aiSessionId: staleSessionId }),
+      (error) => error.code === 'AI_SESSION_EXPIRED',
+    );
+
+    const started = await manager.resume(jobId, { scope: 'body_completion', params });
+    await waitForJob(manager, started.id, (job) => job.status === 'running');
+    assert.equal(resolveCount, 2);
+    assert.equal(spawnOptions?.env?.XHS_AI_PROVIDER, 'codex');
+    assert.equal(spawnOptions?.env?.XHS_AI_API_KEY, '');
+    assert.equal(spawnOptions?.env?.XHS_AI_MODEL, '');
+
+    const ended = waitForEnd(manager, jobId);
+    child.emit('close', 0, null);
+    await ended;
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('audience profile catch-up logs expose cumulative and current-batch progress', () => {
   const job = { progress: 0 };
 
@@ -792,7 +868,7 @@ test('quality-gate exit code is classified as incomplete instead of failed', asy
   }
 });
 
-test('JobManager materializes every discovered job while scraping and preserves it after cancellation', async () => {
+test('JobManager materializes only body-backed jobs while scraping and preserves them after cancellation', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-checkpoint-analysis-'));
   const fakeRunner = path.join(dataDir, 'runner.py');
   await writeFile(fakeRunner, '', 'utf8');
@@ -809,17 +885,17 @@ test('JobManager materializes every discovered job while scraping and preserves 
     spawnImpl: () => child,
     terminateImpl: async (target) => target.kill('SIGTERM'),
     checkpointAnalyzerImpl: async ({ outputDir }) => {
-      const cards = JSON.parse(await readFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), 'utf8'));
-      analyzed.push(cards.length);
+      const notes = JSON.parse(await readFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), 'utf8'));
+      analyzed.push(notes.length);
       await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
-        records: cards.map((card) => ({ note_id: card.note_id })),
+        records: notes.map((note) => ({ note_id: note.note_id, body: note.body })),
       }), 'utf8');
       await writeFile(path.join(outputDir, 'workflow-summary.json'), JSON.stringify({
-        cardsDiscovered: cards.length,
-        jobCardsGenerated: cards.length,
-        applicationCopyGenerated: cards.length,
+        cardsDiscovered: 3,
+        jobCardsGenerated: notes.length,
+        applicationCopyGenerated: notes.length,
       }), 'utf8');
-      return { stdout: `CHECKPOINT_ANALYSIS records=${cards.length}\n`, stderr: '' };
+      return { stdout: `CHECKPOINT_ANALYSIS records=${notes.length}\n`, stderr: '' };
     },
   });
 
@@ -829,20 +905,22 @@ test('JobManager materializes every discovered job while scraping and preserves 
     const outputDir = manager.getInternal(started.id).outputDir;
     const cards = Array.from({ length: 3 }, (_, index) => ({ note_id: `note-${index + 1}` }));
     await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(cards), 'utf8');
-    await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(cards.slice(0, 1)), 'utf8');
+    await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+      { ...cards[0], body: 'complete job body', access_status: 'detail_ok' },
+    ]), 'utf8');
     await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
       records: Array.from({ length: 3 }, (_, index) => ({ note_id: `stale-${index + 1}` })),
     }), 'utf8');
     child.stdout.write('Collected 3 note links. Starting note extraction...\n');
-    for (let attempt = 0; attempt < 100 && manager.get(started.id).applicationCount !== 3; attempt += 1) {
+    for (let attempt = 0; attempt < 100 && manager.get(started.id).applicationCount !== 1; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.deepEqual(analyzed, [3]);
+    assert.deepEqual(analyzed, [1]);
     assert.equal(manager.get(started.id).status, 'running');
-    assert.equal(manager.get(started.id).applicationCount, 3);
+    assert.equal(manager.get(started.id).applicationCount, 1);
     const livePayload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
-    assert.equal(livePayload.records.length, 3);
-    assert.deepEqual(livePayload.records.map((record) => record.note_id), cards.map((card) => card.note_id));
+    assert.equal(livePayload.records.length, 1);
+    assert.deepEqual(livePayload.records.map((record) => record.note_id), [cards[0].note_id]);
     const ended = new Promise((resolve) => {
       const unsubscribe = manager.subscribe(started.id, (event) => {
         if (event.type === 'end') {
@@ -857,11 +935,11 @@ test('JobManager materializes every discovered job while scraping and preserves 
 
     const job = manager.get(started.id);
     assert.equal(job.status, 'cancelled');
-    assert.deepEqual(analyzed, [3]);
-    assert.equal(job.workflowSummary.jobCardsGenerated, 3);
-    assert.equal(job.workflowSummary.applicationCopyGenerated, 3);
+    assert.deepEqual(analyzed, [1]);
+    assert.equal(job.workflowSummary.jobCardsGenerated, 1);
+    assert.equal(job.workflowSummary.applicationCopyGenerated, 1);
     const payload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
-    assert.equal(payload.records.length, 3);
+    assert.equal(payload.records.length, 1);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

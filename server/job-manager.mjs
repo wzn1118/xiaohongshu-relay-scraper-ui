@@ -1075,15 +1075,27 @@ export class JobManager {
   }
 
   async #resolveResumeRuntime(job, params, options) {
-    const aiSessionId = options.aiSessionId || params.aiSessionId;
-    let ai = { provider: 'codex', apiKey: '', baseUrl: '', model: '', wireApi: 'responses' };
+    const fallbackAi = { provider: 'codex', apiKey: '', baseUrl: '', model: '', wireApi: 'responses' };
+    const hasExplicitAiSession = Object.hasOwn(options, 'aiSessionId');
+    const aiSessionId = hasExplicitAiSession ? options.aiSessionId : params.aiSessionId;
+    let ai = fallbackAi;
     if (aiSessionId) {
       try {
         ai = this.aiSessions.resolve(aiSessionId);
       } catch (error) {
-        const unavailable = jobError('AI_SESSION_UNAVAILABLE', 'The AI session required by this task is unavailable.');
-        unavailable.cause = error;
-        throw unavailable;
+        if (options.scope === 'body_completion' && !hasExplicitAiSession) {
+          ai = fallbackAi;
+        } else {
+          const expired = error?.code === 'AI_SESSION_EXPIRED';
+          const unavailable = jobError(
+            expired ? 'AI_SESSION_EXPIRED' : 'AI_SESSION_UNAVAILABLE',
+            expired
+              ? 'The selected AI session has expired.'
+              : 'The AI session required by this task is unavailable.',
+          );
+          unavailable.cause = error;
+          throw unavailable;
+        }
       }
     }
     let profilePath;
@@ -1404,6 +1416,7 @@ export class JobManager {
       try {
         latestState = await readWorkflowState(job.statePath);
         applyWorkflowStateToJob(job, latestState, { preserveStatus: true });
+        applySourceCoverageStatus(job);
         attempt = currentAttempt(job);
       } catch (error) {
         job.status = 'failed';
@@ -1430,6 +1443,7 @@ export class JobManager {
           expectedRevision: latestState?.revision ?? job.revision,
         });
         applyWorkflowStateToJob(job, finalState);
+        applySourceCoverageStatus(job);
       } catch (error) {
         job.status = 'failed';
         job.error = String(error?.message || error);
@@ -1459,17 +1473,17 @@ export class JobManager {
 
   async #materializeCheckpointApplications(job, append = () => {}) {
     await reconcileJobCheckpoint(job);
-    const expected = Number(job.discoveredCount || 0);
-    if (expected < 1) return false;
+    const expected = await countBodyBackedCheckpointRecords(job.outputDir);
     const existing = await countApplicationRecords(path.join(job.outputDir, 'application_intelligence.json'));
-    const matchesCheckpoint = existing >= expected && await applicationRecordsMatchCheckpoint(job.outputDir);
+    if (expected < 1 && existing < 1) return false;
+    const matchesCheckpoint = existing === expected && await applicationRecordsMatchCheckpoint(job.outputDir);
     if (matchesCheckpoint) {
       delete job.checkpointAnalysisError;
       return false;
     }
     const runtime = this.runtimeContexts.get(job.id) || {};
     const profilePath = await resolveCheckpointProfilePath(job, runtime.profilePath || this.legacyProfilePath);
-    append('system', `Parsing ${expected} discovered jobs from the saved checkpoint.\n`);
+    append('system', `Parsing ${expected} body-backed records from the saved checkpoint.\n`);
     const result = await this.checkpointAnalyzerImpl({
       pythonBin: this.pythonBin,
       runnerPath: this.runnerPath,
@@ -1483,8 +1497,8 @@ export class JobManager {
     if (result?.stdout) append('stdout', result.stdout);
     if (result?.stderr) append('stderr', result.stderr);
     const generated = await countApplicationRecords(path.join(job.outputDir, 'application_intelligence.json'));
-    if (generated < expected || !await applicationRecordsMatchCheckpoint(job.outputDir)) {
-      throw new Error(`Checkpoint analysis generated ${generated} of ${expected} required job cards.`);
+    if (generated !== expected || !await applicationRecordsMatchCheckpoint(job.outputDir)) {
+      throw new Error(`Checkpoint analysis published ${generated} of ${expected} body-backed records.`);
     }
     job.checkpointAnalysisAt = new Date().toISOString();
     job.checkpointAnalysisCount = generated;
@@ -2129,6 +2143,9 @@ function stopReasonForJob(job) {
   if (job.cancelRequested || job.status === 'cancelled') return 'user_cancelled';
   if (job.securityRestriction?.status === 'timed_out') return 'security_verification';
   if (RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)) return 'rate_limit';
+  if (job.status === 'incomplete' && job.progressPhase === 'body_completion_incomplete') {
+    return 'body_completion';
+  }
   if (job.status === 'incomplete') return 'quality_gate';
   if (job.status === 'succeeded') return 'completed';
   if (job.status === 'failed') return 'runner_failed';
@@ -2149,6 +2166,9 @@ function errorCodeForJob(job) {
   if (job.status === 'succeeded' || job.status === 'cancelled') return null;
   if (job.securityRestriction?.status === 'timed_out') return 'SECURITY_VERIFICATION_TIMEOUT';
   if (RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)) return 'RATE_LIMITED';
+  if (job.status === 'incomplete' && job.progressPhase === 'body_completion_incomplete') {
+    return 'BODY_COMPLETION_PENDING';
+  }
   if (job.status === 'incomplete' && job.progressPhase === 'audience_incomplete') {
     return 'AUDIENCE_RUNNER_INTERRUPTED';
   }
@@ -2156,6 +2176,19 @@ function errorCodeForJob(job) {
   if (job.status === 'interrupted') return job.cleanupError ? 'ORPHAN_CLEANUP_FAILED' : 'SERVER_RESTART';
   if (job.status === 'failed') return 'RUNNER_FAILED';
   return null;
+}
+
+function applySourceCoverageStatus(job) {
+  if (job.status !== 'incomplete') return false;
+  const sourceCoverage = job.workflowSummary?.sourceCoverage;
+  const pendingCount = Number(sourceCoverage?.pendingCount || 0);
+  if (!Number.isFinite(pendingCount) || pendingCount <= 0) return false;
+  const readyCount = Number(sourceCoverage?.readyCount || 0);
+  job.progressPhase = 'body_completion_incomplete';
+  job.progressLabel = `岗位正文已解析 ${readyCount} 条，仍有 ${pendingCount} 条等待续采`;
+  job.error = `岗位正文仍有 ${pendingCount} 条待续采；已抓取的正文已完成解析，原任务检查点已保留。`;
+  job.progressUpdatedAt = new Date().toISOString();
+  return true;
 }
 
 export function publicJob(job) {
@@ -2817,21 +2850,58 @@ function recordCheckpointKey(record) {
   return String(record?.note_id || record?.note_url || '').trim();
 }
 
+const FAILED_DETAIL_STATUSES = new Set([
+  'detail_unavailable',
+  'detail_timeout',
+  'detail_playwright_error',
+  'detail_unexpected_error',
+  'missing_record',
+]);
+
+function isBodyBackedCheckpointRecord(record) {
+  return Boolean(String(record?.body || '').trim())
+    && !FAILED_DETAIL_STATUSES.has(String(record?.access_status || '').trim());
+}
+
+async function readBodyBackedCheckpointKeys(outputDir) {
+  const cards = await readFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), 'utf8')
+    .then(JSON.parse)
+    .catch((error) => {
+      if (error.code === 'ENOENT' || error instanceof SyntaxError) return [];
+      throw error;
+    });
+  let notes = [];
+  for (const filename of ['xiaohongshu_notes_latest.json', 'xiaohongshu_notes_latest_dedup.json']) {
+    try {
+      notes = JSON.parse(await readFile(path.join(outputDir, filename), 'utf8'));
+      break;
+    } catch (error) {
+      if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+    }
+  }
+  const cardKeys = new Set((Array.isArray(cards) ? cards : []).map(recordCheckpointKey).filter(Boolean));
+  return new Set((Array.isArray(notes) ? notes : [])
+    .filter(isBodyBackedCheckpointRecord)
+    .map(recordCheckpointKey)
+    .filter((key) => key && (!cardKeys.size || cardKeys.has(key))));
+}
+
+async function countBodyBackedCheckpointRecords(outputDir) {
+  return (await readBodyBackedCheckpointKeys(outputDir)).size;
+}
+
 async function applicationRecordsMatchCheckpoint(outputDir) {
   try {
-    const [cardsPayload, applicationPayload] = await Promise.all([
-      readFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), 'utf8').then(JSON.parse),
+    const [expectedKeys, applicationPayload] = await Promise.all([
+      readBodyBackedCheckpointKeys(outputDir),
       readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8').then(JSON.parse),
     ]);
-    const cards = Array.isArray(cardsPayload) ? cardsPayload : [];
     const records = Array.isArray(applicationPayload?.records) ? applicationPayload.records : [];
-    const cardKeys = cards.map(recordCheckpointKey).filter(Boolean);
     const recordKeys = records.map(recordCheckpointKey).filter(Boolean);
-    if (cardKeys.length !== cards.length || recordKeys.length !== records.length || cardKeys.length !== recordKeys.length) {
+    if (recordKeys.length !== records.length || recordKeys.length !== expectedKeys.size) {
       return false;
     }
-    const expected = new Set(cardKeys);
-    return expected.size === cardKeys.length && recordKeys.every((key) => expected.has(key));
+    return new Set(recordKeys).size === recordKeys.length && recordKeys.every((key) => expectedKeys.has(key));
   } catch (error) {
     if (error.code === 'ENOENT' || error instanceof SyntaxError) return false;
     throw error;

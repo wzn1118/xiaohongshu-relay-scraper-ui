@@ -339,6 +339,19 @@ def test_real_name_replaces_placeholder_during_user_merge():
     assert merged["roles"] == ["author", "commenter"]
 
 
+def test_legacy_shell_avatar_is_rejected_during_user_merge():
+    bad_avatar = "https://sns-avatar-qc.xhscdn.com/avatar/645b7e371fc3de4c930eff9d.jpg?width=360"
+    valid_avatar = "https://sns-avatar-qc.xhscdn.com/avatar/profile-u1.jpg?width=120"
+
+    assert audience_collection.clean_avatar_url(bad_avatar) == ""
+    merged = merge_user(
+        {"user_id": "u-1", "avatar_url": bad_avatar, "roles": [], "post_ids": []},
+        {"user_id": "u-1", "avatar_url": valid_avatar, "roles": [], "post_ids": []},
+    )
+
+    assert merged["avatar_url"] == valid_avatar
+
+
 def test_profile_requires_verified_public_page_before_completion():
     existing = {"user_id": "u-1", "display_name": "评论者", "enrichment_status": "pending"}
 
@@ -354,6 +367,7 @@ def test_profile_requires_verified_public_page_before_completion():
         "follower_count",
         "liked_and_collected_count",
         "ip_location",
+        "avatar_url",
     ]
 
 
@@ -361,6 +375,7 @@ def test_profile_snapshot_keeps_metrics_separate_and_records_ip_location():
     parsed = parse_profile_snapshot({
         "profile_loaded": True,
         "display_name": "Star11",
+        "avatar_url": "https://sns-avatar-qc.xhscdn.com/avatar/star11.jpg",
         "ip_location": "上海",
         "following_count": "5",
         "follower_count": "44",
@@ -372,6 +387,7 @@ def test_profile_snapshot_keeps_metrics_separate_and_records_ip_location():
     assert parsed["liked_and_collected_count"] == 178
     assert parsed["ip_location"] == "上海"
     assert parsed["location"] == "上海"
+    assert parsed["profile_avatar_source"] == "profile_header"
     assert parsed["enrichment_status"] == "complete"
     assert parsed["access_status"] == "public_profile_ok"
 
@@ -380,6 +396,7 @@ def test_profile_with_one_missing_metric_remains_resumable_and_preserves_values(
     parsed = parse_profile_snapshot({
         "profile_loaded": True,
         "display_name": "Star11",
+        "avatar_url": "https://sns-avatar-qc.xhscdn.com/avatar/star11.jpg",
         "ip_location": "上海",
         "following_count": "5",
         "follower_count": "44",
@@ -402,6 +419,8 @@ def test_legacy_duplicate_metrics_are_cleared_and_scheduled_for_refresh():
         "following_count": 544175,
         "follower_count": 544175,
         "liked_and_collected_count": 544175,
+        "avatar_url": "https://sns-avatar-qc.xhscdn.com/avatar/u1.jpg",
+        "ip_location": "上海",
         "location": "上海",
     }
 
@@ -419,6 +438,7 @@ def test_complete_profile_with_missing_metric_is_scheduled_without_clearing_good
         "following_count": 10,
         "follower_count": 20,
         "liked_and_collected_count": None,
+        "avatar_url": "https://sns-avatar-qc.xhscdn.com/avatar/u1.jpg",
         "ip_location": "上海",
     }
 
@@ -428,6 +448,101 @@ def test_complete_profile_with_missing_metric_is_scheduled_without_clearing_good
     assert user["liked_and_collected_count"] is None
     assert user["missing_profile_fields"] == ["liked_and_collected_count"]
     assert user["enrichment_status"] == "pending"
+
+
+def test_duplicate_legacy_avatar_is_cleared_and_scheduled_for_refresh():
+    shared = "https://sns-avatar-qc.xhscdn.com/avatar/sidebar-account.jpg?width=360"
+    users = [
+        {"user_id": f"u-{index}", "avatar_url": shared, "enrichment_status": "complete"}
+        for index in range(8)
+    ]
+    invalid = audience_collection.legacy_duplicate_avatar_fingerprints(users)
+    target = {
+        "user_id": "u-1",
+        "avatar_url": shared,
+        "enrichment_status": "complete",
+        "following_count": 1,
+        "follower_count": 2,
+        "liked_and_collected_count": 3,
+        "ip_location": "上海",
+    }
+
+    assert audience_collection.invalidate_legacy_profile_snapshot(target, invalid) is True
+    assert target["avatar_url"] == ""
+    assert target["profile_status"] == "not_started"
+    assert target["missing_profile_fields"] == ["avatar_url"]
+
+
+def test_duplicate_legacy_avatar_is_restored_from_trusted_checkpoint():
+    shared = "https://sns-avatar-qc.xhscdn.com/avatar/sidebar-account.jpg?width=360"
+    users = {
+        f"u-{index}": {
+            "user_id": f"u-{index}",
+            "avatar_url": shared,
+            "enrichment_status": "complete",
+        }
+        for index in range(8)
+    }
+    invalid = audience_collection.legacy_duplicate_avatar_fingerprints(users.values())
+    restored = audience_collection.restore_legacy_avatar_urls(
+        users,
+        [("post_checkpoint", {
+            "user_id": "u-1",
+            "avatar_url": "https://sns-avatar-qc.xhscdn.com/avatar/real-u-1.jpg",
+        })],
+        invalid,
+    )
+
+    assert restored == ["u-1"]
+    assert users["u-1"]["avatar_url"].endswith("real-u-1.jpg")
+    assert users["u-1"]["profile_avatar_source"] == "post_checkpoint"
+
+
+def test_avatar_repair_migrates_saved_users_without_recollecting(tmp_path):
+    shared = "https://sns-avatar-qc.xhscdn.com/avatar/sidebar-account.jpg?width=360"
+    users = [
+        {
+            "user_id": f"u-{index}",
+            "display_name": f"User {index}",
+            "avatar_url": shared,
+            "comment_count": index,
+            "enrichment_status": "complete",
+        }
+        for index in range(8)
+    ]
+    posts = [
+        {
+            "post_id": f"p-{index}",
+            "author": {
+                "user_id": f"u-{index}",
+                "avatar_url": f"https://sns-avatar-qc.xhscdn.com/avatar/real-u-{index}.jpg",
+            },
+        }
+        for index in range(8)
+    ]
+    (tmp_path / "audience-users.json").write_text(json.dumps(users), encoding="utf-8")
+    (tmp_path / "audience-posts.json").write_text(json.dumps(posts), encoding="utf-8")
+    (tmp_path / "audience-comments.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "audience-summary.json").write_text(json.dumps({"profilesComplete": 8}), encoding="utf-8")
+
+    result = audience_collection.repair_audience_avatar_checkpoints(tmp_path)
+    repaired = json.loads((tmp_path / "audience-users.json").read_text(encoding="utf-8"))
+
+    assert result["affected"] == 8
+    assert result["restored"] == 8
+    assert result["scheduledForRelayRefresh"] == 0
+    assert all("sidebar-account" not in user["avatar_url"] for user in repaired)
+    assert (tmp_path / ".avatar-repair-backup" / "audience-users.json").is_file()
+
+
+def test_profile_snapshot_uses_profile_header_avatar_not_generic_avatar():
+    class Page:
+        def evaluate(self, script):
+            assert ".avatar-wrapper > img.user-image" in script
+            assert "document.querySelector('.avatar img" not in script
+            return {"profile_loaded": True}
+
+    assert audience_collection._profile_snapshot(Page()) == {"profile_loaded": True}
 
 
 def test_closed_relay_target_errors_are_retryable():
@@ -777,6 +892,7 @@ def test_collect_audience_reads_legacy_checkpoint_without_mutating_it(monkeypatc
     complete_user = {
         **target_user,
         "bio": "filled from legacy checkpoint",
+        "avatar_url": "https://sns-avatar-qc.xhscdn.com/avatar/author-1.jpg",
         "ip_location": "Shanghai",
         "following_count": 1,
         "follower_count": 2,

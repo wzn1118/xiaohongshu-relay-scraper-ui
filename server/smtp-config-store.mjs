@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 
 export const SMTP_PROVIDER_PRESETS = Object.freeze({
@@ -28,10 +28,24 @@ const PROVIDERS = new Set(Object.keys(SMTP_PROVIDER_PRESETS));
 const AUTH_MODES = new Set(['login', 'oauth2', 'none']);
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
 const DEFAULT_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+const SMTP_CONFIG_SCHEMA_VERSION = 3;
+const CREDENTIAL_VAULT_VERSION = 1;
+const CREDENTIAL_VAULT_ALGORITHM = 'aes-256-gcm';
+const CREDENTIAL_KEY_BYTES = 32;
+const CREDENTIAL_IV_BYTES = 12;
+const CREDENTIAL_AAD = Buffer.from('xiaohongshu-relay-scraper-ui:smtp-credentials:v1', 'utf8');
 
 export class SmtpConfigStore {
-  constructor({ filePath, defaults = {}, verificationTtlMs = DEFAULT_VERIFICATION_TTL_MS, clock = () => Date.now() }) {
+  constructor({
+    filePath,
+    keyPath = `${filePath}.key`,
+    defaults = {},
+    verificationTtlMs = DEFAULT_VERIFICATION_TTL_MS,
+    clock = () => Date.now(),
+  }) {
     this.filePath = filePath;
+    this.keyPath = keyPath;
+    this.credentialKey = null;
     this.defaults = normalizeSmtpConfig(defaults, { allowEmpty: true });
     this.value = cloneConfig(this.defaults);
     this.clock = clock;
@@ -54,7 +68,18 @@ export class SmtpConfigStore {
       const saved = JSON.parse(await readFile(this.filePath, 'utf8'));
       const legacySecrets = extractSecrets(saved);
       const defaultsSecrets = extractSecrets(this.defaults);
-      const runtimeSecrets = hasRuntimeCredential(legacySecrets) ? legacySecrets : defaultsSecrets;
+      const encryptedSecrets = saved.credentialVault
+        ? await this.decryptPersistedCredentials(saved.credentialVault)
+        : null;
+      const credentialSource = encryptedSecrets
+        ? 'vault'
+        : hasRuntimeCredential(legacySecrets)
+          ? 'legacy'
+          : hasRuntimeCredential(defaultsSecrets)
+            ? 'defaults'
+            : 'none';
+      const runtimeSecrets = encryptedSecrets
+        || (credentialSource === 'legacy' ? legacySecrets : defaultsSecrets);
       this.value = normalizeSmtpConfig({
         ...this.defaults,
         ...saved,
@@ -68,11 +93,12 @@ export class SmtpConfigStore {
       }, { allowEmpty: true });
       this.revision = normalizeRevision(saved.revision, 1);
       this.credentialRevision = normalizeRevision(saved.credentialRevision, 0)
-        + (hasRuntimeCredential(runtimeSecrets) ? 1 : 0);
+        + (['legacy', 'defaults'].includes(credentialSource) ? 1 : 0);
       this.configHash = smtpConfigHash(this.value);
       this.configurationUpdatedAt = normalizeTimestamp(saved.configurationUpdatedAt);
 
-      const canRestoreVerification = !hasRuntimeCredential(runtimeSecrets)
+      const canRestoreVerification = !['legacy', 'defaults'].includes(credentialSource)
+        && isRuntimeConfigured(this.value)
         && saved.configHash === this.configHash
         && saved.verifiedConfigHash === this.configHash
         && Number(saved.verifiedCredentialRevision) === this.credentialRevision;
@@ -82,7 +108,9 @@ export class SmtpConfigStore {
       this.verificationStatus = canRestoreVerification && this.verifiedAt ? 'verified' : 'unverified';
       this.verificationFailureCode = canRestoreVerification ? String(saved.verificationFailureCode || '') : '';
 
-      if (containsPersistedSecret(saved) || Number(saved.schemaVersion) !== 2) await this.persist();
+      if (containsPersistedSecret(saved) || Number(saved.schemaVersion) !== SMTP_CONFIG_SCHEMA_VERSION) {
+        await this.persist();
+      }
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
@@ -327,6 +355,9 @@ export class SmtpConfigStore {
 
   async persist() {
     const temporary = `${this.filePath}.${process.pid}.tmp`;
+    const credentialVault = hasRuntimeCredential(this.value)
+      ? await this.encryptCredentials(extractSecrets(this.value))
+      : null;
     const saved = persistentSmtpConfig(this.value, {
       revision: this.revision,
       credentialRevision: this.credentialRevision,
@@ -337,9 +368,89 @@ export class SmtpConfigStore {
       verificationStatus: this.verificationStatus,
       verificationFailureCode: this.verificationFailureCode,
       configurationUpdatedAt: this.configurationUpdatedAt,
-    });
+    }, credentialVault);
     await writeFile(temporary, `${JSON.stringify(saved, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     await rename(temporary, this.filePath);
+  }
+
+  async encryptCredentials(secrets) {
+    const key = await this.getCredentialKey({ create: true });
+    const iv = randomBytes(CREDENTIAL_IV_BYTES);
+    const cipher = createCipheriv(CREDENTIAL_VAULT_ALGORITHM, key, iv);
+    cipher.setAAD(CREDENTIAL_AAD);
+    const plaintext = Buffer.from(JSON.stringify(secrets), 'utf8');
+    try {
+      const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+      return {
+        version: CREDENTIAL_VAULT_VERSION,
+        algorithm: CREDENTIAL_VAULT_ALGORITHM,
+        iv: iv.toString('base64'),
+        authTag: cipher.getAuthTag().toString('base64'),
+        ciphertext: ciphertext.toString('base64'),
+      };
+    } finally {
+      plaintext.fill(0);
+    }
+  }
+
+  async decryptPersistedCredentials(vault) {
+    try {
+      validateCredentialVault(vault);
+      const key = await this.getCredentialKey({ create: false });
+      const decipher = createDecipheriv(
+        CREDENTIAL_VAULT_ALGORITHM,
+        key,
+        Buffer.from(vault.iv, 'base64'),
+      );
+      decipher.setAAD(CREDENTIAL_AAD);
+      decipher.setAuthTag(Buffer.from(vault.authTag, 'base64'));
+      const plaintext = Buffer.concat([
+        decipher.update(Buffer.from(vault.ciphertext, 'base64')),
+        decipher.final(),
+      ]);
+      try {
+        return extractSecrets(JSON.parse(plaintext.toString('utf8')));
+      } finally {
+        plaintext.fill(0);
+      }
+    } catch (error) {
+      if (error?.code === 'SMTP_CREDENTIAL_KEY_MISSING') throw error;
+      const wrapped = smtpStateError(
+        'SMTP_CREDENTIAL_DECRYPT_FAILED',
+        '本机 SMTP 凭据无法解密，请恢复对应的本机密钥文件或清除后重新配置。',
+      );
+      wrapped.cause = error;
+      throw wrapped;
+    }
+  }
+
+  async getCredentialKey({ create }) {
+    if (this.credentialKey) return this.credentialKey;
+    try {
+      const existing = await readFile(this.keyPath);
+      this.credentialKey = validateCredentialKey(existing);
+      return this.credentialKey;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      if (!create) {
+        throw smtpStateError(
+          'SMTP_CREDENTIAL_KEY_MISSING',
+          'SMTP 本机密钥文件缺失，请恢复密钥文件或清除后重新配置。',
+        );
+      }
+    }
+
+    await mkdir(path.dirname(this.keyPath), { recursive: true });
+    const generated = randomBytes(CREDENTIAL_KEY_BYTES);
+    try {
+      await writeFile(this.keyPath, generated, { mode: 0o600, flag: 'wx' });
+      this.credentialKey = generated;
+    } catch (error) {
+      generated.fill(0);
+      if (error.code !== 'EEXIST') throw error;
+      this.credentialKey = validateCredentialKey(await readFile(this.keyPath));
+    }
+    return this.credentialKey;
   }
 }
 
@@ -399,9 +510,9 @@ export function detectSmtpSettings(email) {
   return preset ? { ...preset } : null;
 }
 
-function persistentSmtpConfig(value, metadata) {
+function persistentSmtpConfig(value, metadata, credentialVault) {
   return {
-    schemaVersion: 2,
+    schemaVersion: SMTP_CONFIG_SCHEMA_VERSION,
     provider: value.provider,
     host: value.host,
     port: value.port,
@@ -415,8 +526,31 @@ function persistentSmtpConfig(value, metadata) {
       clientId: value.oauth.clientId,
       scope: value.oauth.scope,
     },
+    ...(credentialVault ? { credentialVault } : {}),
     ...metadata,
   };
+}
+
+function validateCredentialKey(key) {
+  if (!Buffer.isBuffer(key) || key.length !== CREDENTIAL_KEY_BYTES) {
+    throw smtpStateError(
+      'SMTP_CREDENTIAL_KEY_INVALID',
+      'SMTP 本机密钥文件格式无效，请恢复密钥文件或清除后重新配置。',
+    );
+  }
+  return key;
+}
+
+function validateCredentialVault(vault) {
+  const valid = vault
+    && Number(vault.version) === CREDENTIAL_VAULT_VERSION
+    && vault.algorithm === CREDENTIAL_VAULT_ALGORITHM
+    && Buffer.from(String(vault.iv || ''), 'base64').length === CREDENTIAL_IV_BYTES
+    && Buffer.from(String(vault.authTag || ''), 'base64').length === 16
+    && Buffer.from(String(vault.ciphertext || ''), 'base64').length > 0;
+  if (!valid) {
+    throw smtpStateError('SMTP_CREDENTIAL_VAULT_INVALID', 'SMTP 本机凭据存储格式无效。');
+  }
 }
 
 function extractSecrets(value = {}) {

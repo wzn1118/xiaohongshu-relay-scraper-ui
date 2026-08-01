@@ -36,6 +36,7 @@ from run_project_workflow import (  # noqa: E402
     checkpoint_body_summary,
     completion_target_ids,
     emit_stage,
+    partition_job_ai_targets,
     reuse_completed_records,
     resolve_project_path,
     rewrite_limit,
@@ -395,6 +396,28 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertFalse(requirement_text & responsibility_text)
         self.assertTrue(all(0.5 <= item["classification_confidence"] <= 1 for item in result["requirements"] + result["responsibilities"]))
 
+    def test_numbered_sections_without_sentence_punctuation_keep_role_boundaries(self) -> None:
+        body = (
+            "AI产品经理实习 职位描述 "
+            "1、负责智能平台的产品设计与优化，产出需求文档和原型图 "
+            "2、与研发、策略、算法团队紧密合作，共同推动方案落地 "
+            "3、关注用户反馈、业务诉求及运营数据 "
+            "4、持续跟踪行业前沿发展并挖掘新场景 "
+            "任职要求 "
+            "1、本科及以上学历，计算机、统计学相关专业优先 "
+            "2、具备良好的沟通能力、抗压能力和责任心 "
+            "3、善于学习思考，逻辑思维严密"
+        )
+
+        result = ApplicationInfoAgent().run({"body": body})
+
+        self.assertEqual(len(result["responsibilities"]), 4)
+        self.assertEqual(len(result["requirements"]), 3)
+        self.assertTrue(any(item["text"].startswith("与研发") for item in result["responsibilities"]))
+        self.assertTrue(any(item["text"].startswith("本科及以上") for item in result["requirements"]))
+        for item in result["responsibilities"] + result["requirements"]:
+            self.assertEqual(body[item["offset_start"] : item["offset_end"]], item["text"])
+
     def test_complete_pipeline_uses_only_loaded_evidence(self) -> None:
         card = {"note_id": "n1", "title": "AI产品运营实习", "note_url": "https://example/n1"}
         note = {
@@ -465,15 +488,10 @@ class ApplicationAgentTests(unittest.TestCase):
         result = ApplicationIntelligencePipeline(PROFILE, now=COLLECTED).run([card], [note])
         self.assertFalse(result.passed)
         self.assertEqual(result.payload["quality_gate"]["body_count"], 0)
-        record = result.payload["records"][0]
-        self.assertFalse(record["quality"]["body_present"])
-        self.assertEqual(record["outreach"]["status"], "needs_review")
-        self.assertEqual(record["outreach"]["runtime_status"], "fallback_missing_job_body")
-        self.assertEqual(record["job_card"]["parse_basis"], "search_card")
-        self.assertEqual(record["job_card"]["status"], "generated")
-        self.assertTrue(record["quality"]["job_card_generated"])
-        self.assertTrue(record["quality"]["outreach_generated"])
-        self.assertTrue(all(record["outreach"][field] for field in ("greeting", "email_subject", "email_body", "cover_letter")))
+        self.assertEqual(result.payload["records"], [])
+        self.assertEqual(result.payload["publication_contract"]["published_count"], 0)
+        self.assertEqual(result.payload["publication_contract"]["pending_body_count"], 1)
+        self.assertFalse(result.payload["quality_gate"]["checks"]["all_discovered_notes_have_records"])
         self.assertTrue(result.payload["quality_gate"]["checks"]["all_scraped_jobs_have_job_cards"])
         self.assertTrue(result.payload["quality_gate"]["checks"]["all_scraped_jobs_have_application_copy"])
 
@@ -578,12 +596,13 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertFalse(result.passed)
         gate = result.payload["quality_gate"]
         self.assertEqual(gate["discovered_count"], 2)
-        self.assertEqual(gate["covered_discovered_count"], 1)
+        self.assertEqual(gate["covered_discovered_count"], 0)
         self.assertFalse(gate["checks"]["all_discovered_notes_have_records"])
-        self.assertFalse(gate["checks"]["all_records_have_bodies"])
-        self.assertEqual(len(result.payload["records"]), 2)
-        self.assertEqual(gate["job_cards_generated"], 2)
-        self.assertEqual(gate["application_copy_generated"], 2)
+        self.assertTrue(gate["checks"]["all_records_have_bodies"])
+        self.assertEqual(result.payload["records"], [])
+        self.assertEqual(gate["job_cards_generated"], 0)
+        self.assertEqual(gate["application_copy_generated"], 0)
+        self.assertEqual(result.payload["publication_contract"]["pending_body_count"], 2)
         self.assertTrue(gate["checks"]["all_scraped_jobs_have_job_cards"])
         self.assertTrue(gate["checks"]["all_scraped_jobs_have_application_copy"])
 
@@ -611,10 +630,11 @@ class ApplicationAgentTests(unittest.TestCase):
 
         result = ApplicationIntelligencePipeline(PROFILE, now=COLLECTED).run(cards, notes)
 
-        self.assertEqual([record["note_id"] for record in result.payload["records"]], ["current-1", "current-2"])
+        self.assertEqual([record["note_id"] for record in result.payload["records"]], ["current-1"])
         self.assertEqual(result.payload["quality_gate"]["discovered_count"], 2)
         self.assertEqual(result.payload["quality_gate"]["record_count"], 1)
         self.assertEqual(result.payload["quality_gate"]["covered_discovered_count"], 1)
+        self.assertEqual(result.payload["publication_contract"]["pending_body_count"], 1)
 
     def test_csv_export_accepts_image_fields_added_after_first_row(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -999,6 +1019,40 @@ class WorkflowWrapperTests(unittest.TestCase):
         self.assertEqual(summary["collectionStopReason"], "scrape_runner_failed")
         self.assertEqual(summary["securityVerification"], {})
 
+    def test_job_ai_targets_parse_ready_bodies_without_losing_pending_resume_targets(self) -> None:
+        cards = [
+            {"note_id": "ready", "title": "AI 产品实习"},
+            {"note_id": "pending", "title": "数据产品实习"},
+        ]
+        notes = [{
+            "note_id": "ready",
+            "title": "AI 产品实习",
+            "body": "负责 AI 产品需求分析，要求熟悉 SQL。",
+            "publish_time": "刚刚",
+            "scraped_at": "2026-07-28T09:31:42",
+        }]
+        result = ApplicationIntelligencePipeline(PROFILE, now=COLLECTED).run(cards, notes)
+
+        targets, reason, pending_count, fully_deferred = partition_job_ai_targets(
+            result.payload,
+            None,
+            {"missingBodies": 1, "stopReason": "rate_limited"},
+        )
+
+        self.assertEqual(targets, {"ready"})
+        self.assertEqual(reason, "rate_limited")
+        self.assertEqual(pending_count, 1)
+        self.assertFalse(fully_deferred)
+        self.assertNotEqual(result.payload.get("codex_runtime", {}).get("status"), "deferred_missing_bodies")
+        self.assertEqual(result.payload["source_coverage"]["readyCount"], 1)
+        summary = build_workflow_summary(result.payload, {"missingBodies": 1, "stopReason": "rate_limited"})
+        self.assertTrue(summary["qualityPending"])
+        self.assertEqual(summary["sourceCoverage"]["pendingCount"], 1)
+        self.assertEqual(summary["issues"][0]["code"], "SOURCE_BODY_COMPLETION_PENDING")
+        self.assertEqual(summary["agentStages"][5]["status"], "partial")
+        self.assertEqual(summary["agentStages"][6]["status"], "pending")
+        self.assertEqual(summary["agentStages"][-1]["status"], "pending")
+
     def test_workflow_summary_marks_only_explicit_security_timeout(self) -> None:
         cards = [{"note_id": "n1", "title": "AI one"}]
         result = ApplicationIntelligencePipeline(PROFILE, now=COLLECTED).run(cards, [])
@@ -1061,8 +1115,11 @@ class WorkflowWrapperTests(unittest.TestCase):
             self.assertEqual(summary["analysisMode"], "security_timeout_partial")
             self.assertEqual(summary["collectionStopReason"], "security_verification_timeout")
             self.assertEqual(summary["securityVerification"]["phase"], "search_discovery")
-            self.assertEqual(summary["jobCardsGenerated"], 1)
-            self.assertEqual(summary["applicationCopyGenerated"], 1)
+            self.assertEqual(summary["jobCardsGenerated"], 0)
+            self.assertEqual(summary["applicationCopyGenerated"], 0)
+            self.assertEqual(summary["sourceCoverage"]["targetCount"], 1)
+            self.assertEqual(summary["sourceCoverage"]["readyCount"], 0)
+            self.assertEqual(summary["sourceCoverage"]["pendingCount"], 1)
 
     def test_project_manifest_hashes_every_artifact_except_itself(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

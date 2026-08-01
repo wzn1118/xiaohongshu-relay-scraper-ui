@@ -4,11 +4,13 @@ import base64
 import io
 import ipaddress
 import json
+import math
 import os
 import socket
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,8 +27,74 @@ class AIProviderError(RuntimeError):
     pass
 
 
+class AIProviderTimeoutError(AIProviderError):
+    pass
+
+
 _LOCAL_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 _LOCAL_IMAGE_TOTAL_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def run_with_tree_timeout(
+    command: list[str],
+    *,
+    input_text: str,
+    timeout: int,
+    encoding: str = "utf-8",
+    errors: str = "replace",
+) -> subprocess.CompletedProcess[str]:
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding=encoding,
+        errors=errors,
+        creationflags=creationflags,
+    )
+    try:
+        stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        _terminate_process_tree(process)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as drain_error:
+            _terminate_process_tree(process)
+            stdout = drain_error.output or error.output or ""
+            stderr = drain_error.stderr or error.stderr or ""
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from error
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 class AIProvider:
@@ -38,6 +106,7 @@ class AIProvider:
         model: str = "",
         wire_api: str = "",
         timeout: int | None = None,
+        total_timeout: int | None = None,
         model_context_tokens: int | None = None,
         max_output_tokens: int | None = None,
     ):
@@ -52,6 +121,10 @@ class AIProvider:
             self.timeout = max(30, int(configured_timeout))
         except (TypeError, ValueError):
             self.timeout = 600
+        try:
+            self.total_timeout = max(30, int(total_timeout)) if total_timeout is not None else 0
+        except (TypeError, ValueError):
+            self.total_timeout = 0
         configured_context = (
             model_context_tokens
             if model_context_tokens is not None
@@ -73,10 +146,27 @@ class AIProvider:
         self.last_request_used_images = False
         self.last_request_model = ""
         self._vision_model_cache: str | None = None
+        self._terminal_error = ""
+        self._budget_deadline = 0.0
 
     @property
     def requires_api_key(self) -> bool:
         return self.provider != "local_qwen"
+
+    def _remaining_timeout(self) -> int:
+        if not self.total_timeout:
+            return self.timeout
+        now = time.monotonic()
+        if not self._budget_deadline:
+            self._budget_deadline = now + self.total_timeout
+        remaining = math.ceil(self._budget_deadline - now)
+        if remaining <= 0:
+            self._terminal_error = (
+                f"AI runtime budget exhausted after {self.total_timeout} seconds; "
+                "remaining records were preserved for a later resume"
+            )
+            raise AIProviderTimeoutError(self._terminal_error)
+        return min(self.timeout, remaining)
 
     def generate_json(
         self,
@@ -85,6 +175,9 @@ class AIProvider:
         schema: dict[str, Any],
         image_urls: list[str] | None = None,
     ) -> dict[str, Any]:
+        if self._terminal_error:
+            raise AIProviderTimeoutError(self._terminal_error)
+        self._remaining_timeout()
         images = [
             value.strip()
             for value in (image_urls or [])
@@ -446,24 +539,21 @@ class AIProvider:
                 command.extend(["--model", self.model])
             command.append("-")
             prompt = f"SYSTEM\n{system}\n\nUSER\n{user}"
+            request_timeout = self._remaining_timeout()
             try:
-                completed = subprocess.run(
+                completed = run_with_tree_timeout(
                     command,
-                    input=prompt,
-                    text=True,
+                    input_text=prompt,
+                    timeout=request_timeout,
                     encoding="utf-8",
                     errors="replace",
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=self.timeout,
-                    check=False,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
             except subprocess.TimeoutExpired as error:
-                raise AIProviderError(
-                    f"Codex CLI timed out after {self.timeout} seconds; "
-                    "increase XHS_AI_TIMEOUT_SECONDS or select a faster model"
-                ) from error
+                self._terminal_error = (
+                    f"Codex CLI timed out after {request_timeout} seconds; "
+                    "the current AI run was stopped and remaining records were preserved"
+                )
+                raise AIProviderTimeoutError(self._terminal_error) from error
             if completed.returncode != 0:
                 detail = (completed.stderr or completed.stdout or "Codex CLI failed")[-800:]
                 raise AIProviderError(detail)

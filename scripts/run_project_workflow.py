@@ -21,6 +21,7 @@ from ai_application_workflow import (
     record_needs_completion,
     record_needs_content_completion,
 )
+from ai_provider_runtime import AIProvider
 from audience_collection import collect_audience, normalize_audience_post_status
 from expansion_collection import collect_expansion
 from body_completion_ledger import BodyCompletionLedger, LEDGER_FILENAME, load_ledger
@@ -134,6 +135,13 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser.add_argument("--state-path")
     parser.add_argument("--expected-state-revision", type=int)
     return parser.parse_known_args(arguments)
+
+
+def build_ai_provider(wrapper: argparse.Namespace) -> AIProvider:
+    return AIProvider(
+        timeout=wrapper.codex_timeout_seconds,
+        total_timeout=wrapper.codex_timeout_seconds,
+    )
 
 
 def expansion_config(wrapper: argparse.Namespace) -> dict[str, Any] | None:
@@ -596,10 +604,62 @@ def mark_ai_deferred(payload: dict[str, Any], body_summary: dict[str, Any] | Non
     return reason
 
 
+def partition_job_ai_targets(
+    payload: dict[str, Any],
+    requested_target_ids: set[str] | None,
+    body_summary: dict[str, Any] | None,
+) -> tuple[set[str] | None, str, int, bool]:
+    records = [record for record in payload.get("records", []) if isinstance(record, dict)]
+    gate = payload.get("quality_gate") if isinstance(payload.get("quality_gate"), dict) else {}
+    body_metrics = canonical_body_metrics(body_summary or {}, gate)
+
+    def record_key(record: dict[str, Any]) -> str:
+        return str(record.get("note_id") or record.get("id") or "").strip()
+
+    desired_records = (
+        records
+        if requested_target_ids is None
+        else [record for record in records if record_key(record) in requested_target_ids]
+    )
+    ready_records = [record for record in desired_records if str(record.get("body") or "").strip()]
+    ready_target_ids = {record_key(record) for record in ready_records if record_key(record)}
+    full_body_count = sum(1 for record in records if str(record.get("body") or "").strip())
+    contract = payload.get("publication_contract") if isinstance(payload.get("publication_contract"), dict) else {}
+    target_count = max(
+        len(records),
+        int(body_metrics.get("discovered") or 0),
+        int(gate.get("discovered_count") or 0),
+        int(contract.get("candidate_count") or 0),
+    )
+    ready_count = min(target_count, full_body_count)
+    pending_count = max(0, target_count - ready_count)
+    reason = body_collection_deferred_reason(body_summary) if pending_count else ""
+    if pending_count and not reason:
+        reason = "missing_bodies"
+    fully_deferred = pending_count > 0 and not ready_records
+    payload["source_coverage"] = {
+        "status": "partial" if pending_count else "complete",
+        "reason": reason,
+        "targetCount": target_count,
+        "readyCount": ready_count,
+        "pendingCount": pending_count,
+        "totalRecordCount": len(records),
+        "fullBodyCount": full_body_count,
+        "statisticsSource": body_metrics.get("statisticsSource") or "qualityGate",
+    }
+    if fully_deferred:
+        mark_ai_deferred(payload, body_summary)
+
+    if requested_target_ids is None and pending_count == 0:
+        return None, reason, pending_count, fully_deferred
+    return ready_target_ids, reason, pending_count, fully_deferred
+
+
 def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any] | None = None) -> dict[str, Any]:
     gate = payload["quality_gate"]
     records = payload["records"]
     body_summary = body_summary or {}
+    body_metrics = canonical_body_metrics(body_summary, gate)
     time_normalized = sum(1 for record in records if record["publish_time"]["value"])
     exact_time = sum(
         1
@@ -628,9 +688,27 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
     runtime = payload.get("codex_runtime", {})
     task_mode = "general" if payload.get("analysis_mode") == "general" else "job"
     ai_deferred = runtime.get("status") == "deferred_missing_bodies"
+    stored_source_coverage = payload.get("source_coverage")
+    if isinstance(stored_source_coverage, dict):
+        source_coverage = dict(stored_source_coverage)
+    else:
+        full_body_count = sum(1 for record in records if str(record.get("body") or "").strip())
+        pending_count = max(0, len(records) - full_body_count)
+        source_coverage = {
+            "status": "partial" if pending_count else "complete",
+            "reason": body_collection_deferred_reason(body_summary) if pending_count else "",
+            "targetCount": len(records),
+            "readyCount": full_body_count,
+            "pendingCount": pending_count,
+            "totalRecordCount": len(records),
+            "fullBodyCount": full_body_count,
+        }
+    source_pending_count = max(0, int(source_coverage.get("pendingCount") or 0))
+    source_pending = source_pending_count > 0
     partial_analysis = bool(
         body_summary.get("transitionedToAnalysis")
         or int(body_summary.get("missingBodies") or 0) > 0
+        or source_pending
     )
     collection_stop_reason = str(body_summary.get("stopReason") or "")
     security_verification = body_summary.get("securityVerification")
@@ -641,7 +719,6 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         or security_verification.get("status") == "timed_out"
     )
     rate_limit = body_summary.get("rateLimit")
-    body_metrics = canonical_body_metrics(body_summary, gate)
     if not isinstance(rate_limit, dict):
         rate_limit = {}
     rate_limited = collection_stop_reason == "rate_limited" or rate_limit.get("status") == "stopped"
@@ -660,16 +737,21 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         {"index": 3, "total": 8, "id": "keyword-blueprint-agent" if task_mode == "general" else "profile-memory-agent", "label": "keyword-blueprint" if task_mode == "general" else "background-memory", "status": "completed"},
         {"index": 4, "total": 8, "id": "image-content-agent" if task_mode == "general" else "application-info-agent", "label": "image-and-content" if task_mode == "general" else "responsibilities-requirements-and-routes", "status": "completed"},
         {"index": 5, "total": 8, "id": "dynamic-module-agent" if task_mode == "general" else "capability-agent", "label": "dynamic-modules" if task_mode == "general" else "job-capabilities", "status": "completed"},
-        {"index": 6, "total": 8, "id": "content-analysis-agent" if task_mode == "general" else "ai-writer-agent", "label": "ai-content-analysis" if task_mode == "general" else "per-link-outreach", "status": "deferred" if ai_deferred else runtime.get("status", "disabled")},
-        {"index": 7, "total": 8, "id": "content-quality-agent" if task_mode == "general" else "employer-review-agent", "label": "content-quality-check" if task_mode == "general" else "score-and-rewrite", "status": "deferred" if ai_deferred else runtime.get("status", "disabled")},
+        {"index": 6, "total": 8, "id": "content-analysis-agent" if task_mode == "general" else "ai-writer-agent", "label": "ai-content-analysis" if task_mode == "general" else "per-link-outreach", "status": "deferred" if ai_deferred else "partial" if source_pending else runtime.get("status", "disabled")},
+        {"index": 7, "total": 8, "id": "content-quality-agent" if task_mode == "general" else "employer-review-agent", "label": "content-quality-check" if task_mode == "general" else "score-and-rewrite", "status": "deferred" if ai_deferred else "pending" if source_pending else runtime.get("status", "disabled")},
         {
             "index": 8,
             "total": 8,
             "id": "quality-gate-agent",
             "label": "quality-gate-and-artifacts",
-            "status": "pending" if ai_deferred else "passed" if gate["passed"] else "failed",
+            "status": "pending" if source_pending else "passed" if gate["passed"] else "failed",
         },
     ]
+    source_pending_issues = [{
+        "check": "full_body_coverage",
+        "code": "SOURCE_BODY_COMPLETION_PENDING",
+        "message": f"{source_pending_count} records are waiting for full-body collection before final AI quality review",
+    }] if source_pending else []
     return {
         "schemaVersion": 1,
         "runner": "xiaohongshu-project-workflow",
@@ -699,9 +781,10 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         "generationCoveragePercent": round((application_copy / len(records)) * 100, 2) if records else 100.0,
         "applicationDetailsExtracted": contacts + routes + responsibilities + requirements,
         "codexRuntime": runtime,
-        "qualityPending": ai_deferred,
+        "sourceCoverage": source_coverage,
+        "qualityPending": source_pending,
         "checks": gate["checks"],
-        "issues": [] if ai_deferred else gate["issues"],
+        "issues": source_pending_issues if source_pending else gate["issues"],
         "agentStages": agent_stages,
         "discovered": body_metrics["discovered"],
         "bodyAttempted": body_metrics["attempted"],
@@ -717,7 +800,7 @@ def build_workflow_summary(payload: dict[str, Any], body_summary: dict[str, Any]
         "timesNormalized": time_normalized,
         "applicationInfo": job_cards,
         "draftsGenerated": application_copy,
-        "qualityPassed": 1 if gate["passed"] else 0,
+        "qualityPassed": 1 if gate["passed"] and not source_pending else 0,
     }
 
 
@@ -835,10 +918,13 @@ def materialize_checkpoint(
     content_goal: str = "",
     body_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    print("[checkpoint-analysis] parsing every discovered job card", flush=True)
+    print("[checkpoint-analysis] publishing body-backed records only", flush=True)
     notes_checkpoint = output_dir / "xiaohongshu_notes_latest.json"
     if not notes_checkpoint.exists():
         atomic_json(notes_checkpoint, [])
+    effective_body_summary = checkpoint_body_summary(output_dir, stop_reason=stop_reason)
+    if body_summary:
+        effective_body_summary = {**effective_body_summary, **body_summary}
     result = run_pipeline(output_dir, candidate_profile, use_codex_runtime=False, persist=False)
     result.payload["analysis_mode"] = analysis_mode
     result.payload["keyword"] = keyword
@@ -847,13 +933,12 @@ def materialize_checkpoint(
             "preset": content_preset,
             "goal": content_goal,
         }
+    if analysis_mode == "job":
+        partition_job_ai_targets(result.payload, None, effective_body_summary)
     write_pipeline_artifacts(output_dir, result.payload)
     summary = build_workflow_summary(
         result.payload,
-        body_summary or {
-            "transitionedToAnalysis": True,
-            "stopReason": stop_reason,
-        },
+        effective_body_summary,
     )
     atomic_json(output_dir / "workflow-summary.json", summary)
     write_project_manifest(output_dir, summary)
@@ -1232,6 +1317,8 @@ def main_stateful(
     previous_application = load_application_checkpoint(output_dir) if only_incomplete else None
     payload: dict[str, Any] | None = load_application_checkpoint(output_dir)
     deferred_reason = ""
+    source_pending_reason = ""
+    source_pending_count = 0
     analysis_ran = state.should_run("analysis", force=body_ran)
     if analysis_ran:
         state.start_stage("analysis")
@@ -1263,12 +1350,22 @@ def main_stateful(
             )
             if only_incomplete:
                 print(f"COMPLETE_MISSING targets={len(target_note_ids)} reused={reused}", flush=True)
-            deferred_reason = mark_ai_deferred(payload, body_summary)
-            if deferred_reason:
+            if wrapper.analysis_mode == "job":
+                target_note_ids, source_pending_reason, source_pending_count, fully_deferred = partition_job_ai_targets(
+                    payload,
+                    target_note_ids,
+                    body_summary,
+                )
+                deferred_reason = source_pending_reason if fully_deferred else ""
+            else:
+                deferred_reason = mark_ai_deferred(payload, body_summary)
+                source_pending_reason = deferred_reason
+                source_pending_count = int(body_summary.get("missingBodies") or 0) if deferred_reason else 0
+            if source_pending_reason:
                 write_pipeline_artifacts(output_dir, payload)
                 print(
-                    f"AI_DEFERRED reason={deferred_reason} "
-                    f"missing={int(body_summary.get('missingBodies') or 0)}",
+                    f"AI_{'DEFERRED' if deferred_reason else 'PARTIAL'} reason={source_pending_reason} "
+                    f"ready={len(target_note_ids or set())} pending={source_pending_count}",
                     flush=True,
                 )
             state.checkpoint_analysis(payload)
@@ -1276,6 +1373,8 @@ def main_stateful(
             emit_stage(2, "time-normalization")
             emit_stage(3, "keyword-blueprint" if wrapper.analysis_mode == "general" else "background-memory")
             if wrapper.codex_runtime and not deferred_reason:
+                ai_provider = build_ai_provider(wrapper)
+
                 def checkpoint_ai_progress(
                     completed_count: int,
                     total: int,
@@ -1292,6 +1391,7 @@ def main_stateful(
                     report = enrich_general_payload(
                         payload,
                         keyword,
+                        provider=ai_provider,
                         only_incomplete=only_incomplete,
                         progress_callback=checkpoint_ai_progress,
                         content_preset=wrapper.content_preset,
@@ -1304,6 +1404,7 @@ def main_stateful(
                         profile,
                         threshold=wrapper.cover_letter_threshold,
                         max_attempts=wrapper.cover_letter_max_attempts,
+                        provider=ai_provider,
                         only_incomplete=only_incomplete,
                         target_note_ids=target_note_ids,
                         progress_callback=checkpoint_ai_progress,
@@ -1319,8 +1420,8 @@ def main_stateful(
             if wrapper.analysis_mode == "general":
                 emit_stage(4, "image-and-content")
                 emit_stage(5, "dynamic-modules")
-                emit_stage(6, "ai-content-analysis", "deferred" if deferred_reason else payload["codex_runtime"]["status"])
-                emit_stage(7, "content-quality-check", "deferred" if deferred_reason else "passed" if payload["quality_gate"].get("passed") else "failed")
+                emit_stage(6, "ai-content-analysis", "deferred" if deferred_reason else "partial" if source_pending_reason else payload["codex_runtime"]["status"])
+                emit_stage(7, "content-quality-check", "deferred" if deferred_reason else "pending" if source_pending_reason else "passed" if payload["quality_gate"].get("passed") else "failed")
                 remaining_analysis = sum(
                     1 for item in payload.get("records", [])
                     if isinstance(item, dict) and record_needs_content_completion(item)
@@ -1328,18 +1429,26 @@ def main_stateful(
             else:
                 emit_stage(4, "application-info")
                 emit_stage(5, "job-capabilities")
-                emit_stage(6, "ai-outreach", "deferred" if deferred_reason else payload["codex_runtime"]["status"])
-                emit_stage(7, "employer-score-and-rewrite", "deferred" if deferred_reason else "passed" if payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
+                emit_stage(6, "ai-outreach", "deferred" if deferred_reason else "partial" if source_pending_reason else payload["codex_runtime"]["status"])
+                emit_stage(7, "employer-score-and-rewrite", "deferred" if deferred_reason else "pending" if source_pending_reason else "passed" if payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
                 remaining_analysis = sum(
                     1 for item in payload.get("records", [])
                     if isinstance(item, dict) and record_needs_completion(item)
                 )
-            analysis_status = "blocked" if deferred_reason else "completed" if remaining_analysis == 0 else "partial"
+            analysis_status = (
+                "blocked" if deferred_reason
+                else "partial" if source_pending_reason or remaining_analysis > 0
+                else "completed"
+            )
             state.checkpoint_analysis(payload, status=analysis_status)
-            state.finish_stage("analysis", analysis_status, {
-                "remainingCount": remaining_analysis,
-                "stopReason": deferred_reason,
-            })
+            # `remainingCount` belongs to the analysis ledger.  The number of
+            # notes that still need body collection is a separate upstream
+            # metric and can differ from the number of incomplete analyses.
+            analysis_stage_patch = {
+                "stopReason": source_pending_reason,
+                "sourcePendingCount": source_pending_count,
+            }
+            state.finish_stage("analysis", analysis_status, analysis_stage_patch)
         except BaseException as error:
             fail_state_stage(state, "analysis", error)
             raise
@@ -1353,6 +1462,11 @@ def main_stateful(
         runtime = payload.get("codex_runtime")
         if isinstance(runtime, dict) and runtime.get("status") == "deferred_missing_bodies":
             deferred_reason = str(runtime.get("reason") or body_collection_deferred_reason(body_summary))
+    if payload is not None:
+        source_coverage = payload.get("source_coverage")
+        if isinstance(source_coverage, dict) and int(source_coverage.get("pendingCount") or 0) > 0:
+            source_pending_count = int(source_coverage.get("pendingCount") or 0)
+            source_pending_reason = str(source_coverage.get("reason") or "missing_bodies")
 
     if payload is not None:
         gate = payload.get("quality_gate") if isinstance(payload.get("quality_gate"), dict) else {}
@@ -1360,10 +1474,10 @@ def main_stateful(
             "[quality-gate] "
             f"discovered={gate.get('discovered_count', 0)} records={gate.get('record_count', 0)} "
             f"full_bodies={gate.get('body_count', 0)} "
-            f"status={'DEFERRED' if deferred_reason else 'PASS' if gate.get('passed') else 'FAIL'}",
+            f"status={'PENDING' if source_pending_reason else 'PASS' if gate.get('passed') else 'FAIL'}",
             flush=True,
         )
-        if not deferred_reason:
+        if not source_pending_reason:
             for issue in gate.get("issues", []):
                 if isinstance(issue, dict):
                     print(f"[quality-gate] {issue.get('message', '')}", flush=True)
@@ -1433,8 +1547,8 @@ def main_stateful(
             atomic_json(output_dir / "workflow-summary.json", summary)
             gate_passed = bool(payload and payload.get("quality_gate", {}).get("passed"))
             audience_passed = audience_summary is None or audience_summary.get("status") == "complete"
-            passed = not deferred_reason and gate_passed and audience_passed if payload is not None else audience_passed
-            emit_stage(8, "quality-gate-and-artifacts", "pending" if deferred_reason else "passed" if passed else "failed")
+            passed = not source_pending_reason and gate_passed and audience_passed if payload is not None else audience_passed
+            emit_stage(8, "quality-gate-and-artifacts", "pending" if source_pending_reason else "passed" if passed else "failed")
             manifest_path = write_project_manifest(output_dir, summary)
             finish_artifact_state(state, output_dir, manifest_path)
         except BaseException as error:
@@ -1614,17 +1728,31 @@ def main(arguments: list[str] | None = None) -> int:
     )
     if wrapper.complete_missing_only:
         print(f"COMPLETE_MISSING targets={len(target_note_ids)} reused={reused}", flush=True)
-    deferred_reason = mark_ai_deferred(result.payload, body_summary)
-    if deferred_reason:
+    source_pending_reason = ""
+    source_pending_count = 0
+    if wrapper.analysis_mode == "job":
+        target_note_ids, source_pending_reason, source_pending_count, fully_deferred = partition_job_ai_targets(
+            result.payload,
+            target_note_ids,
+            body_summary,
+        )
+        deferred_reason = source_pending_reason if fully_deferred else ""
+    else:
+        deferred_reason = mark_ai_deferred(result.payload, body_summary)
+        source_pending_reason = deferred_reason
+        source_pending_count = int(body_summary.get("missingBodies") or 0) if deferred_reason else 0
+    if source_pending_reason:
         write_pipeline_artifacts(output_dir, result.payload)
         print(
-            f"AI_DEFERRED reason={deferred_reason} "
-            f"missing={int(body_summary.get('missingBodies') or 0)}",
+            f"AI_{'DEFERRED' if deferred_reason else 'PARTIAL'} reason={source_pending_reason} "
+            f"ready={len(target_note_ids or set())} pending={source_pending_count}",
             flush=True,
         )
     emit_stage(2, "time-normalization")
     emit_stage(3, "keyword-blueprint" if wrapper.analysis_mode == "general" else "background-memory")
     if wrapper.codex_runtime and not deferred_reason:
+        ai_provider = build_ai_provider(wrapper)
+
         def checkpoint_ai_progress(completed: int, total: int, status: str, _record: dict[str, Any]) -> None:
             if completed % 5 == 0 or completed == total or status != "skipped":
                 print(f"AI_RECORD {completed}/{total} {status}", flush=True)
@@ -1635,6 +1763,7 @@ def main(arguments: list[str] | None = None) -> int:
             report = enrich_general_payload(
                 result.payload,
                 keyword,
+                provider=ai_provider,
                 only_incomplete=wrapper.complete_missing_only,
                 progress_callback=checkpoint_ai_progress,
                 content_preset=wrapper.content_preset,
@@ -1647,6 +1776,7 @@ def main(arguments: list[str] | None = None) -> int:
                 profile,
                 threshold=wrapper.cover_letter_threshold,
                 max_attempts=wrapper.cover_letter_max_attempts,
+                provider=ai_provider,
                 only_incomplete=wrapper.complete_missing_only,
                 target_note_ids=target_note_ids,
                 progress_callback=checkpoint_ai_progress,
@@ -1661,22 +1791,22 @@ def main(arguments: list[str] | None = None) -> int:
     if wrapper.analysis_mode == "general":
         emit_stage(4, "image-and-content")
         emit_stage(5, "dynamic-modules")
-        emit_stage(6, "ai-content-analysis", "deferred" if deferred_reason else result.payload["codex_runtime"]["status"])
-        emit_stage(7, "content-quality-check", "deferred" if deferred_reason else "passed" if result.payload["quality_gate"].get("passed") else "failed")
+        emit_stage(6, "ai-content-analysis", "deferred" if deferred_reason else "partial" if source_pending_reason else result.payload["codex_runtime"]["status"])
+        emit_stage(7, "content-quality-check", "deferred" if deferred_reason else "pending" if source_pending_reason else "passed" if result.payload["quality_gate"].get("passed") else "failed")
     else:
         emit_stage(4, "application-info")
         emit_stage(5, "job-capabilities")
-        emit_stage(6, "ai-outreach", "deferred" if deferred_reason else result.payload["codex_runtime"]["status"])
-        emit_stage(7, "employer-score-and-rewrite", "deferred" if deferred_reason else "passed" if result.payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
+        emit_stage(6, "ai-outreach", "deferred" if deferred_reason else "partial" if source_pending_reason else result.payload["codex_runtime"]["status"])
+        emit_stage(7, "employer-score-and-rewrite", "deferred" if deferred_reason else "pending" if source_pending_reason else "passed" if result.payload["quality_gate"].get("cover_letter_quality_passed") else "failed")
     gate = result.payload["quality_gate"]
     print(
         "[quality-gate] "
         f"discovered={gate['discovered_count']} records={gate['record_count']} "
         f"full_bodies={gate['body_count']} "
-        f"status={'DEFERRED' if deferred_reason else 'PASS' if gate['passed'] else 'FAIL'}",
+        f"status={'PENDING' if source_pending_reason else 'PASS' if gate['passed'] else 'FAIL'}",
         flush=True,
     )
-    if not deferred_reason:
+    if not source_pending_reason:
         for issue in gate["issues"]:
             print(f"[quality-gate] {issue['message']}", flush=True)
     audience_summary: dict[str, Any] | None = None
@@ -1704,8 +1834,8 @@ def main(arguments: list[str] | None = None) -> int:
         if audience_summary.get("status") != "complete":
             summary["status"] = "completed_partial"
     atomic_json(output_dir / "workflow-summary.json", summary)
-    result.passed = bool(not deferred_reason and gate["passed"] and (audience_summary is None or audience_summary.get("status") == "complete"))
-    emit_stage(8, "quality-gate-and-artifacts", "pending" if deferred_reason else "passed" if result.passed else "failed")
+    result.passed = bool(not source_pending_reason and gate["passed"] and (audience_summary is None or audience_summary.get("status") == "complete"))
+    emit_stage(8, "quality-gate-and-artifacts", "pending" if source_pending_reason else "passed" if result.passed else "failed")
     write_project_manifest(output_dir, summary)
     return 0 if result.passed else 3
 

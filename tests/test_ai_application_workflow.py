@@ -689,6 +689,7 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertEqual(record["media"]["analysis"]["source"], "vision_model")
         self.assertIn("参与数据产品迭代策划", record["media"]["analysis"]["visible_text"])
         self.assertEqual(record["outreach"]["runtime_status"], "image_enriched_missing_job_body")
+        self.assertTrue(record_needs_completion(record))
 
     def test_caption_body_merges_cached_verified_ocr_into_job_card(self) -> None:
         caption = "深圳/香港实习丨腾讯 商业分析实习 2天前 福建"
@@ -750,7 +751,7 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertTrue(any("香港院校在读" in item for item in requirements))
         self.assertNotIn(caption, responsibilities)
         self.assertTrue(any(item.get("source_field") == "image" for item in record["application_info"]["requirements"]))
-        self.assertFalse(record_needs_completion(record))
+        self.assertTrue(record_needs_completion(record))
         self.assertEqual(events[0]["current"], 0)
         self.assertEqual(events[0]["total"], 1)
         self.assertEqual(events[0]["status"], "image_prefilled")

@@ -752,6 +752,19 @@ function hasVerifiedDraftQuality(result: ApplicationResult): boolean {
     && draft.qualityCheckedHash === draft.contentHash
 }
 
+function hasUncheckedDraftQuality(result: ApplicationResult): boolean {
+  const draft = result.draftVersion
+  if (!draft || draft.qualityStatus !== 'stale') return false
+  const versionCount = Number(draft.versionCount ?? draft.version)
+  return draft.qualityCheckedVersion == null
+    && !draft.qualityCheckedHash
+    && versionCount <= 1
+}
+
+function hasInvalidatedDraftQuality(result: ApplicationResult): boolean {
+  return result.draftVersion?.qualityStatus === 'stale' && !hasUncheckedDraftQuality(result)
+}
+
 function resultFilterStats(results: ApplicationResultsResponse) {
   const items = Array.isArray(results.items) ? results.items : []
   return results.filters?.stats ?? {
@@ -759,6 +772,20 @@ function resultFilterStats(results: ApplicationResultsResponse) {
     incomplete: 0,
     withImages: 0,
     unknown: 0,
+  }
+}
+
+function resultCompletionStats(results: ApplicationResultsResponse) {
+  const incomplete = Math.max(0, Number(resultFilterStats(results).incomplete || 0))
+  const sourcePending = Math.max(0, Number(results.sourceCoverage?.pendingCount || 0))
+  const publishedWithoutBody = Math.max(
+    0,
+    Number(results.sourceCoverage?.totalRecordCount || 0) - Number(results.sourceCoverage?.fullBodyCount || 0),
+  )
+  return {
+    incomplete,
+    sourcePending,
+    total: sourcePending + Math.max(0, incomplete - publishedWithoutBody),
   }
 }
 
@@ -909,6 +936,7 @@ function GeneralResultsWorkspace({
   const selectedImages = selectedResult ? resultImages(selectedResult) : []
   const resultItems = Array.isArray(results.items) ? results.items : []
   const resultStats = resultFilterStats(results)
+  const completionStats = resultCompletionStats(results)
   return (
     <>
       {results.research ? <section className="content-research-context" aria-label="本次非岗位研究设定">
@@ -929,8 +957,9 @@ function GeneralResultsWorkspace({
       </section> : null}
       <div className="results-control-bar general-results-controls">
         <div className="result-stats" aria-label="内容统计">
-          <span><strong>{resultStats.all}</strong>全部内容</span>
+          <span><strong>{resultStats.all}</strong>正文已采</span>
           <span className={(resultSort !== 'newest' || resultTimeRange !== 'all') ? 'active-filter-stat' : ''}><strong>{results.total}</strong>筛选结果</span>
+          <span className={completionStats.sourcePending ? 'warning' : ''}><strong>{completionStats.sourcePending}</strong>正文待续采</span>
           <span className={resultStats.incomplete ? 'warning' : ''}><strong>{resultStats.incomplete}</strong>待 AI 补全</span>
           <span><strong>{resultStats.withImages}</strong>含图片</span>
           <span><strong>{resultStats.unknown}</strong>日期待确认</span>
@@ -939,7 +968,7 @@ function GeneralResultsWorkspace({
           <label><ArrowUpDown size={15} /><span>排序</span><select aria-label="内容时间排序" value={resultSort} disabled={resultsLoading} onChange={(event) => onSort(event.target.value as 'newest' | 'oldest')}><option value="newest">最新发布优先</option><option value="oldest">最早发布优先</option></select></label>
           <label><CalendarClock size={15} /><span>时间</span><select aria-label="内容时间筛选" value={resultTimeRange} disabled={resultsLoading} onChange={(event) => onTimeRange(event.target.value as ApplicationResultsResponse['filters']['timeRange'])}><option value="all">全部时间</option><option value="1">近 24 小时</option><option value="3">近 3 天</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option><option value="unknown">日期待确认</option></select></label>
           {(resultSort !== 'newest' || resultTimeRange !== 'all') && <button className="reset-result-filter" type="button" disabled={resultsLoading} onClick={onReset}><RotateCcw size={15} />重置筛选</button>}
-          <button className="complete-missing-button" type="button" disabled={!resultStats.incomplete || completingMissing || resultsLoading} onClick={onComplete}>{completingMissing ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{completingMissing ? '正在核对任务' : '补全缺失分析'}</button>
+          <button className="complete-missing-button" type="button" disabled={!completionStats.total || completingMissing || resultsLoading} onClick={onComplete}>{completingMissing ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{completingMissing ? '正在核对任务' : completionStats.sourcePending ? '续采正文并解析' : '补全缺失分析'}</button>
         </div>
       </div>
       <div className="results-workspace general-content-workspace">
@@ -1506,6 +1535,17 @@ function jobAnalysisMode(job: Job): AnalysisMode {
 }
 
 function isIncompleteApplicationResult(result: ApplicationResult) {
+  if (!result.body.trim()) return true
+
+  const runtimeStatus = result.outreach?.runtime_status || ''
+  if ([
+    'fallback_missing_job_body',
+    'image_enriched_missing_job_body',
+    'fallback_model_error',
+    'quality_threshold_not_met',
+    'fact_validation_failed',
+    'fact_validation_needs_human_review',
+  ].includes(runtimeStatus)) return true
   const verifiedImageEnrichment = result.media?.analysis?.status === 'analyzed'
     && result.media?.analysis?.source === 'vision_model'
     && result.job_card?.enrichment_status === 'image_enriched'
@@ -1518,9 +1558,7 @@ function isIncompleteApplicationResult(result: ApplicationResult) {
     && result.media?.analysis?.source === 'vision_model'
     && Boolean(result.media?.analysis?.visible_text?.trim())
   return hasUnmergedVerifiedImageText
-    || !result.body.trim()
     || result.job_card?.parse_basis === 'search_card'
-    || result.outreach?.runtime_status === 'fallback_missing_job_body'
 }
 
 function App() {
@@ -2962,7 +3000,7 @@ function App() {
           setSelectedResult((current) => payload.items.find((item) => item.note_id === current?.note_id) || payload.items[0] || null)
         }
       }
-      const remaining = payload.filters.stats.incomplete
+      const remaining = resultCompletionStats(payload).total
       const completed = activeJob.status === 'completed' && remaining === 0
       const message = completed
         ? `补全完成，${noun}已重新载入，当前剩余 0 条未完整记录。`
@@ -3438,7 +3476,7 @@ function App() {
     const generalMode = workspaceMode === 'general' || results?.analysisMode === 'general' || jobAnalysisMode(activeJob) === 'general'
     const sourceJobId = activeJob.id
     const noun = generalMode ? '内容分析' : '岗位信息'
-    const knownIncomplete = results?.filters.stats.incomplete ?? null
+    const knownIncomplete = results ? resultCompletionStats(results).total : null
     if (knownIncomplete === 0) {
       setCompletionFlow({
         stage: 'complete',
@@ -3459,7 +3497,27 @@ function App() {
     })
     setNotice(`正在核对所有未完整${noun}…`)
     try {
-      let session = aiSession
+      let session = aiSession && aiSessionMatchesSelection(aiSession) ? aiSession : null
+      const completionProvider = providers.find((item) => item.id === providerId)
+      const hasSelectedAiConfiguration = Boolean(
+        completionProvider
+        && (completionProvider.local || completionProvider.configured || apiKey.trim()),
+      )
+      if (!session && hasSelectedAiConfiguration && completionProvider) {
+        setRestoringAi(true)
+        setCompletionFlow((current) => current ? {
+          ...current,
+          stage: 'restoring_ai',
+          message: '正在连接当前选择的模型，然后恢复正文采集。',
+        } : current)
+        try {
+          session = apiKey.trim()
+            ? await createSelectedAiSession()
+            : await restoreAiSession(completionProvider)
+        } finally {
+          setRestoringAi(false)
+        }
+      }
       setCompletionFlow((current) => current ? {
         ...current,
         stage: 'starting',
@@ -3472,7 +3530,8 @@ function App() {
         response = await requestCompletion()
       } catch (error) {
         const apiError = error as Error & { code?: string }
-        if (apiError.code !== 'AI_SESSION_EXPIRED') throw error
+        if (!['AI_SESSION_EXPIRED', 'AI_SESSION_UNAVAILABLE'].includes(apiError.code || '')) throw error
+        if (!completionProvider || !hasSelectedAiConfiguration) throw error
         setRestoringAi(true)
         setCompletionFlow((current) => current ? {
           ...current,
@@ -3480,7 +3539,9 @@ function App() {
           message: 'AI 会话已过期，正在自动重连后继续。',
         } : current)
         try {
-          session = await restoreAiSession()
+          session = apiKey.trim()
+            ? await createSelectedAiSession()
+            : await restoreAiSession(completionProvider)
         } finally {
           setRestoringAi(false)
         }
@@ -3769,6 +3830,8 @@ function App() {
   const draftOperationPending = draftSaving || emailSending || deliveryUpdating
   const selectedDraftQualityVerified = Boolean(selectedResult && !selectedResultIncomplete && hasVerifiedDraftQuality(selectedResult))
   const selectedDraftQualityStale = Boolean(selectedResult && !selectedResultIncomplete && selectedResult.draftVersion?.qualityStatus === 'stale')
+  const selectedDraftQualityUnchecked = Boolean(selectedResult && !selectedResultIncomplete && hasUncheckedDraftQuality(selectedResult))
+  const selectedDraftQualityModelFallback = Boolean(selectedResult && !selectedResultIncomplete && selectedResult.outreach?.runtime_status === 'fallback_model_error')
   const selectedDraftQualityRetryable = Boolean(selectedResult?.draftVersion && !draftDirty && !selectedDraftQualityVerified)
   const draftSaveLabel = draftSaving
     ? '保存中'
@@ -3777,7 +3840,9 @@ function App() {
       : draftDirty
         ? '保存修改'
         : selectedDraftQualityRetryable
-          ? '质量已失效'
+          ? selectedDraftQualityUnchecked || selectedDraftQualityModelFallback
+            ? '运行质量检查'
+            : '重新质量检查'
           : '已保存'
   const openImagePreview = useCallback((title: string, images: PreviewImage[], index = 0) => {
     if (!images.length) return
@@ -4169,7 +4234,7 @@ function App() {
               <div className="smtp-simple-layout">
                 <div className="form-row smtp-primary-fields">
                   <label className="field"><span>发件邮箱</span><input type="email" autoComplete="email" value={smtpConfig.from} onChange={(event) => updateSmtpEmail(event.target.value)} placeholder="name@163.com" /></label>
-                  {(!smtpManualMode || smtpConfig.auth === 'login') && <label className="field"><span>{detectedSmtpPreset?.provider === '163' || detectedSmtpPreset?.provider === 'qq' ? '客户端授权密码' : '密码 / 应用专用密码'}</span><input type="password" autoComplete="current-password" value={smtpPassword} onChange={(event) => setSmtpPassword(event.target.value)} placeholder={smtpConfig.hasPassword ? '已保存，留空保持不变' : '仅保存在当前设备'} /></label>}
+                  {(!smtpManualMode || smtpConfig.auth === 'login') && <label className="field"><span>{detectedSmtpPreset?.provider === '163' || detectedSmtpPreset?.provider === 'qq' ? '客户端授权密码' : '密码 / 应用专用密码'}</span><input type="password" autoComplete="current-password" value={smtpPassword} onChange={(event) => setSmtpPassword(event.target.value)} placeholder={smtpConfig.hasPassword ? '已在本机加密保存，留空保持不变' : '保存后将在本机加密保留'} /></label>}
                 </div>
                 <div className={`smtp-auto-status ${detectedSmtpPreset ? 'detected' : ''}`}>
                   <Mail size={17} />
@@ -4223,7 +4288,7 @@ function App() {
                 <p className="smtp-guide-reminder"><ShieldCheck size={15} /><span>{smtpSetupGuide.reminder}</span></p>
               </section>
               <div className="smtp-config-footer">
-                <div className="smtp-guidance"><ShieldCheck size={16} /><span><strong>{smtpManualMode ? '高级参数仅保存在当前设备' : '邮箱凭据仅保存在当前设备'}</strong><small>{smtpManualMode ? smtpProviderOptions.find((item) => item.id === smtpConfig.provider)?.guidance : detectedSmtpProvider?.guidance || '输入完整邮箱后即可自动配置；企业邮箱请使用高级设置。'}</small></span></div>
+                <div className="smtp-guidance"><ShieldCheck size={16} /><span><strong>邮箱配置在本机加密持久保存</strong><small>{smtpManualMode ? `${smtpProviderOptions.find((item) => item.id === smtpConfig.provider)?.guidance || ''} 服务重启后仍可使用，凭据不进入任务记录或 GitHub。` : `${detectedSmtpProvider?.guidance || '输入完整邮箱后即可自动配置；企业邮箱请使用高级设置。'} 服务重启后仍可使用。`}</small></span></div>
                 <div className="smtp-config-actions">
                   <button type="button" className="secondary-button smtp-clear-action" disabled={smtpSaving || (!smtpConfig.from && !smtpConfig.configured && !smtpConfig.hasPassword && !smtpConfig.oauth.hasRefreshToken)} onClick={() => void clearSmtpConfig()}><RotateCcw size={16} />清除配置</button>
                   <button type="button" className="secondary-button" disabled={smtpSaving || !smtpCanSave} onClick={() => void saveSmtpConfig(false)}><Save size={16} />{smtpManualMode ? '保存配置' : '自动配置'}</button>
@@ -4667,8 +4732,9 @@ function App() {
               <>
               <div className="results-control-bar">
                 <div className="result-stats" aria-label="岗位卡统计">
-                  <span><strong>{resultFilterStats(results).all}</strong>全部岗位</span>
+                  <span><strong>{resultFilterStats(results).all}</strong>正文已采岗位</span>
                   <span className={(resultSort !== 'newest' || resultTimeRange !== 'all') ? 'active-filter-stat' : ''}><strong>{results.total}</strong>筛选结果</span>
+                  <span className={resultCompletionStats(results).sourcePending ? 'warning' : ''}><strong>{resultCompletionStats(results).sourcePending}</strong>正文待续采</span>
                   <span className={resultFilterStats(results).incomplete ? 'warning' : ''}><strong>{resultFilterStats(results).incomplete}</strong>信息未完整</span>
                   <span><strong>{resultFilterStats(results).withImages}</strong>含图片</span>
                   <span><strong>{resultFilterStats(results).unknown}</strong>日期待确认</span>
@@ -4683,7 +4749,7 @@ function App() {
                     void draftGuard.requestTransition('更改结果筛选', () => { draftViewRevisionRef.current += 1; setResultOffset(0); setResultTimeRange(value) })
                   }}><option value="all">全部时间</option><option value="1">近 24 小时</option><option value="3">近 3 天</option><option value="7">近 7 天</option><option value="30">近 30 天</option><option value="90">近 90 天</option><option value="unknown">日期待确认</option></select></label>
                   {(resultSort !== 'newest' || resultTimeRange !== 'all') && <button className="reset-result-filter" type="button" disabled={resultsLoading} onClick={() => void draftGuard.requestTransition('重置结果筛选', () => { draftViewRevisionRef.current += 1; setResultOffset(0); setResultSort('newest'); setResultTimeRange('all') })} title="恢复最新发布优先并显示全部时间"><RotateCcw size={15} />重置筛选</button>}
-                <button className="complete-missing-button" type="button" disabled={!resultFilterStats(results).incomplete || completingMissing || submitting || restoringAi || resultsLoading} onClick={() => void completeMissingResults()} title={aiSession ? '自动核对缺失项，并从原任务检查点继续' : '自动恢复已保存的 AI 配置并补全缺失项'}>{restoringAi || completingMissing ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{restoringAi ? '正在恢复 AI' : completingMissing ? '正在核对任务' : ['running', 'resuming', 'queued'].includes(activeJob?.status || '') ? '查看补全进度' : '一键智能补全'}</button>
+                <button className="complete-missing-button" type="button" disabled={!resultCompletionStats(results).total || completingMissing || submitting || restoringAi || resultsLoading} onClick={() => void completeMissingResults()} title={aiSession ? '从原任务检查点续采正文，正文落盘后再运行 AI 解析' : '自动恢复已保存的 AI 配置，续采正文后再解析'}>{restoringAi || completingMissing ? <LoaderCircle className="spin" size={16} /> : <WandSparkles size={16} />}{restoringAi ? '正在恢复 AI' : completingMissing ? '正在核对任务' : ['running', 'resuming', 'queued'].includes(activeJob?.status || '') ? '查看补全进度' : resultCompletionStats(results).sourcePending ? '续采正文并解析' : '一键智能补全'}</button>
                 </div>
               </div>
               <div className="results-workspace">
@@ -4694,18 +4760,24 @@ function App() {
                       const routeLabels = deliveryRoutes(item).map((route) => route.label)
                       const missingJobBody = isIncompleteApplicationResult(item)
                       const draftQualityStale = !missingJobBody && item.draftVersion?.qualityStatus === 'stale'
+                      const draftQualityUnchecked = !missingJobBody && hasUncheckedDraftQuality(item)
+                      const draftQualityInvalidated = !missingJobBody && hasInvalidatedDraftQuality(item)
                       const draftQualityVerified = !missingJobBody && hasVerifiedDraftQuality(item)
                       const draftState = item.delivery?.action === 'email_sent'
                         ? '已发送'
                         : missingJobBody
                           ? '信息未完整'
-                          : draftQualityStale
-                            ? '质量失效'
-                            : draftQualityVerified
-                              ? '≥ 90'
-                              : item.outreach?.runtime_status === 'fallback_model_error'
-                                ? 'AI 失败 · 有初稿'
-                                : '待重写'
+                          : draftQualityVerified
+                            ? '≥ 90'
+                            : item.outreach?.runtime_status === 'fallback_model_error'
+                              ? 'AI 失败 · 有初稿'
+                              : item.draftVersion?.qualityStatus === 'failed'
+                                ? '质量未通过'
+                                : draftQualityInvalidated
+                                  ? '质量失效'
+                                  : draftQualityUnchecked
+                                    ? '待质量检查'
+                                    : '待重写'
                       return (
                         <div key={item.note_id} className={`result-row ${selectedResult?.note_id === item.note_id ? 'selected' : ''}`}>
                           <ResultCardMedia result={item} onPreview={(images, index) => openImagePreview(item.title || '未命名岗位', images, index)} />
@@ -4780,7 +4852,15 @@ function App() {
                     <div className="evaluation-panel">
                       <div><span>用人单位评分</span><strong>{selectedDraftQualityStale ? '-' : selectedResult.cover_letter_evaluation?.score ?? '-'}<small>/ 100</small></strong></div>
                       <div><span>重写轮次</span><strong>{selectedDraftQualityStale ? '-' : selectedResult.cover_letter_evaluation?.attempts ?? '-'}</strong></div>
-                      <p>{selectedDraftQualityStale ? '草稿质量已失效，请保存后重新检查' : selectedResult.cover_letter_evaluation?.passed ? '已通过 90 分投递门槛' : (selectedResult.cover_letter_evaluation?.problems || []).join('；') || '等待评分'}</p>
+                      <p>{selectedDraftQualityModelFallback
+                        ? 'AI 生成曾失败，已保留可编辑初稿；请点击运行质量检查。'
+                        : selectedDraftQualityUnchecked
+                          ? '当前首版草稿尚未执行质量检查，请点击运行质量检查。'
+                          : selectedDraftQualityStale
+                            ? '草稿内容已变化，旧评分已经失效；请重新执行质量检查。'
+                            : selectedResult.cover_letter_evaluation?.passed
+                              ? '已通过 90 分投递门槛'
+                              : (selectedResult.cover_letter_evaluation?.problems || []).join('；') || '等待评分'}</p>
                     </div>
                     <div className="delivery-console">
                       <div className="delivery-target">

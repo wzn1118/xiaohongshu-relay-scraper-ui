@@ -96,6 +96,32 @@ def test_discovery_creates_one_durable_record_per_unique_note(tmp_path: Path) ->
     assert (tmp_path / LEDGER_FILENAME).is_file()
 
 
+def test_progress_counts_only_cards_with_real_attempts() -> None:
+    assert body_completion.processed_attempt_count(
+        ["completed", "failed", "pending-a", "pending-b"],
+        {"completed", "failed", "outside-task"},
+    ) == 2
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"access_status": "detail_playwright_error"}, True),
+        ({
+            "access_status": "detail_worker_error",
+            "worker_error": "Target page, context or browser has been closed",
+        }, True),
+        ({"access_status": "detail_rate_limited"}, False),
+        ({"access_status": "detail_empty"}, False),
+    ],
+)
+def test_fresh_page_retry_only_handles_recoverable_browser_failures(
+    payload: dict[str, str],
+    expected: bool,
+) -> None:
+    assert body_completion.should_retry_on_fresh_page(payload) is expected
+
+
 def test_request_start_is_persisted_before_result_and_duplicate_events_are_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -461,3 +487,88 @@ def test_body_completion_keeps_relay_call_path_fields_and_success_resume_idempot
         "discovered", "queued", "attempted", "succeeded", "failed",
         "not_attempted", "blocked", "cancelled",
     }
+
+
+def test_body_completion_retries_same_card_after_playwright_page_failure(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scrape_calls: list[str] = []
+    created_pages: list[object] = []
+
+    class FakePage:
+        def close(self) -> None:
+            return None
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            page = FakePage()
+            created_pages.append(page)
+            return page
+
+    class FakePlaywright:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeUpstream:
+        @staticmethod
+        def connect_browser(_playwright, _relay_port: int):
+            return object()
+
+        @staticmethod
+        def get_or_create_context(_browser):
+            return FakeContext()
+
+        @staticmethod
+        def scrape_note(_page, card, **_kwargs):
+            scrape_calls.append(card["note_id"])
+            if len(scrape_calls) == 1:
+                return FakeNote(
+                    note_id=card["note_id"],
+                    note_url=card["note_url"],
+                    title="retry me",
+                    body="",
+                    access_status="detail_playwright_error",
+                    source_marker="closed-page",
+                )
+            return FakeNote(
+                note_id=card["note_id"],
+                note_url=card["note_url"],
+                title="recovered",
+                body="full body after page recreation",
+                access_status="detail_ok",
+                source_marker="fresh-page",
+            )
+
+    playwright_package = types.ModuleType("playwright")
+    playwright_sync = types.ModuleType("playwright.sync_api")
+    playwright_sync.sync_playwright = FakePlaywright
+    (tmp_path / "xiaohongshu_cards_latest.json").write_text(
+        json.dumps(cards("n1")),
+        encoding="utf-8",
+    )
+    with mock.patch.object(body_completion, "load_upstream", return_value=FakeUpstream()), mock.patch.dict(
+        sys.modules,
+        {"playwright": playwright_package, "playwright.sync_api": playwright_sync},
+    ):
+        summary = body_completion.complete_bodies(
+            tmp_path,
+            relay_port=18792,
+            workers=1,
+            attempts=1,
+            speed_mode="steady",
+            note_delay_seconds=0,
+            upstream_scraper=tmp_path / "fake-upstream.py",
+        )
+
+    output = capsys.readouterr().out
+    assert scrape_calls == ["n1", "n1"]
+    assert len(created_pages) == 2
+    assert "PARALLEL_RETRY note=n1 reason=page_closed attempt=1/1" in output
+    assert "PARALLEL_PROGRESS processed=1 total=1 complete=1" in output
+    assert summary["bodyAttempted"] == 1
+    assert summary["bodySucceeded"] == 1
+    assert summary["passed"] is True

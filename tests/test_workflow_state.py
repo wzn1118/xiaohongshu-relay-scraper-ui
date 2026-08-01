@@ -64,6 +64,13 @@ def open_session(output_dir: Path, state_path: Path, *, revision: int = 4, scope
     )
 
 
+def test_ai_provider_uses_the_task_timeout() -> None:
+    provider = workflow.build_ai_provider(argparse.Namespace(codex_timeout_seconds=47))
+
+    assert provider.timeout == 47
+    assert provider.total_timeout == 47
+
+
 def test_stage_update_is_revision_checked_and_preserves_unknown_fields(tmp_path: Path) -> None:
     output_dir, state_path, _ = state_fixture(tmp_path)
     session = open_session(output_dir, state_path)

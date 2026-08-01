@@ -1411,9 +1411,22 @@ def _apply_claim_validation(
 
 
 def record_needs_completion(record: dict[str, Any]) -> bool:
+    if not bool(str(record.get("body") or "").strip()):
+        return True
+
     media = record.get("media") if isinstance(record.get("media"), dict) else {}
     analysis = media.get("analysis") if isinstance(media.get("analysis"), dict) else {}
     application = record.get("application_info") if isinstance(record.get("application_info"), dict) else {}
+    runtime_status = str((record.get("outreach") or {}).get("runtime_status") or "")
+    if runtime_status in {
+        "fallback_missing_job_body",
+        "image_enriched_missing_job_body",
+        "fallback_model_error",
+        "quality_threshold_not_met",
+        "fact_validation_failed",
+        "fact_validation_needs_human_review",
+    }:
+        return True
     verified_image_enrichment = (
         analysis.get("status") == "analyzed"
         and analysis.get("source") == "vision_model"
@@ -1425,10 +1438,7 @@ def record_needs_completion(record: dict[str, Any]) -> bool:
     _, has_verified_image_text = _verified_cached_image_role(record)
     return (
         has_verified_image_text
-        or
-        not bool(str(record.get("body") or "").strip())
         or (record.get("job_card") or {}).get("parse_basis") == "search_card"
-        or str((record.get("outreach") or {}).get("runtime_status") or "") == "fallback_missing_job_body"
     )
 
 

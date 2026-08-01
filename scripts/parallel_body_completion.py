@@ -63,6 +63,13 @@ RATE_LIMIT_MARKERS = (
     "error_code=300013",
     "detail_rate_limited",
 )
+PAGE_RECYCLE_STATUSES = {"detail_playwright_error"}
+PAGE_CLOSED_MARKERS = (
+    "target page, context or browser has been closed",
+    "page has been closed",
+    "context has been closed",
+    "browser has been closed",
+)
 
 
 def contains_security_verification(value: Any) -> bool:
@@ -73,6 +80,20 @@ def contains_security_verification(value: Any) -> bool:
 def contains_rate_limit(value: Any) -> bool:
     text = str(value or "").casefold()
     return any(marker.casefold() in text for marker in RATE_LIMIT_MARKERS)
+
+
+def should_retry_on_fresh_page(payload: dict[str, Any]) -> bool:
+    status = str(payload.get("access_status") or "").strip().casefold()
+    if status in PAGE_RECYCLE_STATUSES:
+        return True
+    if status != "detail_worker_error":
+        return False
+    text = json.dumps(payload, ensure_ascii=False).casefold()
+    return any(marker in text for marker in PAGE_CLOSED_MARKERS)
+
+
+def processed_attempt_count(card_keys: list[str], attempted_keys: set[str]) -> int:
+    return len(set(card_keys).intersection(attempted_keys))
 
 
 def record_key(record: dict[str, Any]) -> str:
@@ -397,6 +418,23 @@ def complete_bodies(
                 context = upstream.get_or_create_context(browser)
                 page = context.new_page()
                 page_uses = 0
+
+                def recycle_page(reason: str) -> None:
+                    nonlocal browser, context, page, page_uses
+                    try:
+                        page.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        replacement = context.new_page()
+                    except Exception:  # noqa: BLE001
+                        browser = upstream.connect_browser(playwright, relay_port)
+                        context = upstream.get_or_create_context(browser)
+                        replacement = context.new_page()
+                    page = replacement
+                    page_uses = 0
+                    print(f"PARALLEL_WORKER {worker_id} recycled-page reason={reason}", flush=True)
+
                 print(f"PARALLEL_WORKER {worker_id} ready", flush=True)
                 try:
                     while True:
@@ -414,16 +452,47 @@ def complete_bodies(
                             break
                         key = record_key(card)
                         request_id = ""
-                        try:
-                            payload, request_id = scrape_with_url_fallback(page, card)
-                        except Exception as error:  # noqa: BLE001
-                            payload = {
-                                "note_id": card.get("note_id", ""),
-                                "note_url": card.get("note_url", ""),
-                                "body": "",
-                                "access_status": "detail_worker_error",
-                                "worker_error": str(error),
-                            }
+                        page_retry = 0
+                        while True:
+                            try:
+                                payload, request_id = scrape_with_url_fallback(page, card)
+                            except Exception as error:  # noqa: BLE001
+                                payload = {
+                                    "note_id": card.get("note_id", ""),
+                                    "note_url": card.get("note_url", ""),
+                                    "body": "",
+                                    "access_status": "detail_worker_error",
+                                    "worker_error": str(error),
+                                }
+                            if not should_retry_on_fresh_page(payload) or page_retry >= 1:
+                                break
+                            finish_request(
+                                key,
+                                request_id,
+                                payload,
+                                "failed",
+                                stop_reason_value="page_recycled",
+                                recoverable=True,
+                            )
+                            with lock:
+                                last_failures[key] = payload
+                            page_retry += 1
+                            print(
+                                f"PARALLEL_RETRY note={key} reason=page_closed attempt={page_retry}/1",
+                                flush=True,
+                            )
+                            try:
+                                recycle_page("page_closed_retry")
+                            except Exception as recycle_error:  # noqa: BLE001
+                                payload = {
+                                    "note_id": card.get("note_id", ""),
+                                    "note_url": card.get("note_url", ""),
+                                    "body": "",
+                                    "access_status": "detail_worker_error",
+                                    "worker_error": f"Could not recreate relay page: {recycle_error}",
+                                }
+                                request_id = ""
+                                break
                         # Another worker may have timed out while this request was
                         # in flight. Discard the late result before it mutates the
                         # checkpoint or advances to another card.
@@ -568,7 +637,7 @@ def complete_bodies(
                                 checkpoint()
                             else:
                                 last_failures[key] = payload
-                            processed_count = min(len(cards), len(complete_by_key) + len(last_failures))
+                            processed_count = processed_attempt_count(card_keys, attempted_keys)
                             complete_count = len(complete_by_key)
                             round_processed = round_progress[round_number]
                         print(
@@ -580,14 +649,7 @@ def complete_bodies(
                         )
                         page_uses += 1
                         if page_uses >= page_recycle_every or not record_is_complete(payload):
-                            replacement = context.new_page()
-                            try:
-                                page.close()
-                            except Exception:  # noqa: BLE001
-                                pass
-                            page = replacement
-                            page_uses = 0
-                            print(f"PARALLEL_WORKER {worker_id} recycled-page", flush=True)
+                            recycle_page("scheduled" if page_uses >= page_recycle_every else "failed_record")
                         work.task_done()
                         if stop_event.is_set():
                             break
@@ -595,7 +657,10 @@ def complete_bodies(
                         if delay > 0 and stop_event.wait(delay):
                             break
                 finally:
-                    page.close()
+                    try:
+                        page.close()
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception as error:  # noqa: BLE001
             print(f"PARALLEL_WORKER {worker_id} failed: {error}", flush=True)
 

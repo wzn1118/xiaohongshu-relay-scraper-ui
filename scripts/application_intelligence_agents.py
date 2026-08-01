@@ -277,6 +277,9 @@ class ApplicationInfoAgent:
     RESPONSIBILITY_CUES = (
         "岗位职责",
         "工作职责",
+        "职位描述",
+        "岗位描述",
+        "职责描述",
         "工作内容",
         "职责",
         "负责",
@@ -309,6 +312,9 @@ class ApplicationInfoAgent:
     RESPONSIBILITY_WEIGHTS = {
         "岗位职责": 4,
         "工作职责": 4,
+        "职位描述": 4,
+        "岗位描述": 4,
+        "职责描述": 4,
         "工作内容": 4,
         "职责": 2,
         "负责": 2,
@@ -322,6 +328,83 @@ class ApplicationInfoAgent:
         "撰写": 2,
         "对接": 2,
     }
+    SECTION_CATEGORIES = {
+        "岗位职责": "responsibility",
+        "工作职责": "responsibility",
+        "职位描述": "responsibility",
+        "岗位描述": "responsibility",
+        "职责描述": "responsibility",
+        "工作内容": "responsibility",
+        "任职要求": "requirement",
+        "岗位要求": "requirement",
+        "职位要求": "requirement",
+        "任职资格": "requirement",
+        "任职条件": "requirement",
+        "职位条件": "requirement",
+    }
+    SECTION_HEADING_RE = re.compile(
+        "|".join(re.escape(value) for value in sorted(SECTION_CATEGORIES, key=len, reverse=True)),
+        re.I,
+    )
+    LIST_MARKER_RE = re.compile(
+        r"(?:^|(?<=[\s:：。；;]))"
+        r"(?:\d{1,2}\s*[、.．)）]|[一二三四五六七八九十]{1,3}\s*[、.．)）]|"
+        r"[（(]\s*(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*[）)]|[•●▪◦·])\s*"
+    )
+
+    @classmethod
+    def _section_spans(cls, body: str) -> list[tuple[int, int, str | None, str | None]]:
+        headings = list(cls.SECTION_HEADING_RE.finditer(body))
+        if not headings:
+            return [(0, len(body), None, None)]
+
+        spans: list[tuple[int, int, str | None, str | None]] = []
+        if headings[0].start() > 0:
+            spans.append((0, headings[0].start(), None, None))
+        for index, heading in enumerate(headings):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+            label = heading.group(0)
+            spans.append((heading.end(), end, cls.SECTION_CATEGORIES[label], label))
+        return spans
+
+    @classmethod
+    def _list_item_spans(cls, body: str, start: int, end: int) -> list[tuple[int, int]]:
+        section = body[start:end]
+        markers = list(cls.LIST_MARKER_RE.finditer(section))
+        if not markers:
+            return [(start, end)]
+
+        spans: list[tuple[int, int]] = []
+        if section[: markers[0].start()].strip(" \t\r\n:：-—"):
+            spans.append((start, start + markers[0].start()))
+        for index, marker in enumerate(markers):
+            item_start = start + marker.end()
+            item_end = start + (markers[index + 1].start() if index + 1 < len(markers) else len(section))
+            spans.append((item_start, item_end))
+        return spans
+
+    @classmethod
+    def _classification_clauses(cls, body: str) -> Iterable[tuple[int, str, str | None, str | None]]:
+        boundary_cues = tuple(dict.fromkeys(cls.REQUIREMENT_CUES + cls.RESPONSIBILITY_CUES))
+        boundary_pattern = re.compile(rf"[，,]\s*(?=(?:{'|'.join(map(re.escape, boundary_cues))}))", re.I)
+        for section_start, section_end, section_category, section_label in cls._section_spans(body):
+            for item_start, item_end in cls._list_item_spans(body, section_start, section_end):
+                item_text = body[item_start:item_end]
+                for match in re.finditer(r"[^。！？；;\n]+[。！？；;]?", item_text):
+                    raw_sentence = match.group(0)
+                    starts = [0, *(boundary.end() for boundary in boundary_pattern.finditer(raw_sentence))]
+                    ends = [*starts[1:], len(raw_sentence)]
+                    for local_start, local_end in zip(starts, ends):
+                        raw_clause = raw_sentence[local_start:local_end]
+                        leading = len(raw_clause) - len(raw_clause.lstrip(" \t\r\n:：-—"))
+                        sentence = raw_clause.strip(" \t\r\n:：-—")
+                        if sentence:
+                            yield (
+                                item_start + match.start() + local_start + leading,
+                                sentence,
+                                section_category,
+                                section_label,
+                            )
 
     def run(self, note: dict[str, Any]) -> dict[str, Any]:
         contacts: list[dict[str, Any]] = []
@@ -366,55 +449,62 @@ class ApplicationInfoAgent:
                     source_field = fallback_field
                     break
         classified: set[str] = set()
-        boundary_cues = tuple(dict.fromkeys(self.REQUIREMENT_CUES + self.RESPONSIBILITY_CUES))
-        boundary_pattern = re.compile(rf"[，,]\s*(?=(?:{'|'.join(map(re.escape, boundary_cues))}))", re.I)
-        for match in re.finditer(r"[^。！？；;\n]+[。！？；;]?", body):
-            raw_sentence = match.group(0)
-            starts = [0, *(boundary.end() for boundary in boundary_pattern.finditer(raw_sentence))]
-            ends = [*starts[1:], len(raw_sentence)]
-            for local_start, local_end in zip(starts, ends):
-                raw_clause = raw_sentence[local_start:local_end]
-                leading = len(raw_clause) - len(raw_clause.lstrip())
-                sentence = raw_clause.strip()
-                lowered = sentence.lower()
-                if len(sentence) < 4:
-                    continue
-                normalized = re.sub(r"[\W_]+", "", lowered)
-                if not normalized or normalized in classified:
-                    continue
-                requirement_hits = [cue for cue in self.REQUIREMENT_CUES if cue in lowered]
-                responsibility_hits = [cue for cue in self.RESPONSIBILITY_CUES if cue in lowered]
-                requirement_score = sum(self.REQUIREMENT_WEIGHTS.get(cue, 1) for cue in requirement_hits)
-                responsibility_score = sum(self.RESPONSIBILITY_WEIGHTS.get(cue, 1) for cue in responsibility_hits)
-                if max(requirement_score, responsibility_score) < 2:
-                    continue
-                if requirement_score == responsibility_score:
-                    if any(cue in lowered for cue in ("任职要求", "岗位要求")):
-                        category = "requirement"
-                    elif any(cue in lowered for cue in ("岗位职责", "工作职责", "工作内容")):
-                        category = "responsibility"
-                    else:
-                        continue
+        for offset_start, sentence, section_category, section_label in self._classification_clauses(body):
+            lowered = sentence.lower()
+            if len(sentence) < 4:
+                continue
+            normalized = re.sub(r"[\W_]+", "", lowered)
+            if not normalized or normalized in classified:
+                continue
+            requirement_hits = [cue for cue in self.REQUIREMENT_CUES if cue in lowered]
+            responsibility_hits = [cue for cue in self.RESPONSIBILITY_CUES if cue in lowered]
+            requirement_score = sum(self.REQUIREMENT_WEIGHTS.get(cue, 1) for cue in requirement_hits)
+            responsibility_score = sum(self.RESPONSIBILITY_WEIGHTS.get(cue, 1) for cue in responsibility_hits)
+            if not section_category and max(requirement_score, responsibility_score) < 2:
+                continue
+            if section_category:
+                category = section_category
+                if (
+                    section_category == "responsibility"
+                    and requirement_score >= 4
+                    and requirement_score > responsibility_score
+                ):
+                    category = "requirement"
+            elif requirement_score == responsibility_score:
+                if any(cue in lowered for cue in ("任职要求", "岗位要求")):
+                    category = "requirement"
+                elif any(cue in lowered for cue in ("岗位职责", "工作职责", "工作内容")):
+                    category = "responsibility"
                 else:
-                    category = "requirement" if requirement_score > responsibility_score else "responsibility"
-                winner = max(requirement_score, responsibility_score)
-                loser = min(requirement_score, responsibility_score)
-                confidence = round(min(0.98, 0.55 + winner * 0.07 - loser * 0.03), 2)
-                offset_start = match.start() + local_start + leading
-                item = {
-                    "text": sentence,
-                    "source_field": source_field,
-                    "evidence": sentence,
-                    "offset_start": offset_start,
-                    "offset_end": offset_start + len(sentence),
-                    "classification_confidence": confidence,
-                    "classification_basis": requirement_hits if category == "requirement" else responsibility_hits,
-                }
-                classified.add(normalized)
-                if category == "requirement":
-                    requirements.append(item)
-                else:
-                    responsibilities.append(item)
+                    continue
+            else:
+                category = "requirement" if requirement_score > responsibility_score else "responsibility"
+            winner = max(requirement_score, responsibility_score)
+            loser = min(requirement_score, responsibility_score)
+            confidence = (
+                0.96
+                if section_category and winner >= 2
+                else 0.9
+                if section_category
+                else round(min(0.98, 0.55 + winner * 0.07 - loser * 0.03), 2)
+            )
+            classification_basis = requirement_hits if category == "requirement" else responsibility_hits
+            if section_label and category == section_category:
+                classification_basis = [section_label, *classification_basis]
+            item = {
+                "text": sentence,
+                "source_field": source_field,
+                "evidence": sentence,
+                "offset_start": offset_start,
+                "offset_end": offset_start + len(sentence),
+                "classification_confidence": confidence,
+                "classification_basis": list(dict.fromkeys(classification_basis)),
+            }
+            classified.add(normalized)
+            if category == "requirement":
+                requirements.append(item)
+            else:
+                responsibilities.append(item)
 
         return {
             "contacts": contacts,
@@ -1034,6 +1124,20 @@ class PipelineResult:
     passed: bool
 
 
+FAILED_DETAIL_STATUSES = {
+    "detail_unavailable",
+    "detail_timeout",
+    "detail_playwright_error",
+    "detail_unexpected_error",
+    "missing_record",
+}
+
+
+def has_publishable_detail(record: dict[str, Any]) -> bool:
+    """Only full detail records may enter the AI/publication pipeline."""
+    return bool(_text(record.get("body"))) and _text(record.get("access_status")) not in FAILED_DETAIL_STATUSES
+
+
 class ApplicationIntelligencePipeline:
     def __init__(
         self,
@@ -1074,20 +1178,17 @@ class ApplicationIntelligencePipeline:
             note = note_by_key.get(key)
             if note is None and _text(card.get("note_id")):
                 note = next((candidate for candidate in notes if _text(candidate.get("note_id")) == _text(card.get("note_id"))), None)
-            if note is None:
-                merged.append((dict(card), False))
-            else:
+            if note is not None and has_publishable_detail(note):
                 merged.append(({**card, **note}, True))
         # When cards are present they are the authoritative checkpoint boundary.
         # Resume directories can briefly contain notes copied from an older card
         # set, so appending unmatched notes would create duplicate/stale job cards.
         if not cards:
-            merged.extend((note, True) for note in notes)
+            merged.extend((note, True) for note in notes if has_publishable_detail(note))
 
         results: list[dict[str, Any]] = []
         unparsed_times = 0
         empty_bodies = 0
-        missing_records = 0
         missing_scraped_at = 0
 
         for note, has_record in merged:
@@ -1112,16 +1213,7 @@ class ApplicationIntelligencePipeline:
             outreach = self.writer_agent.run(note, info, fit)
 
             access_status = _text(note.get("access_status"))
-            failed_detail_statuses = {
-                "detail_unavailable",
-                "detail_timeout",
-                "detail_playwright_error",
-                "detail_unexpected_error",
-                "missing_record",
-            }
-            body_present = bool(_text(note.get("body"))) and access_status not in failed_detail_statuses
-            if not has_record:
-                missing_records += 1
+            body_present = has_publishable_detail(note)
             if not body_present:
                 empty_bodies += 1
                 outreach.update(
@@ -1223,9 +1315,10 @@ class ApplicationIntelligencePipeline:
                 invalid_provenance += 1
 
         discovered_count = len(unique_cards) if cards else len(notes)
-        record_keys = {_record_key(note) for note in notes if _record_key(note)}
+        record_keys = {_record_key(record) for record in results if _record_key(record)}
         card_keys = {_record_key(card) for card in cards if _record_key(card)}
         covered_discovered = len(card_keys & record_keys) if cards else len(record_keys)
+        missing_records = max(0, discovered_count - covered_discovered)
         issues = []
         checks = {
             "all_discovered_notes_have_records": missing_records == 0 and covered_discovered == discovered_count,
@@ -1244,7 +1337,9 @@ class ApplicationIntelligencePipeline:
                 and runtime_report["requested"] == runtime_report["generated"] + runtime_report["cached"]
             )
         messages = {
-            "all_discovered_notes_have_records": f"{missing_records} discovered notes have no extracted record",
+            "all_discovered_notes_have_records": (
+                f"{missing_records} discovered cards are waiting for a full detail body before publication"
+            ),
             "all_records_have_bodies": f"{empty_bodies} discovered notes have no full body",
             "all_relative_or_absolute_times_normalized": f"{unparsed_times} supplied time labels could not be normalized",
             "all_records_have_source_collection_time": f"{missing_scraped_at} records lack source scraped_at and use a marked fallback",
@@ -1267,7 +1362,7 @@ class ApplicationIntelligencePipeline:
             "generated_at": self.now.isoformat(timespec="seconds"),
             "timezone": "Asia/Shanghai",
             "discovered_count": discovered_count,
-            "record_count": covered_discovered if cards else len(results),
+            "record_count": len(results),
             "covered_discovered_count": covered_discovered,
             "body_count": sum(1 for item in results if item["quality"]["body_present"]),
             "job_cards_generated": job_cards_generated,
@@ -1280,8 +1375,15 @@ class ApplicationIntelligencePipeline:
         }
         return PipelineResult(
             payload={
-                "schema_version": "1.3",
+                "schema_version": "1.4",
                 "candidate_name": _candidate_name(self.profile),
+                "publication_contract": {
+                    "mode": "card_body_atomic",
+                    "candidate_count": discovered_count,
+                    "published_count": len(results),
+                    "pending_body_count": missing_records,
+                    "ai_runs_after_body_collection": True,
+                },
                 "agents": [
                     {"id": "coverage-agent", "status": "completed", "output": "discovery and body coverage"},
                     {"id": "time-agent", "status": "completed", "output": "Asia/Shanghai publication time"},

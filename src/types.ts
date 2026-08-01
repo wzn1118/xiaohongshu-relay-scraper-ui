@@ -988,6 +988,7 @@ export type DraftQualityStatus = 'pending' | 'passed' | 'failed' | 'stale'
 export type DraftVersionRef = {
   draftId: string
   version: number
+  versionCount?: number
   contentHash: string
   qualityStatus: DraftQualityStatus
   qualityCheckedVersion: number | null
@@ -1200,6 +1201,16 @@ export type ApplicationResultsResponse = {
   }
   codexRuntime: Record<string, unknown> | null
   qualityGate: Record<string, unknown> | null
+  sourceCoverage: {
+    status: 'complete' | 'partial'
+    reason: string
+    targetCount: number
+    readyCount: number
+    pendingCount: number
+    totalRecordCount: number
+    fullBodyCount: number
+    statisticsSource?: string
+  } | null
 }
 
 export type ApplicationResultsQuery = {

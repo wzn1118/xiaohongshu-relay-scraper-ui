@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import importlib.util
 import json
@@ -78,6 +79,10 @@ COMMENT_EXHAUSTED_PATTERN = re.compile(r"没有更多(?:评论|回复)|已显示
 COMMENT_EMPTY_PATTERN = re.compile(r"暂无评论|还没有评论|来抢沙发|成为第一个评论|这是一片荒地")
 RESUMABLE_AUDIENCE_POST_STATUSES = frozenset({"pending", "partial", "failed"})
 PROFILE_CATCHUP_BATCH_SIZE = 12
+LEGACY_DUPLICATE_AVATAR_THRESHOLD = 8
+# This asset was captured from the logged-in account/sidebar by the legacy
+# generic `.avatar img` selector instead of from the viewed user profile.
+KNOWN_NON_PROFILE_AVATAR_MARKERS = frozenset({"645b7e371fc3de4c930eff9d"})
 AUDIENCE_CHECKPOINT_FILENAMES = (
     "xiaohongshu_notes_latest.json",
     "audience-posts.json",
@@ -451,12 +456,92 @@ def profile_url(user_id: str, xsec_token: str = "") -> str:
     return f"https://www.xiaohongshu.com/user/profile/{user_id}{suffix}"
 
 
+def avatar_fingerprint(value: Any) -> str:
+    url = clean_text(value, 2000)
+    if not url or not re.match(r"^https?://", url, re.IGNORECASE):
+        return ""
+    return url.split("?", 1)[0].rstrip("/").casefold()
+
+
+def clean_avatar_url(value: Any) -> str:
+    url = clean_text(value, 2000)
+    fingerprint = avatar_fingerprint(url)
+    if not fingerprint:
+        return ""
+    if any(marker in fingerprint for marker in KNOWN_NON_PROFILE_AVATAR_MARKERS):
+        return ""
+    return url
+
+
+def legacy_duplicate_avatar_fingerprints(
+    users: Iterable[dict[str, Any]],
+    *,
+    threshold: int = LEGACY_DUPLICATE_AVATAR_THRESHOLD,
+) -> set[str]:
+    """Find avatars likely copied from shell chrome by the legacy selector."""
+    counts = Counter(
+        fingerprint
+        for user in users
+        if not clean_text(user.get("profile_avatar_source"), 80)
+        for fingerprint in [avatar_fingerprint(user.get("avatar_url"))]
+        if fingerprint
+    )
+    return {
+        fingerprint
+        for fingerprint, count in counts.items()
+        if count >= max(2, int(threshold))
+    }
+
+
+def restore_legacy_avatar_urls(
+    users_by_id: dict[str, dict[str, Any]],
+    trusted_sources: Iterable[tuple[str, dict[str, Any]]],
+    invalid_avatar_fingerprints: set[str],
+) -> list[str]:
+    """Restore polluted profile avatars from saved API/post checkpoints."""
+    restored_ids: list[str] = []
+    restored: set[str] = set()
+    for source_name, incoming in trusted_sources:
+        user_id = clean_text(first_value(incoming, "user_id", "userid", "id", "userId"), 160)
+        current = users_by_id.get(user_id)
+        if not user_id or not current or user_id in restored:
+            continue
+        current_raw = clean_text(current.get("avatar_url"), 2000)
+        current_fingerprint = avatar_fingerprint(current_raw)
+        current_invalid = (
+            not clean_avatar_url(current_raw)
+            or current_fingerprint in invalid_avatar_fingerprints
+        )
+        if not current_invalid:
+            continue
+        incoming_avatar = clean_avatar_url(
+            first_value(incoming, "avatar_url", "avatar", "image", "imageb")
+        )
+        incoming_fingerprint = avatar_fingerprint(incoming_avatar)
+        if not incoming_avatar or incoming_fingerprint in invalid_avatar_fingerprints:
+            continue
+        current["avatar_url"] = incoming_avatar
+        current["profile_avatar_source"] = source_name
+        missing_fields = [
+            field
+            for field in current.get("missing_profile_fields", [])
+            if field != "avatar_url"
+        ]
+        if missing_fields:
+            current["missing_profile_fields"] = missing_fields
+        else:
+            current.pop("missing_profile_fields", None)
+        restored.add(user_id)
+        restored_ids.append(user_id)
+    return restored_ids
+
+
 def normalize_user(raw: Any, *, role: str = "commenter") -> dict[str, Any]:
     source = raw if isinstance(raw, dict) else {}
     user_id = clean_text(first_value(source, "user_id", "userid", "id", "userId"), 160)
     token = clean_text(first_value(source, "xsec_token", "xsecToken"), 800)
     name = clean_text(first_value(source, "nickname", "nick_name", "name", "display_name"), 200)
-    avatar = clean_text(first_value(source, "image", "avatar", "avatar_url", "imageb"), 2000)
+    avatar = clean_avatar_url(first_value(source, "image", "avatar", "avatar_url", "imageb"))
     url = clean_text(first_value(source, "profile_url", "user_url", "url"), 2000) or profile_url(user_id, token)
     stable = user_id or hashlib.sha256(f"{name}|{url}".encode("utf-8")).hexdigest()[:24]
     ip_location = clean_text(first_value(source, "ip_location"), 200)
@@ -483,8 +568,11 @@ def normalize_user(raw: Any, *, role: str = "commenter") -> dict[str, Any]:
 
 def merge_user(current: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
     if not current:
-        return incoming
+        merged = dict(incoming)
+        merged["avatar_url"] = clean_avatar_url(merged.get("avatar_url"))
+        return merged
     merged = dict(current)
+    merged["avatar_url"] = clean_avatar_url(merged.get("avatar_url"))
     for field in (
         "display_name", "profile_url", "avatar_url", "xhs_id", "bio", "ip_location", "location",
         "following_count", "follower_count", "liked_and_collected_count",
@@ -492,8 +580,13 @@ def merge_user(current: dict[str, Any] | None, incoming: dict[str, Any]) -> dict
         current_missing = merged.get(field) in (None, "", [], {})
         if field == "display_name" and merged.get(field) == "未命名用户":
             current_missing = True
-        if incoming.get(field) not in (None, "", [], {}) and current_missing:
-            merged[field] = incoming[field]
+        incoming_value = (
+            clean_avatar_url(incoming.get(field))
+            if field == "avatar_url"
+            else incoming.get(field)
+        )
+        if incoming_value not in (None, "", [], {}) and current_missing:
+            merged[field] = incoming_value
     merged["roles"] = sorted(set([*merged.get("roles", []), *incoming.get("roles", [])]))
     merged["post_ids"] = list(dict.fromkeys([*merged.get("post_ids", []), *incoming.get("post_ids", [])]))
     merged["comment_count"] = max(int(merged.get("comment_count") or 0), int(incoming.get("comment_count") or 0))
@@ -572,10 +665,14 @@ def extract_comments_from_payload(payload: Any, *, post_id: str, note_url: str) 
 
 def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
     merged = dict(existing)
+    merged["avatar_url"] = clean_avatar_url(merged.get("avatar_url"))
     identity_fields = ("display_name", "avatar_url", "xhs_id", "bio", "ip_location")
     metric_fields = ("following_count", "follower_count", "liked_and_collected_count")
     profile_verified = bool(snapshot.get("profile_loaded")) and any(
-        clean_text(snapshot.get(field), 2000) for field in identity_fields
+        clean_avatar_url(snapshot.get(field))
+        if field == "avatar_url"
+        else clean_text(snapshot.get(field), 2000)
+        for field in identity_fields
     )
     if not profile_verified:
         merged["enrichment_status"] = "partial"
@@ -583,9 +680,15 @@ def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -
         merged["last_enriched_at"] = utc_now()
         return merged
     for field in identity_fields:
-        value = clean_text(snapshot.get(field), 2000 if field == "avatar_url" else 1000)
+        value = (
+            clean_avatar_url(snapshot.get(field))
+            if field == "avatar_url"
+            else clean_text(snapshot.get(field), 1000)
+        )
         if value:
             merged[field] = value
+            if field == "avatar_url":
+                merged["profile_avatar_source"] = "profile_header"
     if merged.get("ip_location"):
         merged["location"] = merged["ip_location"]
     for field in metric_fields:
@@ -596,6 +699,8 @@ def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -
     missing_fields = [*missing_metrics]
     if not clean_text(merged.get("ip_location"), 200):
         missing_fields.append("ip_location")
+    if not clean_avatar_url(merged.get("avatar_url")):
+        missing_fields.append("avatar_url")
     if missing_fields:
         merged["enrichment_status"] = "partial"
         merged["access_status"] = "profile_metrics_missing" if missing_metrics else "profile_fields_missing"
@@ -609,9 +714,21 @@ def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -
     return merged
 
 
-def invalidate_legacy_profile_snapshot(user: dict[str, Any]) -> bool:
+def invalidate_legacy_profile_snapshot(
+    user: dict[str, Any],
+    invalid_avatar_fingerprints: set[str] | None = None,
+) -> bool:
     """Mark profiles affected by the old parent-container metric parser for refresh."""
-    if user.get("enrichment_status") != "complete":
+    raw_avatar = clean_text(user.get("avatar_url"), 2000)
+    fingerprint = avatar_fingerprint(raw_avatar)
+    invalid_avatars = invalid_avatar_fingerprints or set()
+    invalid_avatar = bool(raw_avatar) and (
+        not clean_avatar_url(raw_avatar) or fingerprint in invalid_avatars
+    )
+    if invalid_avatar:
+        user["avatar_url"] = ""
+        user.pop("profile_avatar_source", None)
+    if user.get("enrichment_status") != "complete" and not invalid_avatar:
         return False
     metrics = [
         user.get("following_count"),
@@ -621,15 +738,24 @@ def invalidate_legacy_profile_snapshot(user: dict[str, Any]) -> bool:
     duplicated_metrics = all(value is not None for value in metrics) and len(set(metrics)) == 1
     missing_metrics = any(value is None for value in metrics)
     missing_ip_location = not clean_text(user.get("ip_location"), 200)
-    if not duplicated_metrics and not missing_metrics and not missing_ip_location:
+    missing_avatar = not clean_avatar_url(user.get("avatar_url"))
+    if not duplicated_metrics and not missing_metrics and not missing_ip_location and not missing_avatar:
         return False
     if duplicated_metrics:
         for field in ("following_count", "follower_count", "liked_and_collected_count"):
             user[field] = None
     user["missing_profile_fields"] = [
         field
-        for field in ("following_count", "follower_count", "liked_and_collected_count", "ip_location")
-        if user.get(field) is None or (field == "ip_location" and not clean_text(user.get(field), 200))
+        for field in (
+            "following_count",
+            "follower_count",
+            "liked_and_collected_count",
+            "ip_location",
+            "avatar_url",
+        )
+        if user.get(field) is None
+        or (field == "ip_location" and not clean_text(user.get(field), 200))
+        or (field == "avatar_url" and not clean_avatar_url(user.get(field)))
     ]
     user["enrichment_status"] = "pending"
     user["access_status"] = "profile_refresh_required"
@@ -637,6 +763,83 @@ def invalidate_legacy_profile_snapshot(user: dict[str, Any]) -> bool:
     user["failure_code"] = "profile_refresh_required"
     user["recoverable"] = True
     return True
+
+
+def repair_audience_avatar_checkpoints(output_dir: Path) -> dict[str, Any]:
+    """Repair legacy avatar pollution without repeating comment collection."""
+    resolved = output_dir.resolve()
+    users_path = resolved / "audience-users.json"
+    posts_path = resolved / "audience-posts.json"
+    comments_path = resolved / "audience-comments.json"
+    summary_path = resolved / "audience-summary.json"
+    users = [
+        item for item in load_json(users_path, [])
+        if isinstance(item, dict) and item.get("user_id")
+    ]
+    if not users:
+        raise ValueError(f"Audience users checkpoint was not found: {users_path}")
+    users_by_id = {str(item["user_id"]): item for item in users}
+    invalid_avatars = legacy_duplicate_avatar_fingerprints(users)
+    affected_ids = {
+        str(user["user_id"])
+        for user in users
+        if (
+            not clean_avatar_url(user.get("avatar_url"))
+            or avatar_fingerprint(user.get("avatar_url")) in invalid_avatars
+        )
+    }
+    comments = [item for item in load_json(comments_path, []) if isinstance(item, dict)]
+    posts = [item for item in load_json(posts_path, []) if isinstance(item, dict)]
+    trusted_sources = [
+        ("comment_api", comment["user"])
+        for comment in comments
+        if isinstance(comment.get("user"), dict)
+    ]
+    trusted_sources.extend(
+        ("post_checkpoint", post["author"])
+        for post in posts
+        if isinstance(post.get("author"), dict)
+    )
+    restored_ids = restore_legacy_avatar_urls(
+        users_by_id,
+        trusted_sources,
+        invalid_avatars,
+    )
+    refresh_ids = [
+        user_id
+        for user_id in affected_ids
+        if user_id not in restored_ids
+        and invalidate_legacy_profile_snapshot(users_by_id[user_id], invalid_avatars)
+    ]
+
+    backup_path = resolved / ".avatar-repair-backup" / "audience-users.json"
+    if not backup_path.exists():
+        _copy_verified(users_path, backup_path)
+    sorted_users = sorted(
+        users_by_id.values(),
+        key=lambda item: (-int(item.get("comment_count") or 0), item.get("display_name", "")),
+    )
+    atomic_json(users_path, sorted_users)
+
+    summary = load_json(summary_path, {})
+    if isinstance(summary, dict):
+        profiles_complete, profiles_total = _profile_progress(users_by_id)
+        summary["usersDiscovered"] = profiles_total
+        summary["profilesComplete"] = profiles_complete
+        summary["profileCoveragePercent"] = round(
+            (profiles_complete / profiles_total * 100) if profiles_total else 0,
+            2,
+        )
+        summary["generatedAt"] = utc_now()
+        atomic_json(summary_path, summary)
+
+    return {
+        "affected": len(affected_ids),
+        "restored": len(restored_ids),
+        "scheduledForRelayRefresh": len(refresh_ids),
+        "duplicateAvatarFingerprints": len(invalid_avatars),
+        "backupPath": str(backup_path),
+    }
 
 
 def _challenge_status(text: str) -> str:
@@ -921,9 +1124,14 @@ def _dom_comments(page: Any, post_id: str, note_url: str) -> list[dict[str, Any]
             }
             return '';
           };
+          const imageUrl = (node) => {
+            const value = node?.currentSrc || node?.src || node?.getAttribute?.('data-src') || '';
+            return /^https?:\/\//i.test(value) ? value : '';
+          };
           return nodes.map((node, index) => {
             const profile = node.querySelector('a[href*="/user/profile/"]');
-            const avatar = node.querySelector('img');
+            const avatar = profile?.querySelector('img')
+              || node.querySelector('.avatar img, img[class*="avatar"], img.user-image');
             const href = profile?.href || '';
             const userId = (href.match(/\/user\/profile\/([^/?]+)/) || [])[1] || '';
             return {
@@ -935,7 +1143,7 @@ def _dom_comments(page: Any, post_id: str, note_url: str) -> list[dict[str, Any]
               user_info: {
                 user_id: userId,
                 nickname: text(node, ['.name', '[class*="name"]', '[class*="author"]']),
-                image: avatar?.src || '',
+                image: imageUrl(avatar),
                 profile_url: href,
               },
               dom_index: index,
@@ -1018,6 +1226,15 @@ def _profile_snapshot(page: Any) -> dict[str, Any]:
             }
             return '';
           };
+          const imageUrl = (node) => {
+            const value = node?.currentSrc || node?.src || node?.getAttribute?.('data-src') || '';
+            return /^https?:\/\//i.test(value) ? value : '';
+          };
+          const profileAvatar = [
+            '.avatar-wrapper > img.user-image',
+            '.avatar-wrapper img.user-image',
+            '.avatar-wrapper > img',
+          ].map((selector) => document.querySelector(selector)).find(Boolean);
           const unwrap = (raw) => {
             let value = raw;
             for (let depth = 0; depth < 4 && value && typeof value === 'object'; depth += 1) {
@@ -1095,7 +1312,7 @@ def _profile_snapshot(page: Any) -> dict[str, Any]:
           return {
             profile_loaded: location.pathname.includes('/user/profile/'),
             display_name: read(['.user-name', '[class*="user-name"]', '[class*="userName"]', 'h1']),
-            avatar_url: document.querySelector('.avatar img, [class*="avatar"] img')?.src || '',
+            avatar_url: imageUrl(profileAvatar),
             xhs_id: (allText.match(/小红书号[：:]?\s*([^\s]+)/) || [])[1] || '',
             bio: read(['.user-desc', '[class*="user-desc"]', '[class*="desc"]']),
             ip_location: (allText.match(/IP属地[：:]?\s*([^\n]+)/) || [])[1] || '',
@@ -1534,6 +1751,7 @@ def _collect_audience_impl(
     runtime_attempt_id = attempt_id or f"audience-{os.getpid()}-{int(time.time() * 1000)}"
     for post in posts:
         initialize_post_checkpoint(post)
+    invalid_legacy_avatars = legacy_duplicate_avatar_fingerprints(users_by_id.values())
     for post in posts:
         author = post.get("author") if isinstance(post.get("author"), dict) else None
         if not author or not author.get("user_id"):
@@ -1542,11 +1760,33 @@ def _collect_audience_impl(
     for user in users_by_id.values():
         initialize_user_checkpoint(user)
 
+    trusted_avatar_sources = [
+        ("comment_api", comment["user"])
+        for comment in comments_by_id.values()
+        if isinstance(comment.get("user"), dict)
+    ]
+    trusted_avatar_sources.extend(
+        ("post_checkpoint", post["author"])
+        for post in posts
+        if isinstance(post.get("author"), dict)
+    )
+    restored_legacy_avatar_ids = restore_legacy_avatar_urls(
+        users_by_id,
+        trusted_avatar_sources,
+        invalid_legacy_avatars,
+    )
     legacy_profile_refresh_ids = [
         user_id
         for user_id, user in users_by_id.items()
-        if invalidate_legacy_profile_snapshot(user)
+        if invalidate_legacy_profile_snapshot(user, invalid_legacy_avatars)
     ]
+    if restored_legacy_avatar_ids or legacy_profile_refresh_ids:
+        print(
+            f"AUDIENCE_AVATAR_REPAIR restored={len(restored_legacy_avatar_ids)} "
+            f"scheduled={len(legacy_profile_refresh_ids)} "
+            f"duplicate_avatars={len(invalid_legacy_avatars)}",
+            flush=True,
+        )
 
     stop_reason = ""
     profile_stop_reason = ""
@@ -2242,8 +2482,17 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--resume-checkpoint-dir", action="append", default=[])
     parser.add_argument("--state-path")
     parser.add_argument("--expected-state-revision", type=int)
+    parser.add_argument(
+        "--repair-avatars-only",
+        action="store_true",
+        help="Repair legacy avatar pollution from saved comment/post checkpoints and exit.",
+    )
     options = parser.parse_args(arguments)
     output_dir = Path(options.output_dir).resolve()
+    if options.repair_avatars_only:
+        result = repair_audience_avatar_checkpoints(output_dir)
+        print(f"AUDIENCE_AVATAR_REPAIR_COMPLETE {json.dumps(result, ensure_ascii=False)}", flush=True)
+        return 0
     state = open_workflow_state_from_args(options, output_dir)
     if state is not None:
         if not state.should_run("audience"):

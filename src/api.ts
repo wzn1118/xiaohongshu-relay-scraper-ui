@@ -88,7 +88,7 @@ export const api = {
   completeMissing: (id: string, aiSessionId: string | null) =>
     request<MissingCompletionResponse>(`/api/jobs/${encodeURIComponent(id)}/complete-missing`, {
       method: 'POST',
-      body: JSON.stringify(aiSessionId ? { aiSessionId } : {}),
+      body: JSON.stringify({ aiSessionId }),
     }),
   cancelJob: (id: string) =>
     request<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),

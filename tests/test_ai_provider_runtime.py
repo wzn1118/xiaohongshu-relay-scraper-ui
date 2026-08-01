@@ -11,7 +11,7 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.ai_provider_runtime import AIProvider, AIProviderError
+from scripts.ai_provider_runtime import AIProvider, AIProviderError, run_with_tree_timeout
 
 
 class AiProviderRuntimeTests(unittest.TestCase):
@@ -354,7 +354,7 @@ class AiProviderRuntimeTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with patch("scripts.ai_provider_runtime.shutil.which", side_effect=locate), patch(
-            "scripts.ai_provider_runtime.subprocess.run", side_effect=complete
+            "scripts.ai_provider_runtime.run_with_tree_timeout", side_effect=complete
         ):
             self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
 
@@ -363,11 +363,26 @@ class AiProviderRuntimeTests(unittest.TestCase):
     def test_codex_timeout_becomes_actionable_provider_error(self) -> None:
         provider = AIProvider(provider="codex", timeout=30)
         with patch("scripts.ai_provider_runtime.shutil.which", return_value="codex"), patch(
-            "scripts.ai_provider_runtime.subprocess.run",
+            "scripts.ai_provider_runtime.run_with_tree_timeout",
             side_effect=subprocess.TimeoutExpired(["codex", "exec"], 30),
-        ):
+        ) as runtime:
             with self.assertRaisesRegex(AIProviderError, "timed out after 30 seconds"):
                 provider.generate_json("system", "user", {"type": "object"})
+            with self.assertRaisesRegex(AIProviderError, "timed out after 30 seconds"):
+                provider.generate_json("system", "user", {"type": "object"})
+
+        self.assertEqual(runtime.call_count, 1)
+
+    def test_total_runtime_budget_is_shared_across_requests(self) -> None:
+        provider = AIProvider(provider="codex", timeout=300, total_timeout=300)
+
+        with patch("scripts.ai_provider_runtime.time.monotonic", side_effect=[100.0, 385.0, 401.0]):
+            self.assertEqual(provider._remaining_timeout(), 300)
+            self.assertEqual(provider._remaining_timeout(), 15)
+            with self.assertRaisesRegex(AIProviderError, "runtime budget exhausted"):
+                provider._remaining_timeout()
+
+        self.assertIn("remaining records were preserved", provider._terminal_error)
 
     def test_codex_model_override_is_forwarded(self) -> None:
         provider = AIProvider(provider="codex", model="portable-model", timeout=30)
@@ -380,7 +395,7 @@ class AiProviderRuntimeTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with patch("scripts.ai_provider_runtime.shutil.which", return_value="codex"), patch(
-            "scripts.ai_provider_runtime.subprocess.run", side_effect=complete
+            "scripts.ai_provider_runtime.run_with_tree_timeout", side_effect=complete
         ):
             self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
 
@@ -395,7 +410,7 @@ class AiProviderRuntimeTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with patch("scripts.ai_provider_runtime.shutil.which", return_value="codex"), patch(
-            "scripts.ai_provider_runtime.subprocess.run", side_effect=complete
+            "scripts.ai_provider_runtime.run_with_tree_timeout", side_effect=complete
         ):
             self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
 
@@ -440,8 +455,41 @@ goals = true
 
             with patch.dict(os.environ, {"CODEX_HOME": temporary}, clear=False), patch(
                 "scripts.ai_provider_runtime.shutil.which", return_value="codex"
-            ), patch("scripts.ai_provider_runtime.subprocess.run", side_effect=complete):
+            ), patch("scripts.ai_provider_runtime.run_with_tree_timeout", side_effect=complete):
                 self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
+
+    def test_tree_timeout_terminates_the_windows_process_group(self) -> None:
+        class TimedProcess:
+            pid = 43210
+            returncode = 1
+
+            def __init__(self) -> None:
+                self.communicate_calls = 0
+                self.killed = False
+
+            def communicate(self, **_kwargs: object) -> tuple[str, str]:
+                self.communicate_calls += 1
+                if self.communicate_calls == 1:
+                    raise subprocess.TimeoutExpired(["codex", "exec"], 1)
+                return "", ""
+
+            def poll(self) -> int | None:
+                return 1 if self.killed else None
+
+            def kill(self) -> None:
+                self.killed = True
+
+        process = TimedProcess()
+        with patch("scripts.ai_provider_runtime.subprocess.Popen", return_value=process), patch(
+            "scripts.ai_provider_runtime.subprocess.run",
+            return_value=subprocess.CompletedProcess(["taskkill.exe"], 0),
+        ) as taskkill:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_with_tree_timeout(["codex", "exec"], input_text="prompt", timeout=1)
+
+        self.assertTrue(process.killed)
+        self.assertEqual(process.communicate_calls, 2)
+        self.assertEqual(taskkill.call_args.args[0][:4], ["taskkill.exe", "/PID", "43210", "/T"])
 
 
 if __name__ == "__main__":

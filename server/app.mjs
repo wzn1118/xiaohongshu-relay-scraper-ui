@@ -433,7 +433,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             error.code = 'COMPLETION_SOURCE_UNAVAILABLE';
             throw error;
           }
-          const incompleteBefore = Number(currentResults.filters?.stats?.incomplete || 0);
+          const incompleteBefore = applicationCompletionCount(currentResults);
           if (incompleteBefore === 0) {
             return json(res, 200, {
               action: 'already_complete',
@@ -444,6 +444,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             });
           }
 
+          const requestedAiSessionId = Object.hasOwn(body, 'aiSessionId') ? body.aiSessionId : null;
           const params = validateRunRequest({
             ...sourceParams,
             analysisMode,
@@ -454,12 +455,12 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             resumeFromJobId: id,
             completeMissingOnly: true,
             checkOnly: false,
-            ...(Object.hasOwn(body, 'aiSessionId') ? { aiSessionId: body.aiSessionId } : {}),
+            aiSessionId: requestedAiSessionId,
           });
           const job = await manager.resume(id, {
             scope: 'body_completion',
             params,
-            aiSessionId: Object.hasOwn(body, 'aiSessionId') ? body.aiSessionId : undefined,
+            aiSessionId: requestedAiSessionId,
             idempotencyKey: body.idempotencyKey,
             requestedBy: 'complete_missing_api',
           });
@@ -1122,6 +1123,17 @@ function nonNegativeCount(value) {
   return Number.isFinite(number) ? Math.max(0, number) : 0;
 }
 
+function applicationCompletionCount(results) {
+  const incomplete = nonNegativeCount(results?.filters?.stats?.incomplete);
+  const sourcePending = nonNegativeCount(results?.sourceCoverage?.pendingCount);
+  const publishedWithoutBody = Math.max(
+    0,
+    nonNegativeCount(results?.sourceCoverage?.totalRecordCount)
+      - nonNegativeCount(results?.sourceCoverage?.fullBodyCount),
+  );
+  return sourcePending + Math.max(0, incomplete - publishedWithoutBody);
+}
+
 function audienceContentSourceJobId(manager, jobId) {
   return audienceJobLineage(manager, jobId).at(-1) || jobId;
 }
@@ -1212,6 +1224,7 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
       filters: { sort, timeRange, stats: filterStats },
       codexRuntime: payload.ai_workflow || payload.codex_runtime || null,
       qualityGate: payload.quality_gate || null,
+      sourceCoverage: payload.source_coverage || task.workflowSummary?.sourceCoverage || null,
     };
   } catch (error) {
     if (error.code === 'ENOENT') return {
@@ -1228,6 +1241,7 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
       filters: { sort, timeRange, stats: { all: 0, dated: 0, unknown: 0, incomplete: 0, withImages: 0 } },
       codexRuntime: null,
       qualityGate: null,
+      sourceCoverage: task.workflowSummary?.sourceCoverage || null,
     };
     throw error;
   }

@@ -20,9 +20,10 @@ const LOGIN_CONFIG = Object.freeze({
 async function fixtureStore(options = {}) {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-smtp-phase7-'));
   const filePath = path.join(fixture, 'smtp-config.json');
+  const keyPath = `${filePath}.key`;
   const store = new SmtpConfigStore({ filePath, ...options });
   await store.initialize();
-  return { fixture, filePath, store };
+  return { fixture, filePath, keyPath, store };
 }
 
 test('SMTP settings are detected from common mailbox domains', () => {
@@ -34,7 +35,7 @@ test('SMTP settings are detected from common mailbox domains', () => {
   assert.equal(detectSmtpSettings('candidate@company.example'), null);
 });
 
-test('automatic SMTP configuration keeps its credential in memory only', async () => {
+test('automatic SMTP configuration persists its credential in the encrypted local vault', async () => {
   const { fixture, filePath, store } = await fixtureStore();
   try {
     const saved = await store.update({
@@ -46,7 +47,9 @@ test('automatic SMTP configuration keeps its credential in memory only', async (
     assert.equal(saved.user, 'candidate@163.com');
     assert.equal(saved.hasPassword, true);
     assert.equal(store.getForMailer().pass, 'client-authorization-code');
-    assert.doesNotMatch(await readFile(filePath, 'utf8'), /client-authorization-code|"pass"|"password"/);
+    const raw = await readFile(filePath, 'utf8');
+    assert.doesNotMatch(raw, /client-authorization-code|"pass"|"password"/);
+    assert.equal(JSON.parse(raw).credentialVault.algorithm, 'aes-256-gcm');
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }
@@ -65,8 +68,8 @@ test('automatic SMTP configuration rejects unknown mailbox domains', async () =>
   }
 });
 
-test('password and OAuth credentials never persist in plaintext or derived hashes', async () => {
-  const { fixture, filePath, store } = await fixtureStore();
+test('password and OAuth credentials persist only as authenticated ciphertext', async () => {
+  const { fixture, filePath, keyPath, store } = await fixtureStore();
   try {
     await store.update(LOGIN_CONFIG);
     const loginHash = store.getPublic().configHash;
@@ -84,9 +87,12 @@ test('password and OAuth credentials never persist in plaintext or derived hashe
     const raw = await readFile(filePath, 'utf8');
     assert.doesNotMatch(raw, /different-password|client-secret|refresh-token|"pass"|"clientSecret"|"refreshToken"/);
     const persisted = JSON.parse(raw);
-    assert.equal(persisted.schemaVersion, 2);
+    assert.equal(persisted.schemaVersion, 3);
     assert.match(persisted.configHash, /^[a-f0-9]{64}$/);
     assert.equal(persisted.oauth.clientId, 'client-id');
+    assert.equal(persisted.credentialVault.version, 1);
+    assert.equal(persisted.credentialVault.algorithm, 'aes-256-gcm');
+    assert.equal((await readFile(keyPath)).length, 32);
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }
@@ -198,7 +204,7 @@ test('transport verification failures are bound to the active snapshot', async (
   }
 });
 
-test('a restart retains non-secret settings but requires credentials and verification again', async () => {
+test('a restart restores encrypted credentials and the matching verification state', async () => {
   const { fixture, filePath, store } = await fixtureStore();
   try {
     await store.update(LOGIN_CONFIG);
@@ -206,16 +212,28 @@ test('a restart retains non-secret settings but requires credentials and verific
     const restarted = new SmtpConfigStore({ filePath });
     const loaded = await restarted.initialize();
     assert.equal(loaded.host, LOGIN_CONFIG.host);
-    assert.equal(loaded.hasPassword, false);
-    assert.equal(loaded.verified, false);
-    assert.equal(restarted.getForMailer().pass, '');
-    assert.throws(() => restarted.assertReadyForSend(), { code: 'SMTP_NOT_CONFIGURED' });
+    assert.equal(loaded.hasPassword, true);
+    assert.equal(loaded.verified, true);
+    assert.equal(restarted.getForMailer().pass, 'client-authorization-code');
+    assert.doesNotThrow(() => restarted.assertReadyForSend());
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }
 });
 
-test('legacy plaintext files are migrated to v2 and their verification is invalidated', async () => {
+test('an encrypted SMTP vault never silently replaces a missing local key', async () => {
+  const { fixture, filePath, keyPath, store } = await fixtureStore();
+  try {
+    await store.update(LOGIN_CONFIG);
+    await rm(keyPath, { force: true });
+    const restarted = new SmtpConfigStore({ filePath });
+    await assert.rejects(() => restarted.initialize(), { code: 'SMTP_CREDENTIAL_KEY_MISSING' });
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('legacy plaintext files are migrated to the encrypted vault and their verification is invalidated', async () => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-smtp-legacy-'));
   const filePath = path.join(fixture, 'smtp-config.json');
   try {
@@ -230,7 +248,11 @@ test('legacy plaintext files are migrated to v2 and their verification is invali
     assert.equal(loaded.verified, false);
     const raw = await readFile(filePath, 'utf8');
     assert.doesNotMatch(raw, /legacy-secret|"pass"|"password"/);
-    assert.equal(JSON.parse(raw).schemaVersion, 2);
+    assert.equal(JSON.parse(raw).schemaVersion, 3);
+    assert.equal(JSON.parse(raw).credentialVault.algorithm, 'aes-256-gcm');
+    const restarted = new SmtpConfigStore({ filePath });
+    await restarted.initialize();
+    assert.equal(restarted.getForMailer().pass, 'legacy-secret');
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }
@@ -247,7 +269,9 @@ test('SMTP configuration can be cleared and custom localhost targets remain vali
     const cleared = await store.clear();
     assert.equal(cleared.from, '');
     assert.equal(cleared.hasPassword, false);
-    assert.doesNotMatch(await readFile(filePath, 'utf8'), /candidate@example\.com/);
+    const persisted = await readFile(filePath, 'utf8');
+    assert.doesNotMatch(persisted, /candidate@example\.com/);
+    assert.equal(JSON.parse(persisted).credentialVault, undefined);
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }

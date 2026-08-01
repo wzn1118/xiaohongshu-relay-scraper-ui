@@ -1,6 +1,17 @@
 export function isIncompleteApplicationRecord(record) {
+  if (!String(record?.body || '').trim()) return true;
+
   const analysis = record?.media?.analysis;
   const application = record?.application_info;
+  const runtimeStatus = String(record?.outreach?.runtime_status || '');
+  if (new Set([
+    'fallback_missing_job_body',
+    'image_enriched_missing_job_body',
+    'fallback_model_error',
+    'quality_threshold_not_met',
+    'fact_validation_failed',
+    'fact_validation_needs_human_review',
+  ]).has(runtimeStatus)) return true;
   const verifiedImageEnrichment = analysis?.status === 'analyzed'
     && analysis?.source === 'vision_model'
     && record?.job_card?.enrichment_status === 'image_enriched'
@@ -13,9 +24,7 @@ export function isIncompleteApplicationRecord(record) {
     && analysis?.source === 'vision_model'
     && String(analysis?.visible_text || '').trim().length >= 4;
   return hasUnmergedVerifiedImageText
-    || !String(record?.body || '').trim()
-    || record?.job_card?.parse_basis === 'search_card'
-    || String(record?.outreach?.runtime_status || '') === 'fallback_missing_job_body';
+    || record?.job_card?.parse_basis === 'search_card';
 }
 
 export function isIncompleteGeneralRecord(record) {
