@@ -6,7 +6,10 @@ import pytest
 
 import scripts.audience_collection as audience_collection
 from scripts.audience_collection import (
+    _challenge_status,
+    _comment_api_exhausted,
     _post_source,
+    _profile_progress,
     _summary,
     _wait_for_rate_limit_recovery,
     audience_posts_to_supplement,
@@ -19,6 +22,104 @@ from scripts.audience_collection import (
     normalize_audience_post_status,
     parse_profile_snapshot,
 )
+
+
+def test_profile_progress_is_cumulative_across_resume_batches():
+    users = {
+        "complete-1": {"enrichment_status": "complete"},
+        "complete-2": {"enrichment_status": "complete"},
+        "partial": {"enrichment_status": "partial"},
+        "pending": {},
+    }
+
+    assert _profile_progress(users) == (2, 4)
+
+
+def test_generic_security_phrase_inside_normal_post_is_not_a_challenge():
+    text = "https://www.xiaohongshu.com/explore/note\n" + "普通帖子讨论页面安全验证设计。" * 60
+
+    assert _challenge_status(text) == ""
+    assert _challenge_status("https://www.xiaohongshu.com/captcha\n安全验证") == "security_verification"
+    assert _challenge_status("https://www.xiaohongshu.com/explore/note\n请完成验证") == "security_verification"
+
+
+def test_image_security_challenge_is_detected_inside_a_long_note_page():
+    text = (
+        "https://www.xiaohongshu.com/explore/note\n"
+        + "正常帖子和评论内容" * 100
+        + "\n安全验证\n请选择最符合描述的两张图片\n植物\n换一换\n验证"
+    )
+
+    assert _challenge_status(text) == "security_verification"
+
+
+def test_security_wait_preserves_manual_challenge_and_resumes_when_cleared(monkeypatch):
+    class Body:
+        def __init__(self, page):
+            self.page = page
+
+        def inner_text(self, timeout=0):
+            self.page.reads += 1
+            return "安全验证\n请选择最符合描述的两张图片" if self.page.reads == 1 else "正常帖子页面"
+
+    class Page:
+        url = "https://www.xiaohongshu.com/explore/note"
+        reads = 0
+        reloads = 0
+
+        def locator(self, _selector):
+            return Body(self)
+
+        def reload(self, **_kwargs):
+            self.reloads += 1
+
+    page = Page()
+    monkeypatch.setattr(audience_collection.time, "sleep", lambda _seconds: None)
+
+    cleared, reason = audience_collection._wait_for_manual_verification(
+        page,
+        1,
+    )
+
+    assert (cleared, reason) == (True, "")
+    assert page.reloads == 0
+
+
+def test_security_attention_fronts_page_focuses_relay_window_and_notifies(monkeypatch):
+    calls = []
+
+    class Page:
+        def bring_to_front(self):
+            calls.append("page")
+
+    monkeypatch.setattr(audience_collection, "_relay_listener_pid", lambda port: calls.append(("port", port)) or 123)
+    monkeypatch.setattr(audience_collection, "_focus_windows_process_window", lambda pid: calls.append(("pid", pid)) or True)
+    monkeypatch.setattr(audience_collection, "_show_verification_notification", lambda: calls.append("notification") or True)
+
+    assert audience_collection._surface_security_verification(Page(), 18800) == (True, True)
+    assert calls == ["page", ("port", 18800), ("pid", 123), "notification"]
+
+
+def test_comment_api_final_page_is_strict_exhaustion_evidence():
+    responses = [
+        ("https://edith.xiaohongshu.com/api/sns/web/v2/comment/page", {"data": {"has_more": True}}),
+        ("https://edith.xiaohongshu.com/api/sns/web/v2/comment/page", {"data": {"has_more": False}}),
+    ]
+
+    assert _comment_api_exhausted(responses) is True
+    assert _comment_api_exhausted([
+        ("https://edith.xiaohongshu.com/api/sns/web/v2/comment/sub/page", {"data": {"has_more": False}}),
+    ]) is False
+
+
+def test_current_empty_comment_copy_is_strict_exhaustion_evidence():
+    assert audience_collection.COMMENT_EMPTY_PATTERN.search("这是一片荒地点击评论")
+
+
+def test_stagnation_uses_comment_growth_instead_of_repeated_clicks():
+    stagnant = audience_collection._next_stagnant_rounds(12, 12, 3)
+    assert stagnant == 4
+    assert audience_collection._next_stagnant_rounds(12, 13, stagnant) == 0
 
 
 class FakeRateLimitPage:
@@ -135,6 +236,10 @@ def test_post_source_includes_author_and_expected_comment_count():
             "note_url": "https://www.xiaohongshu.com/explore/note-1",
             "author": "原帖主",
             "author_profile": "https://www.xiaohongshu.com/user/profile/author-1",
+            "card_image_urls": (
+                "https://sns-webpic-qc.xhscdn.com/post.webp | "
+                "https://sns-avatar-qc.xhscdn.com/avatar/author-1.jpg?imageView2/2/w/80/format/jpg"
+            ),
             "comment_count": "1.5万",
         }
     ])
@@ -142,6 +247,7 @@ def test_post_source_includes_author_and_expected_comment_count():
     assert len(posts) == 1
     assert posts[0]["expected_comment_count"] == 15000
     assert posts[0]["author"]["user_id"] == "author-1"
+    assert posts[0]["author"]["avatar_url"].startswith("https://sns-avatar-qc.xhscdn.com/avatar/")
     assert posts[0]["author"]["roles"] == ["author"]
     assert posts[0]["status"] == "pending"
 
@@ -177,9 +283,15 @@ def test_profile_requires_verified_public_page_before_completion():
     assert unverified["enrichment_status"] == "partial"
     assert unverified["access_status"] == "profile_not_verified"
 
-    verified = parse_profile_snapshot({"profile_loaded": True, "display_name": "公开昵称"}, existing)
-    assert verified["enrichment_status"] == "complete"
-    assert verified["access_status"] == "public_profile_ok"
+    identity_only = parse_profile_snapshot({"profile_loaded": True, "display_name": "公开昵称"}, existing)
+    assert identity_only["enrichment_status"] == "partial"
+    assert identity_only["access_status"] == "profile_metrics_missing"
+    assert identity_only["missing_profile_fields"] == [
+        "following_count",
+        "follower_count",
+        "liked_and_collected_count",
+        "ip_location",
+    ]
 
 
 def test_profile_snapshot_keeps_metrics_separate_and_records_ip_location():
@@ -197,6 +309,28 @@ def test_profile_snapshot_keeps_metrics_separate_and_records_ip_location():
     assert parsed["liked_and_collected_count"] == 178
     assert parsed["ip_location"] == "上海"
     assert parsed["location"] == "上海"
+    assert parsed["enrichment_status"] == "complete"
+    assert parsed["access_status"] == "public_profile_ok"
+
+
+def test_profile_with_one_missing_metric_remains_resumable_and_preserves_values():
+    parsed = parse_profile_snapshot({
+        "profile_loaded": True,
+        "display_name": "Star11",
+        "ip_location": "上海",
+        "following_count": "5",
+        "follower_count": "44",
+    }, {
+        "user_id": "u-1",
+        "enrichment_status": "pending",
+        "liked_and_collected_count": None,
+    })
+
+    assert parsed["following_count"] == 5
+    assert parsed["follower_count"] == 44
+    assert parsed["enrichment_status"] == "partial"
+    assert parsed["access_status"] == "profile_metrics_missing"
+    assert parsed["missing_profile_fields"] == ["liked_and_collected_count"]
 
 
 def test_legacy_duplicate_metrics_are_cleared_and_scheduled_for_refresh():
@@ -214,6 +348,30 @@ def test_legacy_duplicate_metrics_are_cleared_and_scheduled_for_refresh():
     assert user["liked_and_collected_count"] is None
     assert user["enrichment_status"] == "pending"
     assert user["access_status"] == "profile_refresh_required"
+
+
+def test_complete_profile_with_missing_metric_is_scheduled_without_clearing_good_values():
+    user = {
+        "enrichment_status": "complete",
+        "following_count": 10,
+        "follower_count": 20,
+        "liked_and_collected_count": None,
+        "ip_location": "上海",
+    }
+
+    assert invalidate_legacy_profile_snapshot(user) is True
+    assert user["following_count"] == 10
+    assert user["follower_count"] == 20
+    assert user["liked_and_collected_count"] is None
+    assert user["missing_profile_fields"] == ["liked_and_collected_count"]
+    assert user["enrichment_status"] == "pending"
+
+
+def test_closed_relay_target_errors_are_retryable():
+    assert audience_collection._is_closed_target_error(
+        RuntimeError("Page.goto: Target page, context or browser has been closed")
+    ) is True
+    assert audience_collection._is_closed_target_error(RuntimeError("navigation timeout")) is False
 
 
 def test_resume_targets_pending_partial_and_legacy_failed_but_never_complete():
@@ -272,7 +430,7 @@ def test_summary_separates_attempted_complete_and_posts_with_comments():
     assert summary["postAttemptPercent"] == 66.67
 
 
-def test_checkpoint_merge_uses_saved_note_url_and_preserves_old_posts_and_counts():
+def test_checkpoint_merge_uses_content_insight_as_authoritative_post_set():
     source_posts = _post_source([{
         "note_id": "note-1",
         "title": "Content insight",
@@ -301,13 +459,11 @@ def test_checkpoint_merge_uses_saved_note_url_and_preserves_old_posts_and_counts
 
     merged = merge_audience_posts(source_posts, existing_posts, comments)
 
-    assert [post["post_id"] for post in merged] == ["note-1", "note-old"]
+    assert [post["post_id"] for post in merged] == ["note-1"]
     assert merged[0]["note_url"].endswith("?from=content-insight")
     assert merged[0]["old_ui_field"] == "keep-visible"
     assert merged[0]["collected_comment_count"] == 1
     assert merged[0]["status"] == "partial"
-    assert merged[1]["old_ui_field"] == "also-keep-visible"
-    assert merged[1]["status"] == "complete"
 
 
 def test_legacy_failed_checkpoint_normalizes_to_partial_and_is_resumable():
@@ -330,6 +486,17 @@ def test_started_audience_attempt_normalizes_to_partial():
     }
 
     assert normalize_audience_post_status(post) == "partial"
+
+
+def test_collected_expected_comment_count_normalizes_to_complete():
+    post = {
+        "post_id": "note-1",
+        "status": "partial",
+        "expected_comment_count": 2,
+        "collected_comment_count": 1,
+    }
+
+    assert normalize_audience_post_status(post, comment_count=2) == "complete"
 
 
 def test_comment_merge_keeps_existing_fields_while_adding_new_checkpoint_data():
@@ -369,12 +536,22 @@ def test_collect_audience_opens_only_saved_incomplete_note_urls(monkeypatch, tmp
             "author_profile": "https://www.xiaohongshu.com/user/profile/author-1",
             "comment_count": 0,
         },
+    ]
+    application_records = {
+        "records": [
+            {"note_id": "complete", "title": "Complete", "note_url": saved_complete_url},
+            {"note_id": "pending", "title": "Pending", "note_url": saved_pending_url},
+        ]
+    }
+    cards = [
         {
-            "note_id": "pending",
-            "title": "Pending",
-            "note_url": saved_pending_url,
-            "author": "Author",
-            "author_profile": "https://www.xiaohongshu.com/user/profile/author-1",
+            "note_id": "complete", "title": "Complete", "note_url": saved_complete_url,
+            "author": "Author", "author_profile": "https://www.xiaohongshu.com/user/profile/author-1",
+            "comment_count": 0,
+        },
+        {
+            "note_id": "pending", "title": "Pending", "note_url": saved_pending_url,
+            "author": "Author", "author_profile": "https://www.xiaohongshu.com/user/profile/author-1",
             "comment_count": 0,
         },
     ]
@@ -400,6 +577,8 @@ def test_collect_audience_opens_only_saved_incomplete_note_urls(monkeypatch, tmp
         "user": author,
     }
     (tmp_path / "xiaohongshu_notes_latest.json").write_text(json.dumps(notes), encoding="utf-8")
+    (tmp_path / "application_intelligence.json").write_text(json.dumps(application_records), encoding="utf-8")
+    (tmp_path / "xiaohongshu_cards_latest.json").write_text(json.dumps(cards), encoding="utf-8")
     (tmp_path / "audience-posts.json").write_text(json.dumps(posts), encoding="utf-8")
     (tmp_path / "audience-comments.json").write_text(json.dumps([preserved_comment]), encoding="utf-8")
     (tmp_path / "audience-users.json").write_text(json.dumps([author]), encoding="utf-8")
@@ -472,6 +651,8 @@ def test_collect_audience_opens_only_saved_incomplete_note_urls(monkeypatch, tmp
     post_navigations = [url for url in navigations if "/explore/" in url or "/search_result" in url]
     assert post_navigations == [saved_pending_url]
     assert not any("search_result" in url for url in navigations)
+    persisted_posts = json.loads((tmp_path / "audience-posts.json").read_text(encoding="utf-8"))
+    assert [post["post_id"] for post in persisted_posts] == ["complete", "pending"]
     persisted_comments = json.loads((tmp_path / "audience-comments.json").read_text(encoding="utf-8"))
     assert persisted_comments == [preserved_comment]
     persisted_users = json.loads((tmp_path / "audience-users.json").read_text(encoding="utf-8"))

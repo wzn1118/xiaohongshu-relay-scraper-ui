@@ -43,6 +43,16 @@ test('validateRunRequest rejects unknown and malformed parameters', () => {
   assert.throws(() => validateRunRequest({ contentGoal: 'bad\nvalue' }), ValidationError);
 });
 
+test('validateRunRequest allows a full day for manual security verification', () => {
+  const result = validateRunRequest({
+    analysisMode: 'general',
+    keyword: 'test',
+    securityVerificationTimeoutSeconds: 86400,
+  });
+
+  assert.equal(result.securityVerificationTimeoutSeconds, 86400);
+});
+
 test('validateRunRequest accepts a bounded non-job research brief', () => {
   const result = validateRunRequest({
     analysisMode: 'general',

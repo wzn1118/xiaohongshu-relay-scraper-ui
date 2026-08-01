@@ -7,6 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { JobManager, publicJob, updateProgressFromLog } from './job-manager.mjs';
 import { validateRunRequest } from './lib/contracts.mjs';
+import { emptyWorkflowStages } from './lib/workflow-state.mjs';
 
 function createFakeChild(pid) {
   const child = new EventEmitter();
@@ -89,6 +90,39 @@ test('audience rate limits expose automatic backoff, recovery, and exhaustion st
   assert.equal(job.rateLimit.recoveryAction, 'wait_then_resume');
 });
 
+test('audience profile catch-up logs expose cumulative and current-batch progress', () => {
+  const job = { progress: 0 };
+
+  const changed = updateProgressFromLog(
+    job,
+    'AUDIENCE_PROGRESS posts=81/197 comments=3187 users=1187 profiles=77/1187 processed=9/12 phase=profile_catchup',
+  );
+
+  assert.equal(changed, true);
+  assert.equal(job.progressPhase, 'audience_profiles');
+  assert.equal(job.progressCurrent, 77);
+  assert.equal(job.progressTotal, 1187);
+  assert.match(job.progressLabel, /9 \/ 12/);
+  assert.match(job.progressLabel, /77 \/ 1187/);
+});
+
+test('audience comment logs keep current batch progress separate from cumulative completion', () => {
+  const job = { progress: 0 };
+
+  const changed = updateProgressFromLog(
+    job,
+    'AUDIENCE_PROGRESS posts=92/197 comments=3434 users=1271 profiles=89/1271 processed=17/105 phase=comments',
+  );
+
+  assert.equal(changed, true);
+  assert.equal(job.progressPhase, 'audience_comments');
+  assert.equal(job.progressCurrent, 92);
+  assert.equal(job.progressTotal, 197);
+  assert.match(job.progressLabel, /17 \/ 105/);
+  assert.match(job.progressLabel, /92 \/ 197/);
+  assert.match(job.progressLabel, /3434/);
+});
+
 test('JobManager persists history and enforces a single active task', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-manager-'));
   const fakeRunner = path.join(dataDir, 'runner.py');
@@ -159,6 +193,11 @@ test('JobManager persists history and enforces a single active task', async () =
     assert.equal(manager.get(job.id).progressPhase, 'security_verification');
     assert.equal(manager.get(job.id).securityRestriction.status, 'waiting');
     assert.equal(manager.get(job.id).securityRestriction.timeoutSeconds, 600);
+    child.stdout.write('AUDIENCE_PROGRESS posts=3/10 comments=8 users=5 profiles=0/5 phase=comments\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.get(job.id).progressPhase, 'audience_comments');
+    assert.equal(manager.get(job.id).securityRestriction.status, 'cleared');
+    child.stdout.write('SECURITY_VERIFICATION detected timeout=600s; new collection paused while waiting for manual completion\n');
     child.stdout.write('SECURITY_VERIFICATION cleared; resuming collection\n');
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(manager.get(job.id).progressPhase, 'scraping');
@@ -508,6 +547,8 @@ test('JobManager materializes every discovered job while scraping and preserves 
 test('JobManager cleans persisted process identity before marking a restarted job interrupted', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-restart-'));
   const outputDir = path.join(dataDir, 'jobs', 'stale-job', 'artifacts');
+  const stages = emptyWorkflowStages();
+  stages.audience.status = 'running';
   await mkdir(outputDir, { recursive: true });
   await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(Array.from({ length: 10 }, (_, index) => ({ id: index }))), 'utf8');
   await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(Array.from({ length: 4 }, (_, index) => ({ id: index }))), 'utf8');
@@ -525,6 +566,7 @@ test('JobManager cleans persisted process identity before marking a restarted jo
     pid: 45678,
     outputDir,
     params: { keyword: 'test' },
+    stages,
   }]), 'utf8');
   const recovered = [];
   const manager = new JobManager({
@@ -556,10 +598,46 @@ test('JobManager cleans persisted process identity before marking a restarted jo
     assert.equal(job.attempts[0].stopReason, 'server_restart');
     assert.equal(job.attempts[0].errorCode, 'SERVER_RESTART');
     assert.equal(job.attempts[0].checkpointRevisionAtEnd, job.revision);
+    assert.equal(job.stages.audience.status, 'partial');
+    assert.equal(job.stages.audience.stopReason, 'server_restart');
+    assert.ok(job.stages.audience.lastCheckpointAt);
     assert.deepEqual(recovered, [{ id: 'stale-job', pid: 45678, outputDir }]);
     const history = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
     assert.equal(history[0].cleanupResult.terminated, 2);
     assert.ok(history[0].cleanupConfirmedAt);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager repairs a terminal task whose audience stage was left running', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-terminal-audience-'));
+  const outputDir = path.join(dataDir, 'jobs', 'failed-audience-job', 'artifacts');
+  const stages = emptyWorkflowStages();
+  stages.audience.status = 'running';
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: 'failed-audience-job',
+    status: 'failed',
+    error: 'Runner exited with code 1.',
+    finishedAt: '2026-07-31T20:11:59.302Z',
+    outputDir,
+    params: { keyword: 'test' },
+    stages,
+  }]), 'utf8');
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: path.join(dataDir, 'runner.py'),
+  });
+
+  try {
+    await manager.initialize();
+    const job = manager.get('failed-audience-job');
+    assert.equal(job.status, 'failed');
+    assert.equal(job.stages.audience.status, 'partial');
+    assert.equal(job.stages.audience.stopReason, 'runner_failed');
+    assert.equal(job.stages.audience.lastCheckpointAt, '2026-07-31T20:11:59.302Z');
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -907,7 +985,7 @@ test('JobManager rejects resume without a checkpoint and does not create a child
     assert.equal(manager.get(sourceId).id, original.id);
     assert.equal(manager.get(sourceId).outputDir, original.outputDir);
   } finally {
-    await rm(dataDir, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -969,6 +1047,80 @@ test('a completed content Job can resume the unfinished audience stage in place'
     await new Promise((resolve) => setImmediate(resolve));
     child.emit('close', 0, null);
     await ended;
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('an audience runner crash preserves the checkpoint as resumable incomplete work', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-runner-exit-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260731130000-acde1234';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  const cards = [{ note_id: 'saved-post', note_url: 'https://example.test/explore/saved-post' }];
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify(cards), 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify(cards), 'utf8');
+  const staleTemp = path.join(outputDir, '.audience-posts.json.86224.abcd1234.tmp');
+  await writeFile(staleTemp, 'stale concurrent writer', 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'incomplete',
+    outputDir,
+    params: { analysisMode: 'general', keyword: 'saved-content' },
+  }]), 'utf8');
+
+  const child = createFakeChild(78906);
+  let recoverCalls = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => child,
+    recoverImpl: async () => {
+      recoverCalls += 1;
+      return recoverCalls === 1
+        ? { matched: 1, terminated: 1, method: 'test-pre-resume' }
+        : { matched: 0, terminated: 0, method: 'test-runner-exit' };
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const started = await manager.resume(jobId, {
+      scope: 'audience',
+      params: validateRunRequest({
+        analysisMode: 'general',
+        keyword: 'saved-content',
+        mode: 'resume',
+        resumeFromJobId: jobId,
+        collectAudience: true,
+        audienceOnly: true,
+        checkOnly: false,
+      }),
+      requestedBy: 'runner-exit-test',
+    });
+    await assert.rejects(readFile(staleTemp, 'utf8'), (error) => error.code === 'ENOENT');
+    const ended = waitForEnd(manager, started.id);
+    child.stdout.write(
+      'AUDIENCE_PROGRESS posts=1/3 comments=232 users=97 profiles=51/94 processed=8/12 phase=profile_catchup\n',
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(manager.getInternal(jobId).progressPhase, 'audience_profiles');
+    child.emit('close', 1, null);
+    await ended;
+
+    const finalJob = manager.get(jobId);
+    assert.equal(finalJob.status, 'incomplete', finalJob.message);
+    assert.equal(finalJob.resumeAvailable, true);
+    assert.match(finalJob.message, /检查点/);
+    assert.match(finalJob.message, /继续补采/);
+    assert.equal(finalJob.attempts.at(-1).errorCode, 'AUDIENCE_RUNNER_INTERRUPTED');
+    assert.equal(finalJob.attempts.at(-1).exitCode, 1);
+    assert.equal(recoverCalls, 2);
+    const history = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
+    assert.equal(history[0].cleanupResult.reason, 'runner_exit');
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }

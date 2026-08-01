@@ -4,6 +4,7 @@ dist/
 .playwright-cli/
 data/
 output/
+test-results/
 tmp/
 profiles/*.json
 !profiles/candidate_profile.example.json

@@ -34,6 +34,9 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   assert.match(bootstrap, /-EnsureBrowserRelay/);
   assert.match(oneClick, /relayServiceReady/);
   assert.match(oneClick, /api\/relay\/login/);
+  assert.match(oneClick, /-WindowStyle Hidden/);
+  assert.match(oneClick, /RedirectStandardOutput/);
+  assert.doesNotMatch(oneClick, /\.WaitForExit\(\)/);
   assert.doesNotMatch(oneClick, /ensure-codex-config\.ps1/);
   assert.doesNotMatch(bootstrap, /ensure-codex-config\.ps1/);
   assert.match(codexConfig, /codex-config\.example\.toml/);

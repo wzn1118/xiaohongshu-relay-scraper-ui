@@ -27,21 +27,23 @@ def test_atomic_write_json_retries_windows_access_conflict() -> None:
             return real_replace(source, destination)
 
         with mock.patch("artifact_io.os.replace", side_effect=flaky_replace), mock.patch("artifact_io.time.sleep"):
-            atomic_write_json(target, {"new": True})
+            written = atomic_write_json(target, {"new": True})
 
+        assert written is True
         assert calls == 2
         assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
         assert not list(target.parent.glob("*.tmp"))
 
 
-def test_atomic_write_json_falls_back_when_target_stays_locked() -> None:
+def test_atomic_write_json_preserves_complete_checkpoint_when_target_stays_locked() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         target = Path(temporary) / "result.json"
         target.write_text('{"old": true}', encoding="utf-8")
 
         locked = PermissionError(errno.EACCES, "locked", str(target))
         with mock.patch("artifact_io.os.replace", side_effect=locked), mock.patch("artifact_io.time.sleep"):
-            atomic_write_json(target, {"new": True}, attempts=2)
+            written = atomic_write_json(target, {"new": True}, attempts=2)
 
-        assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
+        assert written is False
+        assert json.loads(target.read_text(encoding="utf-8")) == {"old": True}
         assert not list(target.parent.glob("*.tmp"))

@@ -53,6 +53,59 @@ test('does not start another process when the relay is already attached', async 
   assert.equal(starts, 0);
 });
 
+test('force restart rebuilds an attached managed browser', async () => {
+  const calls = [];
+  const statuses = [relayStatus({ ok: true, tabs: 2 }), relayStatus({ ok: true, tabs: 1 })];
+  const result = await connectRelay({
+    port: 18792,
+    openClawConfigPath: 'unused',
+    managedBrowserDataDir: 'data/browser',
+    timeoutMs: 1000,
+    forceRestart: true,
+    probeRelayImpl: async () => statuses.shift(),
+    browserEnsurer: async (options) => {
+      calls.push(options);
+      return { running: true, cdpReady: true, restarted: true };
+    },
+  });
+
+  assert.equal(result.ready, true);
+  assert.equal(result.attempted, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].forceRestart, true);
+});
+
+test('a force restart waits for a normal connection and then escalates exactly once', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const starts = [];
+  let probes = 0;
+  const options = {
+    port: 18793,
+    openClawConfigPath: 'unused',
+    managedBrowserDataDir: 'data/browser',
+    timeoutMs: 1000,
+    probeRelayImpl: async () => {
+      probes += 1;
+      return relayStatus({ ok: probes > 1, tabs: probes > 1 ? 1 : 0 });
+    },
+    browserEnsurer: async ({ forceRestart }) => {
+      starts.push(Boolean(forceRestart));
+      if (!forceRestart) await gate;
+      return { running: true, cdpReady: true };
+    },
+  };
+
+  const normal = connectRelay(options);
+  const forced = connectRelay({ ...options, forceRestart: true });
+  release();
+  const [normalResult, forcedResult] = await Promise.all([normal, forced]);
+
+  assert.equal(normalResult.ready, true);
+  assert.equal(forcedResult.ready, true);
+  assert.deepEqual(starts, [false, true]);
+});
+
 test('opens the login page through the managed browser CDP endpoint', async () => {
   const calls = [];
   class FakeWebSocket {

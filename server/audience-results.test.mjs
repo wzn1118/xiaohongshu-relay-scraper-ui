@@ -87,6 +87,51 @@ test('audience results expose saved note checkpoints as uncollected post targets
   }
 });
 
+test('audience results use the complete content-insight link set as the three-state denominator', async () => {
+  const outputDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-content-insight-'));
+  try {
+    await Promise.all([
+      writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({ records: [
+        { note_id: 'post-1', title: 'First post', note_url: 'https://example.test/explore/post-1' },
+        { note_id: 'post-2', title: 'Second post', note_url: 'https://example.test/explore/post-2' },
+        { note_id: 'post-3', title: 'Third post', note_url: 'https://example.test/explore/post-3' },
+      ] }), 'utf8'),
+      writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([
+        { note_id: 'post-1', note_url: 'https://example.test/explore/post-1', author: 'Author one', author_profile: 'https://example.test/user/profile/author-1', comment_count: 5 },
+        { note_id: 'post-2', note_url: 'https://example.test/explore/post-2', author: 'Author two', author_profile: 'https://example.test/user/profile/author-2' },
+        { note_id: 'post-3', note_url: 'https://example.test/explore/post-3', author: 'Author three', author_profile: 'https://example.test/user/profile/author-3' },
+      ]), 'utf8'),
+      writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+        { note_id: 'post-1', title: 'Only collected body', note_url: 'https://example.test/explore/post-1' },
+      ]), 'utf8'),
+      writeFile(path.join(outputDir, 'audience-posts.json'), JSON.stringify([
+        { post_id: 'post-1', status: 'partial', collected_comment_count: 1 },
+        { post_id: 'orphan', status: 'complete', collected_comment_count: 1 },
+      ]), 'utf8'),
+      writeFile(path.join(outputDir, 'audience-comments.json'), JSON.stringify([
+        { comment_id: 'comment-1', post_id: 'post-1', user: { user_id: 'user-1' } },
+        { comment_id: 'orphan-comment', post_id: 'orphan', user: { user_id: 'orphan-user' } },
+      ]), 'utf8'),
+      writeFile(path.join(outputDir, 'audience-users.json'), JSON.stringify([
+        { user_id: 'user-1', post_ids: ['post-1'], enrichment_status: 'partial' },
+        { user_id: 'orphan-user', post_ids: ['orphan'], enrichment_status: 'complete' },
+      ]), 'utf8'),
+    ]);
+
+    const result = await materializeAudienceResults(outputDir);
+    assert.equal(result.summary.postsTotal, 3);
+    assert.equal(result.summary.postsUncollected, 2);
+    assert.equal(result.summary.postsPartial, 1);
+    assert.equal(result.summary.postsComplete, 0);
+    assert.deepEqual(result.posts.map((post) => post.collectionStatus), ['partial', 'uncollected', 'uncollected']);
+    assert.equal(result.posts[0].author.user_id, 'author-1');
+    assert.equal(result.totals.comments, 1);
+    assert.equal(result.totals.users, 1);
+  } finally {
+    await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('audience results merge a supplement with its source checkpoint without hiding old rows', async () => {
   const sourceDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-source-'));
   const supplementDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-supplement-'));

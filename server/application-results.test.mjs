@@ -480,3 +480,113 @@ test('application results proxy Xiaohongshu images through a persistent per-task
     await rm(fixture, { recursive: true, force: true });
   }
 });
+
+test('audience results cache commenter and author avatars through the task media route', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-audience-avatar-cache-'));
+  const outputDir = path.join(fixture, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  const id = '20260801103000-abcdef12';
+  const commenterAvatar = 'https://sns-avatar-qc.xhscdn.com/avatar/commenter.jpg';
+  const authorAvatar = 'https://sns-avatar-qc.xhscdn.com/avatar/author.jpg';
+  await Promise.all([
+    writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([{
+      note_id: 'post-1',
+      title: 'Avatar source post',
+      note_url: 'https://www.xiaohongshu.com/explore/post-1',
+      author: 'Author',
+      author_profile: 'https://www.xiaohongshu.com/user/profile/author-1',
+      card_image_urls: `https://sns-webpic-qc.xhscdn.com/post.webp | ${authorAvatar}`,
+    }]), 'utf8'),
+    writeFile(path.join(outputDir, 'audience-comments.json'), JSON.stringify([{
+      comment_id: 'comment-1',
+      post_id: 'post-1',
+      text: 'Comment',
+      user: { user_id: 'commenter-1', display_name: 'Commenter', avatar_url: commenterAvatar },
+    }]), 'utf8'),
+    writeFile(path.join(outputDir, 'audience-users.json'), JSON.stringify([
+      { user_id: 'commenter-1', display_name: 'Commenter', avatar_url: commenterAvatar, post_ids: ['post-1'] },
+      { user_id: 'author-1', display_name: 'Author', avatar_url: '', post_ids: ['post-1'], roles: ['author'] },
+    ]), 'utf8'),
+  ]);
+  const internal = { id, outputDir, config: {}, params: {} };
+  const manager = {
+    active: null,
+    list: () => [],
+    get: (jobId) => jobId === id ? internal : null,
+    getInternal: (jobId) => jobId === id ? internal : null,
+  };
+  let fetchCount = 0;
+  const server = http.createServer(createApp({
+    manager,
+    config: { host: '127.0.0.1', port: 0, maxBodyBytes: 4096, runnerAvailable: true },
+    mediaFetcher: async () => {
+      fetchCount += 1;
+      return new Response(Buffer.from('avatar-image-body'), {
+        status: 200,
+        headers: { 'content-type': 'image/jpeg' },
+      });
+    },
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const users = await fetch(`${origin}/api/jobs/${id}/audience?kind=users&limit=10`).then((response) => response.json());
+    const commenter = users.items.find((user) => user.user_id === 'commenter-1');
+    const author = users.items.find((user) => user.user_id === 'author-1');
+    assert.equal(commenter.avatar_original_url, commenterAvatar);
+    assert.match(commenter.avatar_url, new RegExp(`^/api/jobs/${id}/media\\?url=`));
+    assert.equal(author.avatar_original_url, authorAvatar);
+    assert.match(author.avatar_url, new RegExp(`^/api/jobs/${id}/media\\?url=`));
+
+    const comments = await fetch(`${origin}/api/jobs/${id}/audience?kind=comments&limit=10`).then((response) => response.json());
+    assert.equal(comments.items[0].user.avatar_original_url, commenterAvatar);
+    assert.match(comments.items[0].user.avatar_url, new RegExp(`^/api/jobs/${id}/media\\?url=`));
+
+    const first = await fetch(`${origin}${commenter.avatar_url}`);
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get('content-type'), 'image/jpeg');
+    assert.equal(await first.text(), 'avatar-image-body');
+    const second = await fetch(`${origin}${commenter.avatar_url}`);
+    assert.equal(second.status, 200);
+    assert.equal(await second.text(), 'avatar-image-body');
+    assert.equal(fetchCount, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('media proxy returns 502 without crashing when the source image rejects access', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-media-source-error-'));
+  const outputDir = path.join(fixture, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  const id = '20260801090000-abcdef12';
+  const internal = { id, outputDir, config: {} };
+  const manager = {
+    active: null,
+    list: () => [],
+    get: (jobId) => jobId === id ? internal : null,
+    getInternal: (jobId) => jobId === id ? internal : null,
+  };
+  const server = http.createServer(createApp({
+    manager,
+    config: { host: '127.0.0.1', port: 0, maxBodyBytes: 4096, runnerAvailable: true },
+    mediaFetcher: async () => new Response('', { status: 403 }),
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const sourceUrl = encodeURIComponent('https://sns-webpic-qc.xhscdn.com/expired.webp');
+    const response = await fetch(`${origin}/api/jobs/${id}/media?url=${sourceUrl}`);
+    assert.equal(response.status, 502);
+    assert.equal((await response.json()).error.code, 'MEDIA_SOURCE_UNAVAILABLE');
+
+    const health = await fetch(`${origin}/api/health`);
+    assert.equal(health.status, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(fixture, { recursive: true, force: true });
+  }
+});

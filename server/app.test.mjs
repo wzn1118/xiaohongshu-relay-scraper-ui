@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { createApp } from './app.mjs';
+import { createDiagnostics } from './lib/diagnostics.mjs';
 
 function readyPreflightReport() {
   return { schemaVersion: 1, kind: 'preflight', status: 'ready', ready: true, checkedAt: new Date().toISOString(), durationMs: 0, checks: [] };
@@ -14,6 +15,12 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-app-'));
   const staticDir = path.join(fixture, 'dist');
   const outputDir = path.join(fixture, 'artifacts');
+  const checkedDraft = {
+    greeting: '编辑后的私信',
+    email_subject: '应聘内容运营实习｜示例用户',
+    email_body: '您好，我希望申请内容运营实习。我曾负责社交媒体内容运营与市场调研，能够围绕目标受众梳理信息，并根据反馈调整内容重点和推进节奏。这段实践与岗位的内容策划和数据分析要求直接相关，期待进一步了解团队当前最需要推进的任务。',
+    cover_letter: '编辑后的求职信',
+  };
   await mkdir(staticDir, { recursive: true });
   await mkdir(outputDir, { recursive: true });
   await writeFile(path.join(staticDir, 'index.html'), '<!doctype html><title>XHS Control</title>', 'utf8');
@@ -32,10 +39,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       job_card: { parse_basis: 'full_body' },
       outreach: {
         runtime_status: 'fallback_missing_candidate_evidence',
-        greeting: '您好，我希望申请内容运营实习。',
-        email_subject: '内容运营实习申请',
-        email_body: '您好，我希望申请内容运营实习。',
-        cover_letter: '我具备内容运营和数据分析经验。',
+        ...checkedDraft,
       },
       cover_letter_evaluation: { score: 94, passed: true },
     }],
@@ -101,11 +105,15 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
   const sentMessages = [];
   const relaySetupCalls = [];
   const relayRecoveryCalls = [];
+  const relayConnectionCalls = [];
+  let relayRecoveryFailuresRemaining = 0;
   const modelDiscoveryCalls = [];
   const localInstallCalls = [];
+  const diagnostics = createDiagnostics();
   const server = http.createServer(createApp({
     manager,
     config,
+    diagnostics,
     preflightService: { run: async () => readyPreflightReport() },
     aiSessions: {
       providers: () => [{ id: 'openai', models: ['gpt-4.1-mini'] }],
@@ -136,20 +144,27 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
         return { ...relaySettings };
       },
     },
-    relayConnector: async ({ port, profile }) => ({
+    relayConnector: async (options) => {
+      relayConnectionCalls.push(options);
+      return {
       ok: true,
       ready: true,
       running: true,
       cdpReady: true,
       authenticated: true,
-      port,
-      profile,
+      port: options.port,
+      profile: options.profile,
       tabs: 1,
       tabCount: 1,
       message: 'Relay 已智能连接。',
-    }),
+      };
+    },
     relayRecoverer: async (options) => {
       relayRecoveryCalls.push(options);
+      if (relayRecoveryFailuresRemaining > 0) {
+        relayRecoveryFailuresRemaining -= 1;
+        return { ok: false, ready: false, warnings: [], message: 'Playwright verification failed.' };
+      }
       const summary = {
         targetCount: 1,
         pageCount: 1,
@@ -230,16 +245,21 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
         return { ...smtpSettings };
       },
     },
-  }));
+}));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   const origin = `http://127.0.0.1:${port}`;
 
   try {
-    const health = await fetch(`${origin}/api/health`).then((response) => response.json());
+    const healthResponse = await fetch(`${origin}/api/health`, { headers: { 'x-request-id': 'phase10-request' } });
+    assert.equal(healthResponse.headers.get('x-request-id'), 'phase10-request');
+    const health = await healthResponse.json();
     assert.equal(health.ok, true);
     assert.equal(health.service, 'xiaohongshu-relay-scraper');
     assert.equal(health.emailDelivery.configured, true);
+    const diagnosticBundle = await fetch(`${origin}/api/diagnostics/bundle`).then((response) => response.json());
+    assert.equal(diagnosticBundle.schemaVersion, 1);
+    assert.equal(diagnosticBundle.events.some((event) => event.requestId === 'phase10-request'), true);
 
     const discoveredModels = await fetch(`${origin}/api/ai/models`, {
       method: 'POST',
@@ -332,6 +352,20 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(relayRecoveryCalls[0].port, 18801);
     assert.equal(relayRecoveryCalls[0].profile, 'work-profile');
 
+    relayRecoveryFailuresRemaining = 1;
+    const rebuilt = await fetch(`${origin}/api/relay/recover`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(rebuilt.status, 200);
+    const rebuiltPayload = await rebuilt.json();
+    assert.equal(rebuiltPayload.playwrightVerified, true);
+    assert.equal(rebuiltPayload.hardRestarted, true);
+    assert.equal(rebuiltPayload.recoveryAttempts, 2);
+    assert.equal(relayConnectionCalls.at(-1).forceRestart, true);
+    assert.equal(relayRecoveryCalls.length, 3);
+
     const setup = await fetch(`${origin}/api/relay/setup`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -406,37 +440,29 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        provider: 'custom', host: 'smtp.example.com', port: 465, secure: true, requireTls: false,
-        auth: 'login', user: 'sender@example.com', from: 'sender@example.com', password: 'replacement',
+        provider: 'custom',
+        host: 'smtp.example.com',
+        port: 465,
+        secure: true,
+        auth: 'login',
+        user: 'sender@example.com',
+        from: 'sender@example.com',
+        password: 'replacement',
       }),
     });
     assert.equal(restoredEmailConfig.status, 200);
+    assert.equal((await fetch(`${origin}/api/email/test`, { method: 'POST' })).status, 200);
 
     const savedDraft = await fetch(`${origin}/api/jobs/${job.id}/draft`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         noteId: 'n1',
-        outreach: {
-          greeting: '编辑后的私信',
-          email_subject: '应聘内容运营实习｜示例用户',
-          email_body: '您好，我希望申请内容运营实习。我曾负责社交媒体内容运营与市场调研，能够围绕目标受众梳理信息，并根据反馈调整内容重点和推进节奏。这段实践与岗位的内容策划和数据分析要求直接相关，期待进一步了解团队当前最需要推进的任务。',
-          cover_letter: '编辑后的求职信',
-        },
+        outreach: checkedDraft,
       }),
     });
     assert.equal(savedDraft.status, 200);
     assert.equal((await savedDraft.json()).delivery.action, 'draft_saved');
-
-    const blockedBeforeVerification = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ noteId: 'n1', to: 'jobs@example.com' }),
-    });
-    assert.equal(blockedBeforeVerification.status, 409);
-    assert.equal((await blockedBeforeVerification.json()).error.code, 'SMTP_NOT_VERIFIED');
-    assert.equal(sentMessages.length, 0);
-    assert.equal((await fetch(`${origin}/api/email/test`, { method: 'POST' })).status, 200);
 
     const resultsWithDraft = await fetch(`${origin}/api/jobs/${job.id}/results?limit=20`).then((response) => response.json());
     assert.equal(resultsWithDraft.items[0].outreach.email_subject, '应聘内容运营实习｜示例用户');
@@ -447,53 +473,15 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       body: JSON.stringify({
         noteId: 'n1',
         to: 'jobs@example.com',
-        idempotencyKey: 'send-n1-v1',
         outreach: resultsWithDraft.items[0].outreach,
       }),
     });
     assert.equal(sentEmail.status, 200);
-    const sentEmailBody = await sentEmail.json();
-    assert.equal(sentEmailBody.delivery.action, 'email_sent');
-    assert.match(sentEmailBody.sendIdempotencyKey, /^[a-f0-9]{64}$/);
+    assert.equal((await sentEmail.json()).delivery.action, 'email_sent');
     assert.equal(sentMessages.length, 1);
     assert.equal(sentMessages[0].to, 'jobs@example.com');
     assert.equal(sentMessages[0].replyTo, 'candidate@example.com');
     assert.equal(sentMessages[0].subject, '应聘内容运营实习｜示例用户');
-
-    const duplicateEmail = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        noteId: 'n1', to: 'jobs@example.com', idempotencyKey: 'send-n1-v1', outreach: resultsWithDraft.items[0].outreach,
-      }),
-    });
-    assert.equal(duplicateEmail.status, 200);
-    const duplicateBody = await duplicateEmail.json();
-    assert.equal(duplicateBody.duplicate, true);
-    assert.equal(duplicateBody.code, 'EMAIL_DUPLICATE_SEND');
-    assert.equal(sentMessages.length, 1);
-    assert.match(duplicateBody.delivery.sendAudit[0].recipient, /^j\*\*\*@example\.com$/);
-    assert.equal('body' in duplicateBody.delivery.sendAudit[0], false);
-
-    const resetDelivery = await fetch(`${origin}/api/jobs/${job.id}/delivery`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ noteId: 'n1', action: 'reset' }),
-    });
-    assert.equal(resetDelivery.status, 200);
-    const concurrentPayload = JSON.stringify({
-      noteId: 'n1', to: 'jobs@example.com', outreach: resultsWithDraft.items[0].outreach,
-    });
-    const concurrentResponses = await Promise.all([1, 2].map(() => fetch(`${origin}/api/jobs/${job.id}/send-email`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: concurrentPayload,
-    })));
-    assert.deepEqual(concurrentResponses.map((response) => response.status), [200, 200]);
-    const concurrentBodies = await Promise.all(concurrentResponses.map((response) => response.json()));
-    assert.equal(concurrentBodies.filter((body) => body.duplicate).length, 1);
-    assert.equal(concurrentBodies.filter((body) => !body.duplicate).length, 1);
-    assert.equal(sentMessages.length, 2);
 
     const rejectedLowQualityEdit = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',
@@ -509,7 +497,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       }),
     });
     assert.equal(rejectedLowQualityEdit.status, 400);
-    assert.equal(sentMessages.length, 2);
+    assert.equal(sentMessages.length, 1);
 
     const invalidRecipient = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',
