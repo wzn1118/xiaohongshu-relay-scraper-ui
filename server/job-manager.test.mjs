@@ -1171,17 +1171,26 @@ test('resume is revision-guarded and idempotent for concurrent retries', async (
       idempotencyKey: 'retry-key-1',
       expectedRevision: revision,
     };
-    const [first, second] = await Promise.all([
+    const [first, second, otherPage] = await Promise.all([
       manager.resume(jobId, options),
       manager.resume(jobId, options),
+      manager.resume(jobId, {
+        ...options,
+        idempotencyKey: 'other-page-key-1',
+      }),
     ]);
     assert.equal(first.id, jobId);
     assert.equal(second.id, jobId);
+    assert.equal(otherPage.id, jobId);
     assert.equal(first.attemptId, second.attemptId);
+    assert.equal(first.attemptId, otherPage.attemptId);
     assert.equal(manager.list().length, 1);
     assert.equal(manager.get(jobId).resumeCount, 1);
     assert.equal(manager.get(jobId).attempts.length, 2);
     assert.equal(spawnCount, 1);
+
+    const persistedState = JSON.parse(await readFile(path.join(dataDir, 'jobs', jobId, 'workflow-state.json'), 'utf8'));
+    assert.deepEqual(persistedState.params, { keyword: 'test' });
 
     const ended = waitForEnd(manager, jobId);
     child.emit('close', 0, null);

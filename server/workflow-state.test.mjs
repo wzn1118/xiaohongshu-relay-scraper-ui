@@ -22,10 +22,12 @@ test('workflow state commits atomically and rejects stale revisions', async () =
       status: 'incomplete',
       activeAttemptId: null,
       resumeCount: 0,
+      params: { keyword: 'test' },
       stages: emptyWorkflowStages(),
       attempts: [],
     });
     assert.equal(initial.revision, 1);
+    assert.deepEqual(initial.params, { keyword: 'test' });
     assert.deepEqual(initial.stages.discovery.discoveredIds, []);
     assert.equal(initial.stages.discovery.scrollCount, 0);
     assert.deepEqual(initial.stages.bodyCompletion.records, {});

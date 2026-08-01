@@ -173,6 +173,9 @@ function validateWorkflowState(value, filePath) {
     throw invalidState(filePath, 'unsupported_schema_version');
   }
   if (!String(value.jobId || '').trim()) throw invalidState(filePath, 'job_id_required');
+  if (value.params !== undefined && !isPlainObject(value.params)) {
+    throw invalidState(filePath, 'params_must_be_object');
+  }
   if (!Number.isInteger(value.revision) || value.revision < 1) {
     throw invalidState(filePath, 'revision_must_be_positive_integer');
   }

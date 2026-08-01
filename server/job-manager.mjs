@@ -360,6 +360,15 @@ export class JobManager {
         : null;
       if (duplicate) return { ...publicJob(job), attemptId: duplicate.attemptId };
 
+      const activeAttempt = currentActiveAttempt(job);
+      if (
+        activeAttempt
+        && activeAttempt.kind !== 'initial'
+        && activeAttempt.resumeScope === scope
+      ) {
+        return { ...publicJob(job), attemptId: activeAttempt.attemptId };
+      }
+
       if (this.recoveryBlockers.length > 0) {
         const error = jobError(
           'JOB_RECOVERY_INCOMPLETE',
@@ -379,7 +388,6 @@ export class JobManager {
         if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
         throw error;
       }
-      const activeAttempt = currentActiveAttempt(job);
       if (activeAttempt) {
         const error = jobError('JOB_ATTEMPT_ACTIVE', 'The task already has an active attempt.');
         error.attemptId = activeAttempt.attemptId;
@@ -1111,6 +1119,7 @@ export class JobManager {
       draft.status = job.status;
       draft.createdAt = job.createdAt;
       draft.outputDir = job.outputDir;
+      draft.params = structuredClone(job.params || {});
       draft.activeAttemptId = job.activeAttemptId || null;
       draft.currentAttemptId = job.currentAttemptId || null;
       draft.resumeCount = Number(job.resumeCount || 0);
@@ -1906,6 +1915,7 @@ function workflowStateFromJob(job) {
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     outputDir: job.outputDir,
+    params: structuredClone(job.params || {}),
     activeAttemptId: job.activeAttemptId || null,
     currentAttemptId: job.currentAttemptId || null,
     resumeCount: Number(job.resumeCount || 0),
