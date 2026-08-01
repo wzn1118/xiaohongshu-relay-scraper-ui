@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -8,9 +8,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }))
     const errorMessage = typeof body.error === 'string' ? body.error : body.error?.message
-    const error = new Error(body.message || errorMessage || `请求失败 (${response.status})`) as Error & { code?: string; status?: number }
+    const error = new Error(body.message || errorMessage || `请求失败 (${response.status})`) as Error & {
+      code?: string
+      status?: number
+      expectedVersion?: number | null
+      currentVersion?: number | null
+    }
     error.code = typeof body.error === 'object' ? body.error?.code : body.code
     error.status = response.status
+    error.expectedVersion = typeof body.expectedVersion === 'number' ? body.expectedVersion : null
+    error.currentVersion = typeof body.currentVersion === 'number' ? body.currentVersion : null
     throw error
   }
   return response.json() as Promise<T>
@@ -101,12 +108,14 @@ export const api = {
     return request<AudienceResultsResponse>(`/api/jobs/${encodeURIComponent(id)}/audience?${params}`)
   },
   resumeAudience: (id: string) => request<AudienceResumeResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/resume`, { method: 'POST' }),
-  setDelivery: (jobId: string, noteId: string, action: 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | 'reset') =>
-    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/delivery`, { method: 'POST', body: JSON.stringify({ noteId, action }) }),
-  saveDraft: (jobId: string, noteId: string, outreach: OutreachDraft) =>
-    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft`, { method: 'POST', body: JSON.stringify({ noteId, outreach }) }),
-  sendEmail: (jobId: string, noteId: string, to: string, outreach: OutreachDraft) =>
-    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/send-email`, { method: 'POST', body: JSON.stringify({ noteId, to, outreach }) }),
+  setDelivery: (jobId: string, noteId: string, action: 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | 'reset', draftVersion?: DraftVersionRef) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/delivery`, { method: 'POST', body: JSON.stringify({ noteId, action, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
+  saveDraft: (jobId: string, noteId: string, outreach: OutreachDraft, draftVersion?: DraftVersionRef) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft`, { method: 'POST', body: JSON.stringify({ noteId, outreach, ...(draftVersion ? { draftId: draftVersion.draftId, baseVersion: draftVersion.version } : {}) }) }),
+  checkDraft: (jobId: string, noteId: string, draftVersion: DraftVersionRef, aiSessionId?: string) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft/quality`, { method: 'POST', body: JSON.stringify({ noteId, draftId: draftVersion.draftId, version: draftVersion.version, ...(aiSessionId ? { aiSessionId } : {}) }) }),
+  sendEmail: (jobId: string, noteId: string, to: string, outreach: OutreachDraft, draftVersion?: DraftVersionRef) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/send-email`, { method: 'POST', body: JSON.stringify({ noteId, to, outreach, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
   artifactUrl: (jobId: string, artifact: Artifact) =>
     artifact.url || `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifact.id)}`,
   subscribe: (id: string, onEvent: (event: JobEvent) => void, onDisconnect: () => void) => {

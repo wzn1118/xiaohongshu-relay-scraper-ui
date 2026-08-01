@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -27,10 +28,21 @@ except ModuleNotFoundError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_UPSTREAM_SCRAPER = PROJECT_ROOT / "vendor/xiaohongshu-relay-scrape/scripts/scrape_xiaohongshu_search.py"
 COMMENT_RESPONSE_MARKERS = ("comment/page", "comment/sub", "comment/list", "/comment")
-SECURITY_MARKERS = ("安全验证", "请完成验证", "拖动滑块", "滑块验证", "captcha")
+SECURITY_MARKERS = (
+    "请完成验证",
+    "拖动滑块",
+    "滑块验证",
+    "captcha",
+    "人机验证",
+    "验证后继续",
+    "请选择最符合描述的两张图片",
+)
 RATE_LIMIT_MARKERS = ("访问频繁", "请稍后再试", "error_code=300013")
 MORE_REPLY_PATTERN = re.compile(r"(?:展开|查看|更多|显示).{0,12}(?:回复|评论)|(?:回复|评论).{0,12}(?:更多|全部)")
+COMMENT_EXHAUSTED_PATTERN = re.compile(r"没有更多(?:评论|回复)|已显示全部(?:评论|回复)|到底了|-\s*THE END\s*-")
+COMMENT_EMPTY_PATTERN = re.compile(r"暂无评论|还没有评论|来抢沙发|成为第一个评论|这是一片荒地")
 RESUMABLE_AUDIENCE_POST_STATUSES = frozenset({"pending", "partial", "failed"})
+PROFILE_CATCHUP_BATCH_SIZE = 12
 AUDIENCE_CHECKPOINT_FILENAMES = (
     "xiaohongshu_notes_latest.json",
     "audience-posts.json",
@@ -39,10 +51,26 @@ AUDIENCE_CHECKPOINT_FILENAMES = (
     "audience-failures.json",
     "audience-summary.json",
 )
+CONTENT_INSIGHT_SOURCE_FILENAMES = (
+    "application_intelligence.json",
+    "xiaohongshu_cards_latest.json",
+    "xiaohongshu_notes_latest.json",
+)
+AUDIENCE_READTHROUGH_SOURCE_FILENAMES = tuple(dict.fromkeys((
+    *AUDIENCE_CHECKPOINT_FILENAMES,
+    *CONTENT_INSIGHT_SOURCE_FILENAMES,
+)))
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _profile_progress(users_by_id: dict[str, dict[str, Any]]) -> tuple[int, int]:
+    return (
+        sum(1 for user in users_by_id.values() if user.get("enrichment_status") == "complete"),
+        len(users_by_id),
+    )
 
 
 def atomic_json(path: Path, payload: Any) -> None:
@@ -128,7 +156,7 @@ def _prepare_readthrough_manifest(
 
     source_files: list[dict[str, str]] = []
     for checkpoint_dir in checkpoint_dirs:
-        for filename in AUDIENCE_CHECKPOINT_FILENAMES:
+        for filename in AUDIENCE_READTHROUGH_SOURCE_FILENAMES:
             source_path = checkpoint_dir / filename
             if source_path.is_file():
                 source_files.append({
@@ -260,6 +288,84 @@ def _enrich_current_record(current: dict[str, Any], incoming: dict[str, Any]) ->
         if merged.get(field) in (None, "", [], {}) and value not in (None, "", [], {}):
             merged[field] = value
     return merged
+
+
+def _content_post_url(record: dict[str, Any]) -> str:
+    return clean_text(first_value(
+        record,
+        "note_url",
+        "search_result_url",
+        "explore_url",
+        "card_search_result_url",
+        "card_explore_url",
+    ), 2000)
+
+
+def _content_post_id(record: dict[str, Any]) -> str:
+    note_url = _content_post_url(record)
+    url_match = re.search(r"/(?:search_result|explore)/([^/?#]+)", note_url)
+    if url_match:
+        return clean_text(url_match.group(1), 200)
+    return clean_text(first_value(record, "note_id", "id"), 200)
+
+
+def _load_content_insight_records(
+    output_dir: Path,
+    checkpoint_dirs: list[Path],
+    merged_notes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    directories = [output_dir, *checkpoint_dirs]
+    application_groups: list[list[dict[str, Any]]] = []
+    card_groups: list[list[dict[str, Any]]] = []
+    note_groups: list[list[dict[str, Any]]] = []
+    for directory in directories:
+        application_payload = load_json(directory / "application_intelligence.json", {})
+        application_records = application_payload.get("records", []) if isinstance(application_payload, dict) else []
+        application_groups.append([
+            item for item in application_records
+            if isinstance(item, dict) and _content_post_id(item) and _content_post_url(item)
+        ])
+
+        cards_payload = load_json(directory / "xiaohongshu_cards_latest.json", [])
+        cards = cards_payload if isinstance(cards_payload, list) else cards_payload.get("cards", []) if isinstance(cards_payload, dict) else []
+        card_groups.append([
+            item for item in cards
+            if isinstance(item, dict) and _content_post_id(item) and _content_post_url(item)
+        ])
+        note_groups.append([
+            item for item in load_json(directory / "xiaohongshu_notes_latest.json", [])
+            if isinstance(item, dict) and _content_post_id(item) and _content_post_url(item)
+        ])
+
+    owner_records = next((group for group in application_groups if group), [])
+    if not owner_records:
+        owner_records = next((group for group in card_groups if group), [])
+    if not owner_records:
+        owner_records = [
+            item for item in merged_notes
+            if _content_post_id(item) and _content_post_url(item)
+        ]
+
+    metadata_by_id: dict[str, dict[str, Any]] = {}
+    for record in [
+        *[item for group in note_groups for item in group],
+        *[item for group in card_groups for item in group],
+    ]:
+        post_id = _content_post_id(record)
+        metadata_by_id[post_id] = _enrich_current_record(
+            metadata_by_id.get(post_id, {}),
+            record,
+        )
+
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for owner in owner_records:
+        post_id = _content_post_id(owner)
+        if not post_id or post_id in seen:
+            continue
+        seen.add(post_id)
+        records.append(_enrich_current_record(owner, metadata_by_id.get(post_id, {})))
+    return records
 
 
 def load_upstream(path: Path):
@@ -432,6 +538,7 @@ def extract_comments_from_payload(payload: Any, *, post_id: str, note_url: str) 
 def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
     merged = dict(existing)
     identity_fields = ("display_name", "avatar_url", "xhs_id", "bio", "ip_location")
+    metric_fields = ("following_count", "follower_count", "liked_and_collected_count")
     profile_verified = bool(snapshot.get("profile_loaded")) and any(
         clean_text(snapshot.get(field), 2000) for field in identity_fields
     )
@@ -446,12 +553,23 @@ def parse_profile_snapshot(snapshot: dict[str, Any], existing: dict[str, Any]) -
             merged[field] = value
     if merged.get("ip_location"):
         merged["location"] = merged["ip_location"]
-    for field in ("following_count", "follower_count", "liked_and_collected_count"):
+    for field in metric_fields:
         value = compact_count(snapshot.get(field))
         if value is not None:
             merged[field] = value
+    missing_metrics = [field for field in metric_fields if merged.get(field) is None]
+    missing_fields = [*missing_metrics]
+    if not clean_text(merged.get("ip_location"), 200):
+        missing_fields.append("ip_location")
+    if missing_fields:
+        merged["enrichment_status"] = "partial"
+        merged["access_status"] = "profile_metrics_missing" if missing_metrics else "profile_fields_missing"
+        merged["missing_profile_fields"] = missing_fields
+        merged["last_enriched_at"] = utc_now()
+        return merged
     merged["enrichment_status"] = "complete"
     merged["access_status"] = "public_profile_ok"
+    merged.pop("missing_profile_fields", None)
     merged["last_enriched_at"] = utc_now()
     return merged
 
@@ -466,12 +584,18 @@ def invalidate_legacy_profile_snapshot(user: dict[str, Any]) -> bool:
         user.get("liked_and_collected_count"),
     ]
     duplicated_metrics = all(value is not None for value in metrics) and len(set(metrics)) == 1
+    missing_metrics = any(value is None for value in metrics)
     missing_ip_location = not clean_text(user.get("ip_location"), 200)
-    if not duplicated_metrics and not missing_ip_location:
+    if not duplicated_metrics and not missing_metrics and not missing_ip_location:
         return False
     if duplicated_metrics:
         for field in ("following_count", "follower_count", "liked_and_collected_count"):
             user[field] = None
+    user["missing_profile_fields"] = [
+        field
+        for field in ("following_count", "follower_count", "liked_and_collected_count", "ip_location")
+        if user.get(field) is None or (field == "ip_location" and not clean_text(user.get(field), 200))
+    ]
     user["enrichment_status"] = "pending"
     user["access_status"] = "profile_refresh_required"
     return True
@@ -483,6 +607,14 @@ def _challenge_status(text: str) -> str:
         return "rate_limited"
     if any(marker.casefold() in folded for marker in SECURITY_MARKERS):
         return "security_verification"
+    # "安全验证" is also ordinary post text. Treat the generic phrase as a
+    # challenge only when the page itself looks like a short verification view.
+    if "安全验证" in folded:
+        first_line, _, remainder = text.partition("\n")
+        url = first_line.casefold() if "://" in first_line else ""
+        body = clean_text(remainder if url else text, 4000)
+        if any(marker in url for marker in ("/captcha", "/verify", "security_check")) or len(body) <= 240:
+            return "security_verification"
     return ""
 
 
@@ -493,16 +625,185 @@ def _body_text(page: Any) -> str:
         return ""
 
 
-def _wait_for_manual_verification(page: Any, timeout_seconds: int) -> tuple[bool, str]:
+def _is_closed_target_error(error: BaseException) -> bool:
+    text = f"{type(error).__name__}: {error}".casefold()
+    return any(marker in text for marker in (
+        "target page, context or browser has been closed",
+        "targetclosederror",
+        "browser has been closed",
+        "context has been closed",
+        "connection closed",
+    ))
+
+
+def _relay_listener_pid(relay_port: int) -> int | None:
+    if os.name != "nt":
+        return None
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    endpoint_suffix = f":{int(relay_port)}"
+    for line in result.stdout.splitlines():
+        columns = line.split()
+        if (
+            len(columns) >= 5
+            and columns[0].casefold() == "tcp"
+            and columns[1].endswith(endpoint_suffix)
+            and columns[3].casefold() == "listening"
+            and columns[4].isdigit()
+        ):
+            return int(columns[4])
+    return None
+
+
+def _focus_windows_process_window(process_id: int | None) -> bool:
+    if os.name != "nt" or not process_id:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = (enum_proc_type, wintypes.LPARAM)
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.BringWindowToTop.argtypes = (wintypes.HWND,)
+        user32.BringWindowToTop.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.SetWindowPos.argtypes = (
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        )
+        user32.SetWindowPos.restype = wintypes.BOOL
+        matches: list[Any] = []
+
+        @enum_proc_type
+        def visit(hwnd: Any, _lparam: Any) -> bool:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            owner_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+            if owner_pid.value == process_id:
+                matches.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(visit, 0)
+        if not matches:
+            return False
+        hwnd = matches[0]
+        user32.ShowWindow(hwnd, 9)
+        user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+        user32.SetWindowPos(hwnd, wintypes.HWND(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
+def _show_verification_notification() -> bool:
+    if os.name != "nt":
+        return False
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "$n=New-Object System.Windows.Forms.NotifyIcon;"
+        "$n.Icon=[System.Drawing.SystemIcons]::Warning;"
+        "$n.BalloonTipTitle='采集任务需要安全验证';"
+        "$n.BalloonTipText='验证页已置顶。完成验证后，原任务会自动继续。';"
+        "$n.Visible=$true;$n.ShowBalloonTip(12000);"
+        "Start-Sleep -Seconds 13;$n.Dispose()"
+    )
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _surface_security_verification(page: Any, relay_port: int) -> tuple[bool, bool]:
+    try:
+        page.bring_to_front()
+    except Exception:  # noqa: BLE001
+        pass
+    focused = _focus_windows_process_window(_relay_listener_pid(relay_port))
+    notified = _show_verification_notification()
+    print(
+        f"SECURITY_VERIFICATION attention page_front=true window_front={str(focused).lower()} "
+        f"notification={str(notified).lower()}",
+        flush=True,
+    )
+    return focused, notified
+
+
+def _wait_for_manual_verification(
+    page: Any,
+    timeout_seconds: int,
+    *,
+    checkpoint_callback: Callable[[], Any] | None = None,
+    reload_interval_seconds: float | None = None,
+) -> tuple[bool, str]:
     deadline = time.monotonic() + timeout_seconds
+    next_checkpoint = time.monotonic()
+    reload_enabled = reload_interval_seconds is not None and reload_interval_seconds > 0
+    next_reload = time.monotonic() + reload_interval_seconds if reload_enabled else float("inf")
     while time.monotonic() < deadline:
-        status = _challenge_status(_body_text(page))
+        status = _challenge_status(f"{getattr(page, 'url', '')}\n{_body_text(page)}")
         if status == "rate_limited":
             return False, status
         if not status:
             return True, ""
+        if checkpoint_callback is not None and time.monotonic() >= next_checkpoint:
+            checkpoint_callback()
+            next_checkpoint = time.monotonic() + 15
+        if reload_enabled and time.monotonic() >= next_reload:
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30_000)
+            except Exception:  # noqa: BLE001
+                pass
+            next_reload = time.monotonic() + max(15.0, reload_interval_seconds or 0)
         time.sleep(min(3, max(0.1, deadline - time.monotonic())))
     return False, "security_verification_timeout"
+
+
+def _comment_api_exhausted(responses: Iterable[tuple[str, Any]]) -> bool:
+    """Return true when a top-level comment endpoint proves its final page."""
+    for url, payload in responses:
+        lowered_url = str(url or "").casefold()
+        if "comment/sub" in lowered_url or not any(
+            marker in lowered_url for marker in ("comment/page", "comment/list")
+        ):
+            continue
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict) and data.get("has_more") is False:
+            return True
+        if isinstance(data, dict) and data.get("hasMore") is False:
+            return True
+    return False
 
 
 def _wait_for_rate_limit_recovery(
@@ -613,7 +914,9 @@ def _click_more_replies(page: Any) -> int:
         candidates = page.get_by_text(MORE_REPLY_PATTERN).all()
     except Exception:  # noqa: BLE001
         candidates = []
-    for candidate in candidates[:100]:
+    # Bound each pass so a note with many stale "more replies" nodes cannot
+    # spend minutes retrying the same controls before progress is evaluated.
+    for candidate in candidates[:20]:
         try:
             if candidate.is_visible(timeout=200) and candidate.is_enabled(timeout=200):
                 candidate.click(timeout=1200)
@@ -622,6 +925,10 @@ def _click_more_replies(page: Any) -> int:
         except Exception:  # noqa: BLE001
             continue
     return clicked
+
+
+def _next_stagnant_rounds(previous_count: int, current_count: int, stagnant_rounds: int) -> int:
+    return stagnant_rounds + 1 if current_count == previous_count else 0
 
 
 def _scroll_comments(page: Any) -> dict[str, Any]:
@@ -649,13 +956,77 @@ def _profile_snapshot(page: Any) -> dict[str, Any]:
             }
             return '';
           };
-          const metric = (labels) => {
-            const rows = [...document.querySelectorAll('.user-interactions > div, [class*="user-interactions"] > div')];
-            for (const row of rows) {
-              const label = row.querySelector('.shows, [class*="shows"]')?.textContent?.trim() || '';
-              if (labels.includes(label)) {
-                return row.querySelector('.count, [class*="count"]')?.textContent?.trim() || '';
+          const unwrap = (raw) => {
+            let value = raw;
+            for (let depth = 0; depth < 4 && value && typeof value === 'object'; depth += 1) {
+              if (Object.prototype.hasOwnProperty.call(value, '_value')) value = value._value;
+              else if (Object.prototype.hasOwnProperty.call(value, 'value')) value = value.value;
+              else break;
+            }
+            return value;
+          };
+          const scalar = (raw) => {
+            const value = unwrap(raw);
+            if (typeof value === 'number' || typeof value === 'string') return String(value).trim();
+            return '';
+          };
+          const aliases = {
+            following_count: ['follows', 'followCount', 'followsCount', 'followingCount', 'following_count'],
+            follower_count: ['fans', 'fanCount', 'fansCount', 'followerCount', 'follower_count'],
+            liked_and_collected_count: ['interaction', 'interactionCount', 'interactionsCount', 'likedAndCollectedCount', 'liked_and_collected_count'],
+          };
+          const hydrationMetrics = (() => {
+            const roots = [window.__INITIAL_STATE__, window.__NUXT__].filter(Boolean);
+            const queue = [...roots];
+            const seen = new WeakSet();
+            let inspected = 0;
+            while (queue.length && inspected < 10000) {
+              const current = unwrap(queue.shift());
+              if (!current || typeof current !== 'object' || seen.has(current)) continue;
+              seen.add(current);
+              inspected += 1;
+              const candidate = {};
+              for (const [field, names] of Object.entries(aliases)) {
+                for (const name of names) {
+                  if (!Object.prototype.hasOwnProperty.call(current, name)) continue;
+                  const value = scalar(current[name]);
+                  if (value !== '') {
+                    candidate[field] = value;
+                    break;
+                  }
+                }
               }
+              if (Object.keys(candidate).length >= 2) return candidate;
+              try {
+                for (const value of Object.values(current)) {
+                  const nested = unwrap(value);
+                  if (nested && typeof nested === 'object') queue.push(nested);
+                }
+              } catch (_) {
+                // Some framework proxies reject enumeration; the visible DOM remains available.
+              }
+            }
+            return {};
+          })();
+          const metric = (field, labels) => {
+            if (hydrationMetrics[field] !== undefined) return hydrationMetrics[field];
+            const knownLabels = ['关注', '粉丝', '获赞与收藏', '获赞和收藏'];
+            const rows = [...document.querySelectorAll([
+              '.user-interactions > div',
+              '[class*="user-interactions"] > div',
+              '.data-info > div',
+              '[class*="data-info"] > div',
+              '[class*="interaction"] > div',
+            ].join(','))];
+            for (const row of rows) {
+              const rowText = (row.textContent || '').replace(/\s+/g, '');
+              const rowLabels = knownLabels.filter((label) => rowText.includes(label));
+              if (rowLabels.length !== 1 || !labels.includes(rowLabels[0])) continue;
+              const direct = row.querySelector('.count, [class*="count"], [class*="number"], strong')?.textContent?.trim() || '';
+              if (direct && /\d/.test(direct)) return direct;
+              const withoutLabel = rowText.replace(rowLabels[0], '');
+              const match = withoutLabel.match(/\d+(?:\.\d+)?\s*[万千wWkK]?/);
+              if (match) return match[0];
             }
             return '';
           };
@@ -666,20 +1037,20 @@ def _profile_snapshot(page: Any) -> dict[str, Any]:
             xhs_id: (allText.match(/小红书号[：:]?\s*([^\s]+)/) || [])[1] || '',
             bio: read(['.user-desc', '[class*="user-desc"]', '[class*="desc"]']),
             ip_location: (allText.match(/IP属地[：:]?\s*([^\n]+)/) || [])[1] || '',
-            following_count: metric(['关注']),
-            follower_count: metric(['粉丝']),
-            liked_and_collected_count: metric(['获赞与收藏', '获赞和收藏']),
+            following_count: metric('following_count', ['关注']),
+            follower_count: metric('follower_count', ['粉丝']),
+            liked_and_collected_count: metric('liked_and_collected_count', ['获赞与收藏', '获赞和收藏']),
           };
         }"""
     )
 
 
-def _post_source(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _post_source(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     posts: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for note in notes:
-        post_id = clean_text(first_value(note, "note_id", "id"), 200)
-        note_url = clean_text(first_value(note, "note_url", "search_result_url", "explore_url"), 2000)
+    for note in records:
+        post_id = _content_post_id(note)
+        note_url = _content_post_url(note)
         if not post_id:
             post_id = hashlib.sha256(note_url.encode("utf-8")).hexdigest()[:24]
         if not note_url or post_id in seen:
@@ -687,11 +1058,30 @@ def _post_source(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(post_id)
         author_name = clean_text(first_value(note, "author", "nickname"), 200)
         author_url = clean_text(first_value(note, "author_profile", "author_url"), 2000)
+        author_avatar = clean_text(
+            first_value(note, "author_avatar", "author_avatar_url", "avatar_url"),
+            2000,
+        )
+        if not author_avatar:
+            for field in ("card_image_urls", "detail_image_urls", "image_urls"):
+                candidates = str(note.get(field) or "").split("|")
+                author_avatar = next((
+                    candidate.strip()
+                    for candidate in candidates
+                    if "sns-avatar" in candidate.casefold() or "/avatar/" in candidate.casefold()
+                ), "")
+                if author_avatar:
+                    break
         author_id = ""
         match = re.search(r"/user/profile/([^/?]+)", author_url)
         if match:
             author_id = match.group(1)
-        author = normalize_user({"user_id": author_id, "nickname": author_name, "profile_url": author_url}, role="author")
+        author = normalize_user({
+            "user_id": author_id,
+            "nickname": author_name,
+            "profile_url": author_url,
+            "avatar_url": author_avatar,
+        }, role="author")
         posts.append({
             "post_id": post_id,
             "title": clean_text(note.get("title"), 500) or "未命名内容",
@@ -706,17 +1096,21 @@ def _post_source(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def normalize_audience_post_status(post: dict[str, Any], *, comment_count: int = 0) -> str:
     """Map legacy audience checkpoints onto pending/partial/complete."""
     status = clean_text(post.get("status"), 40).casefold()
+    stored_count = compact_count(post.get("collected_comment_count")) or 0
+    collected_count = max(stored_count, comment_count)
+    expected_count = compact_count(post.get("expected_comment_count"))
     if status == "complete":
+        return "complete"
+    if expected_count is not None and collected_count > 0 and collected_count >= expected_count:
         return "complete"
     if status in {"partial", "failed"}:
         return "partial"
-    stored_count = compact_count(post.get("collected_comment_count")) or 0
     attempted = bool(
         post.get("last_attempt_at")
         or post.get("last_collected_at")
         or post.get("failure_reason")
     )
-    return "partial" if comment_count > 0 or stored_count > 0 or attempted else "pending"
+    return "partial" if collected_count > 0 or attempted else "pending"
 
 
 def merge_audience_posts(
@@ -724,7 +1118,7 @@ def merge_audience_posts(
     existing_posts: list[dict[str, Any]],
     comments: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Merge saved content links with prior audience state without dropping old posts."""
+    """Merge prior progress onto the authoritative content-insight link set."""
     comments_by_post: dict[str, list[dict[str, Any]]] = {}
     for comment in comments:
         post_id = clean_text(comment.get("post_id"), 200)
@@ -776,12 +1170,13 @@ def merge_audience_posts(
         source_ids.add(post_id)
         merged_posts.append(merge_one(source, existing_by_id.get(post_id, {})))
 
-    for current in existing_posts:
-        post_id = clean_text(current.get("post_id"), 200)
-        if not post_id or post_id in source_ids:
-            continue
-        source_ids.add(post_id)
-        merged_posts.append(merge_one(None, current))
+    if not source_posts:
+        for current in existing_posts:
+            post_id = clean_text(current.get("post_id"), 200)
+            if not post_id or post_id in source_ids:
+                continue
+            source_ids.add(post_id)
+            merged_posts.append(merge_one(None, current))
     return merged_posts
 
 
@@ -907,7 +1302,7 @@ def _load_audience_readthrough(
     dict[str, dict[str, Any]],
     dict[str, dict[str, Any]],
     list[dict[str, Any]],
-    set[str],
+    list[dict[str, Any]],
 ]:
     notes = [item for item in load_json(output_dir / "xiaohongshu_notes_latest.json", []) if isinstance(item, dict)]
     posts = [item for item in load_json(output_dir / "audience-posts.json", []) if isinstance(item, dict) and item.get("post_id")]
@@ -937,8 +1332,6 @@ def _load_audience_readthrough(
         json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         for item in failures
     }
-    checkpoint_post_ids: set[str] = set()
-
     for checkpoint_dir in checkpoint_dirs:
         source_notes = [item for item in load_json(checkpoint_dir / "xiaohongshu_notes_latest.json", []) if isinstance(item, dict)]
         for incoming in source_notes:
@@ -950,10 +1343,6 @@ def _load_audience_readthrough(
             else:
                 note_positions[key] = len(notes)
                 notes.append(dict(incoming))
-            note_id = _record_key(incoming, "note_id", "id")
-            if note_id:
-                checkpoint_post_ids.add(note_id)
-
         source_posts = [
             item for item in load_json(checkpoint_dir / "audience-posts.json", [])
             if isinstance(item, dict) and item.get("post_id")
@@ -965,9 +1354,6 @@ def _load_audience_readthrough(
             else:
                 post_positions[post_id] = len(posts)
                 posts.append(_merge_checkpoint_post(None, incoming))
-            if clean_text(incoming.get("note_url"), 2000):
-                checkpoint_post_ids.add(post_id)
-
         for incoming in load_json(checkpoint_dir / "audience-comments.json", []):
             if not isinstance(incoming, dict) or not incoming.get("comment_id"):
                 continue
@@ -988,7 +1374,12 @@ def _load_audience_readthrough(
                 failure_keys.add(key)
                 failures.append(dict(incoming))
 
-    return notes, posts, comments_by_id, users_by_id, failures, checkpoint_post_ids
+    content_insight_records = _load_content_insight_records(
+        output_dir,
+        checkpoint_dirs,
+        notes,
+    )
+    return notes, posts, comments_by_id, users_by_id, failures, content_insight_records
 
 
 def _summary(posts: list[dict[str, Any]], comments: list[dict[str, Any]], users: list[dict[str, Any]], stop_reason: str = "") -> dict[str, Any]:
@@ -1067,12 +1458,12 @@ def _collect_audience_impl(
         comments_by_id,
         users_by_id,
         failures,
-        checkpoint_post_ids,
+        content_insight_records,
     ) = _load_audience_readthrough(output_dir, readthrough_dirs)
-    if not notes:
-        raise ValueError("Audience collection requires a non-empty note checkpoint")
+    if not content_insight_records:
+        raise ValueError("Audience collection requires content-insight post links")
 
-    source_posts = _post_source(notes)
+    source_posts = _post_source(content_insight_records)
     posts = merge_audience_posts(source_posts, existing_posts, comments_by_id.values())
     for post in posts:
         author = post.get("author") if isinstance(post.get("author"), dict) else None
@@ -1100,8 +1491,13 @@ def _collect_audience_impl(
 
     def checkpoint() -> dict[str, Any]:
         comments = sorted(comments_by_id.values(), key=lambda item: (item.get("post_id", ""), item.get("collected_at", ""), item.get("comment_id", "")))
+        comment_counts_by_user: dict[str, int] = {}
+        for item in comments:
+            user_id = clean_text(item.get("user", {}).get("user_id"), 200)
+            if user_id:
+                comment_counts_by_user[user_id] = comment_counts_by_user.get(user_id, 0) + 1
         for user in users_by_id.values():
-            checkpoint_count = sum(1 for item in comments if item.get("user", {}).get("user_id") == user.get("user_id"))
+            checkpoint_count = comment_counts_by_user.get(clean_text(user.get("user_id"), 200), 0)
             user["comment_count"] = max(compact_count(user.get("comment_count")) or 0, checkpoint_count)
         users = sorted(users_by_id.values(), key=lambda item: (-int(item.get("comment_count") or 0), item.get("display_name", "")))
         atomic_json(notes_path, notes)
@@ -1129,7 +1525,6 @@ def _collect_audience_impl(
         for post in source_posts
         if clean_text(post.get("post_id"), 200)
     }
-    source_post_ids.update(checkpoint_post_ids)
     target_posts = audience_posts_to_supplement(
         posts,
         allowed_post_ids=source_post_ids,
@@ -1146,19 +1541,50 @@ def _collect_audience_impl(
     with sync_playwright() as playwright:
         browser = upstream.connect_browser(playwright, relay_port)
         context = upstream.get_or_create_context(browser)
-        page = context.new_page()
-        profile_page = context.new_page()
-        response_payloads: list[Any] = []
+        get_reusable_page = getattr(upstream, "get_reusable_page", None)
+        reused_page = callable(get_reusable_page)
+        page = get_reusable_page(context) if reused_page else context.new_page()
+        profile_page = page
+        response_payloads: list[tuple[str, Any]] = []
+        response_listener_pages: set[int] = set()
+        created_pages: list[Any] = [] if reused_page else [page]
 
         def on_response(response: Any) -> None:
             if not any(marker in response.url.casefold() for marker in COMMENT_RESPONSE_MARKERS):
                 return
             try:
-                response_payloads.append(response.json())
+                response_payloads.append((response.url, response.json()))
             except Exception:  # noqa: BLE001
                 return
 
-        page.on("response", on_response)
+        def attach_response_listener(candidate: Any) -> None:
+            identity = id(candidate)
+            if identity in response_listener_pages:
+                return
+            candidate.on("response", on_response)
+            response_listener_pages.add(identity)
+
+        def page_is_closed(candidate: Any) -> bool:
+            try:
+                return bool(candidate.is_closed())
+            except (AttributeError, TypeError):
+                return False
+
+        def ensure_live_page(*, force_reconnect: bool = False) -> Any:
+            nonlocal browser, context, page, profile_page
+            if not force_reconnect and not page_is_closed(page):
+                return page
+            browser = upstream.connect_browser(playwright, relay_port)
+            context = upstream.get_or_create_context(browser)
+            candidate = context.new_page()
+            created_pages.append(candidate)
+            attach_response_listener(candidate)
+            page = candidate
+            profile_page = candidate
+            print("AUDIENCE_RELAY_PAGE restored after target closure", flush=True)
+            return candidate
+
+        attach_response_listener(page)
         try:
             def recover_rate_limit(limited_page: Any) -> tuple[bool, str]:
                 return _wait_for_rate_limit_recovery(
@@ -1170,6 +1596,32 @@ def _collect_audience_impl(
                     checkpoint_callback=checkpoint,
                 )
 
+            def recover_access(limited_page: Any, challenge: str) -> tuple[bool, str]:
+                if challenge == "rate_limited":
+                    cleared, reason = recover_rate_limit(limited_page)
+                    if cleared:
+                        return True, ""
+                    challenge = reason
+                if challenge == "security_verification":
+                    _surface_security_verification(limited_page, relay_port)
+                    print(
+                        f"SECURITY_VERIFICATION detected timeout={security_verification_timeout_seconds}s; "
+                        "checkpoint saved and audience collection waiting",
+                        flush=True,
+                    )
+                    cleared, reason = _wait_for_manual_verification(
+                        limited_page,
+                        security_verification_timeout_seconds,
+                        checkpoint_callback=checkpoint,
+                    )
+                    if cleared:
+                        print("SECURITY_VERIFICATION cleared; resuming audience collection", flush=True)
+                        return True, ""
+                    if reason == "rate_limited":
+                        return recover_rate_limit(limited_page)
+                    return False, reason
+                return not challenge, challenge
+
             def enrich_profile(user: dict[str, Any], *, phase: str) -> bool:
                 nonlocal profile_stop_reason
                 user["last_attempt_at"] = utc_now()
@@ -1177,47 +1629,85 @@ def _collect_audience_impl(
                     user["enrichment_status"] = "partial"
                     user["access_status"] = "profile_url_missing"
                     return False
-                try:
-                    profile_page.goto(user["profile_url"], wait_until="domcontentloaded", timeout=goto_timeout_ms)
-                    profile_page.wait_for_timeout(900)
-                    challenge = _challenge_status(f"{profile_page.url}\n{_body_text(profile_page)}")
-                    if challenge == "rate_limited":
-                        cleared, challenge = recover_rate_limit(profile_page)
-                        if cleared:
-                            challenge = ""
-                    if challenge:
-                        profile_stop_reason = challenge
+                for attempt in range(2):
+                    active_page = ensure_live_page(force_reconnect=attempt > 0)
+                    try:
+                        active_page.goto(user["profile_url"], wait_until="domcontentloaded", timeout=goto_timeout_ms)
+                        active_page.wait_for_timeout(900)
+                        challenge = _challenge_status(f"{active_page.url}\n{_body_text(active_page)}")
+                        if challenge:
+                            cleared, challenge = recover_access(active_page, challenge)
+                            if cleared:
+                                challenge = ""
+                        if challenge:
+                            profile_stop_reason = challenge
+                            user["enrichment_status"] = "partial"
+                            user["access_status"] = challenge
+                            print(
+                                f"AUDIENCE_PROFILE_LIMIT reason={challenge}; comments continue and profile checkpoint preserved",
+                                flush=True,
+                            )
+                            return False
+                        parsed = parse_profile_snapshot(_profile_snapshot(active_page), user)
+                        users_by_id[user["user_id"]] = parsed
+                        return parsed.get("enrichment_status") == "complete"
+                    except Exception as error:  # noqa: BLE001
+                        if attempt == 0 and _is_closed_target_error(error):
+                            continue
                         user["enrichment_status"] = "partial"
-                        user["access_status"] = challenge
-                        print(
-                            f"AUDIENCE_PROFILE_LIMIT reason={challenge}; comments continue and profile checkpoint preserved",
-                            flush=True,
-                        )
+                        user["access_status"] = "profile_error"
+                        user["last_enriched_at"] = utc_now()
+                        failures.append({
+                            "user_id": user["user_id"],
+                            "phase": phase,
+                            "reason": clean_text(error, 1000),
+                            "at": utc_now(),
+                        })
                         return False
-                    users_by_id[user["user_id"]] = parse_profile_snapshot(_profile_snapshot(profile_page), user)
-                    return users_by_id[user["user_id"]].get("enrichment_status") == "complete"
-                except Exception as error:  # noqa: BLE001
-                    user["enrichment_status"] = "partial"
-                    user["access_status"] = "profile_error"
-                    user["last_enriched_at"] = utc_now()
-                    failures.append({
-                        "user_id": user["user_id"],
-                        "phase": phase,
-                        "reason": clean_text(error, 1000),
-                        "at": utc_now(),
-                    })
-                    return False
+                return False
 
-            for user_id in legacy_profile_refresh_ids:
-                user = users_by_id.get(user_id)
-                if not user:
-                    continue
-                enrich_profile(user, phase="legacy_profile_refresh")
-                checkpoint()
-                if profile_stop_reason:
-                    break
+            def pending_profile_users() -> list[dict[str, Any]]:
+                commented_post_ids = {
+                    item.get("post_id") for item in comments_by_id.values() if item.get("post_id")
+                }
+                return sorted(
+                    [item for item in users_by_id.values() if item.get("enrichment_status") != "complete"],
+                    key=lambda item: (
+                        0 if item.get("profile_url") else 1,
+                        0 if "author" in item.get("roles", []) and commented_post_ids.intersection(item.get("post_ids", [])) else
+                        1 if "author" in item.get("roles", []) else
+                        2,
+                        -int(compact_count(item.get("comment_count")) or 0),
+                        item.get("display_name", ""),
+                    ),
+                )
 
-            for post in target_posts:
+            # A long comment backlog used to starve profile enrichment for hours.
+            # Resume now refreshes a bounded set of the most visible saved users
+            # first, then continues comments and finally drains every profile.
+            catchup_users = pending_profile_users()
+            if target_posts and len(catchup_users) >= PROFILE_CATCHUP_BATCH_SIZE:
+                catchup_batch = catchup_users[:PROFILE_CATCHUP_BATCH_SIZE]
+                print(
+                    f"AUDIENCE_PROFILE_CATCHUP pending={len(catchup_users)} batch={len(catchup_batch)}",
+                    flush=True,
+                )
+                for profile_index, user in enumerate(catchup_batch, start=1):
+                    enrich_profile(user, phase="profile_catchup")
+                    checkpoint()
+                    profiles_complete, profiles_total = _profile_progress(users_by_id)
+                    print(
+                        f"AUDIENCE_PROGRESS posts={len(posts) - len(target_posts)}/{len(posts)} "
+                        f"comments={len(comments_by_id)} users={len(users_by_id)} "
+                        f"profiles={profiles_complete}/{profiles_total} "
+                        f"processed={profile_index}/{len(catchup_batch)} phase=profile_catchup",
+                        flush=True,
+                    )
+                    if profile_stop_reason:
+                        break
+                    time.sleep(max(0.0, note_delay_seconds))
+
+            for post_index, post in enumerate(target_posts, start=1):
                 post["last_attempt_at"] = utc_now()
                 if not clean_text(post.get("note_url"), 2000):
                     post["status"] = "partial"
@@ -1228,28 +1718,24 @@ def _collect_audience_impl(
                         "reason": post["failure_reason"],
                         "at": utc_now(),
                     })
-                    checkpoint()
+                    progress_summary = checkpoint()
+                    print(
+                        f"AUDIENCE_PROGRESS posts={progress_summary['postsComplete']}/{len(posts)} "
+                        f"comments={len(comments_by_id)} users={len(users_by_id)} "
+                        f"profiles={_profile_progress(users_by_id)[0]}/{len(users_by_id)} "
+                        f"processed={post_index}/{len(target_posts)} phase=comments",
+                        flush=True,
+                    )
                     continue
                 response_payloads.clear()
                 before = len([item for item in comments_by_id.values() if item.get("post_id") == post["post_id"]])
                 try:
+                    page = ensure_live_page()
                     page.goto(post["note_url"], wait_until="domcontentloaded", timeout=goto_timeout_ms)
                     page.wait_for_timeout(1200)
                     challenge = _challenge_status(f"{page.url}\n{_body_text(page)}")
-                    if challenge == "security_verification":
-                        print(
-                            f"SECURITY_VERIFICATION detected timeout={security_verification_timeout_seconds}s; audience collection paused",
-                            flush=True,
-                        )
-                        cleared, reason = _wait_for_manual_verification(page, security_verification_timeout_seconds)
-                        if not cleared:
-                            stop_reason = reason
-                            post["status"] = "partial"
-                            post["failure_reason"] = reason
-                            checkpoint()
-                            break
-                    elif challenge == "rate_limited":
-                        cleared, reason = recover_rate_limit(page)
+                    if challenge:
+                        cleared, reason = recover_access(page, challenge)
                         if not cleared:
                             stop_reason = reason
                             post["status"] = "partial"
@@ -1260,9 +1746,10 @@ def _collect_audience_impl(
                     unchanged = 0
                     previous_count = -1
                     explicit_exhausted = False
+                    api_exhausted = False
                     for _round in range(200):
                         clicked = _click_more_replies(page)
-                        for payload in list(response_payloads):
+                        for _response_url, payload in list(response_payloads):
                             for comment in extract_comments_from_payload(payload, post_id=post["post_id"], note_url=post["note_url"]):
                                 absorb(comment)
                         for comment in _dom_comments(page, post["post_id"], post["note_url"]):
@@ -1272,8 +1759,8 @@ def _collect_audience_impl(
                         page.wait_for_timeout(650)
                         body = _body_text(page)
                         challenge = _challenge_status(f"{page.url}\n{body}")
-                        if challenge == "rate_limited":
-                            cleared, reason = recover_rate_limit(page)
+                        if challenge:
+                            cleared, reason = recover_access(page, challenge)
                             if not cleared:
                                 stop_reason = reason
                                 break
@@ -1281,14 +1768,15 @@ def _collect_audience_impl(
                             unchanged = 0
                             previous_count = -1
                             continue
-                        if challenge:
-                            stop_reason = challenge
-                            break
-                        explicit_exhausted = bool(re.search(r"没有更多(?:评论|回复)|已显示全部(?:评论|回复)|到底了", body))
-                        if current_count == previous_count and clicked == 0:
-                            unchanged += 1
-                        else:
-                            unchanged = 0
+                        api_exhausted = _comment_api_exhausted(response_payloads)
+                        explicit_exhausted = bool(
+                            COMMENT_EXHAUSTED_PATTERN.search(body)
+                            or COMMENT_EMPTY_PATTERN.search(body)
+                            or (api_exhausted and clicked == 0)
+                        )
+                        # A click is only progress when it produces a new comment.
+                        # Some pages leave already-expanded controls clickable forever.
+                        unchanged = _next_stagnant_rounds(previous_count, current_count, unchanged)
                         previous_count = current_count
                         if explicit_exhausted or unchanged >= stable_rounds:
                             break
@@ -1313,7 +1801,7 @@ def _collect_audience_impl(
                         post["failure_reason"] = ""
                     elif unknown_exhausted:
                         post["status"] = "complete"
-                        post["completion_basis"] = "ui_exhausted"
+                        post["completion_basis"] = "api_exhausted" if api_exhausted else "ui_exhausted"
                         post["failure_reason"] = ""
                     else:
                         post["status"] = "partial"
@@ -1321,15 +1809,11 @@ def _collect_audience_impl(
                         post["failure_reason"] = f"expected_{expected}_collected_{collected}" if expected is not None else "comment_list_not_proven_complete"
                     if collected == before and post["status"] != "complete":
                         failures.append({"post_id": post["post_id"], "phase": "comments", "reason": post["failure_reason"], "at": utc_now()})
-                    author = post.get("author") if isinstance(post.get("author"), dict) else None
-                    if collected > 0 and author and not profile_stop_reason:
-                        current_author = users_by_id.get(author.get("user_id"), author)
-                        if current_author.get("enrichment_status") != "complete":
-                            enrich_profile(current_author, phase="author_profile")
                     progress_summary = checkpoint()
                     print(
-                        f"AUDIENCE_PROGRESS posts={progress_summary['postsAttempted']}/{len(posts)} comments={len(comments_by_id)} "
-                        f"users={len(users_by_id)} profiles={sum(1 for item in users_by_id.values() if item.get('enrichment_status') == 'complete')}/{len(users_by_id)} phase=comments",
+                        f"AUDIENCE_PROGRESS posts={progress_summary['postsComplete']}/{len(posts)} comments={len(comments_by_id)} "
+                        f"users={len(users_by_id)} profiles={_profile_progress(users_by_id)[0]}/{len(users_by_id)} "
+                        f"processed={post_index}/{len(target_posts)} phase=comments",
                         flush=True,
                     )
                     if stop_reason:
@@ -1339,36 +1823,35 @@ def _collect_audience_impl(
                     post["status"] = "partial"
                     post["failure_reason"] = clean_text(error, 1000)
                     failures.append({"post_id": post["post_id"], "phase": "comments", "reason": post["failure_reason"], "at": utc_now()})
-                    checkpoint()
+                    progress_summary = checkpoint()
+                    print(
+                        f"AUDIENCE_PROGRESS posts={progress_summary['postsComplete']}/{len(posts)} "
+                        f"comments={len(comments_by_id)} users={len(users_by_id)} "
+                        f"profiles={_profile_progress(users_by_id)[0]}/{len(users_by_id)} "
+                        f"processed={post_index}/{len(target_posts)} phase=comments",
+                        flush=True,
+                    )
 
             if not stop_reason and not profile_stop_reason:
-                commented_post_ids = {
-                    item.get("post_id") for item in comments_by_id.values() if item.get("post_id")
-                }
-                pending_users = sorted(
-                    [item for item in users_by_id.values() if item.get("enrichment_status") != "complete"],
-                    key=lambda item: (
-                        0 if "author" in item.get("roles", []) and commented_post_ids.intersection(item.get("post_ids", [])) else
-                        1 if "author" in item.get("roles", []) else
-                        2,
-                        item.get("display_name", ""),
-                    ),
-                )
+                pending_users = pending_profile_users()
                 for profile_index, user in enumerate(pending_users, start=1):
                     enrich_profile(user, phase="profile")
                     checkpoint()
+                    profiles_complete, profiles_total = _profile_progress(users_by_id)
                     print(
                         f"AUDIENCE_PROGRESS posts={len(posts)}/{len(posts)} comments={len(comments_by_id)} "
-                        f"users={len(users_by_id)} profiles={profile_index}/{len(pending_users)} phase=profiles",
+                        f"users={len(users_by_id)} profiles={profiles_complete}/{profiles_total} "
+                        f"processed={profile_index}/{len(pending_users)} phase=profiles",
                         flush=True,
                     )
                     if profile_stop_reason:
                         break
                     time.sleep(max(0.0, note_delay_seconds))
         finally:
-            for opened_page in (profile_page, page):
+            for created_page in created_pages:
                 try:
-                    opened_page.close()
+                    if not page_is_closed(created_page):
+                        created_page.close()
                 except Exception:  # noqa: BLE001
                     pass
 

@@ -14,6 +14,7 @@ export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, f
         signal: controller.signal,
       });
       let response = await request(relayToken ? { 'x-openclaw-relay-token': relayToken } : {});
+      const authenticated = Boolean(relayToken && response.ok);
       if (!response.ok && relayToken) response = await request({});
       if (!response.ok) throw new Error(`Relay responded with HTTP ${response.status}.`);
       const tabs = await response.json();
@@ -23,7 +24,7 @@ export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, f
         ok: true,
         running: true,
         cdpReady: true,
-        authenticated: true,
+        authenticated,
         port,
         tabs: tabs.length,
         tabCount: tabs.length,

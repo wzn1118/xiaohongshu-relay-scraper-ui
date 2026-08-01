@@ -226,7 +226,12 @@ if (Test-PortOpen $uri.Host $uri.Port) {
 }
 
 Write-Host "Starting application at $url"
-$server = Start-Process -FilePath $npmCommand.Source -ArgumentList @('start') -WorkingDirectory $root -NoNewWindow -PassThru
+$runtimeDir = Join-Path $root '.runtime'
+New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+$logSuffix = "server-$($uri.Port)"
+$stdoutLog = Join-Path $runtimeDir "$logSuffix.out.log"
+$stderrLog = Join-Path $runtimeDir "$logSuffix.err.log"
+$server = Start-Process -FilePath $npmCommand.Source -ArgumentList @('start') -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
 try {
     $ready = $false
     for ($attempt = 0; $attempt -lt 120; $attempt++) {
@@ -238,10 +243,14 @@ try {
     Write-Host "Application is ready: $url"
     Connect-Relay $url | Out-Null
     Open-App $url
-    $server.WaitForExit()
-    exit $server.ExitCode
-} finally {
+    Write-Host "Application will keep running in the background (PID $($server.Id))."
+    Write-Host "Server logs: $stdoutLog"
+    exit 0
+} catch {
     if ($server -and -not $server.HasExited) {
         & taskkill.exe /PID $server.Id /T /F *> $null
     }
+    $details = if (Test-Path -LiteralPath $stderrLog) { (Get-Content -LiteralPath $stderrLog -Tail 20) -join [Environment]::NewLine } else { '' }
+    if ($details) { Write-Error "$($_.Exception.Message)`n$details" }
+    throw
 }

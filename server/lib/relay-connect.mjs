@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { probeRelay } from './relay.mjs';
 import { ensureNativeBrowser, resolveManagedBrowserProfileDir } from './native-browser.mjs';
 
-let activeConnection = null;
+const activeConnections = new Map();
 
 export async function connectRelay({
   port,
@@ -11,23 +11,31 @@ export async function connectRelay({
   managedBrowserDataDir,
   profile = 'openclaw',
   timeoutMs = 25000,
+  forceRestart = false,
   probeRelayImpl = probeRelay,
   browserEnsurer = ensureNativeBrowser,
 }) {
-  if (activeConnection) return activeConnection;
-  activeConnection = performConnection({
+  const key = String(port);
+  while (activeConnections.has(key)) {
+    const active = activeConnections.get(key);
+    const result = await active.promise;
+    if (!forceRestart || active.forceRestart) return { ...result, joinedConnection: true };
+  }
+  const promise = performConnection({
     port,
     openClawConfigPath,
     managedBrowserDataDir,
     profile,
     timeoutMs,
+    forceRestart,
     probeRelayImpl,
     browserEnsurer,
   });
+  activeConnections.set(key, { promise, forceRestart });
   try {
-    return await activeConnection;
+    return await promise;
   } finally {
-    activeConnection = null;
+    if (activeConnections.get(key)?.promise === promise) activeConnections.delete(key);
   }
 }
 
@@ -49,14 +57,15 @@ async function performConnection({
   managedBrowserDataDir,
   profile,
   timeoutMs,
+  forceRestart,
   probeRelayImpl,
   browserEnsurer,
 }) {
   const before = await probeRelayImpl({ port, openClawConfigPath });
-  if (isAttached(before)) {
+  if (!forceRestart && isAttached(before)) {
     return { ...before, ready: true, attempted: false, message: 'Relay is already connected.' };
   }
-  if (before.running && before.cdpReady) {
+  if (!forceRestart && before.running && before.cdpReady) {
     return {
       ...before,
       ready: false,
@@ -74,6 +83,8 @@ async function performConnection({
     timeoutMs,
     url: 'about:blank',
     profile,
+    forceRestart,
+    relayToken: await resolveRelayToken({ port, openClawConfigPath }),
   });
   if (!started.running) {
     return {
@@ -100,7 +111,7 @@ async function performConnection({
     startExitCode: null,
     startTimedOut: false,
     message: ready
-      ? 'Relay connected through the browser service.'
+      ? forceRestart ? 'Relay browser was rebuilt and connected.' : 'Relay connected through the browser service.'
       : after.running && after.cdpReady
         ? 'Relay service is running; waiting for an attached browser tab.'
         : 'Relay service start completed; status is still pending.',

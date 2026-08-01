@@ -62,14 +62,37 @@ export async function materializeAudienceResults(outputDir, {
     (current, source) => source.summary ? mergeRecord(current || {}, source.summary) : current,
     null,
   );
-  const checkpointPosts = sources.flatMap((source) => source.notes.map(postFromCheckpoint).filter(Boolean));
-  const normalizedComments = mergeRecords(sources.flatMap((source) => source.comments), 'comment_id');
+  const checkpointPosts = mergeRecords(sources.flatMap(contentInsightPosts), 'post_id');
+  const sourcePostIds = new Set(checkpointPosts.map((post) => String(post.post_id || '')).filter(Boolean));
+  const allComments = mergeRecords(sources.flatMap((source) => source.comments), 'comment_id');
+  const normalizedComments = sourcePostIds.size
+    ? allComments.filter((comment) => sourcePostIds.has(String(comment.post_id || '')))
+    : allComments;
   const commentStatsByPost = collectCommentStats(normalizedComments);
+  const savedPosts = mergeRecords(sources.flatMap((source) => source.posts), 'post_id');
+  const scopedSavedPosts = sourcePostIds.size
+    ? savedPosts.filter((post) => sourcePostIds.has(String(post.post_id || '')))
+    : savedPosts;
   const normalizedPosts = mergeRecords(
-    [...checkpointPosts, ...sources.flatMap((source) => source.posts)],
+    [...checkpointPosts, ...scopedSavedPosts],
     'post_id',
   ).map((post) => normalizePost(post, commentStatsByPost.get(String(post.post_id || ''))));
-  const normalizedUsers = mergeRecords(sources.flatMap((source) => source.users), 'user_id');
+  const postAuthorsById = new Map(normalizedPosts
+    .map((post) => post.author)
+    .filter((author) => author?.user_id)
+    .map((author) => [String(author.user_id), author]));
+  const allUsers = mergeRecords(sources.flatMap((source) => source.users), 'user_id')
+    .map((user) => mergeRecord(postAuthorsById.get(String(user.user_id)) || {}, user));
+  const relevantUserIds = new Set([
+    ...normalizedComments.map((comment) => String(comment.user?.user_id || comment.user_id || '')).filter(Boolean),
+    ...normalizedPosts.map((post) => String(post.author?.user_id || '')).filter(Boolean),
+  ]);
+  const normalizedUsers = sourcePostIds.size
+    ? allUsers.filter((user) => (
+      relevantUserIds.has(String(user.user_id || ''))
+      || arrayOfStrings(user.post_ids).some((postId) => sourcePostIds.has(postId))
+    ))
+    : allUsers;
   const usersById = new Map(normalizedUsers.map((user) => [String(user.user_id || ''), user]));
   const enrichedComments = normalizedComments.map((comment) => {
     const userId = String(comment.user?.user_id || comment.user_id || '');
@@ -93,12 +116,14 @@ export async function materializeAudienceResults(outputDir, {
 }
 
 async function readAudienceSource(outputDir) {
-  const [summary, posts, comments, users, notes] = await Promise.all([
+  const [summary, posts, comments, users, notes, cardsPayload, applicationPayload] = await Promise.all([
     readJson(path.join(outputDir, 'audience-summary.json'), null),
     readJson(path.join(outputDir, 'audience-posts.json'), []),
     readJson(path.join(outputDir, 'audience-comments.json'), []),
     readJson(path.join(outputDir, 'audience-users.json'), []),
     readJson(path.join(outputDir, 'xiaohongshu_notes_latest.json'), []),
+    readJson(path.join(outputDir, 'xiaohongshu_cards_latest.json'), []),
+    readJson(path.join(outputDir, 'application_intelligence.json'), null),
   ]);
   return {
     summary: summary && typeof summary === 'object' && !Array.isArray(summary) ? summary : null,
@@ -106,12 +131,33 @@ async function readAudienceSource(outputDir) {
     comments: arrayOfObjects(comments),
     users: arrayOfObjects(users),
     notes: arrayOfObjects(notes),
+    cards: arrayOfObjects(Array.isArray(cardsPayload) ? cardsPayload : cardsPayload?.cards),
+    applicationRecords: arrayOfObjects(applicationPayload?.records),
   };
 }
 
+function contentInsightPosts(source) {
+  const owners = source.applicationRecords.length
+    ? source.applicationRecords
+    : source.cards.length
+      ? source.cards
+      : source.notes;
+  const metadataById = new Map();
+  for (const item of [...source.cards, ...source.notes]) {
+    const postId = checkpointPostId(item);
+    if (!postId) continue;
+    metadataById.set(postId, mergeRecord(metadataById.get(postId) || {}, item));
+  }
+  return owners.map((record) => {
+    const postId = checkpointPostId(record);
+    const enriched = mergeRecord(record, metadataById.get(postId) || {});
+    return postFromCheckpoint(enriched);
+  }).filter(Boolean);
+}
+
 function postFromCheckpoint(note) {
-  const noteUrl = firstString(note.note_url, note.search_result_url, note.explore_url);
-  let postId = firstString(note.note_id, note.id);
+  const noteUrl = checkpointPostUrl(note);
+  let postId = checkpointPostId(note);
   if (!postId && noteUrl) postId = createHash('sha256').update(noteUrl).digest('hex').slice(0, 24);
   if (!postId || !noteUrl) return null;
   return {
@@ -122,6 +168,7 @@ function postFromCheckpoint(note) {
       user_id: profileId(firstString(note.author_profile, note.author_url)),
       display_name: firstString(note.author, note.nickname),
       profile_url: firstString(note.author_profile, note.author_url),
+      avatar_url: checkpointAuthorAvatar(note),
       roles: ['author'],
       post_ids: [postId],
       enrichment_status: 'pending',
@@ -129,6 +176,32 @@ function postFromCheckpoint(note) {
     expected_comment_count: numericCount(note.comment_count ?? note.comments),
     status: 'pending',
   };
+}
+
+function checkpointAuthorAvatar(note) {
+  const explicit = firstString(note.author_avatar, note.author_avatar_url, note.avatar_url);
+  if (explicit) return explicit;
+  const candidates = [note.card_image_urls, note.detail_image_urls, note.image_urls]
+    .flatMap((value) => Array.isArray(value) ? value : String(value || '').split('|'))
+    .map((value) => String(value || '').trim());
+  return candidates.find((value) => /sns-avatar|\/avatar\//i.test(value)) || '';
+}
+
+function checkpointPostUrl(note) {
+  return firstString(
+    note.note_url,
+    note.search_result_url,
+    note.explore_url,
+    note.card_search_result_url,
+    note.card_explore_url,
+    note.job_card?.source_url,
+  );
+}
+
+function checkpointPostId(note) {
+  const noteUrl = checkpointPostUrl(note);
+  const urlId = noteUrl.match(/\/(?:search_result|explore)\/([^/?#]+)/)?.[1] || '';
+  return firstString(urlId, note.note_id, note.id);
 }
 
 function normalizePost(post, commentStats = null) {

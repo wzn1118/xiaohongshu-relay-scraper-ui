@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createWriteStream } from 'node:fs';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { buildRunnerArgs } from './lib/contracts.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
@@ -33,6 +33,7 @@ export class JobManager {
     aiSessions,
     profileStore,
     legacyProfilePath,
+    diagnostics,
   }) {
     this.dataDir = dataDir;
     this.historyPath = path.join(dataDir, 'jobs.json');
@@ -41,6 +42,7 @@ export class JobManager {
     this.spawnImpl = spawnImpl;
     this.terminateImpl = terminateImpl;
     this.recoverImpl = recoverImpl;
+    this.processIsolationEnabled = spawnImpl === spawn || recoverImpl !== terminatePersistedJobProcesses;
     this.checkpointAnalyzerImpl = checkpointAnalyzerImpl;
     this.jobs = [];
     this.active = null;
@@ -51,6 +53,7 @@ export class JobManager {
     this.aiSessions = aiSessions;
     this.profileStore = profileStore;
     this.legacyProfilePath = legacyProfilePath;
+    this.diagnostics = diagnostics;
     this.runtimeContexts = new Map();
     this.liveCheckpointAnalyses = new Map();
     this.recoveryBlockers = [];
@@ -110,6 +113,7 @@ export class JobManager {
           job.error += ` Orphan cleanup failed: ${job.cleanupError}`;
         }
         if (cleanupConfirmed) job.pid = null;
+        finalizeRunningAudienceStage(job, 'server_restart', now);
         finishAttempt(activeAttempt, {
           status: 'interrupted',
           finishedAt: now,
@@ -126,6 +130,15 @@ export class JobManager {
         changed = true;
       } else if (TERMINAL.has(job.status) && job.pid != null && cleanupConfirmed) {
         job.pid = null;
+        changed = true;
+      }
+      if (!wasInFlight && TERMINAL.has(job.status) && finalizeRunningAudienceStage(
+        job,
+        stopReasonForJob(job),
+        job.finishedAt || now,
+      )) {
+        const nextState = await this.#commitWorkflowState(job);
+        applyWorkflowStateToJob(job, nextState);
         changed = true;
       }
     }
@@ -303,6 +316,21 @@ export class JobManager {
         error.attemptId = activeAttempt.attemptId;
         error.activeJob = publicJob(job);
         throw error;
+      }
+
+      try {
+        const cleanup = await this.#isolatePersistedProcesses(job, 'before_resume');
+        if (cleanup.matched > 0 || cleanup.staleTempsRemoved > 0) await this.persist();
+      } catch (error) {
+        job.cleanupError = String(error?.message || error);
+        job.updatedAt = new Date().toISOString();
+        await this.persist();
+        const isolationError = jobError(
+          'JOB_PROCESS_ISOLATION_FAILED',
+          `The previous collection process could not be isolated before resume: ${job.cleanupError}`,
+        );
+        isolationError.cause = error;
+        throw isolationError;
       }
 
       await reconcileJobCheckpoint(job);
@@ -621,6 +649,7 @@ export class JobManager {
       job.finishedAt = new Date().toISOString();
       job.updatedAt = job.finishedAt;
       job.pid = null;
+      finalizeRunningAudienceStage(job, 'server_shutdown', job.finishedAt);
       finishAttempt(currentAttempt(job), {
         status: 'interrupted',
         finishedAt: job.finishedAt,
@@ -745,6 +774,8 @@ export class JobManager {
   async #run(job) {
     let attempt = currentAttempt(job);
     let executionPid = attempt?.pid || null;
+    const runtime = this.runtimeContexts.get(job.id) || {};
+    const runnerParams = runtime.runnerParams || job.params;
     const log = createWriteStream(job.logPath, { flags: 'a', encoding: 'utf8' });
     const attemptLog = attempt?.logPath
       ? createWriteStream(attempt.logPath, { flags: 'a', encoding: 'utf8' })
@@ -780,8 +811,6 @@ export class JobManager {
         append('system', `Task ${job.id} was cancelled before it started.\n`);
         return;
       }
-      const runtime = this.runtimeContexts.get(job.id) || {};
-      const runnerParams = runtime.runnerParams || job.params;
       const runnerState = {
         resumeScope: runtime.resumeScope || attempt?.resumeScope || 'full',
         attemptId: attempt?.attemptId || runtime.attemptId,
@@ -819,12 +848,26 @@ export class JobManager {
       this.#emit(job.id, 'state', publicJob(job));
       await this.persist();
       const result = await completion;
+      let cleanupFailure = null;
+      try {
+        const cleanup = await this.#isolatePersistedProcesses(job, 'runner_exit');
+        if (cleanup.matched > 0) {
+          append('system', `Cleaned ${cleanup.terminated} orphaned collection process(es) after runner exit.\n`);
+        }
+      } catch (error) {
+        cleanupFailure = error;
+        job.cleanupError = String(error?.message || error);
+        append('system', `Runner process isolation failed: ${job.cleanupError}\n`);
+      }
       job.exitCode = result.code;
       if (job.interruptRequested) {
         job.status = 'interrupted';
         job.error = 'Server shutdown interrupted the task; resume is available from its checkpoint.';
       } else if (job.cancelRequested) {
         job.status = 'cancelled';
+      } else if (cleanupFailure) {
+        job.status = 'failed';
+        job.error = `Runner exited, but orphan process cleanup failed: ${job.cleanupError}`;
       } else if (result.error) {
         job.status = 'failed';
         job.error = result.error.message;
@@ -843,6 +886,12 @@ export class JobManager {
         job.progressLabel = job.params?.analysisMode === 'general'
           ? '当前检查点已完成分析，仍有内容正文或可回溯证据待补全'
           : '当前检查点已完成分析，仍有岗位正文待补全';
+        job.progressUpdatedAt = new Date().toISOString();
+      } else if (isRecoverableAudienceRunnerExit(job, runnerParams)) {
+        job.status = 'incomplete';
+        job.error = '受众采集进程意外中断；已保存的评论、用户与主页检查点完整保留，可继续补采未完成部分。';
+        job.progressPhase = 'audience_incomplete';
+        job.progressLabel = '本轮采集已中断，检查点已保存，可继续补采未完成评论与用户主页';
         job.progressUpdatedAt = new Date().toISOString();
       } else {
         job.status = 'failed';
@@ -893,6 +942,9 @@ export class JobManager {
         job.status = 'failed';
         job.error = String(error?.message || error);
         append('system', `${job.error}\n`);
+      }
+      if (job.status !== 'succeeded') {
+        finalizeRunningAudienceStage(job, stopReasonForJob(job), job.finishedAt);
       }
       finishAttempt(attempt, {
         status: job.status,
@@ -1000,7 +1052,24 @@ export class JobManager {
     return analysis;
   }
 
+  async #isolatePersistedProcesses(job, reason) {
+    if (!this.processIsolationEnabled) {
+      return { matched: 0, terminated: 0, staleTempsRemoved: 0, method: 'disabled-for-injected-runner' };
+    }
+    const cleanup = await this.recoverImpl(job) || { matched: 0, terminated: 0 };
+    const staleTempsRemoved = await removeStaleAtomicTemps(job.outputDir);
+    job.cleanupConfirmedAt = new Date().toISOString();
+    job.cleanupResult = {
+      ...cleanup,
+      staleTempsRemoved,
+      reason,
+    };
+    delete job.cleanupError;
+    return job.cleanupResult;
+  }
+
   #emit(id, type, data) {
+    this.diagnostics?.recordJobEvent?.(id, type, data);
     this.events.emit(`job:${id}`, { type, data });
   }
 
@@ -1161,6 +1230,18 @@ function attemptProcessedCount(attempt, job) {
   return Math.max(
     0,
     processedCountForJob(job) - Math.max(0, Number(attempt?.processedCountAtStart || 0)),
+  );
+}
+
+function isRecoverableAudienceRunnerExit(job, runnerParams = job?.params) {
+  return Boolean(
+    runnerParams?.audienceOnly
+    && runnerParams?.collectAudience
+    && (
+      String(job?.progressPhase || '').startsWith('audience_')
+      || Number(job?.workflowSummary?.audience?.commentsCollected || 0) > 0
+      || Number(job?.stages?.audience?.postsTotal || 0) > 0
+    )
   );
 }
 
@@ -1386,10 +1467,22 @@ function stopReasonForJob(job) {
   return null;
 }
 
+function finalizeRunningAudienceStage(job, stopReason, timestamp = new Date().toISOString()) {
+  const stage = job.stages?.audience;
+  if (stage?.status !== 'running') return false;
+  stage.status = 'partial';
+  stage.stopReason = stage.stopReason || stopReason || 'interrupted';
+  stage.lastCheckpointAt ||= timestamp;
+  return true;
+}
+
 function errorCodeForJob(job) {
   if (job.status === 'succeeded' || job.status === 'cancelled') return null;
   if (job.securityRestriction?.status === 'timed_out') return 'SECURITY_VERIFICATION_TIMEOUT';
   if (job.rateLimit?.status === 'stopped') return 'RATE_LIMITED';
+  if (job.status === 'incomplete' && job.progressPhase === 'audience_incomplete') {
+    return 'AUDIENCE_RUNNER_INTERRUPTED';
+  }
   if (job.status === 'incomplete') return 'QUALITY_GATE_INCOMPLETE';
   if (job.status === 'interrupted') return job.cleanupError ? 'ORPHAN_CLEANUP_FAILED' : 'SERVER_RESTART';
   if (job.status === 'failed') return 'RUNNER_FAILED';
@@ -1568,17 +1661,32 @@ export function updateProgressFromLog(job, message) {
     });
   }
 
-  for (const match of message.matchAll(/AUDIENCE_PROGRESS posts=(\d+)\/(\d+) comments=(\d+) users=(\d+) profiles=(\d+)\/(\d+) phase=(comments|profiles)/gi)) {
-    const phase = match[7].toLowerCase();
+  for (const match of message.matchAll(/AUDIENCE_PROGRESS posts=(\d+)\/(\d+) comments=(\d+) users=(\d+) profiles=(\d+)\/(\d+)(?: processed=(\d+)\/(\d+))? phase=(comments|profiles|profile_catchup)/gi)) {
+    const phase = match[9].toLowerCase();
     const current = phase === 'comments' ? Number(match[1]) : Number(match[5]);
     const total = phase === 'comments' ? Number(match[2]) : Number(match[6]);
+    const batchCurrent = Number(match[7] || 0);
+    const batchTotal = Number(match[8] || 0);
+    const recoveredSecurity = job.securityRestriction?.status === 'waiting'
+      ? {
+          ...job.securityRestriction,
+          status: 'cleared',
+          clearedAt: new Date().toISOString(),
+          recoveryAction: null,
+        }
+      : job.securityRestriction;
     update({
       progressPhase: phase === 'comments' ? 'audience_comments' : 'audience_profiles',
       progressLabel: phase === 'comments'
-        ? `正在全量采集评论与回复，已检查 ${match[1]} / ${match[2]} 篇，收集 ${match[3]} 条评论`
-        : `正在补全评论者公开资料，已处理 ${match[5]} / ${match[6]} 位`,
+        ? batchTotal > 0
+          ? `正在全量采集评论与回复，本轮已处理 ${batchCurrent} / ${batchTotal} 篇，累计完整 ${match[1]} / ${match[2]} 篇，已收集 ${match[3]} 条评论`
+          : `正在全量采集评论与回复，累计完整 ${match[1]} / ${match[2]} 篇，已收集 ${match[3]} 条评论`
+        : batchTotal > 0
+          ? `正在补全评论者公开资料，本轮已处理 ${batchCurrent} / ${batchTotal} 位，累计完成 ${match[5]} / ${match[6]} 位`
+          : `正在补全评论者公开资料，累计完成 ${match[5]} / ${match[6]} 位`,
       progressCurrent: current,
       progressTotal: total,
+      securityRestriction: recoveredSecurity,
     });
     setProgress(Math.min(98, 88 + Math.round((current / Math.max(1, total)) * 10)));
   }
@@ -2104,6 +2212,30 @@ async function terminatePersistedJobProcesses(job) {
     throw new Error(`Persisted job process cleanup left ${remaining.length} matching process(es) running.`);
   }
   return { matched: matches.length, terminated: matches.length, method: 'command-line-identity' };
+}
+
+async function removeStaleAtomicTemps(outputDir) {
+  let entries;
+  try {
+    entries = await readdir(outputDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return 0;
+    throw error;
+  }
+  const staleTemps = entries.filter((entry) => (
+    entry.isFile()
+    && entry.name.startsWith('.')
+    && entry.name.endsWith('.tmp')
+    && /\.\d+\.[a-f0-9-]+\.tmp$/i.test(entry.name)
+  ));
+  await Promise.all(staleTemps.map(async (entry) => {
+    try {
+      await unlink(path.join(outputDir, entry.name));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }));
+  return staleTemps.length;
 }
 
 async function listWindowsProcesses() {

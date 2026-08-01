@@ -1,15 +1,28 @@
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
 import { ValidationError, validateRunRequest } from './lib/contracts.mjs';
 import { probeRelay } from './lib/relay.mjs';
 import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
 import { setupRelayRuntime } from './lib/relay-setup.mjs';
 import { recoverRelay } from './lib/relay-recovery.mjs';
+import { createRelaySupervisor } from './lib/relay-supervisor.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 import { readAudienceResults } from './lib/audience-results.mjs';
+import {
+  bindDraftQuality,
+  currentDraftVersion,
+  hashDraftContent,
+  migrateDraftStore,
+  normalizeDraftContent,
+  publicDraftMetadata,
+  resolveDraftForSend,
+  saveDraftVersion,
+} from './lib/draft-store.mjs';
+import { createDraftQualityChecker } from './lib/draft-quality-checker.mjs';
+import { normalizeDiagnosticRoute } from './lib/diagnostics.mjs';
 import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 import { createPreflightService } from './preflight-service.mjs';
 
@@ -22,6 +35,9 @@ const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/i;
 const MEDIA_CACHE_MAX_BYTES = 15 * 1024 * 1024;
 const MEDIA_CACHE_TIMEOUT_MS = 15_000;
+const APPLICATION_RECORD_INDEX = Symbol('applicationRecordIndex');
+const APPLICATION_ARTIFACT_FILENAME = Symbol('applicationArtifactFilename');
+const deliveryStateLocks = new Map();
 const CONTENT_RESEARCH_LABELS = Object.freeze({
   auto: 'AI 自动识别',
   experience: '经验攻略',
@@ -32,8 +48,23 @@ const CONTENT_RESEARCH_LABELS = Object.freeze({
   custom: '自定义研究',
 });
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
+  const relayRuntime = relaySupervisor || createRelaySupervisor({
+    getConfig: getRelayConfig,
+    getActiveJob: () => manager.active,
+    openClawConfigPath: config.openClawConfigPath,
+    managedBrowserDataDir: config.managedBrowserDataDir,
+    pythonBin: config.pythonBin,
+    connectionCheckScriptPath: config.relayConnectionCheckScriptPath,
+    relayConnector,
+    relayRecoverer,
+    monitorIntervalMs: config.relayMonitorIntervalMs,
+    failureThreshold: config.relayFailureThreshold,
+    recoveryCooldownMs: config.relayRecoveryCooldownMs,
+    connectTimeoutMs: config.relayConnectTimeoutMs,
+    playwrightTimeoutMs: config.relayPlaywrightTimeoutMs,
+  });
   const readiness = preflightService || createPreflightService({
     config,
     aiSessions,
@@ -45,12 +76,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     getRelayConfig,
   });
   const mediaDownloads = new Map();
-  let smtpOperationTail = Promise.resolve();
-  const withSmtpOperationLock = (operation) => {
-    const current = smtpOperationTail.catch(() => {}).then(operation);
-    smtpOperationTail = current.catch(() => {});
-    return current;
-  };
+  const checkDraftQuality = draftQualityChecker || createDraftQualityChecker({
+    pythonBin: config.pythonBin || (process.platform === 'win32' ? 'python' : 'python3'),
+    scriptPath: path.join(config.projectRoot || process.cwd(), 'scripts', 'recheck_application_draft.py'),
+  });
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
     configure: () => ({ configured: false, from: '' }),
@@ -65,12 +94,32 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       throw error;
     },
   };
+  let smtpOperationTail = Promise.resolve();
+  const withSmtpOperationLock = (operation) => {
+    const current = smtpOperationTail.catch(() => {}).then(operation);
+    smtpOperationTail = current.catch(() => {});
+    return current;
+  };
   return async function app(req, res) {
+    const requestStartedAt = performance.now();
+    const requestId = diagnostics?.requestId?.(req.headers['x-request-id']);
+    if (requestId) res.setHeader('X-Request-Id', requestId);
     setSecurityHeaders(res);
     if (req.method === 'OPTIONS') return noContent(res);
     const url = new URL(req.url, 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean);
+    res.once('finish', () => diagnostics?.record?.('http_request_completed', {
+      requestId,
+      method: req.method,
+      route: normalizeDiagnosticRoute(url.pathname),
+      statusCode: res.statusCode,
+      durationMs: performance.now() - requestStartedAt,
+    }));
     try {
+      if (req.method === 'GET' && url.pathname === '/api/diagnostics/bundle') {
+        if (!diagnostics?.bundle) return json(res, 503, errorBody('DIAGNOSTICS_UNAVAILABLE', 'Diagnostics are unavailable.'));
+        return json(res, 200, diagnostics.bundle());
+      }
       if (req.method === 'GET' && url.pathname === '/api/health') {
         return json(res, 200, {
           ok: true,
@@ -83,6 +132,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           port: config.port,
           activeJob: manager.active?.id || null,
           emailDelivery: deliveryMailer.status(),
+          relaySupervisor: relayRuntime.snapshot(),
         });
       }
       if (req.method === 'GET' && url.pathname === '/api/relay/config') {
@@ -119,13 +169,16 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       }
       if (req.method === 'POST' && url.pathname === '/api/email/test') {
         return json(res, 200, await withSmtpOperationLock(async () => {
-          const snapshot = smtpConfig?.getVerificationSnapshot?.();
+          const verificationSnapshot = smtpConfig?.getVerificationSnapshot?.();
           try {
             const status = await deliveryMailer.verify();
-            const saved = await smtpConfig?.markVerified?.(snapshot);
+            const saved = await smtpConfig?.markVerified?.(verificationSnapshot);
             return { ok: true, ...status, lastVerifiedAt: saved?.lastVerifiedAt || new Date().toISOString() };
           } catch (error) {
-            await smtpConfig?.markVerificationFailed?.(snapshot, error.code).catch(() => {});
+            await smtpConfig?.markVerificationFailed?.(
+              verificationSnapshot,
+              String(error?.code || 'SMTP_VERIFICATION_FAILED'),
+            ).catch(() => {});
             throw error;
           }
         }));
@@ -135,8 +188,8 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         const requested = url.searchParams.get('port');
         const port = requested === null ? configured.port : Number(requested);
         if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
-        const status = await probeRelay({ port, openClawConfigPath: config.openClawConfigPath });
-        return json(res, status.ok ? 200 : 503, status);
+        const status = await relayRuntime.probe({ port });
+        return json(res, 200, status);
       }
       if (req.method === 'POST' && url.pathname === '/api/relay/connect') {
         const body = await readJsonBody(req, config.maxBodyBytes);
@@ -144,12 +197,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         const requested = body?.port;
         const port = requested === undefined ? configured.port : Number(requested);
         if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
-        const status = await relayConnector({
-          port,
-          openClawConfigPath: config.openClawConfigPath,
-          managedBrowserDataDir: config.managedBrowserDataDir,
-          profile: body?.profile || configured.profile,
-        });
+        const status = await relayRuntime.connect({ port, profile: body?.profile || configured.profile });
         return json(res, 200, status);
       }
       if (req.method === 'POST' && url.pathname === '/api/relay/recover') {
@@ -160,22 +208,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         const profile = String(body?.profile || configured.profile || 'openclaw').trim();
         if (!Number.isInteger(port) || port < 1 || port > 65535) return json(res, 400, errorBody('INVALID_PORT', 'Invalid relay port.'));
         if (!/^[\p{L}\p{N}_.-]+$/u.test(profile)) return json(res, 400, errorBody('INVALID_PROFILE', 'Invalid browser profile.'));
-        const connection = await relayConnector({
-          port,
-          openClawConfigPath: config.openClawConfigPath,
-          managedBrowserDataDir: config.managedBrowserDataDir,
-          profile,
-        });
-        if (!connection.running || !connection.cdpReady) {
-          return json(res, 503, { ...connection, ready: false, repaired: false, port, profile });
-        }
-        const recovery = await relayRecoverer({
-          port,
-          profile,
-          openClawConfigPath: config.openClawConfigPath,
-          pythonBin: config.pythonBin,
-          connectionCheckScriptPath: config.relayConnectionCheckScriptPath,
-        });
+        const recovery = await relayRuntime.recover({ port, profile, reason: 'manual' });
         return json(res, recovery.ok ? 200 : 503, recovery);
       }
       if (req.method === 'POST' && url.pathname === '/api/relay/setup') {
@@ -194,12 +227,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           browserDataDir: config.managedBrowserDataDir,
         });
         if (!setup.ok) return json(res, 503, { ...setup, ready: false, port, profile });
-        const status = await relayConnector({
-          port,
-          openClawConfigPath: config.openClawConfigPath,
-          managedBrowserDataDir: config.managedBrowserDataDir,
-          profile,
-        });
+        const status = await relayRuntime.connect({ port, profile });
         return json(res, status.ready ? 200 : 503, { ...status, ...setup, setup, port, profile });
       }
       if (req.method === 'POST' && url.pathname === '/api/relay/login') {
@@ -213,12 +241,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (!/^https:\/\/www\.xiaohongshu\.com(?:\/|$)/i.test(urlToOpen)) {
           return json(res, 400, errorBody('INVALID_LOGIN_URL', 'Login URL must be on the target website.'));
         }
-        const connection = await relayConnector({
-          port: Number(configured.port),
-          openClawConfigPath: config.openClawConfigPath,
-          managedBrowserDataDir: config.managedBrowserDataDir,
-          profile,
-        });
+        const connection = await relayRuntime.connect({ port: Number(configured.port), profile });
         if (!connection.ready && !(connection.running && connection.cdpReady)) {
           return json(res, 503, { ...connection, opened: false, profile, url: urlToOpen });
         }
@@ -430,7 +453,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           return json(res, 200, await readApplicationResults(internal.outputDir, url.searchParams, internal));
         }
         if (req.method === 'GET' && parts[3] === 'media' && parts.length === 4) {
-          return serveCachedMedia(res, {
+          return await serveCachedMedia(res, {
             outputDir: internal.outputDir,
             sourceUrl: url.searchParams.get('url'),
             mediaFetcher,
@@ -494,6 +517,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             collectAudience: true,
             audienceOnly: true,
             checkOnly: false,
+            securityVerificationTimeoutSeconds: 86400,
             aiSessionId: null,
             profileId: null,
           });
@@ -519,7 +543,19 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         }
         if (req.method === 'POST' && parts[3] === 'draft' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
-          return json(res, 200, await updateApplicationDraft(internal.outputDir, body));
+          return json(res, 200, await updateApplicationDraft(internal.outputDir, body, deliveryStateWriter));
+        }
+        if (req.method === 'POST' && parts[3] === 'draft' && parts[4] === 'quality' && parts.length === 5) {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const ai = resolveDraftAiRuntime(aiSessions, internal, body);
+          return json(res, 200, await recheckApplicationDraft(
+            internal.outputDir,
+            body,
+            checkDraftQuality,
+            ai,
+            internal.params?.candidateProfile,
+            deliveryStateWriter,
+          ));
         }
         if (req.method === 'POST' && parts[3] === 'send-email' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
@@ -530,6 +566,11 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             deliveryMailer,
             replyTo,
             smtpConfig,
+            {
+              writeState: deliveryStateWriter,
+              appendAudit: sendAuditAppender,
+              readAudit: sendAuditReader,
+            },
           )));
         }
         if (req.method === 'GET' && parts[3] === 'artifacts' && parts.length === 4) {
@@ -549,7 +590,23 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if ((req.method === 'GET' || req.method === 'HEAD') && await serveSpa(req, res, config.staticDir, url.pathname)) return;
       return json(res, 404, errorBody('NOT_FOUND', 'Endpoint not found.'));
     } catch (error) {
+      diagnostics?.record?.('http_request_failed', {
+        level: 'error',
+        requestId,
+        method: req.method,
+        route: normalizeDiagnosticRoute(url.pathname),
+        errorCode: error?.code || error?.name || 'INTERNAL_ERROR',
+        durationMs: performance.now() - requestStartedAt,
+      });
       if (error instanceof ValidationError) return json(res, 400, errorBody('VALIDATION_ERROR', error.message, error.details));
+      if (error.code === 'DRAFT_VERSION_CONFLICT') {
+        return json(res, 409, {
+          ...errorBody(error.code, error.message),
+          expectedVersion: error.expectedVersion ?? null,
+          currentVersion: error.currentVersion ?? null,
+        });
+      }
+      if (String(error.code || '').startsWith('DRAFT_')) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'JOB_BUSY') return json(res, 409, { ...errorBody('JOB_BUSY', error.message), activeJob: error.activeJob });
       if (error.code === 'JOB_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
       if (['ARTIFACT_NOT_FOUND', 'DRAFT_NOT_FOUND'].includes(error.code)) return json(res, 404, errorBody(error.code, error.message));
@@ -594,13 +651,33 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'PROFILE_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
       if (error.code === 'PROFILE_IMPORT_FAILED') return json(res, 422, errorBody(error.code, error.message));
       if (['MAIL_NOT_CONFIGURED', 'SMTP_NOT_CONFIGURED'].includes(error.code)) return json(res, 503, errorBody(error.code, error.message));
-      if (['SMTP_NOT_VERIFIED', 'SMTP_VERIFICATION_EXPIRED', 'SMTP_CONFIG_CONFLICT', 'EMAIL_SEND_STATUS_UNKNOWN', 'EMAIL_IDEMPOTENCY_CONFLICT'].includes(error.code)) {
+      if (error.code === 'SMTP_CONFIG_CONFLICT') {
+        return json(res, 409, {
+          ...errorBody(error.code, error.message),
+          currentRevision: error.currentRevision ?? null,
+        });
+      }
+      if (['SMTP_NOT_VERIFIED', 'SMTP_VERIFICATION_EXPIRED', 'EMAIL_IDEMPOTENCY_CONFLICT'].includes(error.code)) {
         return json(res, 409, errorBody(error.code, error.message));
       }
       if (error.code === 'SMTP_RATE_LIMITED') return json(res, 429, errorBody(error.code, error.message));
-      if (['SMTP_SENDER_REJECTED', 'SMTP_RECIPIENT_REJECTED'].includes(error.code)) return json(res, 422, errorBody(error.code, error.message));
-      if (['MAIL_CONNECTION_FAILED', 'MAIL_SEND_FAILED', 'SMTP_AUTH_FAILED', 'SMTP_DNS_FAILED', 'SMTP_CONNECTION_TIMEOUT', 'SMTP_TLS_FAILED', 'SMTP_VERIFICATION_FAILED', 'SMTP_SEND_FAILED'].includes(error.code)) {
-        return json(res, 502, errorBody(error.code, error.message));
+      if (['SMTP_SENDER_REJECTED', 'SMTP_RECIPIENT_REJECTED'].includes(error.code)) {
+        return json(res, 422, errorBody(error.code, error.message));
+      }
+      if ([
+        'SMTP_AUTH_FAILED',
+        'SMTP_DNS_FAILED',
+        'SMTP_CONNECTION_TIMEOUT',
+        'SMTP_TLS_FAILED',
+        'SMTP_VERIFICATION_FAILED',
+        'SMTP_SEND_FAILED',
+      ].includes(error.code)) return json(res, 502, errorBody(error.code, error.message));
+      if (error.code === 'MAIL_CONNECTION_FAILED') return json(res, 502, errorBody(error.code, error.message));
+      if (error.code === 'MAIL_SEND_FAILED') return json(res, 502, errorBody(error.code, error.message));
+      if (error.code === 'AI_QUALITY_CHECK_FAILED') return json(res, 502, errorBody(error.code, error.message));
+      if (error.code === 'EMAIL_SEND_STATUS_UNKNOWN') return json(res, 409, errorBody(error.code, error.message));
+      if (['EMAIL_DELIVERED_AUDIT_STATE_PENDING', 'EMAIL_DELIVERED_AUDIT_UNCERTAIN'].includes(error.code)) {
+        return json(res, 500, errorBody(error.code, error.message));
       }
       if (error instanceof SyntaxError) return json(res, 400, errorBody('INVALID_JSON', 'Request body must contain valid JSON.'));
       if (error.code === 'ENOENT' || /artifact/i.test(error.message) || /Path escapes/.test(error.message)) {
@@ -694,8 +771,9 @@ async function readAudienceSnapshot(manager, jobId, searchParams) {
     .slice(0, -1)
     .map((item) => item.outputDir);
   const result = await readAudienceResults(primary.outputDir, searchParams, { fallbackOutputDirs });
+  const localized = localizeAudienceAvatars(result, jobId);
   return {
-    ...result,
+    ...localized,
     sourceJobId,
     checkpointJobId: jobId,
     readThroughJobIds: lineage,
@@ -864,9 +942,11 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
     const delivery = await readDeliveryState(outputDir);
     const legacyMedia = await readLegacyMediaSources(outputDir);
     const hydratedSource = Array.isArray(payload.records)
-      ? payload.records.map((record) => mergeApplicationState(
+      ? payload.records.map((record, recordIndex) => mergeApplicationState(
         hydrateApplicationMedia(record, legacyMedia.get(record.note_id)),
         delivery[record.note_id],
+        recordIndex,
+        payload[APPLICATION_ARTIFACT_FILENAME],
       )).map((record) => localizeApplicationMedia(record, task.id))
       : [];
     const source = analysisMode === 'general'
@@ -943,7 +1023,7 @@ async function readLatestApplicationPayload(outputDir) {
       const filePath = path.join(outputDir, filename);
       try {
         const metadata = await stat(filePath);
-        return { filePath, modifiedAt: metadata.mtimeMs };
+        return { filePath, filename, modifiedAt: metadata.mtimeMs };
       } catch (error) {
         if (error.code === 'ENOENT') return null;
         throw error;
@@ -955,7 +1035,13 @@ async function readLatestApplicationPayload(outputDir) {
   for (const candidate of available) {
     try {
       const payload = JSON.parse(await readFile(candidate.filePath, 'utf8'));
-      if (payload && Array.isArray(payload.records)) return payload;
+      if (payload && Array.isArray(payload.records)) {
+        Object.defineProperty(payload, APPLICATION_ARTIFACT_FILENAME, {
+          value: candidate.filename,
+          enumerable: false,
+        });
+        return payload;
+      }
     } catch (error) {
       lastError = error;
     }
@@ -1059,6 +1145,34 @@ function localizeApplicationMedia(record, jobId) {
       } : {}),
     },
   };
+}
+
+function localizeAudienceProfileAvatar(user, jobId) {
+  if (!user || typeof user !== 'object' || !jobId) return user;
+  const sourceUrl = String(user.avatar_original_url || user.avatar_url || '').trim();
+  if (!isCacheableMediaUrl(sourceUrl)) return user;
+  return {
+    ...user,
+    avatar_url: `/api/jobs/${encodeURIComponent(jobId)}/media?url=${encodeURIComponent(sourceUrl)}`,
+    avatar_original_url: sourceUrl,
+  };
+}
+
+function localizeAudienceAvatars(result, jobId) {
+  const posts = Array.isArray(result?.posts)
+    ? result.posts.map((post) => ({
+      ...post,
+      author: localizeAudienceProfileAvatar(post?.author, jobId),
+    }))
+    : [];
+  const items = Array.isArray(result?.items)
+    ? result.items.map((item) => (
+      result.kind === 'comments'
+        ? { ...item, user: localizeAudienceProfileAvatar(item?.user, jobId) }
+        : localizeAudienceProfileAvatar(item, jobId)
+    ))
+    : [];
+  return { ...result, posts, items };
 }
 
 async function serveCachedMedia(res, { outputDir, sourceUrl, mediaFetcher, mediaDownloads }) {
@@ -1207,9 +1321,17 @@ function applicationTimestamp(record) {
 }
 
 async function readApplicationRecord(outputDir, noteId) {
-  const payload = JSON.parse(await readFile(path.join(outputDir, 'application_intelligence.json'), 'utf8'));
-  const record = Array.isArray(payload.records) ? payload.records.find((item) => item.note_id === noteId) : null;
+  const payload = await readLatestApplicationPayload(outputDir);
+  const recordIndex = Array.isArray(payload.records)
+    ? payload.records.findIndex((item) => item.note_id === noteId)
+    : -1;
+  const record = recordIndex >= 0 ? payload.records[recordIndex] : null;
   if (!record) throw new ValidationError('Application record not found.');
+  Object.defineProperty(record, APPLICATION_RECORD_INDEX, { value: recordIndex, enumerable: false });
+  Object.defineProperty(record, APPLICATION_ARTIFACT_FILENAME, {
+    value: payload[APPLICATION_ARTIFACT_FILENAME],
+    enumerable: false,
+  });
   return record;
 }
 
@@ -1223,6 +1345,16 @@ async function readDeliveryState(outputDir) {
   }
 }
 
+function withDeliveryStateLock(outputDir, operation) {
+  const key = path.resolve(outputDir, 'delivery-state.json');
+  const previous = deliveryStateLocks.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(operation);
+  deliveryStateLocks.set(key, current);
+  return current.finally(() => {
+    if (deliveryStateLocks.get(key) === current) deliveryStateLocks.delete(key);
+  });
+}
+
 async function updateDeliveryState(outputDir, value) {
   const noteId = String(value?.noteId || '').trim();
   const action = String(value?.action || '').trim();
@@ -1230,143 +1362,401 @@ async function updateDeliveryState(outputDir, value) {
   if (!['ready_to_apply', 'ready_to_message', 'applied', 'messaged', 'reset'].includes(action)) {
     throw new ValidationError('Invalid delivery action.');
   }
-  await readApplicationRecord(outputDir, noteId);
-  const state = await readDeliveryState(outputDir);
-  if (action === 'reset') delete state[noteId];
-  else state[noteId] = { ...state[noteId], action, updatedAt: new Date().toISOString() };
-  await writeDeliveryState(outputDir, state);
-  return { noteId, delivery: publicDeliveryState(state[noteId]) };
+  const record = await readApplicationRecord(outputDir, noteId);
+  return withDeliveryStateLock(outputDir, async () => {
+    const state = await readDeliveryState(outputDir);
+    const existing = state[noteId] || {};
+    const store = draftStoreFor(record, existing);
+    const current = currentDraftVersion(store);
+    if (action === 'reset') {
+      const { action: _action, email: _email, pendingSend: _pendingSend, updatedAt: _updatedAt, ...preserved } = existing;
+      state[noteId] = {
+        ...preserved,
+        draft: { ...current.content },
+        draftStore: store,
+      };
+      await writeDeliveryState(outputDir, state);
+      return {
+        noteId,
+        draftVersion: draftVersionMetadata(store),
+        delivery: publicDeliveryState(state[noteId]),
+      };
+    }
+
+    const resolved = resolveStoredDraftForAction(record, existing, value);
+    await assertQualityReportReference(outputDir, record, resolved);
+    if (['ready_to_message', 'messaged'].includes(action) && !resolved.content.greeting) {
+      throw new ValidationError('Direct-message greeting is required.');
+    }
+    if (['ready_to_message', 'messaged'].includes(action) && !hasActionableDirectMessageRoute(record)) {
+      throw new ValidationError('This application record does not contain an actionable direct-message route.');
+    }
+    if (['ready_to_apply', 'applied'].includes(action) && !resolved.content.cover_letter) {
+      throw new ValidationError('Cover Letter is required.');
+    }
+    const updatedAt = new Date().toISOString();
+    state[noteId] = {
+      ...existing,
+      action,
+      updatedAt,
+      draft: { ...resolved.content },
+      draftStore: resolved.store,
+    };
+    await writeDeliveryState(outputDir, state);
+    return {
+      noteId,
+      draftVersion: draftVersionMetadata(resolved.store),
+      delivery: publicDeliveryState(state[noteId]),
+    };
+  });
 }
 
-async function updateApplicationDraft(outputDir, value) {
-  const noteId = String(value?.noteId || '').trim();
-  if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
-  await readApplicationRecord(outputDir, noteId);
-  const draft = normalizeDraft(value?.outreach);
-  const state = await readDeliveryState(outputDir);
-  state[noteId] = {
-    ...state[noteId],
-    action: 'draft_saved',
-    updatedAt: new Date().toISOString(),
-    draft,
-  };
-  await writeDeliveryState(outputDir, state);
-  return { noteId, outreach: draft, delivery: publicDeliveryState(state[noteId]) };
-}
-
-async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfig) {
+async function updateApplicationDraft(outputDir, value, writeState = writeDeliveryState) {
   const noteId = String(value?.noteId || '').trim();
   if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
   const record = await readApplicationRecord(outputDir, noteId);
-  const qualityThreshold = Math.max(90, Number(record.cover_letter_evaluation?.threshold || 90));
-  if (!record.cover_letter_evaluation?.passed || Number(record.cover_letter_evaluation?.score || 0) < qualityThreshold) {
-    throw new ValidationError(`Cover Letter must pass the ${qualityThreshold}-point quality gate before delivery.`);
+  return withDeliveryStateLock(outputDir, async () => {
+    const state = await readDeliveryState(outputDir);
+    const existing = state[noteId] || {};
+    const store = draftStoreFor(record, existing);
+    const current = currentDraftVersion(store);
+    const draft = normalizeDraft(value?.outreach, current.content);
+    const suppliedVersion = value?.baseVersion ?? value?.expectedVersion ?? value?.version;
+    const requestedHash = hashDraftContent(draft);
+    const isIdempotentRetry = requestedHash === current.contentHash;
+    const isVersionedWrite = suppliedVersion != null;
+    const writeProtocol = String(existing.draftWriteProtocol || '').trim();
+    if (!isVersionedWrite && !isIdempotentRetry && (
+      writeProtocol === 'versioned'
+      || (store.currentVersion > 1 && writeProtocol !== 'legacy')
+    )) {
+      throw draftVersionConflict(null, store.currentVersion);
+    }
+    const expectedVersion = isVersionedWrite
+      ? Number(suppliedVersion)
+      : store.currentVersion;
+    const updatedStore = saveDraftVersion(store, {
+      draftId: value?.draftId || store.draftId,
+      expectedVersion,
+      content: draft,
+      now: new Date(),
+    });
+    const updated = currentDraftVersion(updatedStore);
+    state[noteId] = {
+      ...existing,
+      action: 'draft_saved',
+      updatedAt: updated.updatedAt,
+      draft: { ...updated.content },
+      draftStore: updatedStore,
+      draftWriteProtocol: isVersionedWrite ? 'versioned' : (writeProtocol || 'legacy'),
+    };
+    await writeState(outputDir, state);
+    return {
+      noteId,
+      outreach: { ...updated.content },
+      draftVersion: draftVersionMetadata(updatedStore),
+      delivery: publicDeliveryState(state[noteId]),
+    };
+  });
+}
+
+async function recheckApplicationDraft(outputDir, value, checker, ai, candidateProfile, writeState = writeDeliveryState) {
+  const noteId = String(value?.noteId || '').trim();
+  if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+  const record = await readApplicationRecord(outputDir, noteId);
+  const snapshot = await withDeliveryStateLock(outputDir, async () => {
+    const state = await readDeliveryState(outputDir);
+    const existing = state[noteId] || {};
+    const store = draftStoreFor(record, existing);
+    const requestedVersion = Number(value?.version);
+    const draftId = String(value?.draftId || '').trim();
+    if (!Number.isInteger(requestedVersion) || requestedVersion < 1) {
+      throw applicationDraftError('DRAFT_VERSION_REQUIRED', 'A valid draft version is required for quality checking.');
+    }
+    if (requestedVersion !== store.currentVersion) {
+      throw draftVersionConflict(requestedVersion, store.currentVersion);
+    }
+    const current = currentDraftVersion(store);
+    if (draftId !== store.draftId) {
+      throw applicationDraftError('DRAFT_ID_MISMATCH', 'The requested draftId does not match the stored draft.');
+    }
+    if (hashDraftContent(current.content) !== current.contentHash) {
+      throw applicationDraftError('DRAFT_CONTENT_HASH_MISMATCH', 'Stored draft content no longer matches its content hash.');
+    }
+    return {
+      draftId: store.draftId,
+      version: current.version,
+      contentHash: current.contentHash,
+      content: { ...current.content },
+    };
+  });
+
+  const threshold = Math.max(90, Number(record?.cover_letter_evaluation?.threshold || 90));
+  let report;
+  try {
+    report = await checker({
+      record,
+      draft: snapshot.content,
+      candidateProfile: candidateProfile || record?.candidate_profile || {},
+      threshold,
+    }, ai);
+  } catch (error) {
+    const failure = applicationDraftError(
+      'AI_QUALITY_CHECK_FAILED',
+      `Draft quality check failed: ${String(error?.message || 'unknown error')}`,
+    );
+    failure.cause = error;
+    throw failure;
   }
+
+  return withDeliveryStateLock(outputDir, async () => {
+    const state = await readDeliveryState(outputDir);
+    const existing = state[noteId] || {};
+    const store = draftStoreFor(record, existing);
+    const current = currentDraftVersion(store);
+    if (
+      store.draftId !== snapshot.draftId
+      || store.currentVersion !== snapshot.version
+      || current.contentHash !== snapshot.contentHash
+      || hashDraftContent(current.content) !== snapshot.contentHash
+    ) {
+      throw draftVersionConflict(snapshot.version, store.currentVersion);
+    }
+    const checkedAt = new Date().toISOString();
+    const evaluation = normalizeDraftQualityReport(report, record?.cover_letter_evaluation);
+    const qualityChecks = Array.isArray(existing.qualityChecks) ? existing.qualityChecks : [];
+    const qualityCheckId = `quality_${randomUUID()}`;
+    const qualityReportRef = `delivery-state.json#/${jsonPointerToken(noteId)}/qualityChecks/${qualityChecks.length}`;
+    const qualityCheck = {
+      id: qualityCheckId,
+      draftId: snapshot.draftId,
+      version: snapshot.version,
+      contentHash: snapshot.contentHash,
+      checkedAt,
+      evaluation,
+    };
+    const updatedStore = bindDraftQuality(store, {
+      draftId: snapshot.draftId,
+      version: snapshot.version,
+      contentHash: snapshot.contentHash,
+      passed: evaluation.passed,
+      qualityReportRef,
+      now: checkedAt,
+    });
+    state[noteId] = {
+      ...existing,
+      action: 'draft_checked',
+      updatedAt: checkedAt,
+      draft: { ...current.content },
+      draftStore: updatedStore,
+      qualityChecks: [...qualityChecks, qualityCheck],
+    };
+    await writeState(outputDir, state);
+    return {
+      noteId,
+      outreach: { ...current.content },
+      draftVersion: draftVersionMetadata(updatedStore),
+      cover_letter_evaluation: evaluation,
+      delivery: publicDeliveryState(state[noteId]),
+    };
+  });
+}
+
+async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfig, options = {}) {
+  const writeState = options.writeState || writeDeliveryState;
+  const appendAudit = options.appendAudit || appendSendAuditJournal;
+  const readAudit = options.readAudit || readSendAuditJournal;
+  const noteId = String(value?.noteId || '').trim();
+  if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+  const requestIdempotencyKey = normalizeSendRequestKey(value?.idempotencyKey);
+  const record = await readApplicationRecord(outputDir, noteId);
   const extracted = extractedEmails(record);
   const requested = String(value?.to || '').trim().toLowerCase();
   const to = extracted.find((item) => item.toLowerCase() === requested) || (!requested ? extracted[0] : '');
   if (!to) throw new ValidationError('Recipient must be an email extracted from this application record.');
 
-  let smtpState = assertSmtpVerified(mailer, smtpConfig);
-  const state = await readDeliveryState(outputDir);
-  const draft = normalizeDraft(value?.outreach || state[noteId]?.draft || record.outreach);
-  if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
-  validateDeliveryDraft(draft, record);
-  const existing = state[noteId] || {};
-  const requestKey = normalizeEmailIdempotencyKey(value?.idempotencyKey);
-  const draftId = String(value?.draftId || existing.draftId || `legacy:${noteId}`);
-  const draftVersion = Number(value?.version || value?.draftVersion || existing.draftVersion?.version || existing.draftVersion || 1);
-  const contentHash = createHash('sha256').update(JSON.stringify(draft)).digest('hex');
-  const idempotencyKey = createHash('sha256').update(JSON.stringify({
-    configHash: smtpState.configHash || '',
-    credentialRevision: smtpState.credentialRevision ?? null,
-    draftId,
-    draftVersion,
-    contentHash,
-    recipient: to.toLowerCase(),
-  })).digest('hex');
-  const priorAudits = Array.isArray(existing.sendAudit) ? existing.sendAudit : [];
-  const requestKeyAudit = requestKey ? priorAudits.find((audit) => audit.requestKey === requestKey) : null;
-  if (requestKeyAudit && requestKeyAudit.idempotencyKey !== idempotencyKey) {
-    throw emailDeliveryError('EMAIL_IDEMPOTENCY_CONFLICT', 'The email idempotency key was already used for different content.');
-  }
-  const completed = priorAudits.find((audit) => audit.idempotencyKey === idempotencyKey && audit.status === 'sent');
-  if (completed) {
-    const duplicateAt = new Date().toISOString();
-    const duplicateAudit = buildSendAudit({
-      status: 'duplicate', draftId, draftVersion, contentHash, idempotencyKey,
-      requestKey, recipient: to, timestamp: duplicateAt, smtpState, errorCode: 'EMAIL_DUPLICATE_SEND',
+  return withDeliveryStateLock(outputDir, async () => {
+    const state = await readDeliveryState(outputDir);
+    const existing = state[noteId] || {};
+    const resolved = resolveStoredDraftForAction(record, existing, value);
+    await assertQualityReportReference(outputDir, record, resolved);
+    const draft = { ...resolved.content };
+    if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
+    validateDeliveryDraft(draft, record);
+    const idempotencyKey = sendIdempotencyKey({
+      draftId: resolved.draftId,
+      version: resolved.version,
+      contentHash: resolved.contentHash,
+      recipient: to,
     });
-    state[noteId] = {
-      ...existing,
-      sendAudit: [...priorAudits, duplicateAudit],
-      updatedAt: duplicateAt,
+    const sendIdentity = {
+      draftId: resolved.draftId,
+      version: resolved.version,
+      contentHash: resolved.contentHash,
+      recipient: to,
+      recipientHash: recipientAuditHash(to),
+      idempotencyKey,
     };
-    await writeDeliveryState(outputDir, state);
-    return {
-      noteId,
-      outreach: draft,
-      delivery: publicDeliveryState(state[noteId]),
-      duplicate: true,
-      code: 'EMAIL_DUPLICATE_SEND',
-      sendIdempotencyKey: idempotencyKey,
+    const journalAudits = await readAudit(outputDir);
+    assertSendRequestKeyAvailable(
+      [
+        ...Object.values(state).flatMap((item) => Array.isArray(item?.sendAudit) ? item.sendAudit : []),
+        ...Object.values(state).flatMap((item) => item?.pendingSend ? [item.pendingSend] : []),
+        ...journalAudits,
+      ],
+      requestIdempotencyKey,
+      idempotencyKey,
+    );
+    const existingAudit = findSendAudit(existing.sendAudit, sendIdentity);
+    if (existingAudit) {
+      return {
+        noteId,
+        outreach: draft,
+        draftVersion: draftVersionMetadata(resolved.store),
+        delivery: publicDeliveryState(existing),
+        duplicate: true,
+        code: 'EMAIL_DUPLICATE_SEND',
+        sendIdempotencyKey: idempotencyKey,
+      };
+    }
+    const journalAudit = findSendAudit(journalAudits, sendIdentity);
+    if (journalAudit) {
+      const reconciledAt = journalAudit.sentAt || journalAudit.timestamp || new Date().toISOString();
+      const reconciled = stateWithoutPendingSend({
+        ...existing,
+        action: 'email_sent',
+        updatedAt: reconciledAt,
+        draft,
+        draftStore: resolved.store,
+        email: {
+          status: 'sent',
+          to,
+          sentAt: reconciledAt,
+          messageId: journalAudit.messageId || '',
+        },
+        sendAudit: appendUniqueSendAudit(existing.sendAudit, sanitizeSendAudit(journalAudit)),
+      });
+      state[noteId] = reconciled;
+      await writeState(outputDir, state);
+      return {
+        noteId,
+        outreach: draft,
+        draftVersion: draftVersionMetadata(resolved.store),
+        delivery: publicDeliveryState(reconciled),
+        duplicate: true,
+        code: 'EMAIL_DUPLICATE_SEND',
+        sendIdempotencyKey: idempotencyKey,
+      };
+    }
+    if (existing.pendingSend) {
+      throw applicationDraftError(
+        'EMAIL_SEND_STATUS_UNKNOWN',
+        'A previous email attempt has a persisted send intent without a confirmed audit; retry is blocked to prevent duplicate delivery.',
+      );
+    }
+    let smtpState = assertSmtpVerified(mailer, smtpConfig);
+    const verificationSnapshot = smtpConfig?.getVerificationSnapshot?.() || {
+      configHash: smtpState?.configHash || '',
+      credentialRevision: Number(smtpState?.credentialRevision || 0),
     };
-  }
-  if (existing.pendingSend) {
-    throw emailDeliveryError('EMAIL_SEND_STATUS_UNKNOWN', 'A previous persisted send intent has no final delivery result.');
-  }
-  const verificationSnapshot = smtpConfig?.getVerificationSnapshot?.() || smtpState;
-  try {
-    await mailer.verify();
-  } catch (error) {
-    await smtpConfig?.markVerificationFailed?.(verificationSnapshot, error.code).catch(() => {});
-    const failedAt = new Date().toISOString();
-    const audit = buildSendAudit({
-      status: 'failed', draftId, draftVersion, contentHash, idempotencyKey,
-      requestKey, recipient: to, timestamp: failedAt, smtpState, errorCode: error.code || 'SMTP_VERIFICATION_FAILED',
-    });
+    try {
+      await mailer.verify();
+      const verified = await smtpConfig?.markVerified?.(verificationSnapshot);
+      smtpState = smtpConfig?.getVerificationState?.() || verified || smtpState;
+    } catch (error) {
+      await smtpConfig?.markVerificationFailed?.(
+        verificationSnapshot,
+        String(error?.code || 'SMTP_VERIFICATION_FAILED'),
+      ).catch(() => {});
+      const failedAt = new Date().toISOString();
+      const failureAudit = createSendAuditRecord(sendIdentity, {
+        requestIdempotencyKey,
+        smtpState,
+        status: 'failed',
+        errorCode: String(error?.code || 'SMTP_VERIFICATION_FAILED'),
+        timestamp: failedAt,
+        qualityReportRef: resolved.qualityReportRef,
+      });
+      state[noteId] = {
+        ...existing,
+        action: 'email_failed',
+        updatedAt: failedAt,
+        draft,
+        draftStore: resolved.store,
+        email: { status: 'failed', to, failedAt },
+        sendAudit: appendSendAuditEvent(existing.sendAudit, failureAudit),
+      };
+      await writeState(outputDir, state);
+      throw error;
+    }
+    const preparedAt = new Date().toISOString();
     state[noteId] = {
       ...existing,
       draft,
-      action: 'email_failed',
-      updatedAt: failedAt,
-      email: { status: 'failed', to, failedAt, errorCode: error.code || 'SMTP_VERIFICATION_FAILED' },
-      sendAudit: [...priorAudits, audit],
+      draftStore: resolved.store,
+      updatedAt: preparedAt,
+      pendingSend: {
+        ...sendIdentity,
+        requestIdempotencyKey,
+        configHash: smtpState?.configHash || '',
+        credentialRevision: Number(smtpState?.credentialRevision || 0),
+        preparedAt,
+        qualityReportRef: resolved.qualityReportRef,
+      },
     };
-    await writeDeliveryState(outputDir, state);
-    throw error;
-  }
-  const refreshedVerification = await smtpConfig?.markVerified?.(verificationSnapshot);
-  if (refreshedVerification) {
-    smtpState = {
-      ...smtpState,
-      configHash: refreshedVerification.configHash || smtpState.configHash,
-      credentialRevision: refreshedVerification.credentialRevision ?? smtpState.credentialRevision,
-      verificationStatus: refreshedVerification.verificationStatus || 'verified',
-    };
-  }
-  const pendingAt = new Date().toISOString();
-  state[noteId] = {
-    ...existing,
-    draft,
-    updatedAt: pendingAt,
-    pendingSend: { idempotencyKey, draftId, draftVersion, contentHash, recipient: maskEmail(to), createdAt: pendingAt },
-  };
-  await writeDeliveryState(outputDir, state);
-  try {
-    const sent = await mailer.send({
-      to,
-      subject: draft.email_subject,
-      text: draft.email_body,
-      replyTo: EMAIL.test(replyTo) ? replyTo : '',
-      ...(Array.isArray(value?.attachments) ? { attachments: value.attachments } : {}),
-    });
+    await writeState(outputDir, state);
+    let sent;
+    try {
+      sent = await mailer.send({
+        to,
+        subject: draft.email_subject,
+        text: draft.email_body,
+        replyTo: EMAIL.test(replyTo) ? replyTo : '',
+      });
+    } catch (error) {
+      const knownNotSent = error?.safeToRetry === true || error?.deliveryStatus === 'not_sent';
+      const failedAt = new Date().toISOString();
+      const failureAudit = createSendAuditRecord(sendIdentity, {
+        requestIdempotencyKey,
+        smtpState,
+        status: knownNotSent ? 'failed' : 'unknown',
+        errorCode: String(error?.code || 'SMTP_SEND_FAILED'),
+        timestamp: failedAt,
+        qualityReportRef: resolved.qualityReportRef,
+      });
+      const failedState = {
+        ...state[noteId],
+        action: knownNotSent ? 'email_failed' : 'email_unknown',
+        updatedAt: failedAt,
+        email: { status: knownNotSent ? 'failed' : 'unknown', to, failedAt },
+        sendAudit: appendSendAuditEvent(state[noteId]?.sendAudit, failureAudit),
+      };
+      state[noteId] = knownNotSent ? stateWithoutPendingSend(failedState) : failedState;
+      await writeState(outputDir, state);
+      throw error;
+    }
     const sentAt = new Date().toISOString();
-    const audit = buildSendAudit({
-      status: 'sent', draftId, draftVersion, contentHash, idempotencyKey,
-      requestKey, recipient: to, timestamp: sentAt, smtpState,
+    const audit = createSendAuditRecord(sendIdentity, {
+      requestIdempotencyKey,
+      smtpState,
+      status: 'sent',
+      errorCode: '',
+      timestamp: sentAt,
+      sentAt,
+      qualityReportRef: resolved.qualityReportRef,
+      messageId: sent.messageId || '',
     });
-    state[noteId] = {
+    try {
+      await appendAudit(outputDir, audit);
+    } catch (error) {
+      const uncertain = applicationDraftError(
+        'EMAIL_DELIVERED_AUDIT_UNCERTAIN',
+        'SMTP accepted the email, but its durable audit journal could not be written; retry is blocked to prevent duplicate delivery.',
+      );
+      uncertain.cause = error;
+      throw uncertain;
+    }
+    state[noteId] = stateWithoutPendingSend({
       ...state[noteId],
       action: 'email_sent',
       updatedAt: sentAt,
@@ -1376,53 +1766,301 @@ async function sendApplicationEmail(outputDir, value, mailer, replyTo, smtpConfi
         sentAt,
         messageId: sent.messageId || '',
       },
-      sendAudit: [...priorAudits, audit],
-    };
-    delete state[noteId].pendingSend;
-    await writeDeliveryState(outputDir, state);
+      sendAudit: appendUniqueSendAudit(state[noteId]?.sendAudit, audit),
+    });
+    try {
+      await writeState(outputDir, state);
+    } catch (error) {
+      const pending = applicationDraftError(
+        'EMAIL_DELIVERED_AUDIT_STATE_PENDING',
+        'SMTP accepted the email and the durable audit was written, but delivery-state reconciliation is pending.',
+      );
+      pending.cause = error;
+      throw pending;
+    }
     return {
       noteId,
       outreach: draft,
+      draftVersion: draftVersionMetadata(resolved.store),
       delivery: publicDeliveryState(state[noteId]),
       duplicate: false,
       sendIdempotencyKey: idempotencyKey,
     };
+  });
+}
+
+function draftStoreFor(
+  record,
+  state,
+  recordIndex = record?.[APPLICATION_RECORD_INDEX],
+  artifactFilename = record?.[APPLICATION_ARTIFACT_FILENAME],
+) {
+  const migrationTimestamp = stableDraftTimestamp(record, state);
+  const actualQualityReportRef = Number.isInteger(recordIndex) && recordIndex >= 0 && artifactFilename
+    ? `${artifactFilename}#/records/${recordIndex}/cover_letter_evaluation`
+    : null;
+  const migrationRecord = actualQualityReportRef && record?.cover_letter_evaluation
+    ? {
+        ...record,
+        cover_letter_evaluation: withoutEmbeddedQualityReportRef(record.cover_letter_evaluation),
+      }
+    : record;
+  return migrateDraftStore(migrationRecord, state, {
+    now: migrationTimestamp,
+    legacyUpdatedAt: migrationTimestamp,
+    ...(actualQualityReportRef
+      ? { legacyQualityReportRef: actualQualityReportRef }
+      : {}),
+  });
+}
+
+function withoutEmbeddedQualityReportRef(evaluation) {
+  if (!evaluation || typeof evaluation !== 'object' || Array.isArray(evaluation)) return evaluation;
+  const {
+    qualityReportRef: _qualityReportRef,
+    reportRef: _reportRef,
+    ...quality
+  } = evaluation;
+  return quality;
+}
+
+function stableDraftTimestamp(record, state) {
+  const candidates = [
+    state?.updatedAt,
+    record?.updated_at,
+    record?.created_at,
+    record?.collected_at,
+  ];
+  for (const candidate of candidates) {
+    const timestamp = Date.parse(String(candidate || ''));
+    if (Number.isFinite(timestamp)) return new Date(timestamp).toISOString();
+  }
+  return '1970-01-01T00:00:00.000Z';
+}
+
+function draftVersionMetadata(store) {
+  const { currentVersion, ...metadata } = publicDraftMetadata(store);
+  return { ...metadata, version: currentVersion };
+}
+
+function resolveStoredDraftForAction(record, state, value) {
+  const store = draftStoreFor(record, state);
+  const requestedVersion = value?.version == null ? store.currentVersion : Number(value.version);
+  if (!Number.isInteger(requestedVersion) || requestedVersion < 1) {
+    throw applicationDraftError('DRAFT_VERSION_REQUIRED', 'A valid draft version is required.');
+  }
+  if (requestedVersion !== store.currentVersion) {
+    throw draftVersionConflict(requestedVersion, store.currentVersion);
+  }
+  const draftId = String(value?.draftId || store.draftId).trim();
+  const resolved = resolveDraftForSend(store, { draftId, version: requestedVersion });
+  if (Object.hasOwn(value || {}, 'outreach')) {
+    const requestedDraft = normalizeDraft(value.outreach, resolved.content);
+    if (hashDraftContent(requestedDraft) !== resolved.contentHash) {
+      throw applicationDraftError(
+        'DRAFT_REQUEST_CONTENT_MISMATCH',
+        'Client-supplied draft content does not match the stored checked version.',
+      );
+    }
+  }
+  return { ...resolved, store };
+}
+
+async function assertQualityReportReference(outputDir, record, resolved) {
+  const reference = resolved?.qualityReportRef;
+  if (typeof reference !== 'string' || !reference.trim()) {
+    throw invalidQualityReportReference('The checked draft quality report reference is invalid.');
+  }
+  const separator = reference.indexOf('#');
+  const relativePath = separator > 0 ? reference.slice(0, separator) : '';
+  const pointer = separator > 0 ? reference.slice(separator + 1) : '';
+  if (!relativePath || !pointer.startsWith('/') || path.isAbsolute(relativePath) || path.win32.isAbsolute(relativePath)) {
+    throw invalidQualityReportReference('The checked draft quality report reference must use an artifact JSON Pointer.');
+  }
+
+  let document;
+  let targetPath;
+  try {
+    const root = await realpath(outputDir);
+    targetPath = path.resolve(root, relativePath);
+    assertPathInside(root, targetPath);
+    const targetRealPath = await realpath(targetPath);
+    assertPathInside(root, targetRealPath);
+    document = JSON.parse(await readFile(targetRealPath, 'utf8'));
   } catch (error) {
-    const failedAt = new Date().toISOString();
-    const status = error.deliveryStatus === 'unknown' ? 'unknown' : 'failed';
-    const audit = buildSendAudit({
-      status, draftId, draftVersion, contentHash, idempotencyKey,
-      requestKey, recipient: to, timestamp: failedAt, smtpState, errorCode: error.code || 'SMTP_SEND_FAILED',
-    });
-    state[noteId] = {
-      ...state[noteId],
-      action: 'email_failed',
-      updatedAt: failedAt,
-      email: { status, to, failedAt, errorCode: error.code || 'SMTP_SEND_FAILED' },
-      sendAudit: [...priorAudits, audit],
-    };
-    if (status !== 'unknown') delete state[noteId].pendingSend;
-    await writeDeliveryState(outputDir, state);
-    throw error;
+    const invalid = invalidQualityReportReference('The checked draft quality report artifact is unavailable or invalid.');
+    invalid.cause = error;
+    throw invalid;
+  }
+
+  const report = resolveJsonPointer(document, pointer);
+  if (!report || typeof report !== 'object' || Array.isArray(report)) {
+    throw invalidQualityReportReference('The checked draft quality report JSON Pointer does not resolve to a report.');
+  }
+
+  const noteId = String(record?.note_id || record?.noteId || '').trim();
+  const recordIndex = record?.[APPLICATION_RECORD_INDEX];
+  const artifactFilename = record?.[APPLICATION_ARTIFACT_FILENAME];
+  const expectedLegacyRef = Number.isInteger(recordIndex) && recordIndex >= 0 && artifactFilename
+    ? `${artifactFilename}#/records/${recordIndex}/cover_letter_evaluation`
+    : null;
+  const expectedStatePrefix = `delivery-state.json#/${jsonPointerToken(noteId)}/qualityChecks/`;
+  const versionBound = String(report.draftId || '') === resolved.draftId
+    && Number(report.version) === resolved.version
+    && String(report.contentHash || '') === resolved.contentHash;
+  const legacyBound = reference === expectedLegacyRef
+    && resolved.version === 1
+    && hashDraftContent(record?.outreach) === resolved.contentHash
+    && JSON.stringify(report) === JSON.stringify(record?.cover_letter_evaluation);
+  if ((versionBound && !reference.startsWith(expectedStatePrefix)) || (!versionBound && !legacyBound)) {
+    throw invalidQualityReportReference('The quality report is not bound to this exact stored draft version and content hash.');
+  }
+
+  const evaluation = versionBound ? report.evaluation : report;
+  const thresholdValue = Number(evaluation?.threshold ?? 90);
+  const threshold = Number.isFinite(thresholdValue) ? Math.max(90, thresholdValue) : 90;
+  const score = Number(evaluation?.score);
+  if (evaluation?.passed !== true || !Number.isFinite(score) || score < threshold) {
+    throw invalidQualityReportReference('The bound quality report does not contain a passing evaluation.');
   }
 }
 
-function assertSmtpVerified(mailer, smtpConfig) {
-  if (smtpConfig?.assertReadyForSend) return smtpConfig.assertReadyForSend();
-  const configured = mailer.status?.().configured;
-  const saved = smtpConfig?.getPublic?.() || {};
-  if (!configured) throw emailDeliveryError('SMTP_NOT_CONFIGURED', '请先配置 SMTP 邮件发送。');
-  if (!(saved.verified ?? Boolean(saved.lastVerifiedAt))) {
-    throw emailDeliveryError('SMTP_NOT_VERIFIED', '当前 SMTP 配置尚未通过连接验证。');
+function resolveJsonPointer(document, pointer) {
+  if (pointer === '') return document;
+  if (!pointer.startsWith('/')) return undefined;
+  let current = document;
+  for (const rawToken of pointer.slice(1).split('/')) {
+    const token = rawToken.replaceAll('~1', '/').replaceAll('~0', '~');
+    if (current === null || typeof current !== 'object' || !Object.prototype.hasOwnProperty.call(current, token)) {
+      return undefined;
+    }
+    current = current[token];
   }
+  return current;
+}
+
+function invalidQualityReportReference(message) {
+  return applicationDraftError('DRAFT_QUALITY_REPORT_INVALID', message);
+}
+
+function draftVersionConflict(expectedVersion, currentVersion) {
+  const error = applicationDraftError(
+    'DRAFT_VERSION_CONFLICT',
+    `Draft version conflict: expected ${expectedVersion}, current ${currentVersion}.`,
+  );
+  error.expectedVersion = expectedVersion;
+  error.currentVersion = currentVersion;
+  return error;
+}
+
+function applicationDraftError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function resolveDraftAiRuntime(aiSessions, internal, value) {
+  const aiSessionId = String(value?.aiSessionId || internal?.params?.aiSessionId || '').trim();
+  if (!aiSessionId || !aiSessions?.resolve) {
+    throw applicationDraftError(
+      'AI_SESSION_UNAVAILABLE',
+      'A configured AI session is required to check the edited draft.',
+    );
+  }
+  return aiSessions.resolve(aiSessionId);
+}
+
+function normalizeDraftQualityReport(report, legacyEvaluation = {}) {
+  const source = report && typeof report === 'object' && !Array.isArray(report) ? report : {};
+  const fallback = legacyEvaluation && typeof legacyEvaluation === 'object' && !Array.isArray(legacyEvaluation)
+    ? legacyEvaluation
+    : {};
+  const score = Math.max(0, Math.min(100, Number(source.score)));
+  if (!Number.isFinite(score)) {
+    throw applicationDraftError('AI_QUALITY_CHECK_FAILED', 'The draft quality checker returned an invalid score.');
+  }
+  const thresholdValue = Number(source.threshold ?? fallback.threshold ?? 90);
+  const threshold = Math.max(90, Math.min(100, Number.isFinite(thresholdValue) ? thresholdValue : 90));
+  const stringList = (value) => Array.isArray(value)
+    ? value.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+  const rubricSource = source.rubric && typeof source.rubric === 'object' && !Array.isArray(source.rubric)
+    ? source.rubric
+    : {};
+  const rubric = Object.fromEntries(Object.entries(rubricSource).flatMap(([key, value]) => {
+    const numeric = Number(value);
+    return key && Number.isFinite(numeric) ? [[key, numeric]] : [];
+  }));
   return {
-    configHash: saved.configHash || '',
-    credentialRevision: saved.credentialRevision ?? null,
-    verificationStatus: 'verified',
+    ...fallback,
+    ...source,
+    score,
+    threshold,
+    passed: source.passed === true && score >= threshold,
+    attempts: Math.max(1, Number.isInteger(Number(source.attempts)) ? Number(source.attempts) : 1),
+    strengths: stringList(source.strengths),
+    problems: stringList(source.problems),
+    rubric,
   };
 }
 
-function normalizeEmailIdempotencyKey(value) {
+function jsonPointerToken(value) {
+  return String(value).replaceAll('~', '~0').replaceAll('/', '~1');
+}
+
+function hasActionableDirectMessageRoute(record) {
+  const routes = [
+    ...(record?.application_info?.contacts || []),
+    ...(record?.application_info?.application_routes || []),
+  ];
+  return routes.some((route) => {
+    if (!route || route.actionable === false) return false;
+    const verificationStatus = String(route.verification_status || route.verificationStatus || '').toLowerCase();
+    if (['invalid', 'rejected', 'unverified'].includes(verificationStatus)) return false;
+    const descriptor = `${route.channel || ''} ${route.type || ''} ${route.value || ''}`.toLowerCase();
+    return route.channel === 'direct_message'
+      || /(?:direct.?message|\bdm\b|message|私信|站内)/iu.test(descriptor);
+  });
+}
+
+function sendIdempotencyKey(value) {
+  const canonical = JSON.stringify([
+    String(value?.draftId || ''),
+    Number(value?.version || 0),
+    String(value?.contentHash || ''),
+    String(value?.recipient || '').trim().toLowerCase(),
+  ]);
+  return createHash('sha256').update(`application-email:v1\n${canonical}`, 'utf8').digest('hex');
+}
+
+function sendAuditMatches(audit, identity) {
+  const status = String(audit?.status || 'sent').toLowerCase();
+  const recipientMatches = audit?.recipientHash
+    ? audit.recipientHash === identity.recipientHash
+    : String(audit?.recipient || '').toLowerCase() === String(identity.recipient || '').toLowerCase();
+  return Boolean(audit)
+    && status === 'sent'
+    && audit.draftId === identity.draftId
+    && Number(audit.version ?? audit.draftVersion) === Number(identity.version)
+    && audit.contentHash === identity.contentHash
+    && recipientMatches
+    && audit.idempotencyKey === identity.idempotencyKey;
+}
+
+function findSendAudit(audits, identity) {
+  return Array.isArray(audits) ? audits.find((audit) => sendAuditMatches(audit, identity)) || null : null;
+}
+
+function appendUniqueSendAudit(audits, audit) {
+  const existing = Array.isArray(audits) ? audits : [];
+  return findSendAudit(existing, audit) ? [...existing] : [...existing, { ...audit }];
+}
+
+function appendSendAuditEvent(audits, audit) {
+  return [...(Array.isArray(audits) ? audits : []), { ...audit }];
+}
+
+function normalizeSendRequestKey(value) {
   if (value === undefined || value === null || value === '') return '';
   if (typeof value !== 'string' || !value.trim() || value.length > 200) {
     throw new ValidationError('idempotencyKey must be a non-empty string of at most 200 characters.');
@@ -1430,41 +2068,122 @@ function normalizeEmailIdempotencyKey(value) {
   return value.trim();
 }
 
-function buildSendAudit({ status, draftId, draftVersion, contentHash, idempotencyKey, requestKey, recipient, timestamp, smtpState, errorCode = '' }) {
+function assertSendRequestKeyAvailable(records, requestIdempotencyKey, idempotencyKey) {
+  if (!requestIdempotencyKey) return;
+  const conflict = (Array.isArray(records) ? records : []).find((record) => (
+    String(record?.requestIdempotencyKey || record?.requestKey || '') === requestIdempotencyKey
+    && String(record?.idempotencyKey || '') !== idempotencyKey
+  ));
+  if (conflict) {
+    throw applicationDraftError(
+      'EMAIL_IDEMPOTENCY_CONFLICT',
+      'The idempotency key is already bound to a different email operation.',
+    );
+  }
+}
+
+function recipientAuditHash(recipient) {
+  return createHash('sha256')
+    .update(`application-email-recipient:v1\n${String(recipient || '').trim().toLowerCase()}`, 'utf8')
+    .digest('hex');
+}
+
+function maskAuditRecipient(recipient) {
+  const value = String(recipient || '').trim();
+  const separator = value.lastIndexOf('@');
+  if (separator <= 0) return value ? '***' : '';
+  return `${value.slice(0, 1)}***${value.slice(separator)}`;
+}
+
+function sanitizeSendAudit(audit) {
+  const recipient = String(audit?.recipient || '');
+  const version = Number(audit?.version ?? audit?.draftVersion ?? 0);
   return {
-    status,
-    recipient: maskEmail(recipient),
-    draftId,
-    draftVersion,
-    contentHash,
-    idempotencyKey,
-    requestKey,
-    timestamp,
-    configHash: smtpState.configHash || '',
-    credentialRevision: smtpState.credentialRevision ?? null,
-    errorCode,
+    ...audit,
+    recipient: recipient.includes('*') ? recipient : maskAuditRecipient(recipient),
+    recipientHash: audit?.recipientHash || recipientAuditHash(recipient),
+    version,
+    draftVersion: version,
+    status: String(audit?.status || 'sent'),
+    errorCode: String(audit?.errorCode || ''),
+    timestamp: audit?.timestamp || audit?.sentAt || '',
   };
 }
 
-function maskEmail(value) {
-  const match = String(value || '').match(/^(.)([^@]*)(@.+)$/);
-  return match ? `${match[1]}***${match[3]}` : '';
+function createSendAuditRecord(identity, details = {}) {
+  const version = Number(identity.version || 0);
+  return {
+    recipient: maskAuditRecipient(identity.recipient),
+    recipientHash: identity.recipientHash || recipientAuditHash(identity.recipient),
+    status: String(details.status || ''),
+    draftId: identity.draftId,
+    version,
+    draftVersion: version,
+    contentHash: identity.contentHash,
+    idempotencyKey: identity.idempotencyKey,
+    ...(details.requestIdempotencyKey ? { requestIdempotencyKey: details.requestIdempotencyKey } : {}),
+    configHash: String(details.smtpState?.configHash || ''),
+    credentialRevision: Number(details.smtpState?.credentialRevision || 0),
+    timestamp: String(details.timestamp || ''),
+    errorCode: String(details.errorCode || ''),
+    qualityReportRef: details.qualityReportRef || null,
+    messageId: String(details.messageId || ''),
+    ...(details.sentAt ? { sentAt: details.sentAt } : {}),
+  };
 }
 
-function emailDeliveryError(code, message) {
-  const error = new Error(message);
-  error.code = code;
-  return error;
+function stateWithoutPendingSend(state) {
+  const { pendingSend: _pendingSend, ...next } = state;
+  return next;
 }
 
-function normalizeDraft(value) {
+function assertSmtpVerified(mailer, smtpConfig) {
+  if (!mailer?.status?.()?.configured) {
+    const error = new Error('Please configure SMTP email delivery first.');
+    error.code = 'MAIL_NOT_CONFIGURED';
+    throw error;
+  }
+  if (typeof smtpConfig?.assertReadyForSend === 'function') {
+    try {
+      return smtpConfig.assertReadyForSend();
+    } catch (error) {
+      if (error?.code !== 'SMTP_NOT_VERIFIED') throw error;
+      const compatible = applicationDraftError(
+        'DRAFT_SMTP_NOT_VERIFIED',
+        'SMTP must be verified before sending a checked draft.',
+      );
+      compatible.cause = error;
+      throw compatible;
+    }
+  }
+  const saved = smtpConfig?.getPublic?.() || {};
+  const lastVerifiedAt = String(saved.lastVerifiedAt || '').trim();
+  const verified = typeof smtpConfig?.isVerified === 'function'
+    ? smtpConfig.isVerified()
+    : Object.hasOwn(saved, 'verified')
+      ? saved.verified === true
+      : Boolean(lastVerifiedAt && Number.isFinite(Date.parse(lastVerifiedAt)));
+  if (!verified || !lastVerifiedAt || !Number.isFinite(Date.parse(lastVerifiedAt))) {
+    throw applicationDraftError('DRAFT_SMTP_NOT_VERIFIED', 'SMTP must be verified before sending a checked draft.');
+  }
+  return {
+    configured: true,
+    configHash: String(saved.configHash || ''),
+    credentialRevision: Number(saved.credentialRevision || 0),
+    verificationStatus: 'verified',
+  };
+}
+
+function normalizeDraft(value, base = {}) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const merged = Object.fromEntries(['greeting', 'email_subject', 'email_body', 'cover_letter'].map((field) => [
+    field,
+    Object.hasOwn(source, field) ? source[field] : base?.[field],
+  ]));
+  const draft = { ...normalizeDraftContent(merged) };
   const limits = { greeting: 2000, email_subject: 240, email_body: 20000, cover_letter: 20000 };
-  const draft = {};
   for (const [field, limit] of Object.entries(limits)) {
-    const text = String(source[field] || '').trim();
-    if (text.length > limit) throw new ValidationError(`${field} is too long.`);
-    draft[field] = text;
+    if (draft[field].length > limit) throw new ValidationError(`${field} is too long.`);
   }
   return draft;
 }
@@ -1501,30 +2220,103 @@ function validateDeliveryDraft(draft, record) {
 
 function extractedEmails(record) {
   const routes = [...(record.application_info?.contacts || []), ...(record.application_info?.application_routes || [])];
-  const values = routes.flatMap((route) => `${route?.value || ''}\n${route?.evidence || ''}`.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []);
+  const values = routes.flatMap((route) => {
+    const routeType = `${route?.type || ''} ${route?.channel || ''}`;
+    const verificationStatus = String(route?.verification_status || route?.verificationStatus || '').toLowerCase();
+    const routeValue = String(route?.value || '').trim();
+    const explicitEmailValue = EMAIL.test(routeValue);
+    if ((!/(?:e-?mail|邮箱|邮件)/i.test(routeType) && !explicitEmailValue) || route?.actionable === false) return [];
+    if (['invalid', 'rejected', 'unverified'].includes(verificationStatus)) return [];
+    return `${routeValue}\n${route?.evidence || ''}`.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+  });
   return [...new Set(values.map((value) => value.toLowerCase()))];
 }
 
-function mergeApplicationState(record, state) {
-  if (!state) return { ...record, delivery: null };
+function mergeApplicationState(record, state, recordIndex, artifactFilename) {
+  const store = draftStoreFor(record, state || {}, recordIndex, artifactFilename);
+  const current = currentDraftVersion(store);
+  const qualityChecks = Array.isArray(state?.qualityChecks) ? state.qualityChecks : [];
+  const currentQuality = [...qualityChecks].reverse().find((item) => (
+    item?.draftId === store.draftId
+    && Number(item?.version) === current.version
+    && item?.contentHash === current.contentHash
+  ));
   return {
     ...record,
-    outreach: { ...record.outreach, ...(state.draft || {}) },
+    outreach: { ...record.outreach, ...current.content },
+    cover_letter_evaluation: currentQuality?.evaluation || record.cover_letter_evaluation,
+    draftVersion: draftVersionMetadata(store),
     delivery: publicDeliveryState(state),
   };
 }
 
 function publicDeliveryState(state) {
   if (!state) return null;
-  const { draft, ...publicState } = state;
-  return publicState;
+  const { draft, draftStore, draftWriteProtocol, qualityChecks, pendingSend, ...publicState } = state;
+  if (Array.isArray(publicState.sendAudit)) {
+    publicState.sendAudit = publicState.sendAudit.map((audit) => sanitizeSendAudit(audit));
+  }
+  return Object.keys(publicState).length ? publicState : null;
+}
+
+async function appendSendAuditJournal(outputDir, audit) {
+  await mkdir(outputDir, { recursive: true });
+  await appendFile(
+    path.join(outputDir, 'delivery-send-audit.jsonl'),
+    `${JSON.stringify({ schemaVersion: 1, event: 'email_sent', ...audit })}\n`,
+    { encoding: 'utf8', flag: 'a' },
+  );
+}
+
+async function readSendAuditJournal(outputDir) {
+  let content;
+  try {
+    content = await readFile(path.join(outputDir, 'delivery-send-audit.jsonl'), 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+  return content.split(/\r?\n/u).flatMap((line) => {
+    if (!line.trim()) return [];
+    try {
+      const value = JSON.parse(line);
+      return value && typeof value === 'object' && !Array.isArray(value) ? [value] : [];
+    } catch {
+      return [];
+    }
+  });
 }
 
 async function writeDeliveryState(outputDir, state) {
   const target = path.join(outputDir, 'delivery-state.json');
+  try {
+    const previous = await readFile(target, 'utf8');
+    let previousSchemaVersion = 0;
+    try {
+      previousSchemaVersion = Number(JSON.parse(previous)?._schemaVersion || 0);
+    } catch {
+      previousSchemaVersion = 0;
+    }
+    if (previousSchemaVersion < 2) {
+      try {
+        await writeFile(path.join(outputDir, 'delivery-state.v1.backup.json'), previous, { encoding: 'utf8', flag: 'wx' });
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+      }
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const persisted = {
+    ...state,
+    _schemaVersion: 2,
+    _revision: Math.max(0, Number(state?._revision || 0)) + 1,
+  };
   const temporary = `${target}.${process.pid}-${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify(state, null, 2), 'utf8');
+  await writeFile(temporary, JSON.stringify(persisted, null, 2), 'utf8');
   await rename(temporary, target);
+  state._schemaVersion = persisted._schemaVersion;
+  state._revision = persisted._revision;
 }
 
 function publicSmtpConfig(smtpConfig, mailer) {
@@ -1540,13 +2332,8 @@ function publicSmtpConfig(smtpConfig, mailer) {
     hasPassword: false,
   };
   const status = mailer.status();
-  return {
-    ...saved,
-    configured: status.configured,
-    verified: saved.verified ?? Boolean(saved.lastVerifiedAt),
-    maskedFrom: status.from,
-    authMode: status.authMode,
-  };
+  const verified = Object.hasOwn(saved, 'verified') ? saved.verified === true : Boolean(saved.lastVerifiedAt);
+  return { ...saved, configured: status.configured, verified, maskedFrom: status.from, authMode: status.authMode };
 }
 
 function boundedInteger(raw, fallback, min, max) {

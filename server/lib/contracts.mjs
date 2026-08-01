@@ -142,7 +142,7 @@ export function validateRunRequest(value) {
     skipPostprocess: booleanField(value.skipPostprocess, 'skipPostprocess', false),
     noAutoAttach: booleanField(value.noAutoAttach, 'noAutoAttach', true),
     checkOnly: booleanField(value.checkOnly, 'checkOnly', false),
-    securityVerificationTimeoutSeconds: integerField(value.securityVerificationTimeoutSeconds, 'securityVerificationTimeoutSeconds', 600, 60, 3600),
+    securityVerificationTimeoutSeconds: integerField(value.securityVerificationTimeoutSeconds, 'securityVerificationTimeoutSeconds', 600, 60, 86400),
     useCodexRuntime: analysisMode === 'general'
       ? true
       : booleanField(value.useCodexRuntime, 'useCodexRuntime', true),

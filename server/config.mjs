@@ -30,6 +30,7 @@ export const config = Object.freeze({
   smtpConfigPath: path.resolve(process.env.XHS_SMTP_CONFIG_PATH || path.join(dataDir, '..', 'smtp-config.json')),
   dataRetentionPath: path.resolve(process.env.XHS_DATA_RETENTION_PATH || path.join(dataDir, '..', 'data-retention.json')),
   deletionAuditPath: path.resolve(process.env.XHS_DELETION_AUDIT_PATH || path.join(dataDir, '..', 'deletion-audit.jsonl')),
+  diagnosticsPath: path.resolve(process.env.XHS_DIAGNOSTICS_PATH || path.join(dataDir, '..', 'diagnostics.jsonl')),
   profileDir: path.resolve(process.env.XHS_PROFILE_DATA_DIR || path.join(serverDir, '..', 'data', 'profiles')),
   profileScriptPath: path.resolve(serverDir, '..', 'scripts', 'profile_memory.py'),
   relayConnectionCheckScriptPath: path.resolve(serverDir, '..', 'scripts', 'check_relay_connection.py'),
@@ -56,6 +57,11 @@ export const config = Object.freeze({
     process.env.OPENCLAW_CONFIG_PATH ||
     path.join(process.env.USERPROFILE || process.env.HOME || '', '.openclaw', 'openclaw.json'),
   maxBodyBytes: readInt(process.env.XHS_MAX_BODY_BYTES, 32 * 1024 * 1024, 1024, 64 * 1024 * 1024),
+  relayMonitorIntervalMs: readInt(process.env.XHS_RELAY_MONITOR_INTERVAL_MS, 15_000, 2_000, 300_000),
+  relayFailureThreshold: readInt(process.env.XHS_RELAY_FAILURE_THRESHOLD, 2, 1, 10),
+  relayRecoveryCooldownMs: readInt(process.env.XHS_RELAY_RECOVERY_COOLDOWN_MS, 60_000, 5_000, 900_000),
+  relayConnectTimeoutMs: readInt(process.env.XHS_RELAY_CONNECT_TIMEOUT_MS, 25_000, 1_000, 120_000),
+  relayPlaywrightTimeoutMs: readInt(process.env.XHS_RELAY_PLAYWRIGHT_TIMEOUT_MS, 60_000, 1_000, 180_000),
 });
 
 function readPort(value, fallback) {

@@ -959,11 +959,21 @@ function audiencePostCollectionState(post: AudiencePost): AudiencePostCollection
 }
 
 function audiencePostCollectionLabel(state: AudiencePostCollectionState) {
-  return state === 'complete' ? '已采集' : state === 'partial' ? '部分采集' : '未采集'
+  return state === 'complete' ? '已完成' : state === 'partial' ? '部分完成' : '未完成'
 }
 
 function audienceMetric(value: number | null | undefined) {
   return typeof value === 'number' ? value.toLocaleString('zh-CN') : '-'
+}
+
+function audienceProfileStatusLabel(user: AudiencePublicProfile) {
+  const missing = [
+    typeof user.follower_count !== 'number' ? '粉丝' : '',
+    typeof user.following_count !== 'number' ? '关注' : '',
+    typeof user.liked_and_collected_count !== 'number' ? '互动' : '',
+  ].filter(Boolean)
+  if (missing.length > 0) return `${missing.join('、')}待续采`
+  return user.enrichment_status === 'complete' ? '公开资料已采集' : '资料待续采'
 }
 
 function audienceStopReasonLabel(reason: string | null | undefined) {
@@ -978,8 +988,12 @@ function audienceStopReasonLabel(reason: string | null | undefined) {
 }
 
 function AudienceAvatar({ user }: { user: AudiencePublicProfile }) {
+  const [failed, setFailed] = useState(false)
+  useEffect(() => setFailed(false), [user.avatar_url])
   const initial = user.display_name?.trim().slice(0, 1) || '用'
-  return <span className="audience-avatar">{user.avatar_url ? <img src={user.avatar_url} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <b>{initial}</b>}</span>
+  return <span className="audience-avatar">{user.avatar_url && !failed
+    ? <img src={user.avatar_url} alt="" loading="lazy" onError={() => setFailed(true)} />
+    : <b>{initial}</b>}</span>
 }
 
 function audienceCommentUser(comment: AudienceComment): AudiencePublicProfile {
@@ -1071,15 +1085,15 @@ function AudienceWorkspace({
       {incomplete && <button type="button" className="audience-resume-button" disabled={resuming || loading || taskActive} onClick={onResume}>{resuming || taskActive ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{taskActive ? (audienceTask?.status === 'queued' ? '已排队，等待自动启动' : '正在补采未完成帖子') : results?.available ? '继续补采未完成帖子' : '开始采集评论与用户'}</button>}
     </section>
     {taskMessage && <div className={`audience-action-status ${taskActive ? 'active' : ''}`} role="status" aria-live="polite">{taskActive && <LoaderCircle className="spin" size={15} />}<span>{taskMessage}</span></div>}
-    {incomplete && <div className={`audience-coverage-callout ${statusClass}`} role="status"><CircleAlert size={17} /><span><strong>{rateLimited ? '平台限流，自动恢复重试已耗尽' : '当前结果尚未证明全量完成'}</strong><small>{rateLimited ? `系统已自动冷却并多次探测恢复，当前已检查 ${audienceMetric(postsAttempted)} / ${audienceMetric(postsTotal)} 篇，检查点完整保留。平台恢复后点击继续补采，未检查帖子会优先处理。` : `${summary?.stopReason ? `停止原因：${audienceStopReasonLabel(summary.stopReason)}。` : '未采集和部分采集帖子仍待补采。'} 已保存的帖子、评论和用户结果会继续保留。`}</small></span></div>}
+    {incomplete && <div className={`audience-coverage-callout ${statusClass}`} role="status"><CircleAlert size={17} /><span><strong>{rateLimited ? '平台限流，自动恢复重试已耗尽' : '当前结果尚未证明全量完成'}</strong><small>{rateLimited ? `系统已自动冷却并多次探测恢复，当前已检查 ${audienceMetric(postsAttempted)} / ${audienceMetric(postsTotal)} 篇，检查点完整保留。平台恢复后点击继续补采，未完成帖子会优先处理。` : `${summary?.stopReason ? `停止原因：${audienceStopReasonLabel(summary.stopReason)}。` : '未完成和部分完成帖子仍待补采。'} 已保存的帖子、评论和用户结果会继续保留。`}</small></span></div>}
     <p className="audience-data-scope"><ShieldCheck size={14} />仅整理帖子和公开主页中可见的评论与用户字段，不推断联系方式或私密属性。</p>
     {posts.length > 0 && <section className="audience-post-coverage" aria-label="内容洞察帖子采集状态">
       <header>
         <div><span>内容洞察已有帖子</span><strong>{audienceMetric(posts.length)}</strong></div>
         <dl>
-          <div className="uncollected"><dt>未检查</dt><dd>{audienceMetric(postStateCounts.uncollected)}</dd></div>
-          <div className="partial"><dt>已检查未全量</dt><dd>{audienceMetric(postStateCounts.partial)}</dd></div>
-          <div className="complete"><dt>严格完整</dt><dd>{audienceMetric(postStateCounts.complete)}</dd></div>
+          <div className="uncollected"><dt>未完成</dt><dd>{audienceMetric(postStateCounts.uncollected)}</dd></div>
+          <div className="partial"><dt>部分完成</dt><dd>{audienceMetric(postStateCounts.partial)}</dd></div>
+          <div className="complete"><dt>已完成</dt><dd>{audienceMetric(postStateCounts.complete)}</dd></div>
         </dl>
       </header>
       <div className="audience-post-list">
@@ -1113,7 +1127,7 @@ function AudienceWorkspace({
       <header><AudienceAvatar user={user} /><div><strong>{user.display_name || '未命名用户'}</strong><span>{user.roles?.includes('author') && <i className="author">原帖主</i>}{user.roles?.includes('commenter') && <i>评论者</i>}</span></div>{user.profile_url && <a href={user.profile_url} target="_blank" rel="noreferrer" title="打开公开主页"><ExternalLink size={15} /></a>}</header>
       <p>{user.bio || '公开主页未显示简介'}</p>
       <dl><div><dt>粉丝</dt><dd>{audienceMetric(user.follower_count)}</dd></div><div><dt>关注</dt><dd>{audienceMetric(user.following_count)}</dd></div><div><dt>互动</dt><dd>{audienceMetric(user.liked_and_collected_count)}</dd></div><div><dt>评论</dt><dd>{audienceMetric(user.comment_count)}</dd></div></dl>
-      <footer><span>{user.xhs_id ? `小红书号 ${user.xhs_id}` : '小红书号未公开'}</span><small>IP属地：{user.ip_location || '待采集'} · {user.enrichment_status === 'complete' ? '公开资料已采集' : '资料待续采'}</small></footer>
+      <footer><span>{user.xhs_id ? `小红书号 ${user.xhs_id}` : '小红书号未公开'}</span><small>IP属地：{user.ip_location || '待采集'} · {audienceProfileStatusLabel(user)}</small></footer>
     </article>)}</div>}
     {selectedResults && selectedResults.total > 0 && <div className="audience-pagination"><span>{offset + 1}-{Math.min(offset + items.length, selectedResults.total)} / {selectedResults.total}</span><div><button type="button" title="上一页" disabled={offset === 0 || loading} onClick={() => onPage(Math.max(0, offset - limit))}><ChevronLeft size={16} /></button><button type="button" title="下一页" disabled={offset + limit >= selectedResults.total || loading} onClick={() => onPage(offset + limit)}><ChevronRight size={16} /></button></div></div>}
   </div>
@@ -1351,6 +1365,7 @@ function App() {
   const [selectedResult, setSelectedResult] = useState<ApplicationResult | null>(null)
   const draftDirtyRef = useRef(false)
   const [emailSending, setEmailSending] = useState(false)
+  const [deliveryUpdating, setDeliveryUpdating] = useState(false)
   const [resultOffset, setResultOffset] = useState(0)
   const [resultsLoading, setResultsLoading] = useState(false)
   const [resultSort, setResultSort] = useState<'newest' | 'oldest'>('newest')
@@ -1877,7 +1892,7 @@ function App() {
         recoveryRecommended: result.after.recoveryRecommended,
       })
       setNotice(result.ok
-        ? `Relay 已修复并完成 Playwright 验证，共关闭 ${result.closedTargets} 个旧页面。`
+        ? `${result.hardRestarted ? 'Relay 浏览器已自动重建，' : 'Relay 已修复，'}并完成 Playwright 验证，共关闭 ${result.closedTargets} 个旧页面。`
         : result.message || 'Relay 已完成清理，但连接验证仍未通过。')
     } catch (error) {
       setNotice(`Relay 一键修复失败：${(error as Error).message}`)
@@ -2832,8 +2847,10 @@ function App() {
   )
 
   const performResumeAudienceCollection = async () => {
-    const resumeTargetJobId = audienceSourceJobId
-    if (!activeJob || !resumeTargetJobId || jobAnalysisMode(activeJob) !== 'general') {
+    const resumeTargetJobId = selectedAudienceDataJob?.id || linkedAudienceTask?.id || audienceSourceJobId
+    const resumeTargetJob = jobs.find((job) => job.id === resumeTargetJobId)
+      || (activeJob?.id === resumeTargetJobId ? activeJob : null)
+    if (!resumeTargetJob || !resumeTargetJobId || jobAnalysisMode(resumeTargetJob) !== 'general') {
       const message = '请先选择一条非岗位内容采集任务。'
       setAudienceActionMessage(message)
       setNotice(message)
@@ -2843,9 +2860,8 @@ function App() {
     setAudienceActionMessage('正在从检查点恢复原任务…')
     setNotice(null)
     try {
-      const resumeTargetJob = jobs.find((job) => job.id === resumeTargetJobId) || activeJob
-      const resumedJob = await resumeJob(resumeTargetJob, 'audience', null)
-      if (!resumedJob) throw new Error('原任务未能恢复，请查看任务状态。')
+      const response = await api.resumeAudience(resumeTargetJobId)
+      const resumedJob = response.job
       setAudienceTask(resumedJob)
       setJobs((current) => replaceJobInPlace(current, resumedJob))
       if (['queued', 'resuming', 'running'].includes(resumedJob.status)) connectJob(resumedJob)
@@ -2855,9 +2871,13 @@ function App() {
       await loadAudienceResults(resumeTargetJobId, 0, {
         preserveExisting: true,
         fallbackJobId: linkedAudienceTask?.id !== resumeTargetJobId ? linkedAudienceTask?.id : undefined,
-        sourceJobId: resumeTargetJobId,
+        sourceJobId: audienceSourceJobId,
       })
-      const message = '已从原任务检查点继续，只补采未采集和部分采集的链接；已有内容保持显示。'
+      const message = response.action === 'already_complete'
+        ? '当前受众结果已经完整，无需再次续采。'
+        : response.action === 'attached'
+          ? '原任务正在采集，已重新连接实时进度；已有内容保持显示。'
+          : '已从原任务检查点继续，只补采未采集和部分采集的链接；已有内容保持显示。'
       setAudienceActionMessage(message)
       setNotice(message)
     } catch (error) {
@@ -3220,6 +3240,8 @@ function App() {
   const relayReady = relayServiceReady && tabCount > 0
   const relaySiteReady = relayReady && xiaohongshuTabCount > 0
   const relayPressureHigh = relay?.targetPressure === 'high' || Boolean(relay?.recoveryRecommended)
+  const relayAutomaticRecovery = Boolean(relay?.supervisor?.inProgress)
+  const relayRecoveryBusy = relayRecovering || relayAutomaticRecovery
   const relayGuideTitle = relaySiteReady
     ? 'Relay 已连通，目标页已打开'
     : relayServiceReady
@@ -3704,7 +3726,7 @@ function App() {
             </div>
             <div className="relay-config-body">
               <div className={`relay-guide-summary ${relayPressureHigh ? 'pressure' : relaySiteReady ? 'ready' : relayServiceReady ? 'active' : ''}`}>
-                <span className="relay-guide-icon">{relayRecovering ? <LoaderCircle className="spin" size={18} /> : relayPressureHigh ? <ShieldAlert size={18} /> : relaySiteReady ? <Check size={18} /> : relayConnecting || relaySettingUp || relayLoginOpening ? <LoaderCircle className="spin" size={18} /> : <Wifi size={18} />}</span>
+                <span className="relay-guide-icon">{relayRecoveryBusy ? <LoaderCircle className="spin" size={18} /> : relayPressureHigh ? <ShieldAlert size={18} /> : relaySiteReady ? <Check size={18} /> : relayConnecting || relaySettingUp || relayLoginOpening ? <LoaderCircle className="spin" size={18} /> : <Wifi size={18} />}</span>
                 <span><small>MANUAL CONNECTION</small><strong>{relayGuideTitle}</strong><p>{relayGuideDescription}</p></span>
                 <b>{relaySiteReady ? '4 / 4' : relayReady ? '3 / 4' : relayServiceReady ? '2 / 4' : relayConfigValid ? '1 / 4' : '0 / 4'}</b>
               </div>
@@ -3717,10 +3739,12 @@ function App() {
                 <span className="relay-recovery-copy">
                   {relayPressureHigh ? <ShieldAlert size={18} /> : <ShieldCheck size={18} />}
                   <span>
-                    <strong>{relayPressureHigh ? '检测到 Relay 目标过载' : relayRecovery?.ok ? 'Relay 已修复并通过真实连接验证' : 'Relay 连接保护已启用'}</strong>
-                    <small>{relayPressureHigh
+                    <strong>{relayAutomaticRecovery ? 'Relay 正在自动恢复' : relayPressureHigh ? '检测到 Relay 目标过载' : relayRecovery?.ok ? 'Relay 已修复并通过真实连接验证' : 'Relay 连接保护已启用'}</strong>
+                    <small>{relayAutomaticRecovery
+                      ? '后端已检测到连续断线或目标页缺失，正在重建浏览器并执行 Playwright 验证。'
+                      : relayPressureHigh
                       ? '页面或后台目标过多会让 Playwright 初始化超时；可直接收敛旧页面并保留登录态。'
-                      : '新任务会自动减压，并使用 60 秒连接窗口；不会清除 Cookie 或浏览器 Profile。'}</small>
+                      : '后端持续巡检并在连续异常后自动恢复；不会清除 Cookie 或浏览器 Profile。'}</small>
                   </span>
                 </span>
                 <dl aria-label="Relay 目标诊断">
@@ -3728,9 +3752,9 @@ function App() {
                   <div><dt>页面</dt><dd>{Number(relay?.pageCount || 0)}</dd></div>
                   <div><dt>后台</dt><dd>{Number(relay?.workerCount || 0) + Number(relay?.iframeCount || 0)}</dd></div>
                 </dl>
-                <button type="button" className={relayPressureHigh ? 'primary-button' : 'secondary-button'} disabled={relayRecovering || relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void repairRelay()}>
-                  {relayRecovering ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}
-                  {relayRecovering ? '正在修复并验证' : '一键修复 Relay'}
+                <button type="button" className={relayPressureHigh ? 'primary-button' : 'secondary-button'} disabled={relayRecoveryBusy || relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void repairRelay()}>
+                  {relayRecoveryBusy ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}
+                  {relayRecoveryBusy ? '正在重建并验证' : '一键修复 Relay'}
                 </button>
               </div>
               {relayGuideOpen && <div className="relay-manual-guide" id="relay-manual-guide">
@@ -4011,7 +4035,7 @@ function App() {
                     <label className="field"><span>最大滚动</span><input type="number" min="1" max="100" value={request.maxScrolls} onChange={(event) => updateRequest('maxScrolls', Number(event.target.value))} /></label>
                     <label className="field"><span>稳定轮次</span><input type="number" min="1" max="20" value={request.stableRounds} onChange={(event) => updateRequest('stableRounds', Number(event.target.value))} /></label>
                     <label className="field"><span>页面超时 ms</span><input type="number" min="1000" max="120000" step="1000" value={request.gotoTimeoutMs} onChange={(event) => updateRequest('gotoTimeoutMs', Number(event.target.value))} /></label>
-                    <label className="field"><span>安全验证等待 s</span><input type="number" min="60" max="3600" step="60" value={request.securityVerificationTimeoutSeconds} onChange={(event) => updateRequest('securityVerificationTimeoutSeconds', Number(event.target.value))} /></label>
+                    <label className="field"><span>安全验证等待 s</span><input type="number" min="60" max="86400" step="60" value={request.securityVerificationTimeoutSeconds} onChange={(event) => updateRequest('securityVerificationTimeoutSeconds', Number(event.target.value))} /></label>
                     <label className="field"><span>Codex 单批数量</span><input type="number" min="1" max="20" value={request.codexBatchSize} onChange={(event) => updateRequest('codexBatchSize', Number(event.target.value))} /></label>
                     <Toggle checked={request.analysisMode === 'general' || request.useCodexRuntime} onChange={(value) => request.analysisMode === 'job' && updateRequest('useCodexRuntime', value)} label={request.analysisMode === 'general' ? 'AI 动态内容模块' : 'AI 文案与评分'} description={request.analysisMode === 'general' ? '根据关键词、正文和图片逐链接生成栏目' : '逐链接写作、评分并自动重写'} />
                     <Toggle checked={request.noAutoAttach} onChange={(value) => updateRequest('noAutoAttach', value)} label="禁用自动附加" description="保持现有浏览器会话" />
@@ -4107,7 +4131,7 @@ function App() {
                       <ol className="security-recovery-steps rate-limit-recovery-steps">
                         <li className="done"><span><Check size={13} /></span><div><strong>保存检查点</strong><small>帖子、评论与用户结果已落盘，不会重复丢失</small></div></li>
                         <li className={rateLimitRecovering ? 'current' : 'done'}><span>{rateLimitRecovering ? '2' : <Check size={13} />}</span><div><strong>递增冷却</strong><small>{rateLimitRecovering ? `剩余约 ${activeJob.rateLimit?.retryAfterSeconds || 0} 秒后探测页面恢复` : '有限次数的自动冷却和恢复探测已执行'}</small></div></li>
-                        <li className={!rateLimitRecovering && rateLimitReadyToResume ? 'current' : ''}><span>3</span><div><strong>{rateLimitRecovering ? '自动续采' : '稍后续跑'}</strong><small>{rateLimitRecovering ? '页面恢复后自动从当前帖子继续' : rateLimitReadyToResume ? '平台恢复后点击续跑，优先处理未检查帖子' : '正在整理并保存当前检查点，请稍候'}</small></div></li>
+                        <li className={!rateLimitRecovering && rateLimitReadyToResume ? 'current' : ''}><span>3</span><div><strong>{rateLimitRecovering ? '自动续采' : '稍后续跑'}</strong><small>{rateLimitRecovering ? '页面恢复后自动从当前帖子继续' : rateLimitReadyToResume ? '平台恢复后点击续跑，优先处理未完成帖子' : '正在整理并保存当前检查点，请稍候'}</small></div></li>
                       </ol>
                       {!rateLimitRecovering && <div className="security-recovery-actions">
                         <button type="button" onClick={() => void openRelayLogin()} disabled={relayLoginOpening}><ExternalLink size={15} />{relayLoginOpening ? '正在打开' : '打开小红书检查页'}</button>

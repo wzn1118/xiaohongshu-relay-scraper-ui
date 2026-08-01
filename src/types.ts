@@ -149,6 +149,21 @@ export type RelayStatus = {
   setupStep?: 'install' | 'start' | 'login' | 'ready'
   checkedAt?: string
   message?: string
+  supervisor?: RelaySupervisorStatus
+}
+
+export type RelaySupervisorStatus = {
+  phase: 'idle' | 'connecting' | 'verifying' | 'restarting' | string
+  inProgress: boolean
+  automaticEnabled: boolean
+  consecutiveProbeFailures: number
+  consecutiveDegradedChecks: number
+  lastProbeAt?: string | null
+  lastRecoveryAt?: string | null
+  lastSuccessAt?: string | null
+  lastError?: string | null
+  reason?: string | null
+  nextAutomaticAttemptAt?: string | null
 }
 
 export type RelayTargetSummary = {
@@ -175,6 +190,9 @@ export type RelayRecoveryResult = RelayStatus & {
   before: RelayTargetSummary
   after: RelayTargetSummary
   warnings: string[]
+  hardRestarted?: boolean
+  recoveryAttempts?: number
+  joinedRecovery?: boolean
 }
 
 export type RelayConfig = {
@@ -415,6 +433,7 @@ export type AudiencePublicProfile = {
   display_name: string
   profile_url: string
   avatar_url: string
+  avatar_original_url?: string
   xhs_id: string
   bio: string
   ip_location?: string
@@ -427,6 +446,7 @@ export type AudiencePublicProfile = {
   post_ids: string[]
   enrichment_status: 'complete' | 'partial' | 'pending' | string
   access_status: string
+  missing_profile_fields?: string[]
   last_enriched_at: string
 }
 
@@ -536,6 +556,20 @@ export type OutreachDraft = {
   cover_letter: string
 }
 
+export type DraftQualityStatus = 'pending' | 'passed' | 'failed' | 'stale'
+
+export type DraftVersionRef = {
+  draftId: string
+  version: number
+  contentHash: string
+  qualityStatus: DraftQualityStatus
+  qualityCheckedVersion: number | null
+  qualityCheckedHash: string | null
+  qualityReportRef?: string | null
+  createdAt: string
+  updatedAt: string
+}
+
 export type DeliveryState = {
   action: string
   updatedAt: string
@@ -546,6 +580,16 @@ export type DeliveryState = {
     failedAt?: string
     messageId?: string
   }
+  sendAudit?: Array<{
+    draftId: string
+    version: number
+    contentHash: string
+    recipient: string
+    sentAt: string
+    qualityReportRef: string | null
+    idempotencyKey?: string
+    messageId?: string
+  }>
 }
 
 export type ApplicationMedia = {
@@ -692,6 +736,7 @@ export type ApplicationResult = {
     problems: string[]
     rubric: Record<string, number>
   }
+  draftVersion?: DraftVersionRef
   delivery?: DeliveryState | null
   quality: Record<string, boolean>
 }
@@ -699,6 +744,8 @@ export type ApplicationResult = {
 export type ApplicationMutationResponse = {
   noteId: string
   outreach?: OutreachDraft
+  draftVersion?: DraftVersionRef
+  cover_letter_evaluation?: ApplicationResult['cover_letter_evaluation']
   delivery: DeliveryState | null
 }
 
