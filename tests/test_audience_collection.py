@@ -473,6 +473,30 @@ def test_duplicate_legacy_avatar_is_cleared_and_scheduled_for_refresh():
     assert target["missing_profile_fields"] == ["avatar_url"]
 
 
+def test_legitimate_shared_default_avatar_does_not_trigger_profile_refresh():
+    shared = "https://sns-avatar-qc.xhscdn.com/avatar/platform-default-user.jpg?width=360"
+    users = [
+        {"user_id": f"u-{index}", "avatar_url": shared, "enrichment_status": "complete"}
+        for index in range(12)
+    ]
+    invalid = audience_collection.legacy_duplicate_avatar_fingerprints(users)
+    target = {
+        "user_id": "u-1",
+        "avatar_url": shared,
+        "enrichment_status": "complete",
+        "profile_status": "complete_reachable",
+        "following_count": 1,
+        "follower_count": 2,
+        "liked_and_collected_count": 3,
+        "ip_location": "上海",
+    }
+
+    assert invalid == set()
+    assert audience_collection.invalidate_legacy_profile_snapshot(target, invalid) is False
+    assert target["avatar_url"] == shared
+    assert target["profile_status"] == "complete_reachable"
+
+
 def test_duplicate_legacy_avatar_is_restored_from_trusted_checkpoint():
     shared = "https://sns-avatar-qc.xhscdn.com/avatar/sidebar-account.jpg?width=360"
     users = {

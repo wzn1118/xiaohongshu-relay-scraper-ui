@@ -83,6 +83,12 @@ LEGACY_DUPLICATE_AVATAR_THRESHOLD = 8
 # This asset was captured from the logged-in account/sidebar by the legacy
 # generic `.avatar img` selector instead of from the viewed user profile.
 KNOWN_NON_PROFILE_AVATAR_MARKERS = frozenset({"645b7e371fc3de4c930eff9d"})
+LEGACY_SHELL_AVATAR_MARKERS = frozenset({
+    "sidebar-account",
+    "account-sidebar",
+    "nav-account-avatar",
+    "logged-in-account",
+})
 AUDIENCE_CHECKPOINT_FILENAMES = (
     "xiaohongshu_notes_latest.json",
     "audience-posts.json",
@@ -478,7 +484,11 @@ def legacy_duplicate_avatar_fingerprints(
     *,
     threshold: int = LEGACY_DUPLICATE_AVATAR_THRESHOLD,
 ) -> set[str]:
-    """Find avatars likely copied from shell chrome by the legacy selector."""
+    """Find repeated avatars with evidence that they came from legacy shell chrome.
+
+    Repetition alone is not corruption evidence: platform default avatars may be
+    legitimately shared by many users.
+    """
     counts = Counter(
         fingerprint
         for user in users
@@ -490,6 +500,10 @@ def legacy_duplicate_avatar_fingerprints(
         fingerprint
         for fingerprint, count in counts.items()
         if count >= max(2, int(threshold))
+        and (
+            any(marker in fingerprint for marker in KNOWN_NON_PROFILE_AVATAR_MARKERS)
+            or any(marker in fingerprint for marker in LEGACY_SHELL_AVATAR_MARKERS)
+        )
     }
 
 

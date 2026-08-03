@@ -31,6 +31,39 @@ export async function readExpansionSeeds(outputDir) {
   });
 }
 
+export async function readPersistedExpansion(outputDir) {
+  const [summary, request, frontier, graph] = await Promise.all([
+    readJson(path.join(outputDir, 'expansion_summary.json'), {}),
+    readJson(path.join(path.dirname(outputDir), 'expansion-request.json'), {}),
+    readJson(path.join(outputDir, 'expansion_frontier.json'), {}),
+    readJson(path.join(outputDir, 'graph.json'), {}),
+  ]);
+  const hasEvidence = [summary, request, frontier, graph]
+    .some((item) => item && typeof item === 'object' && Object.keys(item).length > 0);
+  if (!hasEvidence) return null;
+  const requestAttemptId = String(request.attemptId || '');
+  const summaryAttemptId = String(summary.attemptId || '');
+  const attemptId = String(requestAttemptId || summaryAttemptId || frontier.attemptId || '');
+  const summaryBelongsToAttempt = !requestAttemptId
+    || requestAttemptId === summaryAttemptId
+    || (!request.resetExecution && request.action !== 'new_attempt' && !summaryAttemptId);
+  const activeSummary = summaryBelongsToAttempt ? summary : {};
+  const seedPostIds = firstStringArray(request.seedPostIds, activeSummary.seedPostIds, graph.seedPostIds);
+  const config = firstObject(request.config, activeSummary.config, activeSummary.budgets, graph.budgets);
+  const businessStatus = String(activeSummary.status || (attemptId ? 'interrupted' : 'idle'));
+  const runtimeStatus = String(activeSummary.runtimeStatus || (businessStatus === 'complete' ? 'completed' : businessStatus));
+  return {
+    ...activeSummary,
+    ...(attemptId ? { attemptId } : {}),
+    seedPostIds,
+    ...(config ? { config } : {}),
+    status: businessStatus,
+    runtimeStatus,
+    resumable: actionState(runtimeStatus) === 'resumable',
+    updatedAt: String(activeSummary.updatedAt || activeSummary.generatedAt || frontier.updatedAt || ''),
+  };
+}
+
 export async function readExpansionSnapshot(outputDir, searchParams = new URLSearchParams(), runtime = {}) {
   const kind = KINDS.has(searchParams.get('kind')) ? searchParams.get('kind') : 'users';
   const offset = boundedInteger(searchParams.get('offset'), 0, 0, 1_000_000);
@@ -40,7 +73,7 @@ export async function readExpansionSnapshot(outputDir, searchParams = new URLSea
   const seedFilter = searchParams.get('seed') || '';
   const [seeds, diskSummary, rounds, frontier, graph, allArtifacts] = await Promise.all([
     readExpansionSeeds(outputDir),
-    readJson(path.join(outputDir, 'expansion_summary.json'), {}),
+    readPersistedExpansion(outputDir),
     readJson(path.join(outputDir, 'expansion_rounds.json'), []),
     readJson(path.join(outputDir, 'expansion_frontier.json'), {}),
     readJson(path.join(outputDir, 'graph.json'), {}),
@@ -124,4 +157,15 @@ function boundedInteger(raw, fallback, min, max) {
   if (raw === null || raw === '') return fallback;
   const value = Number(raw);
   return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+function firstStringArray(...values) {
+  const arrays = values.filter((item) => Array.isArray(item));
+  const value = arrays.find((item) => item.length > 0) || arrays[0];
+  return value ? value.map(String).filter(Boolean) : [];
+}
+
+function firstObject(...values) {
+  const objects = values.filter((item) => item && typeof item === 'object' && !Array.isArray(item));
+  return objects.find((item) => Object.keys(item).length > 0) || objects[0] || null;
 }

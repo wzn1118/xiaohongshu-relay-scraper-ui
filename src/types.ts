@@ -510,6 +510,28 @@ export type JobRequest = {
   coverLetterThreshold: number
   coverLetterMaxAttempts: number
   expansion: ExpansionRequest
+  bodyOnly?: boolean
+  importSourceName?: string
+  importedBodyCount?: number
+}
+
+export type BodyImportOptions = Pick<JobRequest,
+  'browserProfile' | 'relayPort' | 'gotoTimeoutMs' | 'noteDelaySeconds' | 'speedMode'
+  | 'randomDelayMinSeconds' | 'randomDelayMaxSeconds' | 'securityVerificationTimeoutSeconds' | 'maxAgeDays'
+>
+
+export type BodyImportSummary = {
+  receivedCount: number
+  acceptedCount: number
+  duplicateCount: number
+  rejectedCount: number
+  rejected: Array<{ index: number; reason: string; message: string }>
+}
+
+export type BodyImportResponse = {
+  summary: BodyImportSummary
+  job: Job
+  message: string
 }
 
 export type PreflightCheckStatus = 'passed' | 'warning' | 'blocked'

@@ -342,14 +342,25 @@ class ApplicationInfoAgent:
         "任职条件": "requirement",
         "职位条件": "requirement",
     }
+    LIST_MARKER_PATTERN = (
+        r"(?:\d{1,2}\s*(?:[、)）]|[.．](?!\d))|[一二三四五六七八九十]{1,3}\s*[、.．)）]|"
+        r"[（(]\s*(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*[）)]|[•●▪◦·])"
+    )
+    SECTION_HEADING_CONNECTOR_PATTERN = r"(?:主要包括|具体包括|具体如下|主要如下|如下|包括)"
     SECTION_HEADING_RE = re.compile(
-        "|".join(re.escape(value) for value in sorted(SECTION_CATEGORIES, key=len, reverse=True)),
-        re.I,
+        r"(?<![\w])(?P<label>"
+        + "|".join(re.escape(value) for value in sorted(SECTION_CATEGORIES, key=len, reverse=True))
+        + r")(?P<connector>[ \t]*"
+        + SECTION_HEADING_CONNECTOR_PATTERN
+        + r")?(?=[ \t]*(?::|：|\r?\n|$|"
+        + LIST_MARKER_PATTERN
+        + r"))",
+        re.I | re.M,
     )
     LIST_MARKER_RE = re.compile(
         r"(?:^|(?<=[\s:：。；;]))"
-        r"(?:\d{1,2}\s*[、.．)）]|[一二三四五六七八九十]{1,3}\s*[、.．)）]|"
-        r"[（(]\s*(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*[）)]|[•●▪◦·])\s*"
+        + LIST_MARKER_PATTERN
+        + r"\s*"
     )
 
     @classmethod
@@ -363,7 +374,7 @@ class ApplicationInfoAgent:
             spans.append((0, headings[0].start(), None, None))
         for index, heading in enumerate(headings):
             end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
-            label = heading.group(0)
+            label = heading.group("label")
             spans.append((heading.end(), end, cls.SECTION_CATEGORIES[label], label))
         return spans
 
@@ -468,6 +479,7 @@ class ApplicationInfoAgent:
                     section_category == "responsibility"
                     and requirement_score >= 4
                     and requirement_score > responsibility_score
+                    and not responsibility_hits
                 ):
                     category = "requirement"
             elif requirement_score == responsibility_score:

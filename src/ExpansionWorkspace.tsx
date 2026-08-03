@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Ban, ChevronLeft, ChevronRight, Download, ExternalLink, FileDown, Image as ImageIcon, LoaderCircle, Network, Play, RefreshCw, RotateCcw, Wifi, WifiOff } from 'lucide-react'
+import { Ban, ChevronLeft, ChevronRight, Download, ExternalLink, FileDown, Image as ImageIcon, LoaderCircle, Network, Play, PlusCircle, RefreshCw, RotateCcw, Wifi, WifiOff } from 'lucide-react'
 import { api } from './api'
-import type { ExpansionConfig, ExpansionWorkspaceState, Job, RelayStatus } from './types'
+import type { ExpansionConfig, ExpansionWorkspaceState, Job } from './types'
 
 const DEFAULT_CONFIG: ExpansionConfig = {
   rounds: 2,
@@ -20,6 +20,19 @@ const DEFAULT_CONFIG: ExpansionConfig = {
   schemaVersion: 1,
 }
 
+const HIGH_OUTPUT_CONFIG: ExpansionConfig = {
+  ...DEFAULT_CONFIG,
+  rounds: 3,
+  maxUsersPerRound: 50,
+  maxPostsPerUser: 5,
+  maxCommentsPerPost: 200,
+  maxTotalUsers: 1000,
+  maxTotalPosts: 3000,
+  maxTotalComments: 30000,
+  timeBudgetMinutes: 60,
+  maxFailureCount: 20,
+}
+
 const STATUS_LABELS: Record<string, string> = {
   idle: '未运行', running: '扩散中', cancelling: '正在停止', completed: '已完成', partial: '部分完成',
   failed: '运行失败', blocked: '已阻断', cancelled: '已取消', interrupted: '已中断',
@@ -29,7 +42,7 @@ const ARTIFACT_NAMES = ['expansion_summary.json', 'expansion_rounds.json', 'expa
 
 type Props = {
   job: Job | null
-  relay: RelayStatus | null
+  relayReady: boolean
   visible: boolean
   onJobUpdated: (job: Job) => void
   onReturnInsights: () => void
@@ -44,7 +57,7 @@ function SeedCover({ src, title }: { src: string; title: string }) {
   </span>
 }
 
-export function ExpansionWorkspace({ job, relay, visible, onJobUpdated, onReturnInsights }: Props) {
+export function ExpansionWorkspace({ job, relayReady, visible, onJobUpdated, onReturnInsights }: Props) {
   const [state, setState] = useState<ExpansionWorkspaceState | null>(null)
   const [selected, setSelected] = useState<string[]>([])
   const [config, setConfig] = useState<ExpansionConfig>(DEFAULT_CONFIG)
@@ -57,6 +70,8 @@ export function ExpansionWorkspace({ job, relay, visible, onJobUpdated, onReturn
   const [action, setAction] = useState('')
   const [error, setError] = useState('')
   const actionRef = useRef(false)
+  const hydratedJobRef = useRef('')
+  const activeJobRef = useRef('')
   const draftKey = job ? `expansion-draft:${job.id}` : ''
 
   const load = useCallback(async (nextOffset = offset, quiet = false) => {
@@ -68,38 +83,55 @@ export function ExpansionWorkspace({ job, relay, visible, onJobUpdated, onReturn
       setOffset(next.results.offset)
       setError('')
       const persisted = Array.isArray(next.summary.seedPostIds) ? next.summary.seedPostIds.map(String) : []
-      if (persisted.length) setSelected(persisted)
-      else setSelected((current) => current.length ? current : next.seeds.filter((seed) => seed.available && seed.commentStatus !== 'complete').map((seed) => seed.postId))
-      if (next.config) setConfig(next.config)
+      if (hydratedJobRef.current !== job.id) {
+        let draft: { selected?: string[]; config?: ExpansionConfig } = {}
+        if (next.actionState === 'ready') {
+          try {
+            draft = JSON.parse(localStorage.getItem(draftKey) || '{}') as typeof draft
+          } catch {
+            localStorage.removeItem(draftKey)
+          }
+        }
+        const available = new Set(next.seeds.filter((seed) => seed.available).map((seed) => seed.postId))
+        const defaultSelection = next.seeds
+          .filter((seed) => seed.available && seed.commentStatus !== 'complete')
+          .map((seed) => seed.postId)
+        const restored = next.actionState === 'ready'
+          ? (Array.isArray(draft.selected) ? draft.selected : (persisted.length ? persisted : defaultSelection))
+          : persisted
+        setSelected(restored.filter((postId) => available.has(postId)))
+        setConfig(draft.config || next.config || DEFAULT_CONFIG)
+        hydratedJobRef.current = job.id
+      } else if (next.actionState === 'running') {
+        setSelected(persisted)
+        if (next.config) setConfig(next.config)
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
       if (!quiet) setLoading(false)
     }
-  }, [job?.id, kind, offset, roundFilter, seedFilter, statusFilter])
+  }, [draftKey, job?.id, kind, offset, roundFilter, seedFilter, statusFilter])
 
   useEffect(() => {
-    setState(null)
-    setSelected([])
-    setConfig(DEFAULT_CONFIG)
-    setOffset(0)
-    setError('')
-    if (!job) return
-    const saved = localStorage.getItem(draftKey)
-    if (saved) {
-      try {
-        const draft = JSON.parse(saved) as { selected?: string[]; config?: ExpansionConfig }
-        if (draft.selected) setSelected(draft.selected)
-        if (draft.config) setConfig(draft.config)
-      } catch { localStorage.removeItem(draftKey) }
+    const nextJobId = job?.id || ''
+    if (activeJobRef.current !== nextJobId) {
+      activeJobRef.current = nextJobId
+      hydratedJobRef.current = ''
+      setState(null)
+      setSelected([])
+      setConfig(DEFAULT_CONFIG)
+      setError('')
     }
+    setOffset(0)
+    if (!job) return
     void load(0)
   }, [job?.id, kind, roundFilter, seedFilter, statusFilter])
 
   useEffect(() => {
-    if (!draftKey || state?.actionState !== 'ready') return
+    if (!draftKey || !state || state.actionState === 'running' || hydratedJobRef.current !== job?.id) return
     localStorage.setItem(draftKey, JSON.stringify({ selected, config }))
-  }, [config, draftKey, selected, state?.actionState])
+  }, [config, draftKey, job?.id, selected, state])
 
   useEffect(() => {
     if (!job || !['running', 'cancelling'].includes(state?.status || '')) return
@@ -119,15 +151,16 @@ export function ExpansionWorkspace({ job, relay, visible, onJobUpdated, onReturn
     try {
       const response = await operation()
       setState(response.expansion)
+      localStorage.removeItem(draftKey)
       onJobUpdated(response.job)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally { actionRef.current = false; setAction('') }
   }
 
-  const immutable = state?.actionState !== 'ready'
   const running = state?.actionState === 'running'
-  const canStart = Boolean(job && state?.available && selected.length && !immutable && relay?.ready)
+  const controlsLocked = !state || running || Boolean(action)
+  const canStart = Boolean(job && state?.available && selected.length && !running && relayReady)
   const status = state?.status || 'idle'
   const metrics = state?.metrics || { rounds: 0, currentRound: 0, frontier: 0, users: 0, expandedUsers: 0, posts: 0, comments: 0, duplicates: 0, failures: 0, remainingMinutes: null }
   const totalPages = Math.max(1, Math.ceil((state?.results.total || 0) / 50))
@@ -143,23 +176,24 @@ export function ExpansionWorkspace({ job, relay, visible, onJobUpdated, onReturn
     <header className="expansion-command-bar">
       <div className={`expansion-runtime ${statusClass}`}><Network size={20} /><span><small>RELATIONSHIP EXPANSION</small><strong>{STATUS_LABELS[status] || status}</strong><i>原任务 {job?.id || '-'}</i><em>{attemptId ? `Attempt ${attemptId}` : '尚未创建 Attempt'} · 第 {metrics.currentRound}/{Number(state?.summary.maxRounds || config.rounds)} 轮 · {checkpointAt ? `检查点 ${new Date(checkpointAt).toLocaleString('zh-CN')}` : '暂无检查点'}{stopReason ? ` · ${stopReason}` : ''}</em></span></div>
       <div className="expansion-actions">
-        <span className={relay?.ready ? 'relay-ready' : 'relay-offline'}>{relay?.ready ? <Wifi size={14} /> : <WifiOff size={14} />}{relay?.ready ? 'Relay 已就绪' : 'Relay 未就绪'}</span>
-        {!immutable && <button className="primary-button" disabled={!canStart || Boolean(action)} onClick={() => job && void runAction('start', () => api.startExpansion(job.id, selected, config))}>{action === 'start' ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}开始扩散</button>}
-        {state?.actionState === 'resumable' && <><button disabled={Boolean(action) || !relay?.ready} onClick={() => job && void runAction('resume', () => api.resumeExpansion(job.id))}><RefreshCw size={15} />继续扩散</button><button disabled={Boolean(action) || !relay?.ready} onClick={() => job && void runAction('retry', () => api.resumeExpansion(job.id, true))}><RotateCcw size={15} />重试未完成</button></>}
+        <span className={relayReady ? 'relay-ready' : 'relay-offline'}>{relayReady ? <Wifi size={14} /> : <WifiOff size={14} />}{relayReady ? 'Relay 已就绪' : 'Relay 未就绪'}</span>
+        {state?.actionState === 'ready' && <button className="primary-button" disabled={!canStart || Boolean(action)} onClick={() => job && void runAction('start', () => api.startExpansion(job.id, selected, config))}>{action === 'start' ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}开始扩散</button>}
+        {state && ['resumable', 'completed'].includes(state.actionState) && <button className="primary-button" disabled={!canStart || Boolean(action)} onClick={() => job && void runAction('new-attempt', () => api.createExpansionAttempt(job.id, selected, config))}>{action === 'new-attempt' ? <LoaderCircle className="spin" size={15} /> : <PlusCircle size={15} />}按所选帖子新建 Attempt</button>}
+        {state?.actionState === 'resumable' && <><button disabled={Boolean(action) || !relayReady} onClick={() => job && void runAction('resume', () => api.resumeExpansion(job.id))}><RefreshCw size={15} />继续扩散</button><button disabled={Boolean(action) || !relayReady} onClick={() => job && void runAction('retry', () => api.resumeExpansion(job.id, true))}><RotateCcw size={15} />重试未完成</button></>}
         {running && <button className="danger-action" disabled={Boolean(action)} onClick={() => job && window.confirm('停止当前扩散轮次并保留检查点？') && void runAction('cancel', () => api.cancelExpansion(job.id))}><Ban size={15} />停止</button>}
         <button disabled={!state?.artifacts.length} title={state?.artifacts.length ? '定位到当前检查点产物' : '当前检查点还没有产物'} onClick={() => document.getElementById('expansion-artifacts')?.scrollIntoView({ behavior: 'smooth' })}><FileDown size={15} />导出</button>
       </div>
     </header>
     {!job && <div className="expansion-notice"><span>请先选择一个已有内容采集任务。</span><button onClick={onReturnInsights}>返回内容洞察</button></div>}
     {error && <div className="expansion-notice error">{error}</div>}
-    {!relay?.ready && <div className="expansion-notice">启动前需要已登录且可连接的 Relay；当前帖子、受众和扩散结果均保持可见。</div>}
+    {!relayReady && <div className="expansion-notice">启动前需要已登录且可连接的 Relay；当前帖子、受众和扩散结果均保持可见。</div>}
 
     <div className="expansion-layout">
       <section className="expansion-seeds">
-        <header><span><strong>种子帖子</strong><small>仅使用当前任务已持久化的内容</small></span><div className="expansion-seed-tools"><button disabled={immutable || !availableSeeds.length} onClick={() => setSelected(availableSeeds)}>全选可用</button><button disabled={immutable || !selected.length} onClick={() => setSelected([])}>清空</button><b>{selected.length} / {state?.seeds.length || 0}</b></div></header>
+        <header><span><strong>种子帖子</strong><small>勾选本次扩散要使用的帖子</small></span><div className="expansion-seed-tools"><button disabled={controlsLocked || !availableSeeds.length} onClick={() => setSelected(availableSeeds)}>全选可用</button><button disabled={controlsLocked || !selected.length} onClick={() => setSelected([])}>清空</button><b>{selected.length} / {state?.seeds.length || 0}</b></div></header>
         <div className="expansion-seed-list">
           {state?.seeds.map((seed) => <label key={seed.postId} className={`${selected.includes(seed.postId) ? 'selected' : ''} ${!seed.available ? 'unavailable' : ''}`}>
-            <input type="checkbox" checked={selected.includes(seed.postId)} disabled={immutable || !seed.available} onChange={(event) => setSelected((current) => event.target.checked ? [...new Set([...current, seed.postId])] : current.filter((item) => item !== seed.postId))} />
+            <input type="checkbox" checked={selected.includes(seed.postId)} disabled={controlsLocked || !seed.available} onChange={(event) => setSelected((current) => event.target.checked ? [...new Set([...current, seed.postId])] : current.filter((item) => item !== seed.postId))} />
             <SeedCover key={seed.coverUrl || 'empty'} src={seed.coverUrl} title={seed.title} />
             <span className="expansion-seed-copy"><strong>{seed.title}</strong><small>{String(seed.author?.display_name || '作者待确认')} · {seed.collectedComments} 条评论{seed.unavailableReason ? ` · ${seed.unavailableReason}` : ''}</small>{seed.url && <a href={seed.url} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>打开原帖 <ExternalLink size={11} /></a>}</span>
             <i className={`seed-state ${seed.commentStatus}`} title={seed.collectionReason}>{seed.expansionStatus === 'expanding' ? '扩散中' : seed.expansionStatus === 'used' ? '已用于扩散' : seed.commentStatus === 'complete' ? '已采集' : seed.commentStatus === 'partial' ? '部分采集' : '未采集'}</i>
@@ -171,13 +205,18 @@ export function ExpansionWorkspace({ job, relay, visible, onJobUpdated, onReturn
       <section className="expansion-main">
         <details className="expansion-parameters">
           <summary>扩散参数 <small>{config.rounds} 轮 · 每轮 {config.maxUsersPerRound} 用户 · {config.timeBudgetMinutes} 分钟</small></summary>
-          <div>{[
+          <div className="expansion-parameter-presets" role="group" aria-label="性能预设">
+            <span>性能预设</span>
+            <button type="button" disabled={controlsLocked} onClick={() => setConfig(DEFAULT_CONFIG)}>均衡</button>
+            <button type="button" disabled={controlsLocked} onClick={() => setConfig(HIGH_OUTPUT_CONFIG)}>高产</button>
+          </div>
+          <div className="expansion-parameter-grid">{[
             ['rounds', '扩散轮数', 1, 10], ['maxReplyDepth', '回复深度', 0, 10], ['maxUsersPerRound', '每轮用户', 1, 1000], ['maxPostsPerUser', '每用户帖子', 1, 100],
             ['maxCommentsPerPost', '每帖评论', 1, 5000], ['maxTotalUsers', '总用户预算', 1, 100000], ['maxTotalPosts', '总帖子预算', 1, 100000],
             ['maxTotalComments', '总评论预算', 1, 1000000], ['timeBudgetMinutes', '时间预算（分钟）', 1, 1440], ['maxFailureCount', '失败预算', 1, 1000], ['concurrency', '并发数', 1, 1],
-          ].map(([key, label, min, max]) => <label key={String(key)}><span>{label}</span><input type="number" min={Number(min)} max={Number(max)} disabled={immutable} value={Number(config[key as keyof ExpansionConfig])} onChange={(event) => setConfig((current) => ({ ...current, [key]: Number(event.target.value) }))} /></label>)}
-            <label className="expansion-toggle"><span>采集楼中楼回复</span><input type="checkbox" disabled={immutable} checked={config.includeReplies} onChange={(event) => setConfig((current) => ({ ...current, includeReplies: event.target.checked }))} /></label>
-            <label><span>帖子选择策略</span><select disabled={immutable} value={config.postSelectionStrategy} onChange={(event) => setConfig((current) => ({ ...current, postSelectionStrategy: event.target.value as ExpansionConfig['postSelectionStrategy'] }))}><option value="latest">最新帖子</option><option value="keyword_match">关键词匹配</option><option value="top_engagement">高互动</option><option value="all_reachable">全部可达</option></select></label>
+          ].map(([key, label, min, max]) => <label key={String(key)}><span>{label}</span><input type="number" min={Number(min)} max={Number(max)} disabled={controlsLocked} value={Number(config[key as keyof ExpansionConfig])} onChange={(event) => setConfig((current) => ({ ...current, [key]: Number(event.target.value) }))} /></label>)}
+            <label className="expansion-toggle"><span>采集楼中楼回复</span><input type="checkbox" disabled={controlsLocked} checked={config.includeReplies} onChange={(event) => setConfig((current) => ({ ...current, includeReplies: event.target.checked }))} /></label>
+            <label><span>帖子选择策略</span><select disabled={controlsLocked} value={config.postSelectionStrategy} onChange={(event) => setConfig((current) => ({ ...current, postSelectionStrategy: event.target.value as ExpansionConfig['postSelectionStrategy'] }))}><option value="latest">最新帖子</option><option value="keyword_match">关键词匹配</option><option value="top_engagement">高互动</option><option value="all_reachable">全部可达</option></select></label>
           </div>
         </details>
 

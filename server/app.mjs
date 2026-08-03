@@ -4,6 +4,7 @@ import { createReadStream } from 'node:fs';
 import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { assertPathInside, enumerateArtifacts, resolveDownload } from './lib/artifacts.mjs';
 import { ValidationError, validateAudienceGrowthRequest, validateExpansionCancelRequest, validateExpansionResumeRequest, validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
+import { validateBodyImportRequest } from './lib/body-import.mjs';
 import { probeRelay } from './lib/relay.mjs';
 import { connectRelay, openRelayLogin } from './lib/relay-connect.mjs';
 import { setupRelayRuntime } from './lib/relay-setup.mjs';
@@ -47,6 +48,7 @@ import { DEFAULT_RELAY_CONFIG } from './relay-config-store.mjs';
 import { createPreflightService } from './preflight-service.mjs';
 import { AudienceAiService } from './audience-ai-service.mjs';
 import { createAudienceAiProfileRunner } from './lib/audience-ai-profile-runner.mjs';
+import { handleDataCopilotRequest } from './data-copilot-http.mjs';
 import {
   AudienceAiValidationError,
   validateAudienceAiEmptyRequest,
@@ -85,7 +87,7 @@ const CONTENT_RESEARCH_LABELS = Object.freeze({
   custom: '自定义研究',
 });
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService, dataCopilotService }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const relayRuntime = relaySupervisor || createRelaySupervisor({
     getConfig: getRelayConfig,
@@ -183,6 +185,13 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           },
         });
       }
+      if (await handleDataCopilotRequest({
+        req,
+        res,
+        url,
+        service: dataCopilotService,
+        maxBodyBytes: config.maxBodyBytes,
+      })) return;
       if (req.method === 'GET' && url.pathname === '/api/relay/config') {
         return json(res, 200, getRelayConfig());
       }
@@ -393,6 +402,20 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           : await manager.start(params);
         return json(res, 202, job);
       }
+      if (req.method === 'POST' && url.pathname === '/api/body-imports') {
+        const imported = validateBodyImportRequest(await readJsonBody(req, config.maxBodyBytes));
+        const job = await manager.startImportedBodies(imported.params, imported.cards, {
+          queueIfBusy: true,
+          requestedBy: 'body_import_api',
+        });
+        return json(res, 202, {
+          summary: imported.summary,
+          job,
+          message: job.status === 'queued'
+            ? 'Body collection task queued.'
+            : 'Body collection task started.',
+        });
+      }
       if (parts[0] === 'api' && parts[1] === 'jobs' && parts[2]) {
         const id = parts[2];
         const audienceAiRoute = isAudienceAiRouteParts(parts);
@@ -477,7 +500,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             ...sourceParams,
             analysisMode,
             searchSort: 'latest',
-            maxAgeDays: 0,
+            maxAgeDays: sourceParams.maxAgeDays ?? 14,
             limit: 0,
             mode: 'resume',
             resumeFromJobId: id,
@@ -599,6 +622,16 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           const result = await manager.startExpansion(id, request);
           return json(res, 202, { ...result, expansion: localizeExpansionMedia(await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}), id) });
         }
+        if (req.method === 'POST' && parts[3] === 'expansion' && parts[4] === 'attempts' && parts.length === 5) {
+          const request = validateExpansionStartRequest(await readJsonBody(req, config.maxBodyBytes));
+          const ownedSeedIds = new Set((await readExpansionSeeds(internal.outputDir)).filter((item) => item.available).map((item) => item.postId));
+          const foreign = request.seedPostIds.filter((postId) => !ownedSeedIds.has(postId));
+          if (foreign.length) {
+            throw new ValidationError('Expansion seeds must belong to the current task.', foreign.map((postId) => ({ field: 'seedPostIds', reason: 'not_owned_by_task', value: postId })));
+          }
+          const result = await manager.createExpansionAttempt(id, request);
+          return json(res, 202, { ...result, expansion: localizeExpansionMedia(await readExpansionSnapshot(internal.outputDir, new URLSearchParams(), result.job.workflowSummary?.expansion || {}), id) });
+        }
         if (req.method === 'POST' && parts[3] === 'expansion' && parts[4] === 'resume' && parts.length === 5) {
           const request = validateExpansionResumeRequest(await readJsonBody(req, config.maxBodyBytes));
           const result = await manager.resumeExpansion(id, request);
@@ -674,7 +707,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             ...sourceParams,
             analysisMode: 'general',
             searchSort: 'latest',
-            maxAgeDays: 0,
+            maxAgeDays: sourceParams.maxAgeDays ?? 14,
             limit: 0,
             mode: 'resume',
             resumeFromJobId: sourceJobId,
@@ -736,7 +769,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             ...sourceParams,
             analysisMode: 'general',
             searchSort: 'latest',
-            maxAgeDays: 0,
+            maxAgeDays: sourceParams.maxAgeDays ?? 14,
             limit: 0,
             maxScrolls: request.maxScrolls,
             mode: 'resume',

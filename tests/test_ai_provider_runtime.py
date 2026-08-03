@@ -4,7 +4,9 @@ import base64
 import io
 import os
 import json
+import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -384,6 +386,71 @@ class AiProviderRuntimeTests(unittest.TestCase):
 
         self.assertIn("remaining records were preserved", provider._terminal_error)
 
+    def test_http_retries_use_the_remaining_total_runtime_budget(self) -> None:
+        provider = AIProvider(
+            provider="openai",
+            api_key="test-key",
+            base_url="https://api.example/v1",
+            model="vision-model",
+            timeout=300,
+            total_timeout=300,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+
+        def open_url(_request: object, *, timeout: int) -> Response:
+            request_timeouts.append(timeout)
+            if len(request_timeouts) == 1:
+                raise urllib.error.URLError("vision request failed")
+            return Response()
+
+        request_timeouts: list[int] = []
+        with patch("scripts.ai_provider_runtime.time.monotonic", side_effect=[100.0, 385.0, 395.0]), patch(
+            "scripts.ai_provider_runtime.urllib.request.urlopen", side_effect=open_url
+        ):
+            result = provider.generate_json(
+                "system",
+                "user",
+                {"type": "object"},
+                image_urls=["https://img.example/job.jpg"],
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(request_timeouts, [15, 5])
+
+    def test_http_retry_stops_when_total_runtime_budget_is_exhausted(self) -> None:
+        provider = AIProvider(
+            provider="openai",
+            api_key="test-key",
+            base_url="https://api.example/v1",
+            model="vision-model",
+            timeout=300,
+            total_timeout=300,
+        )
+
+        with patch("scripts.ai_provider_runtime.time.monotonic", side_effect=[100.0, 385.0, 401.0]), patch(
+            "scripts.ai_provider_runtime.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("vision request failed"),
+        ) as open_url:
+            with self.assertRaisesRegex(AIProviderError, "runtime budget exhausted"):
+                provider.generate_json(
+                    "system",
+                    "user",
+                    {"type": "object"},
+                    image_urls=["https://img.example/job.jpg"],
+                )
+
+        self.assertEqual(open_url.call_count, 1)
+        self.assertEqual(open_url.call_args.kwargs["timeout"], 15)
+
     def test_codex_model_override_is_forwarded(self) -> None:
         provider = AIProvider(provider="codex", model="portable-model", timeout=30)
 
@@ -458,7 +525,7 @@ goals = true
             ), patch("scripts.ai_provider_runtime.run_with_tree_timeout", side_effect=complete):
                 self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
 
-    @unittest.skipUnless(os.name == "nt", "requires Windows taskkill")
+    @unittest.skipUnless(os.name == "nt", "Windows taskkill is unavailable on POSIX")
     def test_tree_timeout_terminates_the_windows_process_group(self) -> None:
         class TimedProcess:
             pid = 43210
@@ -491,6 +558,134 @@ goals = true
         self.assertTrue(process.killed)
         self.assertEqual(process.communicate_calls, 2)
         self.assertEqual(taskkill.call_args.args[0][:4], ["taskkill.exe", "/PID", "43210", "/T"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups are unavailable on Windows")
+    def test_tree_timeout_escalates_the_posix_process_group(self) -> None:
+        class TimedProcess:
+            pid = 43210
+            returncode = 1
+
+            def communicate(self, **_kwargs: object) -> tuple[str, str]:
+                raise subprocess.TimeoutExpired(["codex", "exec"], 1)
+
+            def poll(self) -> None:
+                return None
+
+            def terminate(self) -> None:
+                raise AssertionError("process-group signaling should be used")
+
+            def kill(self) -> None:
+                raise AssertionError("process-group signaling should be used")
+
+        process = TimedProcess()
+        with patch("scripts.ai_provider_runtime.subprocess.Popen", return_value=process) as popen, patch(
+            "scripts.ai_provider_runtime.os.killpg"
+        ) as kill_group:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_with_tree_timeout(["codex", "exec"], input_text="prompt", timeout=1)
+
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(
+            kill_group.call_args_list,
+            [
+                unittest.mock.call(43210, signal.SIGTERM),
+                unittest.mock.call(43210, signal.SIGKILL),
+                unittest.mock.call(43210, signal.SIGKILL),
+            ],
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups are unavailable on Windows")
+    def test_tree_timeout_terminates_a_real_posix_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child_script = root / "child.py"
+            parent_script = root / "parent.py"
+            child_ready = root / "child-ready"
+            child_stopped = root / "child-stopped"
+            child_pid_path = root / "child-pid"
+            parent_stopped = root / "parent-stopped"
+            child_script.write_text(
+                """
+import signal
+import sys
+import time
+from pathlib import Path
+
+ready = Path(sys.argv[1])
+stopped = Path(sys.argv[2])
+
+def stop(_signum, _frame):
+    stopped.write_text("stopped", encoding="utf-8")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+ready.write_text("ready", encoding="utf-8")
+while True:
+    time.sleep(0.05)
+""".strip(),
+                encoding="utf-8",
+            )
+            parent_script.write_text(
+                """
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+child_script, ready_path, stopped_path, pid_path, parent_stopped_path = sys.argv[1:]
+stop_requested = False
+
+def stop(_signum, _frame):
+    global stop_requested
+    stop_requested = True
+
+signal.signal(signal.SIGTERM, stop)
+child = subprocess.Popen([sys.executable, child_script, ready_path, stopped_path])
+Path(pid_path).write_text(str(child.pid), encoding="utf-8")
+deadline = time.monotonic() + 5
+while not Path(ready_path).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+while not stop_requested:
+    time.sleep(0.05)
+child.wait(timeout=3)
+Path(parent_stopped_path).write_text("stopped", encoding="utf-8")
+""".strip(),
+                encoding="utf-8",
+            )
+
+            child_pid = 0
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run_with_tree_timeout(
+                        [
+                            sys.executable,
+                            str(parent_script),
+                            str(child_script),
+                            str(child_ready),
+                            str(child_stopped),
+                            str(child_pid_path),
+                            str(parent_stopped),
+                        ],
+                        input_text="",
+                        timeout=2,
+                    )
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                self.assertTrue(child_stopped.is_file())
+                self.assertTrue(parent_stopped.is_file())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            finally:
+                if not child_pid and child_pid_path.is_file():
+                    try:
+                        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                    except ValueError:
+                        pass
+                if child_pid:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 if __name__ == "__main__":

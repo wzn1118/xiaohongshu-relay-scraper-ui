@@ -164,7 +164,9 @@ export class AiSessionStore {
 
     const headers = { Accept: 'application/json' };
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    const candidates = modelDiscoveryCandidates(baseUrl);
+    const candidates = modelDiscoveryCandidates(baseUrl, {
+      preferVersioned: Boolean(definition.relay || provider === 'custom'),
+    });
 
     for (const [index, candidate] of candidates.entries()) {
       let response;
@@ -296,13 +298,12 @@ function modelId(value) {
   return /^[^\s<>"']{1,160}$/u.test(text) ? text : '';
 }
 
-function modelDiscoveryCandidates(baseUrl) {
-  const candidates = [{ baseUrl }];
+function modelDiscoveryCandidates(baseUrl, { preferVersioned = false } = {}) {
+  const direct = { baseUrl };
   const parsed = new URL(baseUrl);
-  if (!parsed.pathname.toLowerCase().endsWith('/v1')) {
-    candidates.push({ baseUrl: `${baseUrl}/v1` });
-  }
-  return candidates;
+  if (parsed.pathname.toLowerCase().endsWith('/v1')) return [direct];
+  const versioned = { baseUrl: `${baseUrl}/v1` };
+  return preferVersioned ? [versioned, direct] : [direct, versioned];
 }
 
 function modelEntries(payload) {

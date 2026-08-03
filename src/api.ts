@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationAttachment, ApplicationAttachmentList, ApplicationContext, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, EmailPreview, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationAttachment, ApplicationAttachmentList, ApplicationContext, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, BodyImportOptions, BodyImportResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, EmailPreview, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
@@ -82,6 +82,8 @@ export const api = {
     request<PreflightReport>('/api/preflight', { method: 'POST', body: JSON.stringify(payload) }),
   createJob: (payload: JobRequest) =>
     request<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
+  createBodyImport: (payload: { records: Record<string, unknown>[]; sourceName: string; analysisMode: 'job' | 'general'; options: BodyImportOptions }) =>
+    request<BodyImportResponse>('/api/body-imports', { method: 'POST', body: JSON.stringify(payload) }),
   resumeJob: (id: string, options: ResumeJobOptions) =>
     request<Job>(`/api/jobs/${encodeURIComponent(id)}/resume`, {
       method: 'POST',
@@ -140,6 +142,10 @@ export const api = {
   expansion: (id: string, kind: 'users' | 'posts' | 'comments' | 'relations' = 'users', offset = 0, limit = 50, filters: { round?: string; status?: string; seed?: string } = {}) =>
     request<ExpansionWorkspaceState>(`/api/jobs/${encodeURIComponent(id)}/expansion?${new URLSearchParams({ kind, offset: String(offset), limit: String(limit), ...(filters.round ? { round: filters.round } : {}), ...(filters.status ? { status: filters.status } : {}), ...(filters.seed ? { seed: filters.seed } : {}) })}`),
   startExpansion: (id: string, seedPostIds: string[], config: ExpansionConfig) => request<ExpansionActionResponse>(`/api/jobs/${encodeURIComponent(id)}/expansion/start`, {
+    method: 'POST',
+    body: JSON.stringify({ seedPostIds, config }),
+  }),
+  createExpansionAttempt: (id: string, seedPostIds: string[], config: ExpansionConfig) => request<ExpansionActionResponse>(`/api/jobs/${encodeURIComponent(id)}/expansion/attempts`, {
     method: 'POST',
     body: JSON.stringify({ seedPostIds, config }),
   }),

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 import types
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -58,6 +61,327 @@ def cards(*note_ids: str) -> list[dict[str, str]]:
         {"note_id": note_id, "note_url": f"https://example.test/explore/{note_id}"}
         for note_id in note_ids
     ]
+
+
+def test_pending_retry_priority_defers_rate_limited_notes() -> None:
+    candidates = cards("rate-limited", "failed", "fresh")
+    ledger_records = {
+        "rate-limited": {"attemptCount": 3, "failureCode": "detail_rate_limited"},
+        "failed": {"attemptCount": 1, "failureCode": "detail_timeout"},
+        "fresh": {"attemptCount": 0, "failureCode": ""},
+    }
+
+    ordered = sorted(
+        candidates,
+        key=lambda card: body_completion.pending_retry_priority(card, ledger_records),
+    )
+
+    assert [card["note_id"] for card in ordered] == ["fresh", "failed", "rate-limited"]
+
+
+def test_adaptive_pacer_backs_off_and_recovers_after_stable_successes() -> None:
+    pacer = body_completion.AdaptivePacer(enabled=True, max_delay_seconds=20)
+
+    assert pacer.next_delay(
+        speed_mode="steady",
+        note_delay_seconds=1,
+        random_delay_min_seconds=1,
+        random_delay_max_seconds=1,
+    ) == 1
+    pacer.observe(False)
+    pacer.observe(False)
+    assert pacer.next_delay(
+        speed_mode="steady",
+        note_delay_seconds=1,
+        random_delay_min_seconds=1,
+        random_delay_max_seconds=1,
+    ) == 4
+
+    for _ in range(5):
+        pacer.observe(True)
+
+    assert pacer.snapshot()["failureLevel"] == 1
+    assert pacer.next_delay(
+        speed_mode="steady",
+        note_delay_seconds=1,
+        random_delay_min_seconds=1,
+        random_delay_max_seconds=1,
+    ) == 2
+
+
+def test_adaptive_pacer_shortens_batch_pause_only_after_clean_streak() -> None:
+    pacer = body_completion.AdaptivePacer(enabled=True, max_delay_seconds=20)
+
+    assert pacer.healthy_batch_pause_scale() == 1.0
+    for _ in range(12):
+        pacer.observe(True)
+    assert pacer.healthy_batch_pause_scale() == 0.75
+    assert pacer.next_delay(
+        speed_mode="steady",
+        note_delay_seconds=1,
+        random_delay_min_seconds=1,
+        random_delay_max_seconds=1,
+    ) == 0.75
+    for _ in range(12):
+        pacer.observe(True)
+    assert pacer.healthy_batch_pause_scale() == 0.5
+    assert pacer.next_delay(
+        speed_mode="steady",
+        note_delay_seconds=1,
+        random_delay_min_seconds=1,
+        random_delay_max_seconds=1,
+    ) == 0.5
+
+    pacer.observe(False)
+    assert pacer.healthy_batch_pause_scale() == 1.0
+    assert pacer.next_delay(
+        speed_mode="steady",
+        note_delay_seconds=1,
+        random_delay_min_seconds=1,
+        random_delay_max_seconds=1,
+    ) == 2
+
+
+def test_rate_limit_recovery_escalates_spacing_and_resets_after_stable_successes() -> None:
+    recovery = body_completion.RateLimitRecovery(
+        initial_delay_seconds=0,
+        max_delay_seconds=0,
+        max_retries=2,
+        recovery_spacing_seconds=5,
+        max_recovery_spacing_seconds=20,
+        stable_successes=2,
+    )
+
+    first = recovery.register_rate_limit()
+    assert first == {
+        "recoverable": True,
+        "attempt": 1,
+        "maxRetries": 2,
+        "waitSeconds": 0,
+    }
+    assert recovery.next_spacing() == 5
+    assert recovery.observe_success() is False
+    assert recovery.observe_success() is True
+    assert recovery.next_spacing() == 0
+
+    recovery.register_rate_limit()
+    second = recovery.register_rate_limit()
+    assert second["recoverable"] is True
+    assert second["attempt"] == 2
+    assert recovery.next_spacing() == 10
+    exhausted = recovery.register_rate_limit()
+    assert exhausted["recoverable"] is False
+    assert recovery.snapshot()["exhausted"] is True
+
+
+def test_lightweight_detail_page_blocks_only_heavy_resources() -> None:
+    decisions: dict[str, str] = {}
+
+    class FakeRequest:
+        def __init__(self, resource_type: str) -> None:
+            self.resource_type = resource_type
+
+    class FakeRoute:
+        def __init__(self, resource_type: str) -> None:
+            self.request = FakeRequest(resource_type)
+
+        def abort(self) -> None:
+            decisions[self.request.resource_type] = "abort"
+
+        def continue_(self) -> None:
+            decisions[self.request.resource_type] = "continue"
+
+    class FakePage:
+        handler = None
+
+        def route(self, pattern: str, handler) -> None:
+            assert pattern == "**/*"
+            self.handler = handler
+
+    page = FakePage()
+    body_completion.configure_lightweight_detail_page(page)
+    assert page.handler is not None
+
+    for resource_type in ("image", "media", "font", "script", "xhr", "document"):
+        page.handler(FakeRoute(resource_type))
+
+    assert decisions == {
+        "image": "abort",
+        "media": "abort",
+        "font": "abort",
+        "script": "continue",
+        "xhr": "continue",
+        "document": "continue",
+    }
+
+
+def test_body_completion_reuses_complete_bodies_from_sibling_jobs(tmp_path: Path) -> None:
+    jobs_root = tmp_path / "data" / "jobs"
+    current = jobs_root / "current-job" / "artifacts"
+    previous = jobs_root / "previous-job" / "artifacts"
+    current.mkdir(parents=True)
+    previous.mkdir(parents=True)
+    (current / "xiaohongshu_cards_latest.json").write_text(
+        json.dumps(cards("n1", "n2")),
+        encoding="utf-8",
+    )
+    (current / "xiaohongshu_notes_latest.json").write_text(
+        json.dumps([{
+            "note_id": "n1",
+            "note_url": "https://example.test/explore/n1",
+            "title": "current",
+            "body": "current body",
+            "access_status": "detail_ok",
+        }]),
+        encoding="utf-8",
+    )
+    (previous / "xiaohongshu_notes_latest.json").write_text(
+        json.dumps([{
+            "note_id": "n2",
+            "note_url": "https://example.test/explore/n2",
+            "title": "cached",
+            "body": "cached full body",
+            "access_status": "detail_ok",
+            "scraped_at": "2026-08-02T10:00:00",
+        }]),
+        encoding="utf-8",
+    )
+
+    summary = body_completion.complete_bodies(
+        current,
+        relay_port=18792,
+        workers=1,
+        attempts=1,
+        upstream_scraper=tmp_path / "browser-must-not-start.py",
+    )
+
+    notes = json.loads((current / "xiaohongshu_notes_latest.json").read_text(encoding="utf-8"))
+    reused = next(record for record in notes if record["note_id"] == "n2")
+    ledger = load_ledger(current / LEDGER_FILENAME)
+    assert summary["passed"] is True
+    assert summary["completeBodies"] == 2
+    assert summary["bodyCache"]["reusedBodies"] == 1
+    assert summary["bodyCache"]["networkRequestsAvoided"] == 1
+    assert reused["body"] == "cached full body"
+    assert reused["body_cache_hit"] is True
+    assert reused["body_cache_source_job"] == "previous-job"
+    assert reused["body_cache_original_scraped_at"] == "2026-08-02T10:00:00"
+    assert ledger is not None
+    assert ledger["records"]["n2"]["status"] == "succeeded"
+
+
+def test_body_cache_reuse_excludes_incomplete_and_expired_records(tmp_path: Path) -> None:
+    jobs_root = tmp_path / "data" / "jobs"
+    current = jobs_root / "current-job" / "artifacts"
+    incomplete = jobs_root / "incomplete-job" / "artifacts"
+    expired = jobs_root / "expired-job" / "artifacts"
+    current.mkdir(parents=True)
+    incomplete.mkdir(parents=True)
+    expired.mkdir(parents=True)
+    incomplete_path = incomplete / "xiaohongshu_notes_latest.json"
+    expired_path = expired / "xiaohongshu_notes_latest.json"
+    incomplete_path.write_text(
+        json.dumps([{
+            "note_id": "n1",
+            "body": "card text only",
+            "access_status": "detail_unavailable",
+        }]),
+        encoding="utf-8",
+    )
+    expired_path.write_text(
+        json.dumps([{
+            "note_id": "n2",
+            "body": "old full body",
+            "access_status": "detail_ok",
+        }]),
+        encoding="utf-8",
+    )
+    old_timestamp = time.time() - (31 * 86400)
+    os.utime(expired_path, (old_timestamp, old_timestamp))
+
+    reusable, stats = body_completion.load_reusable_body_records(
+        current,
+        {"n1", "n2"},
+        max_age_days=30,
+    )
+
+    assert reusable == {}
+    assert stats["eligibleBodies"] == 0
+
+
+def test_cache_only_recency_scope_reduces_network_queue_and_can_expand(tmp_path: Path) -> None:
+    jobs_root = tmp_path / "data" / "jobs"
+    current = jobs_root / "current-job" / "artifacts"
+    previous = jobs_root / "previous-job" / "artifacts"
+    current.mkdir(parents=True)
+    previous.mkdir(parents=True)
+    scoped_cards = [
+        {**cards("recent")[0], "publish_time": "08-01"},
+        {**cards("cached")[0], "publish_time": "07-31"},
+        {**cards("old")[0], "publish_time": "07-01"},
+        {**cards("unknown")[0], "publish_time": ""},
+    ]
+    cards_path = current / "xiaohongshu_cards_latest.json"
+    cards_path.write_text(json.dumps(scoped_cards), encoding="utf-8")
+    collected_at = datetime(2026, 8, 2, 12, 0).timestamp()
+    os.utime(cards_path, (collected_at, collected_at))
+    (current / "xiaohongshu_notes_latest.json").write_text(
+        json.dumps([{
+            "note_id": "recent",
+            "note_url": "https://example.test/explore/recent",
+            "title": "current",
+            "body": "current body",
+            "access_status": "detail_ok",
+        }]),
+        encoding="utf-8",
+    )
+    (previous / "xiaohongshu_notes_latest.json").write_text(
+        json.dumps([{
+            "note_id": "cached",
+            "note_url": "https://example.test/explore/cached",
+            "title": "cached",
+            "body": "cached body",
+            "access_status": "detail_ok",
+        }]),
+        encoding="utf-8",
+    )
+    BodyCompletionLedger.open(current, scoped_cards)
+
+    summary = body_completion.complete_bodies(
+        current,
+        relay_port=18792,
+        max_age_days=14,
+        cache_only=True,
+        upstream_scraper=tmp_path / "browser-must-not-start.py",
+    )
+
+    assert summary["scope"]["maxAgeDays"] == 14
+    assert summary["scope"]["sourceCards"] == 4
+    assert summary["scope"]["eligibleCards"] == 3
+    assert summary["scope"]["excludedOlderCards"] == 1
+    assert summary["scope"]["unknownDateCards"] == 1
+    assert summary["scope"]["referenceTime"].startswith("2026-08-02T12:00:00")
+    assert summary["scope"]["outOfScopeArtifact"] == "xiaohongshu_cards_out_of_scope.json"
+    assert summary["completeBodies"] == 2
+    assert summary["missingBodies"] == 1
+    assert summary["bodyCache"]["networkRequestsAvoided"] == 1
+    assert summary["bodySucceeded"] == 2
+    assert summary["bodyNotAttempted"] == 1
+    assert [item["note_id"] for item in json.loads(cards_path.read_text(encoding="utf-8"))] == [
+        "recent", "cached", "unknown",
+    ]
+    assert [item["note_id"] for item in json.loads((current / "xiaohongshu_cards_out_of_scope.json").read_text(encoding="utf-8"))] == ["old"]
+
+    expanded = body_completion.complete_bodies(
+        current,
+        relay_port=18792,
+        max_age_days=0,
+        cache_only=True,
+        upstream_scraper=tmp_path / "browser-must-not-start.py",
+    )
+    assert expanded["cards"] == 4
+    assert expanded["scope"]["excludedOlderCards"] == 0
+    assert not (current / "xiaohongshu_cards_out_of_scope.json").exists()
 
 
 def finish(
@@ -237,6 +561,25 @@ def test_restart_recovers_in_flight_and_queued_records_without_double_counting(t
 
     restarted_again = BodyCompletionLedger.open(tmp_path, cards("in-flight", "queued", "done"))
     assert restarted_again.records["in-flight"]["attemptCount"] == 1
+
+
+def test_scope_change_archives_and_restores_ledger_records(tmp_path: Path) -> None:
+    all_cards = cards("recent", "old")
+    initial = BodyCompletionLedger.open(tmp_path, all_cards)
+    finish(initial, "old", "failed", reason="detail_timeout", recoverable=True)
+
+    scoped = BodyCompletionLedger.open(tmp_path, cards("recent"))
+    scoped_payload = scoped.snapshot()
+    assert set(scoped_payload["records"]) == {"recent"}
+    assert scoped_payload["summary"]["discoveredCount"] == 1
+    assert scoped_payload["scopeExcludedRecords"]["old"]["attemptCount"] == 1
+
+    restored = BodyCompletionLedger.open(tmp_path, all_cards)
+    restored_payload = restored.snapshot()
+    assert set(restored_payload["records"]) == {"recent", "old"}
+    assert restored_payload["records"]["old"]["bodyStatus"] == "failed"
+    assert restored_payload["records"]["old"]["attemptCount"] == 1
+    assert restored_payload["scopeExcludedRecords"] == {}
 
 
 def test_discovery_observer_does_not_reclassify_live_attempt(tmp_path: Path) -> None:
@@ -572,3 +915,248 @@ def test_body_completion_retries_same_card_after_playwright_page_failure(
     assert summary["bodyAttempted"] == 1
     assert summary["bodySucceeded"] == 1
     assert summary["passed"] is True
+
+
+def test_failed_retry_reuses_the_replacement_page_without_second_recycle(
+    tmp_path: Path,
+) -> None:
+    created_pages: list[object] = []
+    scrape_calls = 0
+
+    class FakeBody:
+        def inner_text(self, **_kwargs) -> str:
+            return ""
+
+    class FakePage:
+        def close(self) -> None:
+            return None
+
+        def locator(self, selector: str) -> FakeBody:
+            assert selector == "body"
+            return FakeBody()
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            page = FakePage()
+            created_pages.append(page)
+            return page
+
+    class FakePlaywright:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeUpstream:
+        @staticmethod
+        def connect_browser(_playwright, _relay_port: int):
+            return object()
+
+        @staticmethod
+        def get_or_create_context(_browser):
+            return FakeContext()
+
+        @staticmethod
+        def scrape_note(_page, card, **_kwargs):
+            nonlocal scrape_calls
+            scrape_calls += 1
+            return FakeNote(
+                note_id=card["note_id"],
+                note_url=card["note_url"],
+                title="still unavailable",
+                body="",
+                access_status=("detail_playwright_error" if scrape_calls == 1 else "detail_empty"),
+                source_marker="fixture",
+            )
+
+    playwright_package = types.ModuleType("playwright")
+    playwright_sync = types.ModuleType("playwright.sync_api")
+    playwright_sync.sync_playwright = FakePlaywright
+    (tmp_path / "xiaohongshu_cards_latest.json").write_text(
+        json.dumps(cards("n1")),
+        encoding="utf-8",
+    )
+
+    with mock.patch.object(body_completion, "load_upstream", return_value=FakeUpstream()), mock.patch.dict(
+        sys.modules,
+        {"playwright": playwright_package, "playwright.sync_api": playwright_sync},
+    ):
+        summary = body_completion.complete_bodies(
+            tmp_path,
+            relay_port=18792,
+            workers=1,
+            attempts=1,
+            speed_mode="steady",
+            note_delay_seconds=0,
+            upstream_scraper=tmp_path / "fake-upstream.py",
+        )
+
+    assert scrape_calls == 2
+    assert len(created_pages) == 2
+    assert summary["bodyFailed"] == 1
+
+
+def test_body_completion_recovers_rate_limit_inside_same_task(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scrape_calls: list[str] = []
+
+    class FakePage:
+        def close(self) -> None:
+            return None
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakePlaywright:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeUpstream:
+        @staticmethod
+        def connect_browser(_playwright, _relay_port: int):
+            return object()
+
+        @staticmethod
+        def get_or_create_context(_browser):
+            return FakeContext()
+
+        @staticmethod
+        def scrape_note(_page, card, **_kwargs):
+            note_id = card["note_id"]
+            scrape_calls.append(note_id)
+            if note_id == "n1" and scrape_calls.count("n1") == 1:
+                return FakeNote(
+                    note_id=note_id,
+                    note_url=card["note_url"],
+                    title="rate limited",
+                    body="",
+                    access_status="detail_rate_limited",
+                    source_marker="fixture",
+                )
+            return FakeNote(
+                note_id=note_id,
+                note_url=card["note_url"],
+                title="recovered",
+                body=f"full body for {note_id}",
+                access_status="detail_ok",
+                source_marker="fixture",
+            )
+
+    playwright_package = types.ModuleType("playwright")
+    playwright_sync = types.ModuleType("playwright.sync_api")
+    playwright_sync.sync_playwright = FakePlaywright
+    (tmp_path / "xiaohongshu_cards_latest.json").write_text(
+        json.dumps(cards("n1", "n2")),
+        encoding="utf-8",
+    )
+
+    with mock.patch.object(body_completion, "load_upstream", return_value=FakeUpstream()), mock.patch.dict(
+        sys.modules,
+        {"playwright": playwright_package, "playwright.sync_api": playwright_sync},
+    ):
+        summary = body_completion.complete_bodies(
+            tmp_path,
+            relay_port=18792,
+            workers=1,
+            attempts=1,
+            speed_mode="steady",
+            note_delay_seconds=0,
+            rate_limit_initial_delay_seconds=0,
+            rate_limit_max_delay_seconds=0,
+            rate_limit_recovery_spacing_seconds=0,
+            rate_limit_max_recovery_spacing_seconds=0,
+            rate_limit_stable_successes=1,
+            upstream_scraper=tmp_path / "fake-upstream.py",
+        )
+
+    output = capsys.readouterr().out
+    ledger = load_ledger(tmp_path / LEDGER_FILENAME)
+    assert scrape_calls == ["n1", "n2", "n1"]
+    assert "BODY_RATE_LIMIT cooldown attempt=1/6 wait=0.0s note=n1" in output
+    assert "BODY_RATE_LIMIT probe attempt=1/6" in output
+    assert "BODY_RATE_LIMIT cleared stable_successes=1" in output
+    assert "RATE_LIMIT detected; stopping" not in output
+    assert summary["passed"] is True
+    assert summary["rateLimit"]["status"] == "cleared"
+    assert summary["rateLimit"]["detectedCount"] == 1
+    assert summary["queueConsumptionStopped"] is False
+    assert ledger is not None
+    assert ledger["records"]["n1"]["attemptCount"] == 2
+    assert ledger["records"]["n2"]["attemptCount"] == 1
+
+
+def test_body_completion_delegates_url_fallback_once_to_upstream(tmp_path: Path) -> None:
+    scrape_calls: list[dict[str, str]] = []
+
+    class FakePage:
+        def close(self) -> None:
+            return None
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakePlaywright:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeUpstream:
+        @staticmethod
+        def connect_browser(_playwright, _relay_port: int):
+            return object()
+
+        @staticmethod
+        def get_or_create_context(_browser):
+            return FakeContext()
+
+        @staticmethod
+        def scrape_note(_page, card, **_kwargs):
+            scrape_calls.append(card)
+            return FakeNote(
+                note_id=card["note_id"],
+                note_url=card["note_url"],
+                title="unavailable",
+                body="",
+                access_status="detail_unavailable",
+                source_marker="upstream-owned-fallback",
+            )
+
+    playwright_package = types.ModuleType("playwright")
+    playwright_sync = types.ModuleType("playwright.sync_api")
+    playwright_sync.sync_playwright = FakePlaywright
+    imported = [{
+        "note_id": "n1",
+        "search_result_url": "https://example.test/search_result/n1?xsec_token=token",
+        "note_url": "https://example.test/search_result/n1?xsec_token=token",
+        "explore_url": "https://example.test/explore/n1",
+    }]
+    (tmp_path / "xiaohongshu_cards_latest.json").write_text(json.dumps(imported), encoding="utf-8")
+
+    with mock.patch.object(body_completion, "load_upstream", return_value=FakeUpstream()), mock.patch.dict(
+        sys.modules,
+        {"playwright": playwright_package, "playwright.sync_api": playwright_sync},
+    ):
+        summary = body_completion.complete_bodies(
+            tmp_path,
+            relay_port=18792,
+            workers=1,
+            attempts=1,
+            speed_mode="steady",
+            note_delay_seconds=0,
+            upstream_scraper=tmp_path / "fake-upstream.py",
+        )
+
+    assert len(scrape_calls) == 1
+    assert scrape_calls[0]["explore_url"].endswith("/explore/n1")
+    assert summary["bodyAttempted"] == 1
+    assert summary["bodyFailed"] == 1

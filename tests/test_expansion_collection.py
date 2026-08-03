@@ -183,6 +183,28 @@ def test_one_round_expands_only_seed_commenters(tmp_path):
     }
 
 
+def test_preloaded_seed_comments_fill_frontier_before_live_refresh(tmp_path):
+    adapter = FakeExpansionAdapter(comments_by_post={"seed": []}, posts_by_user={"A": [], "B": []})
+    output = tmp_path / "preloaded" / "artifacts"
+    summary = collect_expansion(
+        output,
+        config=config(1),
+        adapter=adapter,
+        seed_posts=[seed("seed")],
+        seed_comments_by_post={"seed": [comment("stored-a", "A"), comment("stored-b", "B")]},
+    )
+
+    assert adapter.post_calls == ["seed"]
+    assert adapter.expand_calls == ["A", "B"]
+    assert summary["counters"]["users"] == 2
+    assert summary["counters"]["comments"] == 2
+    seed_node = next(
+        item for item in read_json(output / "graph.json")["nodes"]
+        if item["type"] == "Post" and item["postId"] == "seed"
+    )
+    assert seed_node["commentsSucceeded"] == 2
+
+
 def test_two_rounds_expand_the_next_unique_frontier(tmp_path):
     adapter = FakeExpansionAdapter(
         comments_by_post={
@@ -302,6 +324,21 @@ def test_total_entity_budgets_stop_at_the_cap(tmp_path, name, limits, expected_r
         assert post_node["hasMore"] is True
 
 
+def test_user_budget_keeps_already_queued_users_running(tmp_path):
+    adapter = FakeExpansionAdapter(
+        comments_by_post={"seed": [comment("a", "A"), comment("b", "B")]},
+        posts_by_user={"A": []},
+    )
+    _, summary = run_fixture(
+        tmp_path, "soft-user-budget", adapter, [seed("seed")],
+        rounds=1, maxTotalUsers=1,
+    )
+
+    assert adapter.expand_calls == ["A"]
+    assert summary["counters"]["expandedUsers"] == 1
+    assert summary["stopReason"] == "user_budget_reached"
+
+
 def test_time_budget_stops_before_the_next_scheduled_operation(tmp_path):
     class Clock:
         def __init__(self):
@@ -341,6 +378,82 @@ def test_interrupted_round_resumes_without_reexpanding_completed_users(tmp_path)
     assert resumed["stopReason"] == "rounds_completed"
     assert resumed["counters"]["users"] >= before["users"]
     assert resumed["counters"] == {"users": 4, "posts": 3, "comments": 4, "expandedUsers": 2, "crawledPosts": 3}
+
+
+def test_new_attempt_recollects_selected_posts_and_keeps_accumulated_graph(tmp_path):
+    first = FakeExpansionAdapter(comments_by_post={
+        "seed-1": [comment("first-comment", "first-user")],
+    })
+    output, initial = run_fixture(tmp_path, "new-attempt", first, [seed("seed-1")])
+    assert first.post_calls == ["seed-1"]
+    assert initial["attemptId"] == "new-attempt"
+
+    second = FakeExpansionAdapter(comments_by_post={
+        "seed-1": [comment("refreshed-comment", "refreshed-user")],
+        "seed-2": [comment("second-comment", "second-user")],
+    })
+    refreshed = collect_expansion(
+        output,
+        config=config(0),
+        adapter=second,
+        seed_posts=[seed("seed-1"), seed("seed-2")],
+        keyword="fixture",
+        attempt_id="attempt-2",
+        new_attempt=True,
+    )
+
+    graph = read_json(output / "graph.json")
+    assert second.post_calls == ["seed-1", "seed-2"]
+    assert refreshed["attemptId"] == "attempt-2"
+    assert refreshed["seedPostIds"] == ["seed-1", "seed-2"]
+    assert refreshed["failureCount"] == 0
+    assert {item["postId"] for item in graph["nodes"] if item["type"] == "Post"} == {"seed-1", "seed-2"}
+    assert {item["commentId"] for item in graph["nodes"] if item["type"] == "Comment"} == {
+        "first-comment", "refreshed-comment", "second-comment",
+    }
+
+
+def test_new_attempt_resets_failure_budget_before_opening_relay(tmp_path):
+    failed = FakeExpansionAdapter(
+        comments_by_post={"seed-1": [comment("failed-comment", "failed-user")]},
+        failed_users={"failed-user"},
+    )
+    output, first = run_fixture(
+        tmp_path, "new-attempt-failure-reset", failed, [seed("seed-1")],
+        rounds=1, maxFailureCount=1,
+    )
+    assert first["failureCount"] == 1
+
+    class OpenFailureAdapter(FakeExpansionAdapter):
+        def open(self):
+            raise RuntimeError("relay fixture unavailable")
+
+    unavailable = collect_expansion(
+        output,
+        config=config(0, maxFailureCount=1),
+        adapter=OpenFailureAdapter(),
+        seed_posts=[seed("seed-2")],
+        attempt_id="attempt-open-failure",
+        new_attempt=True,
+    )
+    frontier = read_json(output / "expansion_frontier.json")
+    assert unavailable["attemptId"] == "attempt-open-failure"
+    assert unavailable["failureCount"] == 0
+    assert frontier["currentFrontier"] == []
+
+    retry = FakeExpansionAdapter(comments_by_post={
+        "seed-2": [comment("retry-comment", "retry-user")],
+    })
+    recovered = collect_expansion(
+        output,
+        config=config(0, maxFailureCount=1),
+        adapter=retry,
+        seed_posts=[seed("seed-2")],
+        attempt_id="attempt-open-failure",
+    )
+    assert retry.post_calls == ["seed-2"]
+    assert recovered["failureCount"] == 0
+    assert recovered["seedPostIds"] == ["seed-2"]
 
 
 def test_security_block_is_checkpointed_without_retry_or_complete_status(tmp_path):

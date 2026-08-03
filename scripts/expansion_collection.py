@@ -192,6 +192,33 @@ class ExpansionStore:
         )
         self.connection.commit()
 
+    def begin_new_attempt(self) -> None:
+        """Reset attempt-local execution state while retaining accumulated entities and relations."""
+        meta = {
+            "seedPostIds": [],
+            "seedInitialized": False,
+            "seedRoundCompleted": False,
+            "currentRoundIndex": 0,
+            "currentOperation": {},
+            "lastSuccessfulAtomicOperation": {},
+            "failureCount": 0,
+            "duplicateUserCount": 0,
+            "fatalError": "",
+        }
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute("DELETE FROM frontier")
+            self.connection.execute("DELETE FROM rounds")
+            self.connection.executemany(
+                "INSERT INTO meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ((key, _json(value)) for key, value in meta.items()),
+            )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def entity(self, kind: str, entity_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT payload FROM entities WHERE kind = ? AND id = ?", (kind, entity_id)
@@ -573,31 +600,43 @@ class ExpansionOrchestrator:
         config: ExpansionConfig,
         adapter: ExpansionAdapter,
         seed_posts: list[dict[str, Any]],
+        seed_comments_by_post: dict[str, list[dict[str, Any]]] | None = None,
         keyword: str = "",
         attempt_id: str = "",
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         materialize_audience_compat: bool = True,
+        new_attempt: bool = False,
     ):
         self.output_dir = output_dir
         self.config = config
         self.adapter = adapter
         self.seed_posts = seed_posts
+        self.seed_comments_by_post = seed_comments_by_post or {}
         self.keyword = keyword
         self.attempt_id = attempt_id
         self.progress_callback = progress_callback
         self.cancel_requested = cancel_requested or (lambda: False)
         self.monotonic = monotonic
         self.materialize_audience_compat = materialize_audience_compat
+        self.new_attempt = new_attempt
         self.started = monotonic()
         self.store = ExpansionStore(output_dir.parent / "expansion-state.sqlite3")
         self.stop_reason = ""
+        self.soft_budget_reason = ""
+        self.comment_budget_post_ids: set[str] = set()
+        self.per_post_budget_post_ids: set[str] = set()
+        self.post_comment_counts: dict[str, int] = {}
         self.failures = int(self.store.get_meta("failureCount", 0))
         self.duplicate_users = int(self.store.get_meta("duplicateUserCount", 0))
 
     def run(self) -> dict[str, Any]:
         try:
+            if self.new_attempt:
+                self.store.begin_new_attempt()
+                self.failures = 0
+                self.duplicate_users = 0
             configure_deadline = getattr(self.adapter, "configure_deadline", None)
             if callable(configure_deadline):
                 configure_deadline(self.started + self.config.time_budget_minutes * 60)
@@ -613,7 +652,7 @@ class ExpansionOrchestrator:
                 self._emit("expansion_round_started", {"roundIndex": round_index})
                 self._run_user_round(round_index)
             if not self.stop_reason:
-                self.stop_reason = "rounds_completed" if self.config.rounds == 0 else "rounds_completed"
+                self.stop_reason = self.soft_budget_reason or "rounds_completed"
         except (KeyboardInterrupt, InterruptedError):
             self.stop_reason = "interrupted"
         except Exception as error:  # noqa: BLE001
@@ -640,10 +679,28 @@ class ExpansionOrchestrator:
             if existing_post is None and self.store.count("Post") >= self.config.max_total_posts:
                 self.stop_reason = "post_budget_reached"
                 break
-            self.store.upsert_entity("Post", post["postId"], post if existing_post is None else {
-                "title": post.get("title") or existing_post.get("title", ""),
-                "postUrl": post.get("postUrl") or existing_post.get("postUrl", ""),
-            })
+            if existing_post is None:
+                post_patch = post
+            else:
+                post_patch = {
+                    "title": post.get("title") or existing_post.get("title", ""),
+                    "postUrl": post.get("postUrl") or existing_post.get("postUrl", ""),
+                }
+                if self.new_attempt:
+                    post_patch.update({
+                        "roundIndex": 0,
+                        "sourceSeedPostId": post["postId"],
+                        "commentStatus": "uncollected",
+                        "commentExecutionStatus": "queued",
+                        "commentsAttempted": 0,
+                        "commentsSucceeded": 0,
+                        "repliesAttempted": 0,
+                        "repliesSucceeded": 0,
+                        "hasMore": False,
+                        "stopReason": "",
+                        "paginationCursor": "",
+                    })
+            self.store.upsert_entity("Post", post["postId"], post_patch)
             seed_ids.append(post["postId"])
             author = raw.get("author") if isinstance(raw.get("author"), dict) else {}
             author_id = str(post.get("authorUserId") or "")
@@ -673,6 +730,7 @@ class ExpansionOrchestrator:
             post = self.store.entity("Post", post_id)
             if not post or post.get("commentExecutionStatus") == "succeeded":
                 continue
+            self._preload_seed_comments(post_id, round_index=0, seed_post_id=post_id)
             attempted += 1
             if self._collect_post(post, round_index=0, seed_post_id=post_id):
                 crawled += 1
@@ -681,7 +739,7 @@ class ExpansionOrchestrator:
         if not self.stop_reason:
             self.store.set_meta("seedRoundCompleted", True)
             if self.config.rounds > 0 and not self.store.frontier(1, limit=1):
-                self.stop_reason = "empty_frontier"
+                self.stop_reason = self.soft_budget_reason or "empty_frontier"
         self._checkpoint(self.stop_reason)
 
     def _run_user_round(self, round_index: int) -> None:
@@ -694,7 +752,7 @@ class ExpansionOrchestrator:
             round_index, states=recoverable, limit=self.config.max_users_per_round
         )
         if not queued:
-            self.stop_reason = "empty_frontier"
+            self.stop_reason = self.soft_budget_reason or "empty_frontier"
             return
         started = self.monotonic()
         counters_before = self._counts()
@@ -781,8 +839,8 @@ class ExpansionOrchestrator:
                     continue
                 existing_post = self.store.entity("Post", post["postId"])
                 if existing_post is None and self.store.count("Post") >= self.config.max_total_posts:
-                    self.stop_reason = "post_budget_reached"
-                    break
+                    self._set_soft_budget("post_budget_reached")
+                    continue
                 self.store.upsert_entity("Post", post["postId"], post if existing_post is None else {
                     "title": post.get("title") or existing_post.get("title", ""),
                     "postUrl": post.get("postUrl") or existing_post.get("postUrl", ""),
@@ -805,7 +863,7 @@ class ExpansionOrchestrator:
             self.store.set_meta("currentOperation", {})
             self._checkpoint(self.stop_reason)
             self._emit("expansion_user_completed", {"userId": user_id, "roundIndex": round_index, "state": final_state})
-        round_stop = self.stop_reason or ("round_user_budget_reached" if skipped_count else "round_completed")
+        round_stop = self.stop_reason or self.soft_budget_reason or ("round_user_budget_reached" if skipped_count else "round_completed")
         self._save_round(
             round_index, frontier_count, attempted_posts, crawled_posts, counters_before,
             started, round_stop, expanded_count, blocked_count, failed_count, duplicate_before,
@@ -846,9 +904,12 @@ class ExpansionOrchestrator:
                 absorbed += 1
             if self.stop_reason:
                 break
-        if self.stop_reason == "comment_budget_reached":
+        if post_id in self.comment_budget_post_ids:
             status = "partial_limit"
             result = {**result, "stopReason": "max_total_comments", "hasMore": True}
+        elif post_id in self.per_post_budget_post_ids:
+            status = "partial_limit"
+            result = {**result, "stopReason": "max_comments_per_post", "hasMore": True}
         execution = (
             "succeeded" if status == "complete_reachable"
             else "blocked" if status == "blocked_verification"
@@ -860,8 +921,11 @@ class ExpansionOrchestrator:
             "Post", post_id,
             commentStatus=status,
             commentExecutionStatus=execution,
-            commentsAttempted=int(result.get("commentsAttempted") or len(comments)),
-            commentsSucceeded=absorbed,
+            commentsAttempted=max(
+                int(existing.get("commentsAttempted") or 0),
+                int(result.get("commentsAttempted") or len(comments)),
+            ),
+            commentsSucceeded=self._comment_count_for_post(post_id),
             repliesAttempted=int(result.get("repliesAttempted") or 0),
             repliesSucceeded=int(result.get("repliesSucceeded") or 0),
             paginationCursor=str(result.get("paginationCursor") or ""),
@@ -892,19 +956,25 @@ class ExpansionOrchestrator:
             "round": round_index, "sourceSeedPostId": seed_post_id,
         }
         existing_comment = self.store.entity("Comment", comment_id)
+        if existing_comment is None and self._comment_count_for_post(post_id) >= self.config.max_comments_per_post:
+            self.per_post_budget_post_ids.add(post_id)
+            return False
         if existing_comment is None and self.store.count("Comment") >= self.config.max_total_comments:
-            self.stop_reason = "comment_budget_reached"
+            self.comment_budget_post_ids.add(post_id)
+            self._set_soft_budget("comment_budget_reached")
             return False
         self.store.upsert_entity("Comment", comment_id, comment if existing_comment is None else {
             "content": comment.get("content") or existing_comment.get("content", ""),
             "publishedAt": comment.get("publishedAt") or existing_comment.get("publishedAt", ""),
         })
+        if existing_comment is None:
+            self.post_comment_counts[post_id] = self._comment_count_for_post(post_id) + 1
         if not user_id:
             return True
         existing = self.store.entity("User", user_id)
         user = self._normalize_user(user_raw, round_index, post_id, comment_id, seed_post_id)
         if existing is None and self.store.count("User") >= self.config.max_total_users:
-            self.stop_reason = "user_budget_reached"
+            self._set_soft_budget("user_budget_reached")
             return True
         if existing is None:
             created = self.store.upsert_entity("User", user_id, user)
@@ -932,6 +1002,38 @@ class ExpansionOrchestrator:
         ):
             self.store.enqueue(round_index + 1, user_id)
         return True
+
+    def _preload_seed_comments(self, post_id: str, *, round_index: int, seed_post_id: str) -> None:
+        comments = self.seed_comments_by_post.get(post_id, [])
+        if not comments:
+            return
+        for raw in comments:
+            self._absorb_comment(raw, post_id, round_index, seed_post_id)
+            if self.stop_reason:
+                break
+        current = self.store.entity("Post", post_id) or {}
+        self.store.update_entity(
+            "Post", post_id,
+            commentsAttempted=max(int(current.get("commentsAttempted") or 0), len(comments)),
+            commentsSucceeded=self._comment_count_for_post(post_id),
+        )
+        self._emit("expansion_seed_comments_preloaded", {
+            "postId": post_id,
+            "available": len(comments),
+            "imported": self._comment_count_for_post(post_id),
+        })
+
+    def _comment_count_for_post(self, post_id: str) -> int:
+        cached = self.post_comment_counts.get(post_id)
+        if cached is not None:
+            return cached
+        count = len(self.store.ids("Comment", lambda item: str(item.get("postId") or "") == post_id))
+        self.post_comment_counts[post_id] = count
+        return count
+
+    def _set_soft_budget(self, reason: str) -> None:
+        if not self.soft_budget_reason:
+            self.soft_budget_reason = reason
 
     def _normalize_user(self, raw: dict[str, Any], round_index: int, post_id: str, comment_id: str, seed_post_id: str) -> dict[str, Any]:
         normalized = audience.normalize_user(raw)
@@ -1121,8 +1223,12 @@ class ExpansionOrchestrator:
         complete_profiles = len(self.store.ids(
             "User", lambda item: item.get("profileStatus") == "completed"
         ))
+        generated_at = utc_now()
         return {
             "schemaVersion": SCHEMA_VERSION, "status": status, "enabled": True,
+            "attemptId": self.attempt_id,
+            "seedPostIds": self.store.get_meta("seedPostIds", []),
+            "config": self.config.public(),
             "maxRounds": self.config.rounds, "completedRounds": max(0, len(self.store.round_summaries()) - 1),
             "stopReason": stop_reason, "budgets": self.config.public(), "counters": counts,
             "postsTotal": counts["posts"], "postsComplete": counts["crawledPosts"],
@@ -1140,7 +1246,7 @@ class ExpansionOrchestrator:
             "postCoveragePercent": round((counts["crawledPosts"] / counts["posts"]) * 100, 2) if counts["posts"] else 0,
             "postAttemptPercent": round((attempted_posts / counts["posts"]) * 100, 2) if counts["posts"] else 0,
             "profileCoveragePercent": round((complete_profiles / counts["users"]) * 100, 2) if counts["users"] else 0,
-            "effectiveConcurrency": 1, "generatedAt": utc_now(),
+            "effectiveConcurrency": 1, "updatedAt": generated_at, "generatedAt": generated_at,
         }
 
     def _export_artifacts(self) -> dict[str, Any]:
@@ -1243,8 +1349,10 @@ def collect_expansion(
     cancel_requested: Callable[[], bool] | None = None,
     adapter: ExpansionAdapter | None = None,
     seed_posts: list[dict[str, Any]] | None = None,
+    seed_comments_by_post: dict[str, list[dict[str, Any]]] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     materialize_audience_compat: bool = True,
+    new_attempt: bool = False,
 ) -> dict[str, Any]:
     expansion = ExpansionConfig.from_dict(config)
     if not expansion.enabled:
@@ -1258,8 +1366,10 @@ def collect_expansion(
     orchestrator = ExpansionOrchestrator(
         output_dir=output_dir, config=expansion, adapter=production_adapter,
         seed_posts=seed_posts if seed_posts is not None else _seed_posts(output_dir, checkpoint_dirs),
+        seed_comments_by_post=seed_comments_by_post,
         keyword=keyword, attempt_id=attempt_id, progress_callback=progress_callback,
         cancel_requested=cancel_requested, monotonic=monotonic,
         materialize_audience_compat=materialize_audience_compat,
+        new_attempt=new_attempt,
     )
     return orchestrator.run()

@@ -120,10 +120,7 @@ export function validateRunRequest(value) {
     throw fieldError('randomDelayMaxSeconds', 'must_be_greater_than_or_equal_to_randomDelayMinSeconds');
   }
 
-  // Validate the legacy field so malformed clients still receive a useful
-  // response, then normalize collection to lossless discovery. Recency is a
-  // result-view filter and must never delete cards before body collection.
-  integerField(value.maxAgeDays, 'maxAgeDays', 0, 0, 365);
+  const maxAgeDays = integerField(value.maxAgeDays, 'maxAgeDays', 14, 0, 365);
 
   return Object.freeze({
     analysisMode,
@@ -131,7 +128,7 @@ export function validateRunRequest(value) {
     contentPreset,
     contentGoal,
     searchSort,
-    maxAgeDays: 0,
+    maxAgeDays,
     browserProfile,
     relayPort: integerField(value.relayPort, 'relayPort', 18800, 1, 65535),
     // Every production run must collect the body for every discovered card.
@@ -298,6 +295,16 @@ function boundedCandidateString(value, field, defaultValue, max) {
 }
 
 export function buildRunnerArgs(params, outputDir, execution = null) {
+  const importedBodyMode = Number(params.importedBodyCount || 0) > 0;
+  const noteDelaySeconds = importedBodyMode
+    ? Math.max(Number(params.noteDelaySeconds || 0), 1.2)
+    : params.noteDelaySeconds;
+  const randomDelayMinSeconds = importedBodyMode
+    ? Math.max(Number(params.randomDelayMinSeconds || 0), 0.8)
+    : params.randomDelayMinSeconds;
+  const randomDelayMaxSeconds = importedBodyMode
+    ? Math.max(Number(params.randomDelayMaxSeconds || 0), randomDelayMinSeconds, 2.4)
+    : params.randomDelayMaxSeconds;
   const args = [
     '--analysis-mode', params.analysisMode,
     '--keyword', params.audienceOnly ? '' : params.keyword,
@@ -305,26 +312,49 @@ export function buildRunnerArgs(params, outputDir, execution = null) {
     '--content-goal', params.contentGoal,
     '--output-dir', outputDir,
     '--search-sort', 'latest',
-    '--max-age-days', '0',
+    '--max-age-days', String(params.maxAgeDays),
     '--browser-profile', params.browserProfile,
     '--relay-port', String(params.relayPort),
     '--limit', String(params.limit),
     '--max-scrolls', String(params.maxScrolls),
     '--stable-rounds', String(params.stableRounds),
     '--goto-timeout-ms', String(params.gotoTimeoutMs),
-    '--note-delay-seconds', String(params.noteDelaySeconds),
+    '--note-delay-seconds', String(noteDelaySeconds),
     '--speed-mode', params.speedMode,
-    '--random-delay-min-seconds', String(params.randomDelayMinSeconds),
-    '--random-delay-max-seconds', String(params.randomDelayMaxSeconds),
+    '--random-delay-min-seconds', String(randomDelayMinSeconds),
+    '--random-delay-max-seconds', String(randomDelayMaxSeconds),
     params.mode === 'resume' ? '--resume' : '--fresh',
     '--security-verification-timeout-seconds', String(params.securityVerificationTimeoutSeconds),
     '--codex-batch-size', String(params.codexBatchSize),
     '--codex-timeout-seconds', String(params.codexTimeoutSeconds),
     '--cover-letter-threshold', String(params.coverLetterThreshold),
     '--cover-letter-max-attempts', String(params.coverLetterMaxAttempts),
+    '--rate-limit-auto-recovery',
+    '--rate-limit-initial-delay-seconds', '120',
+    '--rate-limit-max-delay-seconds', '900',
+    '--rate-limit-max-retries', '6',
+    '--rate-limit-recovery-spacing-seconds', '30',
+    '--rate-limit-max-recovery-spacing-seconds', '120',
+    '--rate-limit-stable-successes', '3',
+    '--reuse-body-cache',
+    '--body-cache-max-age-days', '30',
   ];
+  if (importedBodyMode) {
+    args.push(
+      '--page-recovery-delay-seconds', '0.5',
+      '--body-batch-size', '6',
+      '--body-batch-pause-min-seconds', '8',
+      '--body-batch-pause-max-seconds', '15',
+      '--proactive-rest-every', '120',
+      '--proactive-rest-seconds', '600',
+      '--adaptive-pacing',
+      '--adaptive-max-delay-seconds', '20',
+      '--block-heavy-resources',
+    );
+  }
   args.push(params.useCodexRuntime ? '--codex-runtime' : '--no-codex-runtime');
   if (params.completeMissingOnly) args.push('--complete-missing-only');
+  if (params.bodyOnly) args.push('--body-only');
   args.push(params.collectAudience ? '--collect-audience' : '--no-collect-audience');
   if (params.expansion?.enabled) {
     args.push('--expansion-config-json', JSON.stringify(params.expansion));

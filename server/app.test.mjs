@@ -102,6 +102,10 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       expansionCalls.push(['start', id, request]);
       return { job: { ...job, workflowSummary: { expansion: { runtimeStatus: 'running', seedPostIds: request.seedPostIds, config: request.config } } }, attemptId: 'expansion-1' };
     },
+    createExpansionAttempt: async (id, request) => {
+      expansionCalls.push(['attempt', id, request]);
+      return { job: { ...job, workflowSummary: { expansion: { runtimeStatus: 'running', seedPostIds: request.seedPostIds, config: request.config } } }, attemptId: 'expansion-2' };
+    },
     resumeExpansion: async (id, request) => {
       expansionCalls.push(['resume', id, request]);
       return { job: { ...job, workflowSummary: { expansion: { runtimeStatus: 'running', seedPostIds: ['n1'], config: { rounds: 1 } } } }, attemptId: 'expansion-2' };
@@ -474,9 +478,26 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(foreignSeed.status, 400);
     assert.equal(expansionCalls.length, 1);
 
+    const expansionAttempt = await fetch(`${origin}/api/jobs/${job.id}/expansion/attempts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seedPostIds: ['n1'], config: { rounds: 2 } }),
+    });
+    assert.equal(expansionAttempt.status, 202);
+    assert.equal((await expansionAttempt.json()).attemptId, 'expansion-2');
+    assert.deepEqual(expansionCalls[1].slice(0, 2), ['attempt', job.id]);
+
+    const foreignAttempt = await fetch(`${origin}/api/jobs/${job.id}/expansion/attempts`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seedPostIds: ['foreign-post'], config: { rounds: 1 } }),
+    });
+    assert.equal(foreignAttempt.status, 400);
+    assert.equal(expansionCalls.length, 2);
+
     assert.equal((await fetch(`${origin}/api/jobs/${job.id}/expansion/resume`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"retryIncomplete":true}' })).status, 202);
     assert.equal((await fetch(`${origin}/api/jobs/${job.id}/expansion/cancel`, { method: 'POST' })).status, 202);
-    assert.deepEqual(expansionCalls.map((item) => item[0]), ['start', 'resume', 'cancel']);
+    assert.deepEqual(expansionCalls.map((item) => item[0]), ['start', 'attempt', 'resume', 'cancel']);
 
     const audienceResume = await fetch(`${origin}/api/jobs/${job.id}/audience/resume`, { method: 'POST' });
     assert.equal(audienceResume.status, 200);

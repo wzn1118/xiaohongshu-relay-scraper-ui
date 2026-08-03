@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 
 export const SMTP_PROVIDER_PRESETS = Object.freeze({
   '163': Object.freeze({ host: 'smtp.163.com', port: 465, secure: true, requireTls: false }),
@@ -59,13 +59,16 @@ export class SmtpConfigStore {
     this.verificationStatus = 'unverified';
     this.verificationFailureCode = '';
     this.configurationUpdatedAt = '';
+    this.credentialErrorCode = '';
     this.mutationQueue = Promise.resolve();
   }
 
   async initialize() {
     await mkdir(path.dirname(this.filePath), { recursive: true });
+    let saved = null;
+    this.credentialErrorCode = '';
     try {
-      const saved = JSON.parse(await readFile(this.filePath, 'utf8'));
+      saved = JSON.parse(await readFile(this.filePath, 'utf8'));
       const legacySecrets = extractSecrets(saved);
       const defaultsSecrets = extractSecrets(this.defaults);
       const encryptedSecrets = saved.credentialVault
@@ -112,9 +115,36 @@ export class SmtpConfigStore {
         await this.persist();
       }
     } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
+      if (error.code === 'ENOENT') return this.getPublic();
+      if (!isRecoverableCredentialError(error)) throw error;
+      this.restoreCredentialRecoveryState(saved, error.code);
     }
     return this.getPublic();
+  }
+
+  restoreCredentialRecoveryState(saved, errorCode) {
+    const source = saved && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+    this.value = normalizeSmtpConfig({
+      ...this.defaults,
+      ...source,
+      pass: '',
+      oauth: {
+        ...this.defaults.oauth,
+        ...source.oauth,
+        clientSecret: '',
+        refreshToken: '',
+      },
+    }, { allowEmpty: true });
+    this.revision = normalizeRevision(source.revision, 1);
+    this.credentialRevision = normalizeRevision(source.credentialRevision, 0);
+    this.configHash = smtpConfigHash(this.value);
+    this.verifiedConfigHash = '';
+    this.verifiedCredentialRevision = null;
+    this.verifiedAt = '';
+    this.verificationStatus = 'unverified';
+    this.verificationFailureCode = '';
+    this.configurationUpdatedAt = normalizeTimestamp(source.configurationUpdatedAt);
+    this.credentialErrorCode = String(errorCode);
   }
 
   getForMailer() {
@@ -184,6 +214,11 @@ export class SmtpConfigStore {
   getPublic() {
     const { pass, oauth, lastVerifiedAt: _lastVerifiedAt, ...value } = this.value;
     const verification = this.getVerificationState();
+    const credentialStatus = this.credentialErrorCode
+      ? 'error'
+      : hasRuntimeCredential(this.value)
+        ? 'available'
+        : 'empty';
     return {
       ...value,
       revision: this.revision,
@@ -197,6 +232,9 @@ export class SmtpConfigStore {
       credentialRevision: this.credentialRevision,
       verified: verification.verificationStatus === 'verified',
       hasPassword: Boolean(pass),
+      credentialStatus,
+      credentialErrorCode: this.credentialErrorCode,
+      resetRequired: credentialStatus === 'error',
       oauth: {
         tenant: oauth.tenant,
         clientId: oauth.clientId,
@@ -244,6 +282,7 @@ export class SmtpConfigStore {
         credentialRevision: credentialChanged ? this.credentialRevision + 1 : this.credentialRevision,
         configurationUpdatedAt: changed ? new Date(this.clock()).toISOString() : this.configurationUpdatedAt,
         invalidateVerification: changed,
+        clearCredentialError: true,
       });
       return this.getPublic();
     });
@@ -257,13 +296,16 @@ export class SmtpConfigStore {
         credentialRevision: this.credentialRevision + 1,
         configurationUpdatedAt: new Date(this.clock()).toISOString(),
         invalidateVerification: true,
+        clearCredentialError: true,
       });
+      await this.removeCredentialKey();
       return this.getPublic();
     });
   }
 
   async markVerified(expected = this.getVerificationSnapshot()) {
     return this.enqueueMutation(async () => {
+      if (this.credentialErrorCode) return this.getPublic();
       const snapshot = normalizeExpectedSnapshot(expected, this.credentialRevision);
       if (snapshot.configHash !== this.configHash || snapshot.credentialRevision !== this.credentialRevision) {
         throw conflict(this.revision);
@@ -288,6 +330,7 @@ export class SmtpConfigStore {
 
   async markVerificationFailed(expected, failureCode = 'SMTP_VERIFICATION_FAILED') {
     return this.enqueueMutation(async () => {
+      if (this.credentialErrorCode) return this.getPublic();
       const snapshot = normalizeExpectedSnapshot(expected, this.credentialRevision);
       if (snapshot.configHash !== this.configHash || snapshot.credentialRevision !== this.credentialRevision) {
         throw conflict(this.revision);
@@ -315,7 +358,15 @@ export class SmtpConfigStore {
     return result;
   }
 
-  async commit({ value, revision, credentialRevision, configurationUpdatedAt, invalidateVerification = false, verification }) {
+  async commit({
+    value,
+    revision,
+    credentialRevision,
+    configurationUpdatedAt,
+    invalidateVerification = false,
+    verification,
+    clearCredentialError = false,
+  }) {
     const previous = this.snapshotState();
     this.value = cloneConfig(value);
     this.revision = revision;
@@ -330,6 +381,7 @@ export class SmtpConfigStore {
       this.verificationFailureCode = '';
     }
     if (verification) Object.assign(this, verification);
+    if (clearCredentialError) this.credentialErrorCode = '';
     try {
       await this.persist();
     } catch (error) {
@@ -350,7 +402,14 @@ export class SmtpConfigStore {
       verificationStatus: this.verificationStatus,
       verificationFailureCode: this.verificationFailureCode,
       configurationUpdatedAt: this.configurationUpdatedAt,
+      credentialErrorCode: this.credentialErrorCode,
     };
+  }
+
+  async removeCredentialKey() {
+    if (this.credentialKey) this.credentialKey.fill(0);
+    this.credentialKey = null;
+    await rm(this.keyPath, { force: true });
   }
 
   async persist() {
@@ -414,7 +473,7 @@ export class SmtpConfigStore {
         plaintext.fill(0);
       }
     } catch (error) {
-      if (error?.code === 'SMTP_CREDENTIAL_KEY_MISSING') throw error;
+      if (isRecoverableCredentialError(error)) throw error;
       const wrapped = smtpStateError(
         'SMTP_CREDENTIAL_DECRYPT_FAILED',
         '本机 SMTP 凭据无法解密，请恢复对应的本机密钥文件或清除后重新配置。',
@@ -551,6 +610,15 @@ function validateCredentialVault(vault) {
   if (!valid) {
     throw smtpStateError('SMTP_CREDENTIAL_VAULT_INVALID', 'SMTP 本机凭据存储格式无效。');
   }
+}
+
+function isRecoverableCredentialError(error) {
+  return [
+    'SMTP_CREDENTIAL_KEY_MISSING',
+    'SMTP_CREDENTIAL_KEY_INVALID',
+    'SMTP_CREDENTIAL_VAULT_INVALID',
+    'SMTP_CREDENTIAL_DECRYPT_FAILED',
+  ].includes(String(error?.code || ''));
 }
 
 function extractSecrets(value = {}) {

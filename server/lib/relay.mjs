@@ -22,6 +22,7 @@ export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, f
       const targetSummary = relayTargetSummary(tabs);
       return {
         ok: true,
+        ready: tabs.length > 0,
         running: true,
         cdpReady: true,
         authenticated,
@@ -44,6 +45,7 @@ export async function probeRelay({ port, openClawConfigPath, timeoutMs = 2500, f
     const message = publicError(error);
     return {
       ok: false,
+      ready: false,
       running: false,
       cdpReady: false,
       authenticated: false,

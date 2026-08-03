@@ -221,8 +221,9 @@ def test_relay_overload_reset_creates_clean_target_before_closing_old_pages(monk
 
 
 class FakeSortPage:
-    def __init__(self, *, has_filter: bool = True) -> None:
+    def __init__(self, *, has_filter: bool = True, panel_renders: bool = True) -> None:
         self.has_filter = has_filter
+        self.panel_renders = panel_renders
         self.panel_open = False
         self.latest_selected = False
         self.timeouts: list[int] = []
@@ -249,7 +250,7 @@ class FakeSortPage:
         if script == SCRAPER.LATEST_SORT_SELECTED_JS:
             assert self.latest_selected
         elif "Boolean(document.querySelector('.filter-panel'))" in script:
-            assert self.panel_open
+            assert self.panel_open and self.panel_renders
         elif "!document.querySelector('.filter-panel')" in script:
             assert not self.panel_open
 
@@ -279,6 +280,17 @@ def test_latest_sort_stops_before_scraping_when_filter_is_missing(monkeypatch) -
         raise AssertionError("Missing latest-sort control must stop collection")
 
 
+def test_latest_sort_falls_back_when_legacy_panel_does_not_render(monkeypatch) -> None:
+    page = FakeSortPage(panel_renders=False)
+    settled: list[bool] = []
+    monkeypatch.setattr(SCRAPER, "wait_for_search_results", lambda _page: settled.append(True))
+
+    SCRAPER.select_latest_sort(page)
+
+    assert not page.panel_open
+    assert settled == [True]
+
+
 def test_latest_sort_is_only_applied_during_live_card_discovery() -> None:
     assert SCRAPER.should_apply_live_search_sort(False)
     assert not SCRAPER.should_apply_live_search_sort(True)
@@ -305,9 +317,10 @@ def test_recency_filter_removes_old_cards_and_keeps_unknown_dates() -> None:
     assert unknown == 1
 
 
-def test_full_collection_ignores_legacy_recency_filter() -> None:
-    assert SCRAPER.collection_max_age_days(0, 30) == 0
+def test_full_collection_applies_recency_before_body_collection() -> None:
+    assert SCRAPER.collection_max_age_days(0, 30) == 30
     assert SCRAPER.collection_max_age_days(100, 30) == 30
+    assert SCRAPER.collection_max_age_days(0, 0) == 0
 
 
 def test_latest_resume_only_reuses_records_still_present_in_live_cards() -> None:
@@ -336,6 +349,56 @@ def test_detail_access_classification(url: str, title: str, body: str, expected:
     record = make_record("detail_ok", title=title, body=body)
 
     assert SCRAPER.classify_detail_access(url, record) == expected
+
+
+def test_navigation_stall_on_rate_limit_does_not_open_fallback(monkeypatch) -> None:
+    class FakeBody:
+        def inner_text(self, **_kwargs) -> str:
+            return "访问频繁，请稍后再试"
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://example.test/website-login/error?error_code=300013"
+            self.goto_calls: list[str] = []
+
+        def goto(self, url: str, **_kwargs) -> None:
+            self.goto_calls.append(url)
+            raise SCRAPER.TimeoutError("navigation stalled")
+
+        def wait_for_timeout(self, _milliseconds: int) -> None:
+            return None
+
+        def locator(self, selector: str) -> FakeBody:
+            assert selector == "body"
+            return FakeBody()
+
+    page = FakePage()
+    monkeypatch.setattr(
+        SCRAPER,
+        "wait_for_note_ready",
+        lambda _page: pytest.fail("restriction must stop before note readiness wait"),
+    )
+    monkeypatch.setattr(
+        SCRAPER,
+        "extract_note",
+        lambda *_args: pytest.fail("restriction must stop before extraction"),
+    )
+    card = {
+        "note_id": "n1",
+        "search_result_url": "https://example.test/search_result/n1",
+        "explore_url": "https://example.test/explore/n1",
+    }
+
+    record = SCRAPER.scrape_note(
+        page,
+        card,
+        goto_timeout_ms=10000,
+        source_search_url="https://example.test/search_result?keyword=test",
+    )
+
+    assert record is not None
+    assert record.access_status == "detail_rate_limited"
+    assert page.goto_calls == [card["search_result_url"]]
 
 
 def test_atomic_write_preserves_existing_checkpoint_when_replace_fails(tmp_path, monkeypatch) -> None:

@@ -630,8 +630,14 @@ def select_latest_sort(page: Page) -> None:
 
     try:
         page.wait_for_function("() => Boolean(document.querySelector('.filter-panel'))", timeout=5000)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError("Xiaohongshu filter panel did not open; latest-first sorting was not applied.") from exc
+    except Exception:  # noqa: BLE001
+        # Some current search-page variants toggle the filter affordance without
+        # rendering the legacy panel. Keep bounded runs usable; max-age filtering
+        # still enforces the requested result window after card discovery.
+        page.evaluate(CLOSE_FILTER_PANEL_JS)
+        log("Latest-sort panel unavailable; continuing with result-level recency filtering.")
+        wait_for_search_results(page)
+        return
 
     already_selected = bool(page.evaluate(LATEST_SORT_SELECTED_JS))
     if not already_selected:
@@ -761,8 +767,8 @@ def filter_cards_by_recency(
 
 
 def collection_max_age_days(limit: int, max_age_days: int) -> int:
-    """Full collection is lossless; recency belongs to the result view."""
-    return 0 if limit <= 0 else max_age_days
+    """Apply the requested recency scope before opening detail pages."""
+    return max(0, max_age_days)
 
 
 def resume_record_matches_cards(record: NoteRecord, cards: list[dict[str, Any]]) -> bool:
@@ -800,21 +806,12 @@ def wait_for_search_page_to_settle(page: Page) -> None:
 
 
 def wait_for_note_ready(page: Page) -> None:
-    selectors = [
-        "#detail-title",
-        "#detail-desc",
-        ".note-content",
-        "article",
-        "h1",
-    ]
-    for selector in selectors:
-        try:
-            page.locator(selector).first.wait_for(state="visible", timeout=1800)
-            page.wait_for_timeout(250)
-            return
-        except Exception:  # noqa: BLE001
-            continue
-    page.wait_for_timeout(900)
+    selector = ":is(#detail-title, #detail-desc, .note-content, article, h1):visible"
+    try:
+        page.locator(selector).first.wait_for(state="visible", timeout=3000)
+        page.wait_for_timeout(250)
+    except Exception:  # noqa: BLE001
+        page.wait_for_timeout(500)
 
 
 def extract_cards(page: Page) -> list[dict[str, Any]]:
@@ -1426,6 +1423,23 @@ def classify_detail_access(page_url: str, record: NoteRecord) -> str:
     return "detail_ok"
 
 
+def classify_visible_detail_restriction(page: Page, *, timeout_ms: int = 400) -> str:
+    """Detect a rendered restriction before waiting for or extracting note content."""
+    page_text = unquote(str(getattr(page, "url", "") or ""))
+    try:
+        page_text = f"{page_text} {page.locator('body').inner_text(timeout=timeout_ms)}"
+    except Exception:  # noqa: BLE001
+        pass
+    normalized = page_text.casefold()
+    if any(marker.casefold() in normalized for marker in RATE_LIMIT_MARKERS):
+        return "detail_rate_limited"
+    if any(marker.casefold() in normalized for marker in SECURITY_VERIFICATION_MARKERS):
+        return "detail_security_verification"
+    if any(marker.casefold() in normalized for marker in LOGIN_REQUIRED_MARKERS):
+        return "detail_login_required"
+    return ""
+
+
 def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, source_search_url: str) -> NoteRecord | None:
     started_at = time.time()
     target_url = card.get("search_result_url") or card.get("note_url", "")
@@ -1437,13 +1451,29 @@ def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, sourc
             try:
                 page.goto(candidate_url, wait_until="commit", timeout=goto_timeout_ms)
                 navigation_error = None
+                restriction = classify_visible_detail_restriction(page)
+                if restriction:
+                    log(f"detail restriction detected early as {restriction}: {candidate_url}")
+                    return build_card_record(
+                        card,
+                        access_status=restriction,
+                        source_search_url=source_search_url,
+                    )
                 break
             except (TimeoutError, Error) as exc:
                 navigation_error = exc
                 try:
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(250)
                 except Error:
                     pass
+                restriction = classify_visible_detail_restriction(page)
+                if restriction:
+                    log(f"detail restriction detected after navigation stall as {restriction}: {candidate_url}")
+                    return build_card_record(
+                        card,
+                        access_status=restriction,
+                        source_search_url=source_search_url,
+                    )
                 if card.get("note_id") and card["note_id"] in page.url:
                     navigation_error = None
                     break
@@ -1451,6 +1481,14 @@ def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, sourc
         if navigation_error is not None:
             raise navigation_error
         wait_for_note_ready(page)
+        restriction = classify_visible_detail_restriction(page)
+        if restriction:
+            log(f"detail restriction detected before extraction as {restriction}: {target_url}")
+            return build_card_record(
+                card,
+                access_status=restriction,
+                source_search_url=source_search_url,
+            )
         goto_elapsed = time.time() - goto_started_at
         log(f"detail goto finished in {goto_elapsed:.1f}s: {target_url}")
 
@@ -1524,7 +1562,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stable-rounds", type=int, default=4)
     parser.add_argument("--limit", type=int, default=0, help="Optional max note count to scrape. 0 means no cap.")
     parser.add_argument("--search-sort", choices=("latest",), default="latest")
-    parser.add_argument("--max-age-days", type=int, default=0, help="Legacy bounded-run filter. Full collection always keeps every discovered card.")
+    parser.add_argument("--max-age-days", type=int, default=14, help="Keep cards within this many days before body collection; 0 keeps all dates.")
     parser.add_argument("--goto-timeout-ms", type=int, default=45000)
     parser.add_argument("--note-delay-seconds", type=float, default=DEFAULT_NOTE_DELAY_SECONDS)
     parser.add_argument("--speed-mode", choices=("steady", "random"), default=DEFAULT_SPEED_MODE)
@@ -1646,7 +1684,7 @@ def main() -> int:
                 random_delay_min_seconds=args.random_delay_min_seconds,
                 random_delay_max_seconds=args.random_delay_max_seconds,
                 security_verification_timeout_seconds=args.security_verification_timeout_seconds,
-                full_discovery=args.limit <= 0,
+                full_discovery=args.limit <= 0 and args.max_age_days <= 0,
                 checkpoint=lambda discovered: (
                     write_json_payload(discovered, discovered_cards_json),
                     write_json_payload(discovered, latest_cards_json),
@@ -1666,19 +1704,13 @@ def main() -> int:
         write_json_payload(cards, discovered_cards_json)
         effective_max_age_days = collection_max_age_days(args.limit, args.max_age_days)
         cards, removed_count, unknown_count = filter_cards_by_recency(cards, effective_max_age_days)
-        if args.limit <= 0:
-            if args.max_age_days > 0:
-                log(
-                    f"Full collection ignored legacy --max-age-days={args.max_age_days}; "
-                    f"kept all {len(cards)} discovered cards. Apply recency only in result views."
-                )
-            else:
-                log(f"Full collection kept all {len(cards)} discovered cards for body collection.")
-        elif effective_max_age_days > 0:
+        if effective_max_age_days > 0:
             log(
                 f"Recency filter kept {len(cards)} cards within {effective_max_age_days} days; "
                 f"removed {removed_count} older cards; kept {unknown_count} cards with unknown dates."
             )
+        else:
+            log(f"Full collection kept all {len(cards)} discovered cards for body collection.")
         write_json_payload(cards, latest_cards_json)
         if security_timed_out:
             return 3

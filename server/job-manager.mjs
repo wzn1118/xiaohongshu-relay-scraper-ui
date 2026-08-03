@@ -6,6 +6,7 @@ import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { buildRunnerArgs } from './lib/contracts.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
+import { readPersistedExpansion } from './lib/expansion-results.mjs';
 import {
   WORKFLOW_STATE_SCHEMA_VERSION,
   emptyWorkflowStages,
@@ -79,10 +80,16 @@ export class JobManager {
     let changed = false;
     for (const job of this.jobs) {
       changed = migrateLegacyJob(job, this.dataDir, now) || changed;
+      const expansionBeforeState = job.workflowSummary?.expansion;
       const state = await initializeWorkflowState(job.statePath, workflowStateFromJob(job));
       changed = applyWorkflowStateToJob(job, state) || changed;
-      const expansionWasInFlight = ['running', 'cancelling'].includes(job.workflowSummary?.expansion?.runtimeStatus);
+      const expansionAfterState = job.workflowSummary?.expansion;
+      const expansionWasInFlight = [expansionBeforeState, expansionAfterState]
+        .some((expansion) => ['running', 'cancelling'].includes(expansion?.runtimeStatus));
       if (expansionWasInFlight) {
+        const inFlightExpansion = ['running', 'cancelling'].includes(expansionAfterState?.runtimeStatus)
+          ? expansionAfterState
+          : expansionBeforeState;
         try {
           await this.recoverImpl({ ...job, pid: job.expansionPid || job.pid });
         } catch (error) {
@@ -91,7 +98,7 @@ export class JobManager {
         job.workflowSummary = {
           ...(job.workflowSummary || {}),
           expansion: {
-            ...job.workflowSummary.expansion,
+            ...inFlightExpansion,
             runtimeStatus: 'interrupted',
             status: 'interrupted',
             stopReason: 'server_restart',
@@ -177,11 +184,19 @@ export class JobManager {
         job.checkpointAnalysisError = String(error?.message || error);
         changed = true;
       }
-      const persistedExpansion = job.workflowSummary?.expansion;
+      const persistedWorkflow = job.workflowSummary && typeof job.workflowSummary === 'object'
+        ? job.workflowSummary
+        : {};
+      const persistedExpansion = persistedWorkflow.expansion;
       const diskSummary = await readWorkflowSummary(job.outputDir);
-      job.workflowSummary = persistedExpansion
-        ? { ...(diskSummary || {}), expansion: { ...(diskSummary?.expansion || {}), ...persistedExpansion } }
-        : diskSummary;
+      const recoveredExpansion = await readPersistedExpansion(job.outputDir);
+      const expansion = (recoveredExpansion || diskSummary?.expansion || persistedExpansion)
+        ? { ...(recoveredExpansion || {}), ...(diskSummary?.expansion || {}), ...(persistedExpansion || {}) }
+        : null;
+      job.workflowSummary = expansion
+        ? { ...persistedWorkflow, ...(diskSummary || {}), expansion }
+        : { ...persistedWorkflow, ...(diskSummary || {}) };
+      if (!persistedExpansion && recoveredExpansion) changed = true;
       if (!job.rateLimit && job.workflowSummary?.rateLimit?.status === 'stopped') {
         job.rateLimit = {
           detected: true,
@@ -245,7 +260,16 @@ export class JobManager {
         resumeCheckpointJobIds: options.resumeCheckpointJobIds,
       });
     }
-    const { queueIfBusy = false } = options;
+    const {
+      queueIfBusy = false,
+      seedCards = null,
+      initialResumeScope = 'full',
+    } = options;
+    const importedCards = Array.isArray(seedCards) ? structuredClone(seedCards) : null;
+    const resumeScope = normalizeResumeScope(initialResumeScope);
+    if (importedCards && importedCards.length < 1) {
+      throw jobError('BODY_IMPORT_EMPTY', 'At least one imported note is required.');
+    }
     if (this.recoveryBlockers.length > 0) {
       const error = new Error('A previous scrape process could not be cleaned up after restart. Restart cleanup must succeed before a new task can start.');
       error.code = 'JOB_RECOVERY_INCOMPLETE';
@@ -273,14 +297,18 @@ export class JobManager {
     const outputDir = path.join(jobDir, 'artifacts');
     const logPath = path.join(jobDir, 'run.log');
     await mkdir(outputDir, { recursive: true });
+    if (importedCards) {
+      await writeJsonAtomically(path.join(outputDir, 'xiaohongshu_cards_latest.json'), importedCards);
+    }
     const runtimeProfilePath = await createRuntimeProfile(profilePath, params.candidateProfile, jobDir);
     const now = new Date().toISOString();
+    const stages = importedCards ? importedBodyStages(importedCards, now) : emptyWorkflowStages();
     const attempt = createAttempt({
       jobId: id,
       jobDir,
       sequence: 1,
       kind: 'initial',
-      resumeScope: 'full',
+      resumeScope,
       requestedBy: options.requestedBy || 'user',
       idempotencyKey: options.idempotencyKey || null,
       checkpointRevisionAtStart: 0,
@@ -303,13 +331,13 @@ export class JobManager {
       logPath,
       pid: null,
       progress: 8,
-      discoveredCount: 0,
+      discoveredCount: importedCards?.length || 0,
       scrapedCount: 0,
       bodyProcessedCount: 0,
       progressPhase: 'queued',
       progressLabel: '任务已创建，等待启动',
       progressCurrent: 0,
-      progressTotal: 0,
+      progressTotal: importedCards?.length || 0,
       progressUpdatedAt: now,
       workflowSummary: null,
       queuedBehindJobId: queuedBehind?.id || null,
@@ -318,10 +346,10 @@ export class JobManager {
       resumeCount: 0,
       lastResumedAt: null,
       revision: 0,
-      stages: emptyWorkflowStages(),
+      stages,
       attempts: [attempt],
       statePath: workflowStatePath(outputDir),
-      artifactCount: 0,
+      artifactCount: importedCards ? 1 : 0,
     };
     if (runtimeBusy) job.progressLabel = '任务已排队，当前采集或任务内补采结束后将自动启动';
     const state = await initializeWorkflowState(job.statePath, workflowStateFromJob(job));
@@ -332,6 +360,7 @@ export class JobManager {
       profilePath: runtimeProfilePath,
       runnerParams: params,
       attemptId: attempt.attemptId,
+      resumeScope,
     });
     if (!runtimeBusy) {
       this.active = job;
@@ -340,6 +369,16 @@ export class JobManager {
     await this.persist();
     if (!runtimeBusy) queueMicrotask(() => this.#run(job));
     return publicJob(job);
+  }
+
+  async startImportedBodies(params, cards, options = {}) {
+    return this.start(params, {
+      ...options,
+      queueIfBusy: options.queueIfBusy !== false,
+      requestedBy: options.requestedBy || 'body_import_api',
+      seedCards: cards,
+      initialResumeScope: 'body_completion',
+    });
   }
 
   async resume(jobId, options = {}) {
@@ -410,9 +449,9 @@ export class JobManager {
         throw isolationError;
       }
 
-      await reconcileJobCheckpoint(job);
       const state = await readWorkflowState(job.statePath);
       applyWorkflowStateToJob(job, state);
+      await reconcileJobCheckpoint(job);
       if (options.expectedRevision !== undefined && Number(options.expectedRevision) !== state.revision) {
         const error = jobError(
           'WORKFLOW_REVISION_CONFLICT',
@@ -709,11 +748,33 @@ export class JobManager {
         if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
         throw error;
       }
-      const previous = job.workflowSummary?.expansion;
+      const previous = await expansionStateForJob(job);
       if (previous?.attemptId || previous?.seedPostIds?.length) {
         throw jobError('EXPANSION_ALREADY_INITIALIZED', 'Relationship expansion already has persisted state; resume it instead.');
       }
       return this.#beginExpansion(job, { seedPostIds, config, kind: 'initial' });
+    }));
+  }
+
+  async createExpansionAttempt(id, { seedPostIds, config }) {
+    return this.#withJobLock('__active_runtime__', () => this.#withJobLock(id, async () => {
+      const job = this.getInternal(id);
+      if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+      if (job.params?.analysisMode !== 'general') throw jobError('EXPANSION_SOURCE_INVALID', 'Relationship expansion requires a content research task.');
+      if (this.active || this.relaySubtask) {
+        const error = jobError('JOB_BUSY', 'A collection process is already running.');
+        if (this.active) error.activeJob = publicJob(this.active);
+        if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
+        throw error;
+      }
+      const previous = await expansionStateForJob(job);
+      if (['running', 'cancelling'].includes(previous?.runtimeStatus)) {
+        throw jobError('EXPANSION_ALREADY_RUNNING', 'Relationship expansion is already running.');
+      }
+      if (previous) {
+        job.workflowSummary = { ...(job.workflowSummary || {}), expansion: previous };
+      }
+      return this.#beginExpansion(job, { seedPostIds, config, kind: 'new_attempt' });
     }));
   }
 
@@ -727,13 +788,14 @@ export class JobManager {
         if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
         throw error;
       }
-      const previous = job.workflowSummary?.expansion;
+      const previous = await expansionStateForJob(job);
       if (!previous?.seedPostIds?.length || !previous?.config) {
         throw jobError('EXPANSION_NOT_RESUMABLE', 'Relationship expansion has no saved checkpoint to resume.');
       }
       if (['running', 'cancelling'].includes(previous.runtimeStatus)) {
         throw jobError('EXPANSION_ALREADY_RUNNING', 'Relationship expansion is already running.');
       }
+      job.workflowSummary = { ...(job.workflowSummary || {}), expansion: previous };
       return this.#beginExpansion(job, {
         seedPostIds: previous.seedPostIds,
         config: previous.config,
@@ -771,6 +833,8 @@ export class JobManager {
     const request = {
       outputDir: job.outputDir,
       attemptId,
+      action: kind,
+      resetExecution: kind === 'new_attempt',
       seedPostIds,
       config,
       keyword: job.params?.keyword || '',
@@ -782,10 +846,15 @@ export class JobManager {
     };
     await writeJsonAtomically(requestPath, request);
     const previous = job.workflowSummary && typeof job.workflowSummary === 'object' ? job.workflowSummary : {};
+    const previousExpansion = previous.expansion && typeof previous.expansion === 'object' ? previous.expansion : {};
+    const attemptHistory = Array.isArray(previousExpansion.attemptHistory) ? [...previousExpansion.attemptHistory] : [];
+    if (kind === 'new_attempt' && previousExpansion.attemptId) {
+      attemptHistory.push(archiveExpansionAttempt(previousExpansion));
+    }
     job.workflowSummary = {
       ...previous,
       expansion: {
-        ...(previous.expansion && typeof previous.expansion === 'object' ? previous.expansion : {}),
+        ...previousExpansion,
         enabled: true,
         runtimeStatus: 'running',
         status: 'running',
@@ -798,6 +867,7 @@ export class JobManager {
         finishedAt: null,
         stopReason: '',
         cancelPath,
+        attemptHistory: attemptHistory.slice(-20),
       },
     };
     job.updatedAt = now;
@@ -1147,14 +1217,19 @@ export class JobManager {
   async #markAttemptRunning(job) {
     const now = new Date().toISOString();
     const attempt = currentAttempt(job);
+    const importedBodyTotal = job.params?.bodyOnly
+      ? Math.max(0, Number(job.params?.importedBodyCount || job.progressTotal || 0))
+      : 0;
     job.status = 'running';
     job.progress = Math.max(10, Number(job.progress || 0));
     job.startedAt ||= now;
     job.updatedAt = now;
     job.progressPhase = 'starting';
-    job.progressLabel = '正在启动采集器并连接 Relay';
+    job.progressLabel = importedBodyTotal > 0
+      ? `正在启动采集器，准备采集 ${importedBodyTotal} 条正文`
+      : '正在启动采集器并连接 Relay';
     job.progressCurrent = 0;
-    job.progressTotal = 0;
+    job.progressTotal = importedBodyTotal;
     job.progressUpdatedAt = now;
     if (attempt) {
       attempt.status = 'running';
@@ -1213,8 +1288,15 @@ export class JobManager {
         if (line) updateProgressFromLog(job, line);
       }
       const diskSummary = await readWorkflowSummary(job.outputDir);
+      const artifactExpansion = await readPersistedExpansion(job.outputDir);
       const previous = job.workflowSummary?.expansion || {};
-      const fromDisk = diskSummary?.expansion && typeof diskSummary.expansion === 'object' ? diskSummary.expansion : {};
+      const workflowExpansionCandidate = diskSummary?.expansion && typeof diskSummary.expansion === 'object'
+        ? diskSummary.expansion
+        : {};
+      const workflowExpansion = expansionMatchesAttempt(workflowExpansionCandidate, previous.attemptId)
+        ? workflowExpansionCandidate
+        : {};
+      const fromDisk = { ...(artifactExpansion || {}), ...workflowExpansion };
       const stopReason = String(fromDisk.stopReason || previous.stopReason || (previous.cancelRequestedAt ? 'user_cancelled' : result.error ? 'runner_error' : result.code === 2 ? 'invalid_seed' : 'runner_exit'));
       const interrupted = Boolean(job.expansionInterruptRequested);
       const runtimeStatus = interrupted ? 'interrupted' : expansionRuntimeStatus(fromDisk.status, stopReason, result);
@@ -1410,7 +1492,7 @@ export class JobManager {
         append('system', `Checkpoint analysis failed: ${job.checkpointAnalysisError}\n`);
       }
       this.runtimeContexts.delete(job.id);
-      job.workflowSummary = await readWorkflowSummary(job.outputDir);
+      job.workflowSummary = mergeWorkflowSummary(job.workflowSummary, await readWorkflowSummary(job.outputDir));
       job.artifactCount = await countArtifactFiles(job.outputDir);
       let latestState;
       try {
@@ -1513,7 +1595,7 @@ export class JobManager {
       try {
         const materialized = await this.#materializeCheckpointApplications(job, append);
         if (!materialized) return;
-        job.workflowSummary = await readWorkflowSummary(job.outputDir);
+        job.workflowSummary = mergeWorkflowSummary(job.workflowSummary, await readWorkflowSummary(job.outputDir));
         job.artifactCount = await countArtifactFiles(job.outputDir);
         await this.persist();
         append('system', job.params?.analysisMode === 'general'
@@ -1574,9 +1656,15 @@ function expansionRuntimeStatus(summaryStatus, stopReason, result) {
   if (stopReason === 'user_cancelled') return 'cancelled';
   if (stopReason === 'verification_blocked') return 'blocked';
   if (result?.error || ['relay_unavailable', 'fatal_error', 'runner_error', 'invalid_seed'].includes(stopReason)) return 'failed';
+  if (result?.code != null && ![0, 3].includes(Number(result.code))) return 'failed';
   if (summaryStatus === 'complete') return 'completed';
   if (stopReason === 'interrupted') return 'interrupted';
   return 'partial';
+}
+
+function expansionMatchesAttempt(expansion, attemptId) {
+  if (!attemptId || !expansion || typeof expansion !== 'object') return true;
+  return String(expansion.attemptId || '') === String(attemptId);
 }
 
 function normalizeResumeScope(value) {
@@ -1595,6 +1683,49 @@ function inferResumeScope(params) {
   if (params?.analysisOnly) return 'analysis';
   if (params?.artifactOnly) return 'artifacts';
   return 'full';
+}
+
+function importedBodyStages(cards, timestamp) {
+  const stages = emptyWorkflowStages();
+  const discoveredIds = cards.map((card) => String(card.note_id || card.note_url || '').trim());
+  stages.discovery = {
+    ...stages.discovery,
+    status: 'completed',
+    discoveredIds,
+    discoveredCount: discoveredIds.length,
+    stopReason: 'frontend_import',
+    lastCheckpointAt: timestamp,
+  };
+  stages.bodyCompletion = {
+    ...stages.bodyCompletion,
+    records: Object.fromEntries(discoveredIds.map((noteId) => [noteId, {
+      noteId,
+      bodyStatus: 'discovered',
+      status: 'discovered',
+      attemptCount: 0,
+      discoveredAt: timestamp,
+      firstAttemptAt: null,
+      lastAttemptAt: null,
+      completedAt: null,
+      failureCode: '',
+      failureMessage: '',
+      recoverable: true,
+      stopReason: '',
+      updatedAt: timestamp,
+    }])),
+    totalCount: discoveredIds.length,
+    completedCount: 0,
+    remainingCount: discoveredIds.length,
+    attemptedCount: 0,
+    failedCount: 0,
+    notAttemptedCount: 0,
+    blockedCount: 0,
+    cancelledCount: 0,
+    pendingCount: discoveredIds.length,
+    conservationValid: true,
+    lastCheckpointAt: timestamp,
+  };
+  return stages;
 }
 
 function normalizeIdempotencyKey(value) {
@@ -1752,6 +1883,24 @@ function bodyMetricsFromRecords(records, statisticsSource) {
     statisticsSource,
     statusCounts,
   });
+}
+
+function bodyWorkflowCountsFromRecords(records) {
+  const statusCounts = Object.fromEntries([...BODY_LEDGER_STATUSES].map((status) => [status, 0]));
+  for (const record of Object.values(records)) {
+    const rawStatus = String(record?.bodyStatus || record?.status || 'not_attempted');
+    const status = BODY_LEDGER_STATUSES.has(rawStatus) ? rawStatus : 'not_attempted';
+    statusCounts[status] += 1;
+  }
+  return {
+    attemptedCount: Object.values(records)
+      .filter((record) => bodyMetricNumber(record?.attemptCount) > 0).length,
+    failedCount: statusCounts.failed,
+    notAttemptedCount: statusCounts.not_attempted,
+    blockedCount: statusCounts.blocked,
+    cancelledCount: statusCounts.cancelled,
+    pendingCount: statusCounts.discovered + statusCounts.queued + statusCounts.attempted,
+  };
 }
 
 function metricsFromPersistedSummary(summary, statisticsSource) {
@@ -2197,9 +2346,12 @@ export function publicJob(job) {
   const discoveredCount = bodyMetrics.discovered;
   const scrapedCount = Number(job.scrapedCount || job.workflowSummary?.notesCollected || 0);
   const bodyProcessedCount = bodyMetrics.attempted;
-  const incompleteCount = Number.isFinite(job.checkpointIncompleteCount)
-    ? Number(job.checkpointIncompleteCount)
-    : Math.max(0, discoveredCount - scrapedCount);
+  const sourcePendingCount = Number(job.workflowSummary?.sourceCoverage?.pendingCount || 0);
+  const incompleteCount = sourcePendingCount > 0
+    ? sourcePendingCount
+    : Number.isFinite(job.checkpointIncompleteCount)
+      ? Number(job.checkpointIncompleteCount)
+      : Math.max(0, discoveredCount - scrapedCount);
   const resumableStatus = ['incomplete', 'interrupted', 'cancelled', 'failed', 'blocked'].includes(job.status)
     || (job.status === 'succeeded' && incompleteCount > 0);
   const summarySecurity = job.workflowSummary?.securityVerification;
@@ -2422,6 +2574,84 @@ export function updateProgressFromLog(job, message) {
     });
   }
 
+  for (const match of message.matchAll(/BODY_RATE_LIMIT cooldown attempt=(\d+)\/(\d+) wait=([\d.]+)s/gi)) {
+    update({
+      progressPhase: 'body_rate_limit_backoff',
+      progressLabel: `正文访问冷却中，${match[3]} 秒后自动执行第 ${match[1]} / ${match[2]} 次恢复探测`,
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'waiting',
+        resumeScope: 'body_completion',
+        detectedAt: job.rateLimit?.detectedAt || new Date().toISOString(),
+        retryAttempt: Number(match[1]),
+        maxRetries: Number(match[2]),
+        retryAfterSeconds: Number(match[3]),
+        recoveryAction: 'automatic_backoff',
+      },
+    });
+  }
+  for (const match of message.matchAll(/BODY_RATE_LIMIT waiting attempt=(\d+)\/(\d+) remaining=([\d.]+)s/gi)) {
+    update({
+      progressPhase: 'body_rate_limit_backoff',
+      progressLabel: `正文访问冷却中，剩余 ${match[3]} 秒，随后自动探测并从检查点继续`,
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'waiting',
+        resumeScope: 'body_completion',
+        retryAttempt: Number(match[1]),
+        maxRetries: Number(match[2]),
+        retryAfterSeconds: Number(match[3]),
+        recoveryAction: 'automatic_backoff',
+      },
+    });
+  }
+  for (const match of message.matchAll(/BODY_RATE_LIMIT probe attempt=(\d+)\/(\d+)/gi)) {
+    update({
+      progressPhase: 'body_rate_limit_probe',
+      progressLabel: `冷却结束，正在执行第 ${match[1]} / ${match[2]} 次正文恢复探测`,
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'waiting',
+        resumeScope: 'body_completion',
+        retryAttempt: Number(match[1]),
+        maxRetries: Number(match[2]),
+        retryAfterSeconds: 0,
+        recoveryAction: 'automatic_probe',
+      },
+    });
+  }
+  if (/BODY_RATE_LIMIT cleared/gi.test(message)) {
+    update({
+      progressPhase: 'scraping',
+      progressLabel: '正文访问已恢复，正在从当前检查点继续采集',
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'cleared',
+        resumeScope: 'body_completion',
+        clearedAt: new Date().toISOString(),
+        retryAfterSeconds: 0,
+        recoveryAction: null,
+      },
+    });
+  }
+
+  for (const match of message.matchAll(/BODY_PROACTIVE_COOLDOWN\s+every=(\d+)\s+wait=([\d.]+)s/gi)) {
+    update({
+      progressPhase: 'body_proactive_cooldown',
+      progressLabel: `正文批量保护等待 ${match[2]} 秒，随后自动从当前检查点继续`,
+      proactiveCooldown: {
+        status: 'waiting',
+        requestBatchSize: Number(match[1]),
+        waitSeconds: Number(match[2]),
+        startedAt: new Date().toISOString(),
+      },
+    });
+  }
+
   if (/RATE_LIMIT detected/gi.test(message)) {
     update({
       progressPhase: 'rate_limited',
@@ -2608,6 +2838,21 @@ export function updateProgressFromLog(job, message) {
       discoveredCount: total,
     });
   }
+  for (const match of message.matchAll(/BODY_CACHE_REUSE\s+matched=(\d+)\s+complete=(\d+)\/(\d+)\s+scanned_jobs=(\d+)/gi)) {
+    const reused = Number(match[1]);
+    const complete = Number(match[2]);
+    const total = Number(match[3]);
+    update({
+      progressPhase: 'body_cache_reuse',
+      progressLabel: `已复用 ${reused} 篇历史完整正文，当前 ${complete} / ${total} 篇，开始采集剩余内容`,
+      progressCurrent: complete,
+      progressTotal: total,
+      discoveredCount: total,
+      scrapedCount: complete,
+      bodyCacheReusedCount: reused,
+    });
+    setProgress(Math.min(82, 25 + Math.round((complete / Math.max(1, total)) * 57)));
+  }
   for (const match of message.matchAll(/PARALLEL_ROUND\s+(\d+)\/(\d+)\s+pending=(\d+)\s+workers=(\d+)/gi)) {
     const round = Number(match[1]);
     const attempts = Number(match[2]);
@@ -2632,6 +2877,25 @@ export function updateProgressFromLog(job, message) {
     const round = Number(match[5] || 1);
     const roundProcessed = Number(match[6] || 0);
     const roundTotal = Number(match[7] || 0);
+    const recoveredRateLimit = status === 'detail_ok'
+      && RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)
+      ? {
+          ...job.rateLimit,
+          status: 'cleared',
+          clearedAt: new Date().toISOString(),
+          nextRetryAt: null,
+          retryAfterSeconds: 0,
+          recoveryAction: null,
+        }
+      : job.rateLimit;
+    const recoveredProactiveCooldown = status === 'detail_ok'
+      && job.proactiveCooldown?.status === 'waiting'
+      ? {
+          ...job.proactiveCooldown,
+          status: 'cleared',
+          clearedAt: new Date().toISOString(),
+        }
+      : job.proactiveCooldown;
     update({
       progressPhase: 'scraping',
       progressLabel: round > 1
@@ -2644,6 +2908,8 @@ export function updateProgressFromLog(job, message) {
       discoveredCount: total,
       scrapedCount: complete,
       bodyProcessedCount: processed,
+      rateLimit: recoveredRateLimit,
+      proactiveCooldown: recoveredProactiveCooldown,
     });
     setProgress(Math.min(82, 25 + Math.round((processed / Math.max(1, total)) * 57)));
   }
@@ -2749,14 +3015,98 @@ export function updateProgressFromLog(job, message) {
   return changed;
 }
 
+async function expansionStateForJob(job) {
+  const recovered = await readPersistedExpansion(job.outputDir);
+  const current = job.workflowSummary?.expansion;
+  if (!recovered && !current) return null;
+  return { ...(recovered || {}), ...(current || {}) };
+}
+
+function archiveExpansionAttempt(expansion) {
+  return {
+    attemptId: String(expansion.attemptId || ''),
+    seedPostIds: Array.isArray(expansion.seedPostIds) ? expansion.seedPostIds.map(String) : [],
+    config: expansion.config || null,
+    status: String(expansion.status || expansion.runtimeStatus || ''),
+    stopReason: String(expansion.stopReason || ''),
+    startedAt: expansion.startedAt || null,
+    finishedAt: expansion.finishedAt || null,
+    counters: expansion.counters || null,
+  };
+}
+
+function mergeWorkflowSummary(current, disk) {
+  const currentExpansion = current?.expansion && typeof current.expansion === 'object' ? current.expansion : null;
+  const diskExpansion = disk?.expansion && typeof disk.expansion === 'object' ? disk.expansion : null;
+  if (!disk && !currentExpansion) return null;
+  return currentExpansion || diskExpansion
+    ? { ...(disk || {}), expansion: { ...(diskExpansion || {}), ...(currentExpansion || {}) } }
+    : disk;
+}
+
 async function readWorkflowSummary(outputDir) {
   try {
     const payload = JSON.parse(await readFile(path.join(outputDir, 'workflow-summary.json'), 'utf8'));
-    return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
+    const summary = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
+    return mergeBodyCheckpointSummary(summary, await readBodyCheckpoint(outputDir));
+  } catch (error) {
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) {
+      return mergeBodyCheckpointSummary(null, await readBodyCheckpoint(outputDir));
+    }
+    throw error;
+  }
+}
+
+async function readBodyCheckpoint(outputDir) {
+  try {
+    const [ledgerPayload, summaryPayload] = await Promise.all([
+      readFile(path.join(outputDir, 'body-completion-ledger.json'), 'utf8'),
+      readFile(path.join(outputDir, 'parallel-body-summary.json'), 'utf8'),
+    ]);
+    const ledger = JSON.parse(ledgerPayload);
+    const summary = JSON.parse(summaryPayload);
+    if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger)) return null;
+    if (!ledger.records || typeof ledger.records !== 'object' || Array.isArray(ledger.records)) return null;
+    if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return null;
+    return { ledger, summary };
   } catch (error) {
     if (error.code === 'ENOENT' || error instanceof SyntaxError) return null;
     throw error;
   }
+}
+
+function mergeBodyCheckpointSummary(current, checkpoint) {
+  if (!checkpoint) return current;
+  const summary = checkpoint.summary;
+  const metrics = summary.bodyMetrics && typeof summary.bodyMetrics === 'object'
+    ? structuredClone(summary.bodyMetrics)
+    : null;
+  if (!metrics) return current;
+  const pendingCount = Math.max(0, Number(metrics.discovered || 0) - Number(metrics.succeeded || 0));
+  return {
+    ...(current || {}),
+    cardsDiscovered: Number(metrics.discovered || 0),
+    notesCollected: Number(metrics.succeeded || 0),
+    bodyAttempted: Number(metrics.attempted || 0),
+    bodySucceeded: Number(metrics.succeeded || 0),
+    bodyFailed: Number(metrics.failed || 0),
+    bodyNotAttempted: Number(metrics.notAttempted || 0),
+    bodyBlocked: Number(metrics.blocked || 0),
+    bodyCancelled: Number(metrics.cancelled || 0),
+    missingBodies: pendingCount,
+    bodyStatisticsSource: String(metrics.statisticsSource || 'bodyCompletionLedger'),
+    legacyInferred: Boolean(metrics.legacyInferred),
+    bodyMetrics: metrics,
+    bodyCompletionLedger: structuredClone(summary.bodyCompletionLedger || null),
+    sourceCoverage: {
+      ...((current?.sourceCoverage && typeof current.sourceCoverage === 'object') ? current.sourceCoverage : {}),
+      status: pendingCount > 0 ? 'partial' : 'complete',
+      reason: pendingCount > 0 ? String(summary.stopReason || 'body_completion_incomplete') : '',
+      targetCount: Number(metrics.discovered || 0),
+      readyCount: Number(metrics.succeeded || 0),
+      pendingCount,
+    },
+  };
 }
 
 function waitForChild(child) {
@@ -2787,19 +3137,73 @@ function closeWriteStream(stream) {
 
 async function reconcileJobCheckpoint(job) {
   if (!job?.outputDir) return false;
-  const [cards, notes, applications] = await Promise.all([
+  const [cards, notes, applications, bodyCheckpoint] = await Promise.all([
     countJsonArray(path.join(job.outputDir, 'xiaohongshu_cards_latest.json')),
     countJsonArray(path.join(job.outputDir, 'xiaohongshu_notes_latest.json')),
     inspectApplicationRecords(path.join(job.outputDir, 'application_intelligence.json'), job.params?.analysisMode),
+    readBodyCheckpoint(job.outputDir),
   ]);
   let changed = false;
-  if (cards > Number(job.discoveredCount || 0)) {
+  if (cards !== null && cards !== Number(job.discoveredCount || 0)) {
     job.discoveredCount = cards;
     changed = true;
   }
-  if (notes > Number(job.scrapedCount || 0)) {
+  if (notes !== null && notes !== Number(job.scrapedCount || 0)) {
     job.scrapedCount = notes;
     changed = true;
+  }
+  if (bodyCheckpoint) {
+    const { ledger, summary } = bodyCheckpoint;
+    const metrics = summary.bodyMetrics && typeof summary.bodyMetrics === 'object'
+      ? summary.bodyMetrics
+      : null;
+    const scopeDays = Number(summary.scope?.maxAgeDays);
+    if (Number.isFinite(scopeDays) && scopeDays >= 0 && Number(job.params?.maxAgeDays) !== scopeDays) {
+      job.params = { ...(job.params || {}), maxAgeDays: scopeDays };
+      changed = true;
+    }
+    if (metrics) {
+      const records = structuredClone(ledger.records);
+      const succeeded = Object.values(records).filter((record) => record?.bodyStatus === 'succeeded').length;
+      const workflowCounts = bodyWorkflowCountsFromRecords(records);
+      const previousStage = job.stages?.bodyCompletion || {};
+      job.stages = {
+        ...(job.stages || emptyWorkflowStages()),
+        bodyCompletion: {
+          ...previousStage,
+          status: summary.passed
+            ? 'completed'
+            : (summary.collectionStatus === 'partial' || summary.stopReason === 'cache_only' ? 'partial' : 'blocked'),
+          ledgerSchemaVersion: Number(ledger.schemaVersion || 1),
+          statisticsSource: String(ledger.statisticsSource || 'bodyCompletionLedger'),
+          legacyInferred: Boolean(ledger.legacyInferred),
+          records,
+          totalCount: Object.keys(records).length,
+          completedCount: succeeded,
+          remainingCount: Math.max(0, Object.keys(records).length - succeeded),
+          attemptedCount: workflowCounts.attemptedCount,
+          failedCount: workflowCounts.failedCount,
+          notAttemptedCount: workflowCounts.notAttemptedCount,
+          blockedCount: workflowCounts.blockedCount,
+          cancelledCount: workflowCounts.cancelledCount,
+          pendingCount: workflowCounts.pendingCount,
+          conservationValid: metrics.conservation?.valid === true,
+          stopReason: String(summary.stopReason || ''),
+          lastCheckpointAt: String(summary.finishedAt || ledger.updatedAt || ''),
+        },
+      };
+      job.workflowSummary = mergeBodyCheckpointSummary(job.workflowSummary, bodyCheckpoint);
+      const pendingCount = Math.max(0, Number(metrics.discovered || 0) - Number(metrics.succeeded || 0));
+      if (job.status === 'incomplete' && pendingCount > 0) {
+        const scopeLabel = scopeDays > 0 ? `近 ${scopeDays} 天` : '全部日期';
+        job.progressPhase = 'body_completion_incomplete';
+        job.progressLabel = `正文已采集 ${Number(metrics.succeeded || 0)} 条，${scopeLabel}范围仍有 ${pendingCount} 条待续采`;
+        job.progressCurrent = Number(metrics.succeeded || 0);
+        job.progressTotal = Number(metrics.discovered || 0);
+        job.error = `范围内正文仍有 ${pendingCount} 条待续采；已复用缓存并保留原任务检查点。`;
+      }
+      changed = true;
+    }
   }
   if (applications.total > 0 && job.checkpointAnalysisCount !== applications.total) {
     job.checkpointAnalysisCount = applications.total;
@@ -2831,7 +3235,10 @@ async function countJsonArray(filePath) {
     const payload = JSON.parse(await readFile(filePath, 'utf8'));
     return Array.isArray(payload) ? payload.length : 0;
   } catch (error) {
-    if (error.code === 'ENOENT' || error instanceof SyntaxError) return 0;
+    // A live checkpoint may not have published its atomic artifact yet. In
+    // that window, preserve progress observed from the runner instead of
+    // treating an absent or incomplete file as an authoritative empty array.
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) return null;
     throw error;
   }
 }

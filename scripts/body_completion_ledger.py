@@ -216,6 +216,12 @@ def load_ledger(path: Path) -> dict[str, Any] | None:
         for note_id, record in raw_records.items()
         if str(note_id) and isinstance(record, dict)
     }
+    raw_excluded = payload.get("scopeExcludedRecords")
+    payload["scopeExcludedRecords"] = {
+        str(note_id): normalize_record(str(note_id), record, now)
+        for note_id, record in (raw_excluded.items() if isinstance(raw_excluded, dict) else ())
+        if str(note_id) and isinstance(record, dict)
+    }
     statistics_source = str(payload.get("statisticsSource") or "bodyCompletionLedger")
     payload["statisticsSource"] = statistics_source
     payload["legacyInferred"] = statistics_source == "legacyInferred"
@@ -254,13 +260,15 @@ class BodyCompletionLedger:
         path = output_dir.resolve() / LEDGER_FILENAME
         loaded = load_ledger(path)
         now = clock()
+        cards = list(cards)
+        active_ids = {record_key(card) for card in cards if record_key(card)}
+        completed_by_id = {
+            record_key(item): item for item in complete_records if record_key(item)
+        }
+        failures_by_id = {
+            record_key(item): item for item in failures if record_key(item)
+        }
         if loaded is None:
-            completed_by_id = {
-                record_key(item): item for item in complete_records if record_key(item)
-            }
-            failures_by_id = {
-                record_key(item): item for item in failures if record_key(item)
-            }
             legacy_inferred = bool(completed_by_id or failures_by_id)
             payload: dict[str, Any] = {
                 "schemaVersion": LEDGER_SCHEMA_VERSION,
@@ -269,6 +277,7 @@ class BodyCompletionLedger:
                 "createdAt": now,
                 "updatedAt": now,
                 "records": {},
+                "scopeExcludedRecords": {},
             }
             for card in cards:
                 note_id = record_key(card)
@@ -300,7 +309,33 @@ class BodyCompletionLedger:
         else:
             payload = loaded
             records = payload["records"]
+            excluded_records = payload.setdefault("scopeExcludedRecords", {})
             recovered = False
+            for note_id in list(records):
+                if note_id in active_ids:
+                    continue
+                excluded_records[note_id] = records.pop(note_id)
+                recovered = True
+            for note_id in list(excluded_records):
+                if note_id not in active_ids:
+                    continue
+                records[note_id] = excluded_records.pop(note_id)
+                recovered = True
+            for note_id, completed in completed_by_id.items():
+                record = records.get(note_id)
+                if record is None or record["bodyStatus"] == "succeeded":
+                    continue
+                record.update({
+                    "bodyStatus": "succeeded",
+                    "status": "succeeded",
+                    "completedAt": now,
+                    "failureCode": "",
+                    "failureMessage": "",
+                    "recoverable": False,
+                    "stopReason": "cache_reuse",
+                    "updatedAt": now,
+                })
+                recovered = True
             if recover_interrupted:
                 for record in records.values():
                     status = record["bodyStatus"]

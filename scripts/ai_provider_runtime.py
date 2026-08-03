@@ -6,6 +6,7 @@ import ipaddress
 import json
 import math
 import os
+import signal
 import socket
 import shutil
 import subprocess
@@ -35,10 +36,10 @@ _LOCAL_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 _LOCAL_IMAGE_TOTAL_MAX_BYTES = 20 * 1024 * 1024
 
 
-def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
+def _terminate_process_tree(process: subprocess.Popen[str], *, force: bool = False) -> None:
     if os.name == "nt":
+        if process.poll() is not None:
+            return
         try:
             subprocess.run(
                 ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
@@ -50,9 +51,30 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
             )
         except (OSError, subprocess.SubprocessError):
             pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        return
+
+    group_signal = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        # POSIX processes are launched as session leaders, so their PID remains
+        # the process-group ID even if the direct child exits before descendants.
+        os.killpg(process.pid, group_signal)
+        return
+    except ProcessLookupError:
+        return
+    except OSError:
+        pass
+
     if process.poll() is None:
         try:
-            process.kill()
+            if force:
+                process.kill()
+            else:
+                process.terminate()
         except OSError:
             pass
 
@@ -66,8 +88,11 @@ def run_with_tree_timeout(
     errors: str = "replace",
 ) -> subprocess.CompletedProcess[str]:
     creationflags = 0
+    popen_options: dict[str, Any] = {}
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    else:
+        popen_options["start_new_session"] = True
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -77,6 +102,7 @@ def run_with_tree_timeout(
         encoding=encoding,
         errors=errors,
         creationflags=creationflags,
+        **popen_options,
     )
     try:
         stdout, stderr = process.communicate(input=input_text, timeout=timeout)
@@ -85,9 +111,13 @@ def run_with_tree_timeout(
         try:
             stdout, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired as drain_error:
-            _terminate_process_tree(process)
-            stdout = drain_error.output or error.output or ""
-            stderr = drain_error.stderr or error.stderr or ""
+            _terminate_process_tree(process, force=True)
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired as force_error:
+                _terminate_process_tree(process, force=True)
+                stdout = force_error.output or drain_error.output or error.output or ""
+                stderr = force_error.stderr or drain_error.stderr or error.stderr or ""
         raise subprocess.TimeoutExpired(
             command,
             timeout,
@@ -167,6 +197,10 @@ class AIProvider:
             )
             raise AIProviderTimeoutError(self._terminal_error)
         return min(self.timeout, remaining)
+
+    def _request_timeout(self, maximum: int | None = None) -> int:
+        remaining = self._remaining_timeout()
+        return min(remaining, maximum) if maximum is not None else remaining
 
     def generate_json(
         self,
@@ -248,7 +282,7 @@ class AIProvider:
                 method="GET",
             )
             try:
-                with urllib.request.urlopen(request, timeout=min(self.timeout, 30)) as response:
+                with urllib.request.urlopen(request, timeout=self._request_timeout(30)) as response:
                     content_type = str(getattr(response, "headers", {}).get("Content-Type", "")).lower()
                     image_bytes = response.read(byte_limit + 1)
             except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError):
@@ -293,7 +327,7 @@ class AIProvider:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=min(self.timeout, 10)) as response:
+            with urllib.request.urlopen(request, timeout=self._request_timeout(10)) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError, OSError, ValueError):
             return set()
@@ -318,7 +352,7 @@ class AIProvider:
             return self._vision_model_cache
         root_url = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
         try:
-            with urllib.request.urlopen(f"{root_url}/api/tags", timeout=min(self.timeout, 10)) as response:
+            with urllib.request.urlopen(f"{root_url}/api/tags", timeout=self._request_timeout(10)) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError, OSError, ValueError):
             self._vision_model_cache = ""
@@ -381,7 +415,7 @@ class AIProvider:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
                     result = json.loads(response.read().decode("utf-8"))
                 self.last_request_model = selected_model
             except urllib.error.HTTPError as error:
@@ -441,7 +475,7 @@ class AIProvider:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:500]
@@ -483,7 +517,7 @@ class AIProvider:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:500]

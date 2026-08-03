@@ -418,6 +418,60 @@ class ApplicationAgentTests(unittest.TestCase):
         for item in result["responsibilities"] + result["requirements"]:
             self.assertEqual(body[item["offset_start"] : item["offset_end"]], item["text"])
 
+    def test_inline_heading_phrase_does_not_reclassify_following_responsibilities(self) -> None:
+        body = (
+            "岗位职责："
+            "1、负责梳理岗位要求：并同步职位信息 "
+            "2、跟进候选人沟通并支持招聘流程"
+        )
+
+        result = ApplicationInfoAgent().run({"body": body})
+
+        self.assertEqual(
+            [item["text"] for item in result["responsibilities"]],
+            ["负责梳理岗位要求：并同步职位信息", "跟进候选人沟通并支持招聘流程"],
+        )
+        self.assertEqual(result["requirements"], [])
+        for item in result["responsibilities"]:
+            self.assertEqual(body[item["offset_start"] : item["offset_end"]], item["text"])
+
+    def test_structural_heading_connectors_preserve_section_boundaries(self) -> None:
+        body = (
+            "岗位要求如下："
+            "1、熟悉 Python "
+            "2、拥有 3.5 年相关经验 "
+            "工作职责包括："
+            "1、负责需求分析 "
+            "2、跟进项目上线"
+        )
+
+        result = ApplicationInfoAgent().run({"body": body})
+
+        self.assertEqual(
+            [item["text"] for item in result["requirements"]],
+            ["熟悉 Python", "拥有 3.5 年相关经验"],
+        )
+        self.assertEqual(
+            [item["text"] for item in result["responsibilities"]],
+            ["负责需求分析", "跟进项目上线"],
+        )
+        extracted = result["requirements"] + result["responsibilities"]
+        self.assertFalse(any(item["text"] in {"如下", "包括"} for item in extracted))
+        for item in extracted:
+            self.assertEqual(body[item["offset_start"] : item["offset_end"]], item["text"])
+
+    def test_decimal_experience_is_not_treated_as_a_numbered_list_marker(self) -> None:
+        body = "任职要求：拥有 3.5 年相关经验。"
+
+        result = ApplicationInfoAgent().run({"body": body})
+
+        self.assertEqual(
+            [item["text"] for item in result["requirements"]],
+            ["拥有 3.5 年相关经验。"],
+        )
+        requirement = result["requirements"][0]
+        self.assertEqual(body[requirement["offset_start"] : requirement["offset_end"]], requirement["text"])
+
     def test_complete_pipeline_uses_only_loaded_evidence(self) -> None:
         card = {"note_id": "n1", "title": "AI产品运营实习", "note_url": "https://example/n1"}
         note = {
@@ -726,17 +780,17 @@ class WorkflowWrapperTests(unittest.TestCase):
     def test_limit_is_always_rewritten_to_unlimited(self) -> None:
         self.assertEqual(
             rewrite_unlimited_args(["--limit", "20", "--max-age-days", "30", "--max-scrolls", "40"]),
-            ["--max-scrolls", "40", "--limit", "0", "--max-age-days", "0"],
+            ["--max-age-days", "30", "--max-scrolls", "40", "--limit", "0"],
         )
         self.assertEqual(
             rewrite_unlimited_args(["--limit=200", "--max-age-days=90"]),
-            ["--limit", "0", "--max-age-days", "0"],
+            ["--max-age-days=90", "--limit", "0"],
         )
 
     def test_bootstrap_limit_is_internal_and_bounded(self) -> None:
         self.assertEqual(
             rewrite_limit(["--limit", "20", "--max-scrolls", "40"], 1),
-            ["--max-scrolls", "40", "--limit", "1", "--max-age-days", "0"],
+            ["--max-scrolls", "40", "--limit", "1"],
         )
 
     def test_parallel_completion_requires_full_detail_body(self) -> None:
@@ -937,7 +991,13 @@ class WorkflowWrapperTests(unittest.TestCase):
                     sys.modules,
                     {"playwright": playwright_package, "playwright.sync_api": playwright_sync},
                 ):
-                    summary = body_completion.complete_bodies(output, relay_port=18792, workers=1, attempts=3)
+                    summary = body_completion.complete_bodies(
+                        output,
+                        relay_port=18792,
+                        workers=1,
+                        attempts=3,
+                        rate_limit_auto_recovery=False,
+                    )
             finally:
                 body_completion.load_upstream = original_loader
 

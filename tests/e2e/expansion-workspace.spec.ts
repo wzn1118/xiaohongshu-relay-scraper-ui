@@ -81,6 +81,7 @@ async function openExpansion(page: Page, options: { initialRuntime?: MockRuntime
   let newTaskRequests = 0
   let expansionStarts = 0
   let expansionCancels = 0
+  const expansionAttempts: Array<{ seedPostIds: string[]; config: typeof config }> = []
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const path = new URL(request.url()).pathname
@@ -91,7 +92,7 @@ async function openExpansion(page: Page, options: { initialRuntime?: MockRuntime
     if (path === '/api/jobs' && method === 'GET') return json(route, [currentTask])
     if (path === '/api/jobs' && method === 'POST') { newTaskRequests += 1; return json(route, currentTask, 202) }
     if (path === '/api/relay/config') return json(route, { port: 18800, profile: 'openclaw', autoConnect: true })
-    if (path === '/api/relay/status') return json(route, { running: true, cdpReady: true, ready: true, authenticated: true, tabs: 1, xiaohongshuTabs: 1, port: 18800 })
+    if (path === '/api/relay/status') return json(route, { running: true, cdpReady: true, authenticated: true, tabs: 1, xiaohongshuTabs: 1, port: 18800 })
     if (path === '/api/email/config') return json(route, { provider: 'custom', host: '', port: 465, secure: true, requireTls: false, auth: 'login', user: '', from: '', configured: false, verified: false, oauth: {} })
     if (path === '/api/ai/providers') return json(route, [{ id: 'codex', label: 'Codex', baseUrl: 'http://127.0.0.1', model: 'test', models: ['test'], requiresKey: false, configured: true }])
     if (path === '/api/ai/local-models') return json(route, { runtime: { ready: false }, catalog: [], installedModels: [], install: null })
@@ -108,6 +109,12 @@ async function openExpansion(page: Page, options: { initialRuntime?: MockRuntime
       const running = state(runtime)
       return json(route, { job: { ...task, workflowSummary: { ...task.workflowSummary, expansion: running.summary } }, attemptId: 'expansion-1', expansion: running }, 202)
     }
+    if (path.endsWith('/expansion/attempts') && method === 'POST') {
+      expansionAttempts.push(request.postDataJSON() as { seedPostIds: string[]; config: typeof config })
+      runtime = 'running'
+      const running = state(runtime)
+      return json(route, { job: { ...task, workflowSummary: { ...task.workflowSummary, expansion: running.summary } }, attemptId: 'expansion-2', expansion: running }, 202)
+    }
     if (path.endsWith('/expansion/resume') && method === 'POST') {
       runtime = 'running'
       const running = state(runtime)
@@ -122,10 +129,11 @@ async function openExpansion(page: Page, options: { initialRuntime?: MockRuntime
     if (path.endsWith('/expansion')) return json(route, expansion)
     return json(route, {})
   })
-  await page.goto('/content?module=expansion')
+  await page.goto('/content?module=expansion', { waitUntil: 'domcontentloaded' })
   await expect(page.getByRole('heading', { name: '关系扩散' })).toBeVisible()
   return {
     counts: () => ({ newTaskRequests, expansionStarts, expansionCancels }),
+    attempts: () => expansionAttempts,
     setRuntime: (next: MockRuntime) => { runtime = next },
   }
 }
@@ -139,7 +147,8 @@ for (const viewport of [
     await page.setViewportSize({ width: viewport.width, height: viewport.height })
     await page.clock.setFixedTime(new Date(now))
     const harness = await openExpansion(page)
-    await expect(page.getByRole('tab')).toHaveCount(3)
+    const resultTabs = page.getByRole('tablist', { name: '非岗位研究结果模块' })
+    await expect(resultTabs.getByRole('tab')).toHaveCount(3)
     await expect(page.getByRole('tab', { name: /关系扩散/ })).toContainText('多轮')
     await expect(page.locator('.expansion-seed-list > label')).toHaveCount(3)
     await expect(page.locator('.expansion-seed-list > label')).toContainText(['部分采集', '已采集', '未采集'])
@@ -189,4 +198,20 @@ test('关系扩散显示完成、阻断和失败状态，API 失败保留已有�
     await page.reload()
     await expect(page.locator('.expansion-runtime')).toContainText(label)
   }
+})
+
+test('终态扩散可重新点选帖子并按所选帖子创建新 Attempt', async ({ page }) => {
+  const harness = await openExpansion(page, { initialRuntime: 'partial' })
+  const checkboxes = page.locator('.expansion-seed-list input[type="checkbox"]')
+  await expect(checkboxes).toHaveCount(3)
+  await expect(checkboxes.nth(0)).toBeEnabled()
+  await expect(checkboxes.nth(1)).toBeEnabled()
+  await checkboxes.nth(0).uncheck()
+  await checkboxes.nth(1).check()
+
+  await page.getByRole('button', { name: /Attempt/ }).click()
+  await expect(page.locator('.expansion-runtime')).toContainText('扩散中')
+  expect(harness.attempts()).toHaveLength(1)
+  expect(new Set(harness.attempts()[0].seedPostIds)).toEqual(new Set(['post-2', 'post-3']))
+  expect(harness.attempts()[0].config.rounds).toBe(2)
 })

@@ -62,6 +62,11 @@ import {
 import { api } from './api'
 import { draftContentHash } from './draft-state.mjs'
 import { AudienceAiPanel } from './AudienceAiPanel'
+import { BodyImportPanel } from './BodyImportPanel'
+import type { BodyImportRecord } from './body-import'
+import { DataCopilotPanel, type DataCopilotModelConnectionInput } from './DataCopilotPanel'
+import { createDataCopilotTransport } from './data-copilot-transport'
+import type { DataCopilotContextSource, DataCopilotModel } from './DataCopilotContext'
 import { ExpansionWorkspace } from './ExpansionWorkspace'
 import { UnsavedDraftDialog } from './UnsavedDraftDialog'
 import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
@@ -218,7 +223,7 @@ const defaultRequest: JobRequest = {
   contentPreset: 'auto',
   contentGoal: '',
   searchSort: 'latest',
-  maxAgeDays: 0,
+  maxAgeDays: 14,
   browserProfile: 'openclaw',
   relayPort: 18800,
   limit: 0,
@@ -1687,6 +1692,7 @@ function App() {
   const [smtpSaving, setSmtpSaving] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
   const [activeJob, setActiveJob] = useState<Job | null>(null)
+  const [dataCopilotOpen, setDataCopilotOpen] = useState(false)
   const [historyScope, setHistoryScope] = useState<HistoryScope>('all')
   const [historyPage, setHistoryPage] = useState(1)
   const [historyPageSize, setHistoryPageSize] = useState(50)
@@ -1733,6 +1739,7 @@ function App() {
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [logs, setLogs] = useState<string[]>([])
   const [advanced, setAdvanced] = useState(false)
+  const [collectionEntryMode, setCollectionEntryMode] = useState<'search' | 'import'>('search')
   const [loading, setLoading] = useState(true)
   const [relayConnecting, setRelayConnecting] = useState(false)
   const [relaySettingUp, setRelaySettingUp] = useState(false)
@@ -3298,7 +3305,7 @@ function App() {
       const latestPayload: JobRequest = {
         ...payload,
         searchSort: 'latest',
-        maxAgeDays: 0,
+        maxAgeDays: payload.maxAgeDays,
         limit: 0,
         aiSessionId: sessionHint?.id || payload.aiSessionId || null,
       }
@@ -3348,6 +3355,47 @@ function App() {
   const runJob = (payload: JobRequest, sessionHint: AiSession | null = aiSession) => (
     draftGuard.requestTransition(payload.checkOnly ? '执行启动检查' : '启动新任务', () => performRunJob(payload, sessionHint))
   )
+
+  const performBodyImport = async (records: BodyImportRecord[], sourceName: string) => {
+    setSubmitting(true)
+    setNotice(null)
+    setCoverage(null)
+    setArtifacts([])
+    setLogs([`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 正在创建 ${records.length} 条正文采集任务...`])
+    try {
+      const response = await api.createBodyImport({
+        records,
+        sourceName,
+        analysisMode: workspaceMode,
+        options: {
+          browserProfile: request.browserProfile,
+          relayPort: request.relayPort,
+          gotoTimeoutMs: request.gotoTimeoutMs,
+          noteDelaySeconds: request.noteDelaySeconds,
+          speedMode: request.speedMode,
+          randomDelayMinSeconds: request.randomDelayMinSeconds,
+          randomDelayMaxSeconds: request.randomDelayMaxSeconds,
+          securityVerificationTimeoutSeconds: request.securityVerificationTimeoutSeconds,
+          maxAgeDays: request.maxAgeDays,
+        },
+      })
+      const job = response.job
+      setActiveJob(job)
+      activeJobIdCache.current[workspaceMode] = job.id
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)])
+      connectJob(job)
+      const ignored = response.summary.duplicateCount + response.summary.rejectedCount
+      setNotice(`${job.status === 'queued' ? '任务已排队' : '正文采集已启动'}：${response.summary.acceptedCount} 条${ignored ? `，忽略 ${ignored} 条重复或无效记录` : ''}。`)
+    } catch (error) {
+      setNotice((error as Error).message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const startBodyImport = (records: BodyImportRecord[], sourceName: string) => {
+    draftGuard.requestTransition('启动批量正文采集', () => performBodyImport(records, sourceName))
+  }
 
   const performResumeAudienceCollection = async (forceRateLimitRecovery = false, forcedJobId?: string) => {
     const resumeTargetJobId = forcedJobId || selectedAudienceDataJob?.id || linkedAudienceTask?.id || audienceSourceJobId
@@ -3875,6 +3923,7 @@ function App() {
   const currentArtifacts = artifacts.length ? artifacts : activeJob?.artifacts || []
   const exportCount = useMemo(() => workspaceJobs.reduce((sum, job) => sum + (job.artifactCount ?? job.artifacts?.length ?? 0), 0), [workspaceJobs])
   const activeAllMode = activeJob?.config?.limit === 0
+  const activeBodyImport = activeJob?.config?.bodyOnly === true
   const runningLog = logs.slice(-120).join('\n')
   const terminalAnalysisReady = Boolean(activeJob && ['completed', 'incomplete'].includes(activeJob.status) && coverage)
   const activeAnalysisMode = workspaceMode
@@ -3964,7 +4013,7 @@ function App() {
   const selectedAttachmentIds = selectedAttachments.map((attachment) => attachment.attachmentId)
   const selectedAttachmentBytes = selectedAttachments.reduce((total, attachment) => total + attachment.size, 0)
   const selectedApplicationContextKey = activeJob && selectedResult ? `${activeJob.id}:${selectedResult.note_id}` : ''
-  const existingApplicationContext = selectedResult?.outreach.applicationContext
+  const existingApplicationContext = selectedResult?.outreach?.applicationContext
   const selectedApplicationChannel: ApplicationContext['channel'] = selectedEmailRoute
     ? 'email'
     : selectedMessageRoute
@@ -4397,6 +4446,72 @@ function App() {
     }
   }
 
+  const dataCopilotMode = workspaceMode === 'job' ? 'application' : 'research'
+  const dataCopilotSnapshotId = `job-r${Math.max(0, Number(activeJob?.revision || 0))}`
+  const dataCopilotTransport = useMemo(() => createDataCopilotTransport({
+    jobId: activeJob?.id || 'unbound',
+    mode: dataCopilotMode,
+    snapshotId: dataCopilotSnapshotId,
+    aiSessionId: aiSession?.id,
+    allowedScopes: ['*'],
+  }), [activeJob?.id, aiSession?.id, dataCopilotMode, dataCopilotSnapshotId])
+  const dataCopilotModels = useMemo<DataCopilotModel[]>(() => aiSession ? [{
+    id: aiSession.id,
+    label: aiSession.model,
+    provider: aiSession.provider,
+    supportsTools: true,
+    supportsAttachments: true,
+  }] : [], [aiSession])
+  const discoverDataCopilotModels = async (
+    input: Pick<DataCopilotModelConnectionInput, 'provider' | 'apiKey' | 'baseUrl'>,
+  ) => api.discoverAiModels(input)
+  const connectDataCopilotModel = async (input: DataCopilotModelConnectionInput): Promise<DataCopilotModel> => {
+    const session = await api.createAiSession(input)
+    rememberAiSession(session)
+    setNotice(`${session.model} 已连接，可在数据 Copilot 中直接使用。`)
+    return {
+      id: session.id,
+      label: session.model,
+      provider: session.provider,
+      supportsTools: true,
+      supportsAttachments: true,
+    }
+  }
+  const dataCopilotSources = useMemo<DataCopilotContextSource[]>(() => {
+    if (!activeJob) return []
+    const taskKind = workspaceMode === 'job' ? '岗位任务' : '非岗位任务'
+    return [
+      {
+        id: `job:${activeJob.id}`,
+        kind: 'job',
+        title: activeJob.keyword || '当前任务',
+        subtitle: `${taskKind} · #${activeJob.id.slice(0, 8)}`,
+        status: activeJob.status,
+      },
+      {
+        id: 'dataset:content',
+        kind: 'dataset',
+        title: workspaceMode === 'job' ? '岗位与正文数据' : '内容与正文数据',
+        subtitle: '当前任务快照',
+        count: discoveredCount,
+      },
+      {
+        id: 'dataset:audience',
+        kind: 'dataset',
+        title: '评论与用户数据',
+        subtitle: '受众采集结果',
+        count: (audienceResults?.totals.comments || 0) + (audienceResults?.totals.users || 0),
+      },
+      {
+        id: 'dataset:artifacts',
+        kind: 'artifact',
+        title: '任务产物',
+        subtitle: '可引用、预览与作为邮件附件',
+        count: currentArtifacts.length,
+      },
+    ]
+  }, [activeJob, audienceResults?.totals.comments, audienceResults?.totals.users, currentArtifacts.length, discoveredCount, workspaceMode])
+
   const coverageCards = activeAnalysisMode === 'general' ? [
     { label: '发现内容', value: coverage?.discovered, icon: Search },
     { label: '正文尝试', value: coverage?.bodyAttempted, icon: FileText },
@@ -4442,6 +4557,16 @@ function App() {
             </nav>
           </div>
           <div className="topbar-status">
+            <button
+              type="button"
+              className="copilot-launch-button"
+              disabled={!activeJob}
+              title={!activeJob ? '请先选择任务' : !aiSession ? '打开历史会话（发送前需连接 AI 模型）' : '打开数据 Copilot'}
+              onClick={() => setDataCopilotOpen(true)}
+            >
+              <MessagesSquare size={16} />
+              <span>数据助手</span>
+            </button>
             <div className={`relay-indicator ${relayReady ? 'ready' : relayConnecting ? 'connecting' : 'offline'}`}>
               {relayReady ? <Wifi size={17} /> : relayConnecting ? <LoaderCircle className="spin" size={17} /> : <WifiOff size={17} />}
               <span><strong>{relaySiteReady ? 'Relay 已连接' : relayReady ? 'Relay 已启动，待登录' : relayConnecting ? 'Relay 连接中' : 'Relay 待配置'}</strong><small>CDP {request.relayPort} · {tabCount} 个标签页</small></span>
@@ -4763,10 +4888,15 @@ function App() {
           <div className="primary-grid">
             <section className="panel config-panel" id="task-config">
               <div className="panel-heading">
-                <div><span className="step-label">01 / CONFIGURE</span><h2>{request.analysisMode === 'general' ? '新建非岗位信息研究任务' : '新建采集与投递分析任务'}</h2></div>
+                <div><span className="step-label">01 / CONFIGURE</span><h2>{collectionEntryMode === 'import' ? '批量采集指定正文' : request.analysisMode === 'general' ? '新建非岗位信息研究任务' : '新建采集与投递分析任务'}</h2></div>
                 <span className="local-badge">本地执行</span>
               </div>
-              <form onSubmit={submit}>
+              <div className="collection-entry-switch" role="tablist" aria-label="采集入口">
+                <button type="button" role="tab" aria-selected={collectionEntryMode === 'search'} className={collectionEntryMode === 'search' ? 'selected' : ''} onClick={() => setCollectionEntryMode('search')}><Search size={15} />关键词发现</button>
+                <button type="button" role="tab" aria-selected={collectionEntryMode === 'import'} className={collectionEntryMode === 'import' ? 'selected' : ''} onClick={() => setCollectionEntryMode('import')}><FileJson size={15} />批量正文</button>
+              </div>
+              {collectionEntryMode === 'import' && <BodyImportPanel submitting={submitting} relayReady={relayReady} maxAgeDays={request.maxAgeDays} onMaxAgeDays={(days) => updateRequest('maxAgeDays', days)} onStart={startBodyImport} />}
+              <form onSubmit={submit} hidden={collectionEntryMode !== 'search'}>
                 <div className={`workspace-mode-summary ${workspaceMode === 'general' ? 'content' : 'job'}`}>
                   <span className="workspace-mode-icon">{workspaceMode === 'general' ? <BookOpenCheck size={19} /> : <Target size={19} />}</span>
                   <span><small>{workspaceMode === 'general' ? 'NON-JOB RESEARCH INTERFACE' : 'JOB APPLICATION INTERFACE'}</small><strong>{workspaceMode === 'general' ? '非岗位信息采集与 AI 研究' : '岗位采集与投递'}</strong><p>{workspaceMode === 'general' ? '可选择经验、人群、趋势、产品、地点或自定义目标；AI 按内容证据动态生成结构，而不是套岗位模板。' : '采集岗位正文与图片，整理岗位卡、投递方式和通过质量门禁的可编辑投递文案。'}</p></span>
@@ -4787,12 +4917,12 @@ function App() {
 
                 <div className="field range-field">
                   <span>采集范围</span>
-                  <div className="sort-policy full-coverage" role="status" aria-label="发现多少采集多少">
+                  <div className="sort-policy full-coverage" role="status" aria-label="范围内发现多少采集多少">
                     <Target size={17} />
-                    <span><strong>全量发现，发现多少采集多少</strong><small>搜索页发现的每一条内容都会进入候选区和正文队列</small></span>
-                    <em>不截断</em>
+                    <span><strong>时间范围内，发现多少采集多少</strong><small>先按发布时间缩小正文队列，再为范围内每条内容采集正文</small></span>
+                    <em>不限条数</em>
                   </div>
-                  <small className="field-help">全量模式会执行完整 {request.maxScrolls} 轮；连续 {request.stableRounds} 轮没有新增时触发深度加载探测，但不会提前结束。中断后从未裁剪的发现清单续跑。</small>
+                  <small className="field-help">连续 {request.stableRounds} 轮没有新增时即可结束发现；最多执行 {request.maxScrolls} 轮。中断后从同一时间范围的检查点续跑。</small>
                 </div>
 
                 <div className="form-row connection">
@@ -4812,12 +4942,12 @@ function App() {
 
                 <div className="field recency-field">
                   <span>采集时间范围</span>
-                  <div className="sort-policy full-coverage" role="status" aria-label="不限时间全量保留">
-                    <CalendarDays size={17} />
-                    <span><strong>不限时间，全量保留</strong><small>发布时间只用于结果区排序和筛选，不会删除候选内容</small></span>
-                    <em>无损采集</em>
+                  <div className="segmented" role="group" aria-label="采集时间范围">
+                    {[7, 14, 30, 0].map((days) => <button key={days} type="button" className={request.maxAgeDays === days ? 'selected' : ''} onClick={() => updateRequest('maxAgeDays', days)}>
+                      <CalendarDays size={15} />{days === 0 ? '不限' : `${days} 天`}
+                    </button>)}
                   </div>
-                  <small className="field-help">采集完成后仍可在结果区选择近 7 天、近 30 天等范围；切换筛选不会改变正文总数。</small>
+                  <small className="field-help">默认近 14 天。已知早于范围的卡片不会发起正文请求；发布时间无法解析的卡片仍会保留。</small>
                 </div>
 
                 <div className="field mode-field pacing-mode-field">
@@ -4887,8 +5017,8 @@ function App() {
               </div>
               {activeJob ? (
                 <>
-                  <div className="mission-title"><span>关键词</span><strong>{activeJob.keyword}</strong><small>#{activeJob.id.slice(0, 8)}</small></div>
-                  <div className="scope-stamp"><Target size={15} /><span><strong>{activeAllMode ? '全量模式' : '历史限定任务'}</strong><small>{activeAllMode ? `最新优先 · 不限时间 · 完整执行 ${activeJob.config?.maxScrolls ?? '-'} 轮发现 · 单路节流采正文` : '历史任务按原检查点展示'}</small></span></div>
+                  <div className="mission-title"><span>{activeBodyImport ? '批次' : '关键词'}</span><strong>{activeJob.keyword}</strong><small>#{activeJob.id.slice(0, 8)}</small></div>
+                  <div className="scope-stamp"><Target size={15} /><span><strong>{activeBodyImport ? '指定链接批量正文' : activeAllMode ? '范围内全量采集' : '历史限定任务'}</strong><small>{activeBodyImport ? `导入 ${activeJob.config?.importedBodyCount ?? activeJob.progressTotal ?? '-'} 条 · ${activeJob.config?.maxAgeDays ? `近 ${activeJob.config.maxAgeDays} 天` : '不限时间'} · 不重新搜索 · 断点续跑` : activeAllMode ? `最新优先 · ${activeJob.config?.maxAgeDays ? `近 ${activeJob.config.maxAgeDays} 天` : '不限时间'} · 最多 ${activeJob.config?.maxScrolls ?? '-'} 轮发现 · 单路采正文` : '历史任务按原检查点展示'}</small></span></div>
                   <div className={`progress-block outcome-${activeOutcome}`} aria-live="polite">
                     <div className="progress-heading">
                       <span className={['resuming', 'running'].includes(activeJob.status) ? 'live-progress-title active' : 'live-progress-title'}><i />实时进度<small>{progressAge}</small></span>
@@ -5020,7 +5150,7 @@ function App() {
               <button type="button" role="tab" className={generalResultModule === 'audience' ? 'active' : ''} aria-selected={generalResultModule === 'audience'} onClick={() => switchGeneralResultModule('audience')}><UsersRound size={16} /><span>受众及用户界面</span><small>评论、回复与用户卡</small></button>
               <button type="button" role="tab" className={generalResultModule === 'expansion' ? 'active' : ''} aria-selected={generalResultModule === 'expansion'} onClick={() => switchGeneralResultModule('expansion')}><Network size={16} /><span>关系扩散</span><small><b>多轮</b> · 用户、帖子与评论关系</small><i className={`module-state ${expansionStatus}`}>{expansionStatusText}</i></button>
             </nav>}
-            {activeAnalysisMode === 'general' && <ExpansionWorkspace job={activeJob} relay={relay} visible={expansionModuleActive} onJobUpdated={(job) => {
+            {activeAnalysisMode === 'general' && <ExpansionWorkspace job={activeJob} relayReady={relaySiteReady} visible={expansionModuleActive} onJobUpdated={(job) => {
               setActiveJob(job)
               setJobs((current) => current.map((item) => item.id === job.id ? job : item))
             }} onReturnInsights={() => switchGeneralResultModule('insights')} />}
@@ -5300,7 +5430,7 @@ function App() {
                     {visibleHistoryJobs.length ? visibleHistoryJobs.map((job) => {
                       const retryFailedJob = job.status === 'failed'
                       return <tr key={job.id} className={activeJob?.id === job.id ? 'selected-row' : ''} onClick={() => openHistoryJob(job)}>
-                        <td><StatusPill status={job.status} /></td><td><strong>{job.keyword || '未命名任务'}</strong><small>{jobAnalysisMode(job) === 'general' ? '内容采集' : '岗位投递'} · #{job.id.slice(0, 8)}</small></td><td>{formatTime(job.createdAt)}</td><td>{job.config?.limit === 0 ? '全量 · 不限时间' : `历史限定 ${job.config?.limit ?? '-'} 篇`} · {job.config?.searchSort === 'comprehensive' ? '综合' : '最新'}</td><td>{job.artifactCount ?? job.artifacts?.length ?? 0}</td><td>{job.resumeAvailable ? <button className="row-resume" title={retryFailedJob ? '从检查点重试' : '从检查点续跑'} onClick={(event) => { event.stopPropagation(); void resumeJob(job) }} disabled={submitting}><RotateCcw size={14} />{retryFailedJob ? '重试' : '续跑'}</button> : <button className="row-open" title="查看任务"><ChevronDown size={15} /></button>}</td>
+                        <td><StatusPill status={job.status} /></td><td><strong>{job.keyword || '未命名任务'}</strong><small>{jobAnalysisMode(job) === 'general' ? '内容采集' : '岗位投递'} · #{job.id.slice(0, 8)}</small></td><td>{formatTime(job.createdAt)}</td><td>{job.config?.limit === 0 ? `全量 · ${job.config?.maxAgeDays ? `近 ${job.config.maxAgeDays} 天` : '不限时间'}` : `历史限定 ${job.config?.limit ?? '-'} 篇`} · {job.config?.searchSort === 'comprehensive' ? '综合' : '最新'}</td><td>{job.artifactCount ?? job.artifacts?.length ?? 0}</td><td>{job.resumeAvailable ? <button className="row-resume" title={retryFailedJob ? '从检查点重试' : '从检查点续跑'} onClick={(event) => { event.stopPropagation(); void resumeJob(job) }} disabled={submitting}><RotateCcw size={14} />{retryFailedJob ? '重试' : '续跑'}</button> : <button className="row-open" title="查看任务"><ChevronDown size={15} /></button>}</td>
                       </tr>
                     }) : <tr className="empty-row"><td colSpan={6}>{loading ? '正在读取任务记录...' : historyScope === 'all' ? '还没有历史任务' : historyScope === 'general' ? '还没有内容采集任务' : '还没有岗位投递任务'}</td></tr>}
                   </tbody>
@@ -5339,6 +5469,29 @@ function App() {
           </div>
         </main>
       </div>
+      <DataCopilotPanel
+        key={`${activeJob?.id || 'unbound'}:${dataCopilotMode}`}
+        open={dataCopilotOpen && Boolean(activeJob)}
+        transport={dataCopilotTransport}
+        models={dataCopilotModels}
+        defaultModelId={aiSession?.id}
+        modelProviders={providers}
+        defaultModelProviderId={providerId}
+        onDiscoverModels={discoverDataCopilotModels}
+        onConnectModel={connectDataCopilotModel}
+        contextSources={dataCopilotSources}
+        defaultContextSourceIds={dataCopilotSources.map((source) => source.id)}
+        contextMeta={{
+          taskId: activeJob?.id,
+          taskLabel: activeJob?.keyword || '当前任务',
+          mode: dataCopilotMode === 'application' ? '岗位任务' : '非岗位任务',
+          snapshotId: dataCopilotSnapshotId,
+          filters: [],
+        }}
+        title="数据 Copilot"
+        onClose={() => setDataCopilotOpen(false)}
+        onError={(error) => setNotice(error.message)}
+      />
       {imagePreview && <ImagePreview preview={imagePreview} onClose={closeImagePreview} onChange={changePreviewImage} />}
       {emailPreview && <EmailSendPreview preview={emailPreview} sending={emailSending} onClose={() => setEmailPreview(null)} onConfirm={() => void confirmSendEmail()} />}
       {draftGuard.pendingTransition && <UnsavedDraftDialog

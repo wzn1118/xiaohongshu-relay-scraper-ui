@@ -78,19 +78,19 @@ def rewrite_unlimited_args(arguments: list[str]) -> list[str]:
         if skip_next:
             skip_next = False
             continue
-        if argument in {"--limit", "--max-age-days"}:
+        if argument == "--limit":
             skip_next = True
             continue
-        if argument.startswith("--limit=") or argument.startswith("--max-age-days="):
+        if argument.startswith("--limit="):
             continue
         rewritten.append(argument)
-    return rewritten + ["--limit", "0", "--max-age-days", "0"]
+    return rewritten + ["--limit", "0"]
 
 
 def rewrite_limit(arguments: list[str], limit: int) -> list[str]:
     """Keep the historical argument helper available to integrations and tests."""
     rewritten = rewrite_unlimited_args(arguments)
-    return rewritten[:-4] + ["--limit", str(limit), "--max-age-days", "0"]
+    return rewritten[:-2] + ["--limit", str(limit)]
 
 
 def option_value(arguments: list[str], name: str) -> str:
@@ -114,12 +114,39 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser.add_argument("--candidate-profile", default=str(DEFAULT_CANDIDATE_PROFILE))
     parser.add_argument("--analyze-checkpoint", action="store_true")
     parser.add_argument("--complete-missing-only", action="store_true")
+    parser.add_argument("--body-only", action="store_true")
     parser.add_argument("--collect-audience", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--audience-only", action="store_true")
     parser.add_argument("--discover-more", action="store_true")
     parser.add_argument("--expansion-config-json", default="")
     parser.add_argument("--upstream-runner", default="")
     parser.add_argument("--security-verification-timeout-seconds", type=int, default=600)
+    parser.add_argument("--page-recovery-delay-seconds", type=float, default=0)
+    parser.add_argument("--body-batch-size", type=int, default=0)
+    parser.add_argument("--body-batch-pause-min-seconds", type=float, default=0)
+    parser.add_argument("--body-batch-pause-max-seconds", type=float, default=0)
+    parser.add_argument("--proactive-rest-every", type=int, default=0)
+    parser.add_argument("--proactive-rest-seconds", type=float, default=0)
+    parser.add_argument("--adaptive-pacing", action="store_true")
+    parser.add_argument("--adaptive-max-delay-seconds", type=float, default=20)
+    parser.add_argument("--block-heavy-resources", action="store_true")
+    parser.add_argument(
+        "--rate-limit-auto-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--rate-limit-initial-delay-seconds", type=float, default=120)
+    parser.add_argument("--rate-limit-max-delay-seconds", type=float, default=900)
+    parser.add_argument("--rate-limit-max-retries", type=int, default=6)
+    parser.add_argument("--rate-limit-recovery-spacing-seconds", type=float, default=30)
+    parser.add_argument("--rate-limit-max-recovery-spacing-seconds", type=float, default=120)
+    parser.add_argument("--rate-limit-stable-successes", type=int, default=3)
+    parser.add_argument(
+        "--reuse-body-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--body-cache-max-age-days", type=int, default=30)
     parser.add_argument("--codex-runtime", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--codex-cli-bin", default="")
     parser.add_argument("--codex-batch-size", type=int, default=8)
@@ -416,6 +443,25 @@ def collect_body_checkpoint(
     random_delay_min_seconds: float,
     random_delay_max_seconds: float,
     upstream_scraper: Path,
+    page_recovery_delay_seconds: float = 0,
+    body_batch_size: int = 0,
+    body_batch_pause_min_seconds: float = 0,
+    body_batch_pause_max_seconds: float = 0,
+    proactive_rest_every: int = 0,
+    proactive_rest_seconds: float = 0,
+    adaptive_pacing: bool = False,
+    adaptive_max_delay_seconds: float = 20,
+    block_heavy_resources: bool = False,
+    rate_limit_auto_recovery: bool = True,
+    rate_limit_initial_delay_seconds: float = 120,
+    rate_limit_max_delay_seconds: float = 900,
+    rate_limit_max_retries: int = 6,
+    rate_limit_recovery_spacing_seconds: float = 30,
+    rate_limit_max_recovery_spacing_seconds: float = 120,
+    rate_limit_stable_successes: int = 3,
+    reuse_body_cache: bool = True,
+    body_cache_max_age_days: int = 30,
+    max_age_days: int = 0,
     progress_callback: Any = None,
 ) -> dict[str, Any]:
     if scrape_failed and not checkpoint_fallback:
@@ -431,6 +477,25 @@ def collect_body_checkpoint(
         note_delay_seconds=note_delay_seconds,
         random_delay_min_seconds=random_delay_min_seconds,
         random_delay_max_seconds=random_delay_max_seconds,
+        page_recovery_delay_seconds=page_recovery_delay_seconds,
+        body_batch_size=body_batch_size,
+        body_batch_pause_min_seconds=body_batch_pause_min_seconds,
+        body_batch_pause_max_seconds=body_batch_pause_max_seconds,
+        proactive_rest_every=proactive_rest_every,
+        proactive_rest_seconds=proactive_rest_seconds,
+        adaptive_pacing=adaptive_pacing,
+        adaptive_max_delay_seconds=adaptive_max_delay_seconds,
+        block_heavy_resources=block_heavy_resources,
+        rate_limit_auto_recovery=rate_limit_auto_recovery,
+        rate_limit_initial_delay_seconds=rate_limit_initial_delay_seconds,
+        rate_limit_max_delay_seconds=rate_limit_max_delay_seconds,
+        rate_limit_max_retries=rate_limit_max_retries,
+        rate_limit_recovery_spacing_seconds=rate_limit_recovery_spacing_seconds,
+        rate_limit_max_recovery_spacing_seconds=rate_limit_max_recovery_spacing_seconds,
+        rate_limit_stable_successes=rate_limit_stable_successes,
+        reuse_body_cache=reuse_body_cache,
+        body_cache_max_age_days=body_cache_max_age_days,
+        max_age_days=max_age_days,
         upstream_scraper=upstream_scraper,
         progress_callback=progress_callback,
     )
@@ -1264,6 +1329,25 @@ def main_stateful(
                 note_delay_seconds=float(option_value(unlimited_arguments, "--note-delay-seconds") or 1.2),
                 random_delay_min_seconds=float(option_value(unlimited_arguments, "--random-delay-min-seconds") or 0.8),
                 random_delay_max_seconds=float(option_value(unlimited_arguments, "--random-delay-max-seconds") or 2.4),
+                page_recovery_delay_seconds=wrapper.page_recovery_delay_seconds,
+                body_batch_size=wrapper.body_batch_size,
+                body_batch_pause_min_seconds=wrapper.body_batch_pause_min_seconds,
+                body_batch_pause_max_seconds=wrapper.body_batch_pause_max_seconds,
+                proactive_rest_every=wrapper.proactive_rest_every,
+                proactive_rest_seconds=wrapper.proactive_rest_seconds,
+                adaptive_pacing=wrapper.adaptive_pacing,
+                adaptive_max_delay_seconds=wrapper.adaptive_max_delay_seconds,
+                block_heavy_resources=wrapper.block_heavy_resources,
+                rate_limit_auto_recovery=wrapper.rate_limit_auto_recovery,
+                rate_limit_initial_delay_seconds=wrapper.rate_limit_initial_delay_seconds,
+                rate_limit_max_delay_seconds=wrapper.rate_limit_max_delay_seconds,
+                rate_limit_max_retries=wrapper.rate_limit_max_retries,
+                rate_limit_recovery_spacing_seconds=wrapper.rate_limit_recovery_spacing_seconds,
+                rate_limit_max_recovery_spacing_seconds=wrapper.rate_limit_max_recovery_spacing_seconds,
+                rate_limit_stable_successes=wrapper.rate_limit_stable_successes,
+                reuse_body_cache=wrapper.reuse_body_cache,
+                body_cache_max_age_days=wrapper.body_cache_max_age_days,
+                max_age_days=int(option_value(unlimited_arguments, "--max-age-days") or 0),
                 upstream_scraper=upstream_scraper,
                 progress_callback=body_state_callback(state),
             )
@@ -1312,6 +1396,57 @@ def main_stateful(
         )
         if completed.returncode != 0:
             return completed.returncode
+
+    if wrapper.body_only:
+        empty_gate = {"discovered_count": 0, "body_count": 0}
+        body_metrics = canonical_body_metrics(body_summary, empty_gate)
+        pending_count = max(0, int(body_metrics.get("discovered") or 0) - int(body_metrics.get("succeeded") or 0))
+        rate_limit = body_summary.get("rateLimit")
+        security_verification = body_summary.get("securityVerification")
+        summary = {
+            "schemaVersion": 1,
+            "runner": "xiaohongshu-project-workflow",
+            "status": "succeeded" if body_summary.get("passed") else "completed_partial",
+            "taskMode": wrapper.analysis_mode,
+            "analysisMode": "body_only",
+            "bodyOnly": True,
+            "collectionStopReason": str(body_summary.get("stopReason") or ""),
+            "securityVerification": security_verification if isinstance(security_verification, dict) else {},
+            "rateLimit": rate_limit if isinstance(rate_limit, dict) else {},
+            "generatedAt": utc_now(),
+            "cardsDiscovered": body_metrics["discovered"],
+            "notesCollected": body_metrics["succeeded"],
+            "bodiesCaptured": body_metrics["succeeded"],
+            "bodyCoveragePercent": body_metrics["completionRatePercent"],
+            "discovered": body_metrics["discovered"],
+            "bodyAttempted": body_metrics["attempted"],
+            "bodySucceeded": body_metrics["succeeded"],
+            "bodyFailed": body_metrics["failed"],
+            "bodyNotAttempted": body_metrics["notAttempted"],
+            "bodyBlocked": body_metrics["blocked"],
+            "bodyCancelled": body_metrics["cancelled"],
+            "bodyStatisticsSource": body_metrics["statisticsSource"],
+            "legacyInferred": body_metrics["legacyInferred"],
+            "bodyMetrics": body_metrics,
+            "bodyCompletionLedger": body_summary.get("bodyCompletionLedger"),
+            "sourceCoverage": {
+                "status": "partial" if pending_count else "complete",
+                "reason": body_collection_deferred_reason(body_summary) if pending_count else "",
+                "targetCount": body_metrics["discovered"],
+                "readyCount": body_metrics["succeeded"],
+                "pendingCount": pending_count,
+                "totalRecordCount": body_metrics["discovered"],
+                "fullBodyCount": body_metrics["succeeded"],
+            },
+            "qualityPending": pending_count > 0,
+        }
+        atomic_json(output_dir / "workflow-summary.json", summary)
+        print(
+            f"BODY_IMPORT_COMPLETE total={body_metrics['discovered']} "
+            f"succeeded={body_metrics['succeeded']} pending={pending_count}",
+            flush=True,
+        )
+        return 0 if body_summary.get("passed") else 3
 
     only_incomplete = resume_in_place or state.resume_scope != "full"
     previous_application = load_application_checkpoint(output_dir) if only_incomplete else None
@@ -1684,6 +1819,25 @@ def main(arguments: list[str] | None = None) -> int:
         note_delay_seconds=float(option_value(unlimited_arguments, "--note-delay-seconds") or 1.2),
         random_delay_min_seconds=float(option_value(unlimited_arguments, "--random-delay-min-seconds") or 0.8),
         random_delay_max_seconds=float(option_value(unlimited_arguments, "--random-delay-max-seconds") or 2.4),
+        page_recovery_delay_seconds=wrapper.page_recovery_delay_seconds,
+        body_batch_size=wrapper.body_batch_size,
+        body_batch_pause_min_seconds=wrapper.body_batch_pause_min_seconds,
+        body_batch_pause_max_seconds=wrapper.body_batch_pause_max_seconds,
+        proactive_rest_every=wrapper.proactive_rest_every,
+        proactive_rest_seconds=wrapper.proactive_rest_seconds,
+        adaptive_pacing=wrapper.adaptive_pacing,
+        adaptive_max_delay_seconds=wrapper.adaptive_max_delay_seconds,
+        block_heavy_resources=wrapper.block_heavy_resources,
+        rate_limit_auto_recovery=wrapper.rate_limit_auto_recovery,
+        rate_limit_initial_delay_seconds=wrapper.rate_limit_initial_delay_seconds,
+        rate_limit_max_delay_seconds=wrapper.rate_limit_max_delay_seconds,
+        rate_limit_max_retries=wrapper.rate_limit_max_retries,
+        rate_limit_recovery_spacing_seconds=wrapper.rate_limit_recovery_spacing_seconds,
+        rate_limit_max_recovery_spacing_seconds=wrapper.rate_limit_max_recovery_spacing_seconds,
+        rate_limit_stable_successes=wrapper.rate_limit_stable_successes,
+        reuse_body_cache=wrapper.reuse_body_cache,
+        body_cache_max_age_days=wrapper.body_cache_max_age_days,
+        max_age_days=int(option_value(unlimited_arguments, "--max-age-days") or 0),
         upstream_scraper=resolve_upstream_scraper(upstream),
     )
     if not scrape_failed and "--skip-postprocess" not in unlimited_arguments:

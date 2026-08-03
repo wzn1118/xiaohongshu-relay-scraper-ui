@@ -1,4 +1,5 @@
 import http from 'node:http';
+import path from 'node:path';
 import { config } from './config.mjs';
 import { createApp } from './app.mjs';
 import { JobManager } from './job-manager.mjs';
@@ -13,6 +14,14 @@ import { DataLifecycleService } from './data-lifecycle-service.mjs';
 import { createDiagnostics } from './lib/diagnostics.mjs';
 import { AudienceAiService } from './audience-ai-service.mjs';
 import { createAudienceAiProfileRunner } from './lib/audience-ai-profile-runner.mjs';
+import { DataCopilotStore } from './data-copilot-store.mjs';
+import { CopilotApprovalStore } from './copilot-approval-store.mjs';
+import { CopilotArtifactService } from './copilot-artifact-service.mjs';
+import { DataPolicyEngine } from './data-policy-engine.mjs';
+import { DataToolRegistry } from './data-tool-registry.mjs';
+import { McpDataAdapter } from './mcp-data-adapter.mjs';
+import { DataCopilotRuntime } from './data-copilot-runtime.mjs';
+import { DataCopilotService } from './data-copilot-service.mjs';
 
 const diagnostics = createDiagnostics({ filePath: config.diagnosticsPath });
 
@@ -42,6 +51,43 @@ const audienceAi = new AudienceAiService({
   profileEnricher: createAudienceAiProfileRunner({ manager, config, getRelayConfig: () => relayConfig.get() }),
 });
 await audienceAi.initialize();
+const copilotRoot = path.dirname(config.dataDir);
+const copilotStore = new DataCopilotStore({ rootDir: copilotRoot });
+const copilotApprovals = new CopilotApprovalStore({ rootDir: copilotRoot });
+const copilotArtifacts = new CopilotArtifactService({
+  rootDir: copilotRoot,
+  pythonCommands: [config.pythonBin],
+});
+const copilotPolicy = new DataPolicyEngine({ manager });
+const copilotTools = new DataToolRegistry({
+  manager,
+  policy: copilotPolicy,
+  artifactService: copilotArtifacts,
+  mailSender,
+});
+const copilotRuntime = new DataCopilotRuntime({
+  store: copilotStore,
+  approvals: copilotApprovals,
+  registry: copilotTools,
+  aiSessions,
+});
+const copilotMcp = new McpDataAdapter({
+  policy: copilotPolicy,
+  registry: copilotTools,
+  artifacts: copilotArtifacts,
+});
+const dataCopilot = new DataCopilotService({
+  rootDir: copilotRoot,
+  store: copilotStore,
+  approvals: copilotApprovals,
+  artifacts: copilotArtifacts,
+  runtime: copilotRuntime,
+  policy: copilotPolicy,
+  mcpAdapter: copilotMcp,
+  manager,
+  aiSessions,
+});
+await dataCopilot.initialize();
 const dataLifecycle = new DataLifecycleService({
   manager,
   profileStore,
@@ -63,7 +109,7 @@ const relaySupervisor = createRelaySupervisor({
   connectTimeoutMs: config.relayConnectTimeoutMs,
   playwrightTimeoutMs: config.relayPlaywrightTimeoutMs,
 });
-const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relaySupervisor, dataLifecycle, diagnostics, audienceAiService: audienceAi }));
+const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relaySupervisor, dataLifecycle, diagnostics, audienceAiService: audienceAi, dataCopilotService: dataCopilot }));
 server.listen(config.port, config.host, () => {
   diagnostics.record('server_started', { status: 'ready' });
   console.log(`Xiaohongshu relay scraper API listening at http://${config.host}:${config.port}`);

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { readExpansionSeeds, readExpansionSnapshot } from './lib/expansion-results.mjs';
 
 test('expansion snapshot is task-local, paged, and merges persisted runtime state', async () => {
@@ -82,5 +82,44 @@ test('expansion result paging never renders a thousand-node graph in one respons
     assert.equal(last.results.items[0].userId, 'user-1001');
   } finally {
     await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('expansion snapshot restores the latest attempt selection from the task request', async () => {
+  const jobDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-expansion-recovery-'));
+  const outputDir = path.join(jobDir, 'artifacts');
+  try {
+    await mkdir(outputDir, { recursive: true });
+    await writeFile(path.join(outputDir, 'audience-posts.json'), JSON.stringify([
+      { post_id: 'post-old', title: 'Old seed', note_url: 'https://www.xiaohongshu.com/explore/post-old' },
+      { post_id: 'post-new', title: 'New seed', note_url: 'https://www.xiaohongshu.com/explore/post-new' },
+    ]), 'utf8');
+    await writeFile(path.join(outputDir, 'expansion_summary.json'), JSON.stringify({
+      attemptId: 'attempt-old',
+      seedPostIds: [],
+      config: {},
+      status: 'complete',
+      runtimeStatus: 'completed',
+      stopReason: 'user_budget_reached',
+    }), 'utf8');
+    await writeFile(path.join(jobDir, 'expansion-request.json'), JSON.stringify({
+      attemptId: 'attempt-new',
+      action: 'new_attempt',
+      resetExecution: true,
+      seedPostIds: ['post-new'],
+      config: { rounds: 3, maxTotalUsers: 250 },
+    }), 'utf8');
+
+    const snapshot = await readExpansionSnapshot(outputDir);
+    assert.equal(snapshot.summary.attemptId, 'attempt-new');
+    assert.equal(snapshot.runtimeStatus, 'interrupted');
+    assert.equal(snapshot.businessStatus, 'interrupted');
+    assert.equal(snapshot.stopReason, '');
+    assert.deepEqual(snapshot.summary.seedPostIds, ['post-new']);
+    assert.equal(snapshot.config.rounds, 3);
+    assert.equal(snapshot.seeds.find((seed) => seed.postId === 'post-new').selected, true);
+    assert.equal(snapshot.seeds.find((seed) => seed.postId === 'post-old').selected, false);
+  } finally {
+    await rm(jobDir, { recursive: true, force: true });
   }
 });

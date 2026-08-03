@@ -676,7 +676,7 @@ async function openAudience(
     return json(route, {});
   });
   await page.clock.setFixedTime(new Date(now));
-  await page.goto(`/content?module=audience&job=${jobId}`);
+  await page.goto(`/content?module=audience&job=${jobId}`, { waitUntil: "domcontentloaded" });
   await expect(page.locator(".audience-workspace")).toBeVisible();
   return {
     counts: () => ({

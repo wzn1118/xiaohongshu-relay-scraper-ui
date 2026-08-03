@@ -11,7 +11,7 @@ test('validateRunRequest applies bounded production defaults', () => {
   assert.equal(result.contentPreset, 'auto');
   assert.equal(result.contentGoal, '');
   assert.equal(result.searchSort, 'latest');
-  assert.equal(result.maxAgeDays, 0);
+  assert.equal(result.maxAgeDays, 14);
   assert.equal(result.limit, 0);
   assert.equal(result.maxScrolls, 40);
   assert.equal(result.stableRounds, 4);
@@ -121,10 +121,10 @@ test('expansion parameters are optional, strict, bounded, and general-mode only'
   assert.throws(() => validateRunRequest({ analysisMode: 'general', expansion: { enabled: true, postSelectionStrategy: 'random' } }), ValidationError);
 });
 
-test('validateRunRequest always normalizes collection to full-body mode', () => {
+test('validateRunRequest keeps unlimited count and requested recency scope', () => {
   assert.equal(validateRunRequest({ limit: 0 }).limit, 0);
   assert.equal(validateRunRequest({ limit: 1000 }).limit, 0);
-  assert.equal(validateRunRequest({ maxAgeDays: 30 }).maxAgeDays, 0);
+  assert.equal(validateRunRequest({ maxAgeDays: 30 }).maxAgeDays, 30);
 });
 
 test('validateRunRequest always normalizes collection to latest-first search', () => {
@@ -196,14 +196,49 @@ test('buildRunnerArgs only emits the normalized whitelist', () => {
   assert.equal(args[args.indexOf('--search-sort') + 1], 'latest');
   const tamperedArgs = buildRunnerArgs({ ...params, searchSort: 'comprehensive' }, path.resolve('output'));
   assert.equal(tamperedArgs[tamperedArgs.indexOf('--search-sort') + 1], 'latest');
-  assert.equal(args[args.indexOf('--max-age-days') + 1], '0');
+  assert.equal(args[args.indexOf('--max-age-days') + 1], '14');
   const tamperedAgeArgs = buildRunnerArgs({ ...params, maxAgeDays: 30 }, path.resolve('output'));
-  assert.equal(tamperedAgeArgs[tamperedAgeArgs.indexOf('--max-age-days') + 1], '0');
+  assert.equal(tamperedAgeArgs[tamperedAgeArgs.indexOf('--max-age-days') + 1], '30');
   assert.equal(args[args.indexOf('--security-verification-timeout-seconds') + 1], '600');
   assert.equal(args[args.indexOf('--speed-mode') + 1], 'random');
   assert.equal(args[args.indexOf('--random-delay-min-seconds') + 1], '0.8');
   assert.equal(args[args.indexOf('--random-delay-max-seconds') + 1], '2.4');
   assert.equal(args.some((arg) => /[;&|]/.test(arg)), false);
+});
+
+test('buildRunnerArgs supports the internal body-only workflow mode', () => {
+  const params = validateRunRequest({ analysisMode: 'general', keyword: 'batch body import' });
+  const args = buildRunnerArgs({ ...params, bodyOnly: true }, path.resolve('output'));
+  assert.equal(args.includes('--body-only'), true);
+});
+
+test('buildRunnerArgs applies adaptive high-throughput pacing to imported body tasks', () => {
+  const params = validateRunRequest({ analysisMode: 'general', keyword: 'batch body import' });
+  const args = buildRunnerArgs({
+    ...params,
+    bodyOnly: true,
+    importedBodyCount: 602,
+  }, path.resolve('output'));
+
+  assert.equal(args[args.indexOf('--note-delay-seconds') + 1], '1.2');
+  assert.equal(args[args.indexOf('--random-delay-min-seconds') + 1], '0.8');
+  assert.equal(args[args.indexOf('--random-delay-max-seconds') + 1], '2.4');
+  assert.equal(args[args.indexOf('--page-recovery-delay-seconds') + 1], '0.5');
+  assert.equal(args[args.indexOf('--body-batch-size') + 1], '6');
+  assert.equal(args[args.indexOf('--body-batch-pause-min-seconds') + 1], '8');
+  assert.equal(args[args.indexOf('--body-batch-pause-max-seconds') + 1], '15');
+  assert.equal(args[args.indexOf('--proactive-rest-every') + 1], '120');
+  assert.equal(args[args.indexOf('--proactive-rest-seconds') + 1], '600');
+  assert.equal(args.includes('--adaptive-pacing'), true);
+  assert.equal(args[args.indexOf('--adaptive-max-delay-seconds') + 1], '20');
+  assert.equal(args.includes('--block-heavy-resources'), true);
+  assert.equal(args.includes('--rate-limit-auto-recovery'), true);
+  assert.equal(args[args.indexOf('--rate-limit-initial-delay-seconds') + 1], '120');
+  assert.equal(args[args.indexOf('--rate-limit-max-delay-seconds') + 1], '900');
+  assert.equal(args[args.indexOf('--rate-limit-recovery-spacing-seconds') + 1], '30');
+  assert.equal(args[args.indexOf('--rate-limit-max-recovery-spacing-seconds') + 1], '120');
+  assert.equal(args.includes('--reuse-body-cache'), true);
+  assert.equal(args[args.indexOf('--body-cache-max-age-days') + 1], '30');
 });
 
 test('audience growth requests are bounded and emit a dedicated runner flag', () => {

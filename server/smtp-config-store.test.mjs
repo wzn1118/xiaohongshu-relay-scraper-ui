@@ -221,13 +221,61 @@ test('a restart restores encrypted credentials and the matching verification sta
   }
 });
 
-test('an encrypted SMTP vault never silently replaces a missing local key', async () => {
+test('a missing SMTP credential key enters a resettable recovery state without replacing the vault', async () => {
   const { fixture, filePath, keyPath, store } = await fixtureStore();
   try {
     await store.update(LOGIN_CONFIG);
+    const encrypted = await readFile(filePath, 'utf8');
     await rm(keyPath, { force: true });
     const restarted = new SmtpConfigStore({ filePath });
-    await assert.rejects(() => restarted.initialize(), { code: 'SMTP_CREDENTIAL_KEY_MISSING' });
+    const loaded = await restarted.initialize();
+
+    assert.equal(loaded.credentialStatus, 'error');
+    assert.equal(loaded.credentialErrorCode, 'SMTP_CREDENTIAL_KEY_MISSING');
+    assert.equal(loaded.resetRequired, true);
+    assert.equal(loaded.host, LOGIN_CONFIG.host);
+    assert.equal(loaded.from, LOGIN_CONFIG.from);
+    assert.equal(loaded.hasPassword, false);
+    assert.equal(loaded.verified, false);
+    assert.equal(restarted.getForMailer().pass, '');
+    assert.throws(() => restarted.assertReadyForSend(), { code: 'SMTP_NOT_CONFIGURED' });
+    assert.equal(await readFile(filePath, 'utf8'), encrypted);
+    assert.equal('credentialVault' in loaded, false);
+
+    const cleared = await restarted.clear();
+    assert.equal(cleared.credentialStatus, 'empty');
+    assert.equal(cleared.credentialErrorCode, '');
+    assert.equal(cleared.resetRequired, false);
+    assert.equal(JSON.parse(await readFile(filePath, 'utf8')).credentialVault, undefined);
+
+    await restarted.update(LOGIN_CONFIG);
+    assert.equal((await readFile(keyPath)).length, 32);
+    assert.equal(restarted.getForMailer().pass, 'client-authorization-code');
+  } finally {
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('a corrupted SMTP credential key enters recovery without exposing decrypted or encrypted secrets', async () => {
+  const { fixture, filePath, keyPath, store } = await fixtureStore();
+  try {
+    await store.update(LOGIN_CONFIG);
+    const encrypted = await readFile(filePath, 'utf8');
+    await writeFile(keyPath, Buffer.alloc(32, 0x5a));
+
+    const restarted = new SmtpConfigStore({ filePath });
+    const loaded = await restarted.initialize();
+    assert.equal(loaded.credentialStatus, 'error');
+    assert.equal(loaded.credentialErrorCode, 'SMTP_CREDENTIAL_DECRYPT_FAILED');
+    assert.equal(loaded.resetRequired, true);
+    assert.equal(loaded.hasPassword, false);
+    assert.equal(restarted.getForMailer().pass, '');
+    assert.equal(await readFile(filePath, 'utf8'), encrypted);
+    assert.doesNotMatch(JSON.stringify(loaded), /client-authorization-code|ciphertext|authTag/);
+
+    const cleared = await restarted.clear();
+    assert.equal(cleared.credentialStatus, 'empty');
+    await assert.rejects(() => readFile(keyPath), { code: 'ENOENT' });
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }

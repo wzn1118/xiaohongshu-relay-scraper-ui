@@ -23,6 +23,19 @@ def write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def selected_seed_comments(output_dir: Path, selected_ids: set[str]) -> dict[str, list[dict[str, Any]]]:
+    raw = read_json(output_dir / "audience-comments.json", [])
+    comments = raw.get("comments", []) if isinstance(raw, dict) else raw
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in comments if isinstance(comments, list) else []:
+        if not isinstance(item, dict):
+            continue
+        post_id = str(item.get("post_id") or item.get("postId") or "")
+        if post_id in selected_ids:
+            grouped.setdefault(post_id, []).append(item)
+    return grouped
+
+
 def refresh_artifact_manifest(output_dir: Path) -> None:
     manifest_path = output_dir / "artifact-manifest.json"
     manifest = read_json(manifest_path, {})
@@ -64,12 +77,14 @@ def main() -> int:
         output_dir,
         config={**request.get("config", {}), "enabled": True},
         attempt_id=str(request.get("attemptId", "")),
+        new_attempt=bool(request.get("resetExecution", False) or request.get("action") == "new_attempt"),
         keyword=str(request.get("keyword", "")),
         relay_port=int(request.get("relayPort", 18800)),
         goto_timeout_ms=int(request.get("gotoTimeoutMs", 15000)),
         note_delay_seconds=float(request.get("noteDelaySeconds", 1.2)),
         stable_rounds=int(request.get("stableRounds", 5)),
         seed_posts=[available_by_id[item] for item in selected_ids],
+        seed_comments_by_post=selected_seed_comments(output_dir, selected_set),
         cancel_requested=cancel_path.exists,
         materialize_audience_compat=False,
     )
