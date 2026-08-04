@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 import types
 from dataclasses import dataclass
@@ -61,6 +62,65 @@ def cards(*note_ids: str) -> list[dict[str, str]]:
         {"note_id": note_id, "note_url": f"https://example.test/explore/{note_id}"}
         for note_id in note_ids
     ]
+
+
+def test_workflow_progress_counts_are_mutually_exclusive_and_clear_blocked() -> None:
+    target_keys = {"done", "blocked", "pending"}
+    attempted_keys = {"done", "blocked"}
+    outcomes = {"done": "succeeded", "blocked": "blocked"}
+
+    blocked = body_completion.workflow_progress_counts(
+        target_keys=target_keys,
+        attempted_keys=attempted_keys,
+        outcomes=outcomes,
+        reused=4,
+    )
+
+    assert blocked == {
+        "unit": "body",
+        "done": 2,
+        "total": 3,
+        "succeeded": 1,
+        "reused": 4,
+        "retryable": 1,
+        "failed": 0,
+        "blocked": 1,
+    }
+    assert sum(blocked[name] for name in ("succeeded", "retryable", "failed", "blocked")) == 3
+
+    outcomes["blocked"] = "succeeded"
+    recovered = body_completion.workflow_progress_counts(
+        target_keys=target_keys,
+        attempted_keys=attempted_keys,
+        outcomes=outcomes,
+    )
+
+    assert recovered["succeeded"] == 2
+    assert recovered["retryable"] == 1
+    assert recovered["failed"] == 0
+    assert recovered["blocked"] == 0
+
+
+def test_workflow_progress_counts_distinguish_retryable_and_terminal_failures() -> None:
+    assert body_completion.classify_workflow_outcome(
+        succeeded=False,
+        failure_code="detail_timeout",
+    ) == "retryable"
+    assert body_completion.classify_workflow_outcome(
+        succeeded=False,
+        failure_code="detail_unavailable",
+    ) == "failed"
+
+    progress = body_completion.workflow_progress_counts(
+        target_keys={"retry", "terminal"},
+        attempted_keys={"retry", "terminal"},
+        outcomes={"retry": "retryable", "terminal": "failed"},
+    )
+
+    assert progress["done"] == 2
+    assert progress["retryable"] == 1
+    assert progress["failed"] == 1
+    assert progress["blocked"] == 0
 
 
 def test_pending_retry_priority_defers_rate_limited_notes() -> None:
@@ -172,6 +232,113 @@ def test_rate_limit_recovery_escalates_spacing_and_resets_after_stable_successes
     exhausted = recovery.register_rate_limit()
     assert exhausted["recoverable"] is False
     assert recovery.snapshot()["exhausted"] is True
+
+
+def test_rate_limit_recovery_warm_start_spaces_a_resumed_throttled_task() -> None:
+    clock = {"now": 100.0}
+    waits: list[float] = []
+
+    class AdvancingStopEvent:
+        @staticmethod
+        def is_set() -> bool:
+            return False
+
+        @staticmethod
+        def wait(timeout: float) -> bool:
+            waits.append(timeout)
+            clock["now"] += timeout
+            return False
+
+    recovery = body_completion.RateLimitRecovery(
+        recovery_spacing_seconds=30,
+        max_recovery_spacing_seconds=120,
+        stable_successes=3,
+    )
+
+    with mock.patch.object(body_completion.time, "monotonic", side_effect=lambda: clock["now"]):
+        assert recovery.warm_start() is True
+        assert recovery.wait_until_probe(AdvancingStopEvent()) is True
+
+    assert sum(waits) == pytest.approx(30)
+    assert recovery.next_spacing() == 30
+    assert recovery.snapshot()["warmStarted"] is True
+    assert recovery.snapshot()["stableSuccesses"] == 3
+
+    for _ in range(2):
+        assert recovery.observe_success() is False
+    assert recovery.observe_success() is True
+    assert recovery.next_spacing() == 0
+    assert recovery.snapshot()["warmStarted"] is False
+
+
+def test_rate_limit_recovery_manual_probe_skips_remaining_cooldown(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = tmp_path / ".rate-limit-recover.request"
+    recovery = body_completion.RateLimitRecovery(
+        recovery_spacing_seconds=30,
+        manual_recovery_path=marker,
+    )
+
+    assert recovery.warm_start() is True
+    marker.write_text("manual\n", encoding="utf-8")
+    started = time.monotonic()
+    assert recovery.wait_until_probe(threading.Event()) is True
+
+    assert not marker.exists()
+    assert time.monotonic() - started < 1
+    assert "BODY_RATE_LIMIT manual_probe attempt=1/6" in capsys.readouterr().out
+
+
+def test_rate_limit_recovery_warm_start_hands_repeat_limit_back_to_job_manager() -> None:
+    recovery = body_completion.RateLimitRecovery(
+        initial_delay_seconds=120,
+        max_delay_seconds=900,
+        max_retries=6,
+        recovery_spacing_seconds=30,
+        stable_successes=3,
+    )
+
+    assert recovery.warm_start() is True
+    outcome = recovery.register_rate_limit()
+
+    assert outcome == {
+        "recoverable": False,
+        "attempt": 1,
+        "maxRetries": 6,
+        "waitSeconds": 0.0,
+    }
+    assert recovery.snapshot()["exhausted"] is True
+
+
+def test_rate_limit_recovery_requires_consecutive_network_successes() -> None:
+    recovery = body_completion.RateLimitRecovery(stable_successes=3)
+
+    assert recovery.warm_start() is True
+    assert recovery.observe_success() is False
+    assert recovery.snapshot()["successStreak"] == 1
+    assert recovery.observe_failure() is True
+    assert recovery.snapshot()["successStreak"] == 0
+    assert recovery.observe_success() is False
+    assert recovery.observe_success() is False
+    assert recovery.snapshot()["cleared"] is False
+    assert recovery.observe_success() is True
+    assert recovery.snapshot()["cleared"] is True
+
+
+def test_rate_limit_summary_does_not_claim_recovery_below_threshold() -> None:
+    recovery = body_completion.RateLimitRecovery(stable_successes=3)
+
+    assert recovery.warm_start() is True
+    assert recovery.observe_success() is False
+    assert recovery.observe_success() is False
+    state = recovery.snapshot()
+
+    assert state["successStreak"] == 2
+    assert state["cleared"] is False
+    assert body_completion.rate_limit_summary_status("", state) == "waiting"
+    assert body_completion.rate_limit_summary_status("rate_limited", state) == "stopped"
 
 
 def test_lightweight_detail_page_blocks_only_heavy_resources() -> None:
@@ -436,6 +603,7 @@ def test_progress_counts_only_cards_with_real_attempts() -> None:
             "worker_error": "Target page, context or browser has been closed",
         }, True),
         ({"access_status": "detail_rate_limited"}, False),
+        ({"access_status": "detail_note_mismatch"}, False),
         ({"access_status": "detail_empty"}, False),
     ],
 )
@@ -444,6 +612,86 @@ def test_fresh_page_retry_only_handles_recoverable_browser_failures(
     expected: bool,
 ) -> None:
     assert body_completion.should_retry_on_fresh_page(payload) is expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "payload_complete", "page_uses", "expected"),
+    [
+        ({"access_status": "detail_empty"}, False, 1, ""),
+        ({"access_status": "detail_rate_limited"}, False, 1, ""),
+        (
+            {
+                "access_status": "detail_worker_error",
+                "worker_error": "Target page, context or browser has been closed",
+            },
+            False,
+            1,
+            "unhealthy_page",
+        ),
+        ({"access_status": "detail_ok"}, True, 40, "scheduled"),
+    ],
+)
+def test_page_recycle_only_runs_on_unhealthy_or_scheduled_boundaries(
+    payload: dict[str, str],
+    payload_complete: bool,
+    page_uses: int,
+    expected: str,
+) -> None:
+    assert body_completion.page_recycle_reason(
+        payload,
+        payload_complete=payload_complete,
+        page_uses=page_uses,
+        page_recycle_every=40,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"note_id": "stable-note"},
+        {"note_url": "https://example.test/explore/stable-note?xsec_token=old"},
+        {"search_result_url": "https://example.test/search_result/stable-note?xsec_token=new"},
+        {"explore_url": "https://example.test/discovery/item/stable-note?source=web"},
+        {"note_url": "https://example.test/detail?note_id=stable-note&token=volatile"},
+    ],
+)
+def test_record_key_uses_stable_note_id_across_signed_url_variants(record: dict[str, str]) -> None:
+    assert body_completion.record_key(record) == "stable-note"
+
+
+def test_record_key_strips_volatile_query_when_only_a_generic_url_exists() -> None:
+    left = body_completion.record_key(
+        {"note_url": "https://EXAMPLE.test/detail/path?xsec_token=old#fragment"}
+    )
+    right = body_completion.record_key(
+        {"note_url": "https://example.test/detail/path?xsec_token=new"}
+    )
+
+    assert left == "https://example.test/detail/path"
+    assert right == left
+
+
+def test_ledger_migrates_signed_url_keys_before_resume(tmp_path: Path) -> None:
+    old_url = "https://example.test/explore/stable-note?xsec_token=old"
+    legacy = BodyCompletionLedger.open(tmp_path, [{"note_url": old_url}])
+    assert legacy.start_attempt(old_url, "legacy-request")
+    assert legacy.finish_attempt(
+        old_url,
+        "legacy-request",
+        "failed",
+        failure_code="detail_timeout",
+        recoverable=True,
+    )
+
+    resumed = BodyCompletionLedger.open(
+        tmp_path,
+        [{"note_url": "https://example.test/search_result/stable-note?xsec_token=new"}],
+        key_resolver=body_completion.record_key,
+    )
+
+    assert set(resumed.records) == {"stable-note"}
+    assert resumed.records["stable-note"]["attemptCount"] == 1
+    assert resumed.start_attempt("stable-note", "resumed-request")
 
 
 def test_request_start_is_persisted_before_result_and_duplicate_events_are_idempotent(
@@ -723,6 +971,108 @@ class FakeNote:
     body: str
     access_status: str
     source_marker: str
+
+
+def test_body_completion_warm_start_gates_the_first_resumed_request(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    scrape_calls: list[str] = []
+    probe_states: list[tuple[bool, float]] = []
+
+    class FakePage:
+        def close(self) -> None:
+            return None
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakePlaywright:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeUpstream:
+        @staticmethod
+        def connect_browser(_playwright, _relay_port: int):
+            return object()
+
+        @staticmethod
+        def get_or_create_context(_browser):
+            return FakeContext()
+
+        @staticmethod
+        def scrape_note(_page, card, **_kwargs):
+            assert probe_states
+            scrape_calls.append(card["note_id"])
+            return FakeNote(
+                note_id=card["note_id"],
+                note_url=card["note_url"],
+                title="recovered",
+                body=f"full body for {card['note_id']}",
+                access_status="detail_ok",
+                source_marker="warm-start-fixture",
+            )
+
+    playwright_package = types.ModuleType("playwright")
+    playwright_sync = types.ModuleType("playwright.sync_api")
+    playwright_sync.sync_playwright = FakePlaywright
+    (tmp_path / "xiaohongshu_cards_latest.json").write_text(
+        json.dumps(cards("n1", "n2", "n3")),
+        encoding="utf-8",
+    )
+    (tmp_path / "parallel-body-summary.json").write_text(
+        json.dumps({
+            "stopReason": "rate_limited",
+            "rateLimit": {"status": "stopped", "exhausted": True},
+        }),
+        encoding="utf-8",
+    )
+
+    original_wait_until_probe = body_completion.RateLimitRecovery.wait_until_probe
+
+    def advance_probe(self, stop_event) -> bool:
+        with self._lock:
+            remaining = max(0.0, self.blocked_until - time.monotonic())
+            probe_states.append((self.warm_started, remaining))
+            self.blocked_until = time.monotonic()
+            self.recovery_spacing_seconds = 0.0
+            self.max_recovery_spacing_seconds = 0.0
+        return original_wait_until_probe(self, stop_event)
+
+    with mock.patch.object(body_completion, "load_upstream", return_value=FakeUpstream()), mock.patch.object(
+        body_completion.RateLimitRecovery,
+        "wait_until_probe",
+        advance_probe,
+    ), mock.patch.dict(
+        sys.modules,
+        {"playwright": playwright_package, "playwright.sync_api": playwright_sync},
+    ):
+        summary = body_completion.complete_bodies(
+            tmp_path,
+            relay_port=18792,
+            workers=1,
+            attempts=1,
+            speed_mode="steady",
+            note_delay_seconds=0,
+            rate_limit_auto_recovery=True,
+            rate_limit_recovery_spacing_seconds=30,
+            rate_limit_max_recovery_spacing_seconds=120,
+            rate_limit_stable_successes=3,
+            reuse_body_cache=False,
+            upstream_scraper=tmp_path / "fake-upstream.py",
+        )
+
+    output = capsys.readouterr().out
+    assert probe_states[0][0] is True
+    assert 0 < probe_states[0][1] <= 30
+    assert scrape_calls == ["n1", "n2", "n3"]
+    assert "BODY_RATE_LIMIT warm-start attempt=1/6 spacing=30.0s stable_successes=3" in output
+    assert summary["rateLimit"]["status"] == "cleared"
+    assert summary["rateLimit"]["resumedFromRateLimit"] is True
 
 
 def test_body_completion_keeps_relay_call_path_fields_and_success_resume_idempotent(
@@ -1073,6 +1423,7 @@ def test_body_completion_recovers_rate_limit_inside_same_task(
             rate_limit_recovery_spacing_seconds=0,
             rate_limit_max_recovery_spacing_seconds=0,
             rate_limit_stable_successes=1,
+            rate_limit_auto_recovery=True,
             upstream_scraper=tmp_path / "fake-upstream.py",
         )
 

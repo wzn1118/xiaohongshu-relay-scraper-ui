@@ -2355,3 +2355,90 @@ test('two independent Node processes share one idempotent send attempt', async (
   assert.equal(state[NOTE_ID].sendAudit.length, 1);
   assert.equal((await readSendAuditJournal(fixture.outputDir)).length, 1);
 });
+
+test('generation writeback saves a validated draft and provenance metadata', async (t) => {
+  const fixture = await startFixture(t);
+  const initial = (await fixture.getResults()).body.items[0];
+  const response = await fixture.post('application-generation/writeback', {
+    runId: 'generation-run-1',
+    promptVersion: 'xhs-outreach-v11-snapshot-writeback',
+    profileSnapshotId: 'profile-snapshot-1',
+    items: [{
+      noteId: NOTE_ID,
+      draftId: initial.draftVersion.draftId,
+      baseVersion: initial.draftVersion.version,
+      outreach: { ...initial.outreach, greeting: `${initial.outreach.greeting} v2` },
+      generation: {
+        profileSnapshotId: 'profile-snapshot-1',
+        usedEvidenceIds: ['e-ai'],
+        status: 'validated',
+      },
+    }],
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.status, 'completed');
+  assert.equal(response.body.saved, 1);
+  assert.equal(response.body.items[0].status, 'saved');
+  assert.equal(response.body.items[0].draftVersion.version, 2);
+  const state = await readDeliveryState(fixture.outputDir);
+  assert.equal(state[NOTE_ID].generation.runId, 'generation-run-1');
+  assert.equal(state[NOTE_ID].generation.profileSnapshotId, 'profile-snapshot-1');
+  assert.deepEqual(state[NOTE_ID].generation.usedEvidenceIds, ['e-ai']);
+});
+
+test('generation writeback reports a version conflict without overwriting a newer draft', async (t) => {
+  const fixture = await startFixture(t);
+  const initial = (await fixture.getResults()).body.items[0];
+  const body = {
+    runId: 'generation-run-2',
+    profileSnapshotId: 'profile-snapshot-2',
+    items: [{
+      noteId: NOTE_ID,
+      draftId: initial.draftVersion.draftId,
+      baseVersion: 1,
+      outreach: { ...initial.outreach, email_subject: `${initial.outreach.email_subject} v2` },
+      generation: { profileSnapshotId: 'profile-snapshot-2' },
+    }],
+  };
+  const first = await fixture.post('application-generation/writeback', body);
+  const second = await fixture.post('application-generation/writeback', {
+    ...body,
+    items: [{
+      ...body.items[0],
+      outreach: { ...body.items[0].outreach, email_subject: `${body.items[0].outreach.email_subject} stale` },
+    }],
+  });
+  assert.equal(first.body.status, 'completed');
+  assert.equal(second.body.status, 'failed');
+  assert.equal(second.body.conflicts, 1);
+  assert.equal(second.body.items[0].status, 'writeback_conflict');
+  const state = await readDeliveryState(fixture.outputDir);
+  assert.equal(state[NOTE_ID].draftStore.currentVersion, 2);
+  assert.equal(state[NOTE_ID].draftStore.versions.length, 2);
+  assert.equal(state[NOTE_ID].draftStore.versions[1].content.email_subject, body.items[0].outreach.email_subject);
+});
+
+test('generation writeback rejects a resume recommendation outside the snapshot artifacts', async (t) => {
+  const fixture = await startFixture(t);
+  const initial = (await fixture.getResults()).body.items[0];
+  const response = await fixture.post('application-generation/writeback', {
+    runId: 'generation-run-invalid-resume',
+    profileSnapshotId: 'profile-snapshot-invalid-resume',
+    items: [{
+      noteId: NOTE_ID,
+      draftId: initial.draftVersion.draftId,
+      baseVersion: initial.draftVersion.version,
+      outreach: initial.outreach,
+      generation: {
+        profileSnapshotId: 'profile-snapshot-invalid-resume',
+        resumeArtifactIds: ['resume-ops'],
+        recommendedResumeId: 'resume-stale',
+      },
+    }],
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.status, 'failed');
+  assert.equal(response.body.saved, 0);
+  assert.equal(response.body.items[0].status, 'writeback_failed');
+  assert.match(response.body.items[0].error.message, /resumeArtifactIds/);
+});

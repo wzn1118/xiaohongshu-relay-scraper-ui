@@ -311,6 +311,36 @@ test('event IDs and replay buffers survive service restart without swallowing an
   assert.deepEqual(resetReplay.map((event) => event.eventId), [1, 2, 3, 4]);
 });
 
+test('durable event logs retain history beyond the memory window and report replay gaps', async (t) => {
+  const context = await fixture(t);
+  const { conversation } = await create(context.service);
+  for (let index = 0; index < 260; index += 1) {
+    context.service.emit(conversation.conversationId, { type: 'message.delta', delta: String(index) });
+  }
+
+  const received = [];
+  const unsubscribe = context.service.subscribe(conversation.conversationId, (event) => received.push(event), { afterEventId: 1 });
+  unsubscribe();
+  assert.equal(received[0].type, 'stream.gap');
+  assert.deepEqual(received[0].payload, { from: 2, to: 11, recovery: 'GET ?format=json&afterSeq=<cursor>' });
+  assert.equal(received.at(-1).eventId, 261);
+
+  const eventFile = path.join(context.rootDir, 'copilot', conversation.conversationId, 'events.jsonl');
+  assert.equal((await readFile(eventFile, 'utf8')).trim().split(/\r?\n/u).length, 261);
+  const restarted = new DataCopilotService({
+    rootDir: context.rootDir,
+    store: context.store,
+    approvals: context.approvals,
+    artifacts: context.artifacts,
+    runtime: new FakeRuntime(context.store),
+    policy: context.policy,
+    manager: context.manager,
+    aiSessions: context.aiSessions,
+  });
+  await restarted.initialize();
+  assert.equal((await readFile(eventFile, 'utf8')).trim().split(/\r?\n/u).length, 261);
+});
+
 test('initialization marks an active persisted run interrupted without creating a new conversation', async (t) => {
   const context = await fixture(t);
   const { conversation } = await create(context.service);

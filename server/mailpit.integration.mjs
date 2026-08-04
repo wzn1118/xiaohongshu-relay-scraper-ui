@@ -36,12 +36,22 @@ function outreachDraft(overrides = {}) {
   };
 }
 
-function applicationRecord() {
-  const outreach = outreachDraft();
+function applicationRecord({
+  noteId = NOTE_ID,
+  recipient = RECIPIENT,
+  roleName = '内容运营实习',
+  subject = null,
+  body = null,
+} = {}) {
+  const outreach = outreachDraft({
+    ...(subject ? { email_subject: subject } : {}),
+    ...(body ? { email_body: body } : {}),
+  });
   return {
-    note_id: NOTE_ID,
-    title: '内容运营实习',
-    body: `招聘内容运营实习，请联系 ${RECIPIENT}`,
+    note_id: noteId,
+    post_id: noteId,
+    title: roleName,
+    body: `Recruiting ${roleName}. Send the application to ${recipient}.`,
     created_at: '2026-07-31T08:00:00.000Z',
     candidate_profile: { name: '示例用户' },
     application_info: {
@@ -49,8 +59,8 @@ function applicationRecord() {
       application_routes: [{
         type: 'email',
         channel: 'email',
-        value: RECIPIENT,
-        evidence: `请发送至 ${RECIPIENT}`,
+        value: recipient,
+        evidence: `Send the application to ${recipient}`,
         actionable: true,
         verification_status: 'verified',
         confidence: 100,
@@ -58,7 +68,7 @@ function applicationRecord() {
       responsibilities: ['内容策划'],
       requirements: ['数据分析'],
     },
-    job_card: { role_name: '内容运营实习', parse_basis: 'full_body' },
+    job_card: { role_name: roleName, parse_basis: 'full_body' },
     outreach,
     cover_letter_evaluation: {
       score: 95,
@@ -267,18 +277,177 @@ test('API delivery sends a quality-checked UTF-8 message with immutable PDF/DOCX
   }));
 });
 
-async function createApiServer(smtpHost, smtpPort) {
+test('batch API sends one independently frozen message per selected role through Mailpit', async (t) => {
+  const cases = [
+    {
+      noteId: 'batch-role-product',
+      recipient: 'product@example.test',
+      roleName: 'Product Manager',
+      subject: 'Application for Product Manager',
+      body: '您好，我是 Test Candidate，申请 Product Manager 岗位。我有产品规划、用户研究和跨团队交付经验，能够围绕业务目标拆解需求并跟进结果。希望有机会进一步沟通岗位重点，感谢您的时间。',
+    },
+    {
+      noteId: 'batch-role-growth',
+      recipient: 'growth@example.test',
+      roleName: 'Growth Strategist',
+      subject: 'Application for Growth Strategist',
+      body: '您好，我是 Test Candidate，申请 Growth Strategist 岗位。我有增长实验、渠道分析和数据复盘经验，能够根据转化结果持续调整策略并推动落地。希望有机会进一步沟通团队目标，感谢您的时间。',
+    },
+    {
+      noteId: 'batch-role-analyst',
+      recipient: 'analyst@example.test',
+      roleName: 'Data Analyst',
+      subject: 'Application for Data Analyst',
+      body: '您好，我是 Test Candidate，申请 Data Analyst 岗位。我有指标体系、数据清洗和业务分析经验，能够把分析结论转化为清晰建议并跟进验证。希望有机会进一步沟通分析场景，感谢您的时间。',
+    },
+  ];
+  const records = cases.map((item) => applicationRecord(item));
+  const mailpit = await acquireMailpit();
+  let api = null;
+  t.after(async () => {
+    if (api) await api.close();
+    await mailpit.close();
+  });
+  api = await createApiServer(mailpit.smtpHost, mailpit.smtpPort, {
+    records,
+    candidateProfile: { name: 'Test Candidate', email: CANDIDATE_EMAIL },
+  });
+
+  const purge = await fetch(`${mailpit.apiBase}/api/v1/messages`, { method: 'DELETE' });
+  assert.equal(purge.ok, true, `Mailpit purge failed with ${purge.status}`);
+
+  const resultsResponse = await requestJson(api.origin, `/api/jobs/${JOB_ID}/results?limit=20`);
+  assert.equal(resultsResponse.status, 200, JSON.stringify(resultsResponse.body));
+  const results = new Map(resultsResponse.body.items.map((item) => [item.note_id, item]));
+  const resumeBytes = Buffer.from('%PDF-1.7\nBatch resume fixture\n%%EOF\n', 'utf8');
+  const resumeSha256 = sha256(resumeBytes);
+  for (const item of cases) {
+    const record = results.get(item.noteId);
+    assert.ok(record?.draftVersion, `Missing draft version for ${item.noteId}`);
+    const form = new FormData();
+    form.append('noteId', item.noteId);
+    form.append('source', 'uploaded');
+    form.append('draftId', record.draftVersion.draftId);
+    form.append('draftVersion', String(record.draftVersion.version));
+    form.append('selected', 'true');
+    form.append('file', new Blob([resumeBytes], { type: 'application/pdf' }), 'resume.pdf');
+    const uploaded = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-attachments`, {
+      method: 'POST',
+      body: form,
+    });
+    assert.equal(uploaded.status, 201, JSON.stringify(uploaded.body));
+    assert.equal(uploaded.body.attachment.sha256, resumeSha256);
+  }
+
+  const createRequest = {
+    noteIds: cases.map((item) => item.noteId),
+    defaultAttachmentTemplate: '{jobTitle}-{candidateName}-resume',
+    minIntervalMs: 0,
+    aiSessionId: 'mailpit-quality-session',
+    idempotencyKey: 'mailpit-batch-three-roles-v1',
+  };
+  const created = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-batches`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(createRequest),
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.deepEqual(created.body.preflight.readyNoteIds, cases.map((item) => item.noteId));
+  assert.equal(created.body.batch.status, 'ready');
+  assert.equal(created.body.batch.items.length, cases.length);
+
+  const batchId = created.body.batch.batchId;
+  const approved = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-batches/${batchId}/approve`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ expectedRevision: created.body.batch.revision, actor: 'mailpit-test' }),
+  });
+  assert.equal(approved.status, 200, JSON.stringify(approved.body));
+  assert.equal(approved.body.status, 'approved');
+  assert.match(approved.body.approval.snapshotHash, /^[a-f0-9]{64}$/u);
+
+  const started = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-batches/${batchId}/start`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ expectedRevision: approved.body.revision, actor: 'mailpit-test' }),
+  });
+  assert.equal(started.status, 202, JSON.stringify(started.body));
+  const finished = await waitForBatch(api.origin, batchId, 'completed');
+  assert.equal(finished.status, 'completed');
+  assert.deepEqual(finished.items.map((item) => item.status), cases.map(() => 'sent'));
+
+  const list = await waitForMessageCount(mailpit.apiBase, cases.length);
+  assert.equal(list.messages_count, cases.length);
+  const delivered = [];
+  for (const item of cases) {
+    const summary = list.messages.find((message) => message.To?.some((target) => target.Address === item.recipient));
+    assert.ok(summary, `Mailpit message missing for ${item.recipient}`);
+    const response = await fetch(`${mailpit.apiBase}/api/v1/message/${encodeURIComponent(summary.ID)}`);
+    assert.equal(response.ok, true);
+    const message = await response.json();
+    const expectedFilename = `${item.roleName}-Test Candidate-resume.pdf`;
+    assert.equal(message.To[0].Address, item.recipient);
+    assert.equal(message.Subject, item.subject);
+    assert.equal(message.Text.trim(), item.body);
+    assert.equal(message.Attachments.length, 1);
+    assert.equal(message.Attachments[0].FileName, expectedFilename);
+    assert.equal(message.Attachments[0].Checksums.SHA256, resumeSha256);
+    const attachment = await fetch(`${mailpit.apiBase}/api/v1/message/${encodeURIComponent(summary.ID)}/part/${encodeURIComponent(message.Attachments[0].PartID)}`);
+    assert.equal(attachment.ok, true);
+    assert.equal(sha256(Buffer.from(await attachment.arrayBuffer())), resumeSha256);
+    delivered.push({ recipient: item.recipient, subject: message.Subject, filename: expectedFilename });
+  }
+
+  const replay = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-batches`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(createRequest),
+  });
+  assert.equal(replay.status, 200, JSON.stringify(replay.body));
+  assert.equal(replay.body.idempotentReplay, true);
+  assert.equal(replay.body.batch.batchId, batchId);
+  await delay(250);
+  assert.equal((await mailpitMessages(mailpit.apiBase)).messages_count, cases.length);
+
+  const batchDirectory = path.join(api.outputDir, 'artifacts', 'application-batches', batchId);
+  const persistedBatch = JSON.parse(await readFile(path.join(batchDirectory, 'batch.json'), 'utf8'));
+  assert.equal(persistedBatch.status, 'completed');
+  assert.ok(persistedBatch.approval?.snapshotHash);
+  const persistedItems = await Promise.all(cases.map(async (item) => (
+    JSON.parse(await readFile(path.join(batchDirectory, 'items', `${item.noteId}.json`), 'utf8'))
+  )));
+  assert.deepEqual(persistedItems.map((item) => item.status), cases.map(() => 'sent'));
+  assert.deepEqual(persistedItems.map((item) => item.payload.recipient), cases.map((item) => item.recipient));
+  assert.ok(persistedItems.every((item) => item.payload.contact.evidenceHash));
+  const events = (await readFile(path.join(batchDirectory, 'events.jsonl'), 'utf8'))
+    .trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+  assert.equal(events.filter((event) => event.type === 'item_updated' && event.toStatus === 'sent').length, cases.length);
+  const audits = (await readFile(path.join(api.outputDir, 'delivery-send-audit.jsonl'), 'utf8'))
+    .trim().split(/\r?\n/u).map((line) => JSON.parse(line));
+  assert.equal(audits.length, cases.length);
+  assert.ok(audits.every((audit) => audit.event === 'email_sent' && audit.sendId && audit.previewRevision));
+  for (const audit of audits) {
+    const outcome = JSON.parse(await readFile(path.join(api.outputDir, 'application-attachments', 'send-bundles', audit.sendId, 'outcome.json'), 'utf8'));
+    assert.equal(outcome.status, 'sent');
+  }
+
+  console.log(JSON.stringify({ batchId, messageCount: list.messages_count, delivered }));
+});
+
+async function createApiServer(smtpHost, smtpPort, {
+  records = [applicationRecord()],
+  candidateProfile = { name: '示例用户', email: CANDIDATE_EMAIL },
+} = {}) {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-mailpit-api-'));
   const staticDir = path.join(fixture, 'dist');
   const outputDir = path.join(fixture, 'artifacts');
   await Promise.all([mkdir(staticDir, { recursive: true }), mkdir(outputDir, { recursive: true })]);
   await writeFile(path.join(staticDir, 'index.html'), '<!doctype html><title>Mailpit API fixture</title>', 'utf8');
-  const record = applicationRecord();
   await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
     keyword: '内容运营实习',
     analysis_mode: 'job',
-    records: [record],
-    codex_runtime: { status: 'completed', generated: 1 },
+    records,
+    codex_runtime: { status: 'completed', generated: records.length },
     quality_gate: { passed: true },
   }, null, 2), 'utf8');
 
@@ -289,7 +458,7 @@ async function createApiServer(smtpHost, smtpPort) {
     logPath: path.join(fixture, 'run.log'),
     params: {
       keyword: job.keyword,
-      candidateProfile: { name: '示例用户', email: CANDIDATE_EMAIL },
+      candidateProfile,
       aiSessionId: 'mailpit-quality-session',
     },
   };
@@ -514,14 +683,38 @@ async function waitForReady(apiBase, child) {
 
 async function waitForMessage(apiBase, recipient) {
   for (let attempt = 0; attempt < 80; attempt += 1) {
-    const response = await fetch(`${apiBase}/api/v1/messages`);
-    if (response.ok) {
-      const list = await response.json();
-      if (list.messages_count > 0 && list.messages.some((item) => item.To?.some((target) => target.Address === recipient))) return list;
-    }
+    const list = await mailpitMessages(apiBase).catch(() => null);
+    if (list?.messages_count > 0 && list.messages.some((item) => item.To?.some((target) => target.Address === recipient))) return list;
     await delay(100);
   }
   throw new Error(`Mailpit did not receive a message for ${recipient}.`);
+}
+
+async function waitForMessageCount(apiBase, count) {
+  for (let attempt = 0; attempt < 160; attempt += 1) {
+    const list = await mailpitMessages(apiBase).catch(() => null);
+    if (list?.messages_count === count) return list;
+    await delay(100);
+  }
+  throw new Error(`Mailpit did not reach exactly ${count} messages.`);
+}
+
+async function mailpitMessages(apiBase) {
+  const response = await fetch(`${apiBase}/api/v1/messages`);
+  if (!response.ok) throw new Error(`Mailpit message list failed with HTTP ${response.status}.`);
+  return response.json();
+}
+
+async function waitForBatch(origin, batchId, status) {
+  for (let attempt = 0; attempt < 160; attempt += 1) {
+    const response = await requestJson(origin, `/api/jobs/${JOB_ID}/application-batches/${batchId}`);
+    if (response.status === 200 && response.body.status === status) return response.body;
+    if (response.status === 200 && ['paused', 'cancelled'].includes(response.body.status)) {
+      assert.fail(`Batch stopped in ${response.body.status}: ${JSON.stringify(response.body.items)}`);
+    }
+    await delay(100);
+  }
+  throw new Error(`Application batch ${batchId} did not reach ${status}.`);
 }
 
 async function mailpitInfo(apiBase) {

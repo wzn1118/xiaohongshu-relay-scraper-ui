@@ -64,6 +64,119 @@ export type RateLimitState = {
   recoveryAction?: 'automatic_backoff' | 'wait_then_resume' | 'manual_probe' | 'manual_resume' | 'automatic_resume' | null
 }
 
+export type WorkflowStage = 'preflight' | 'discovery' | 'body' | 'classify' | 'extract' | 'match'
+  | 'draft' | 'quality' | 'audience' | 'artifact' | 'delivery'
+
+export type WorkflowStageState = 'queued' | 'running' | 'waiting_system' | 'waiting_user' | 'retrying'
+  | 'partial' | 'completed' | 'failed' | 'cancelled'
+
+export type WorkflowProgress = {
+  unit: 'card' | 'body' | 'job' | 'draft' | 'file' | 'email' | string
+  done: number
+  total: number | null
+  succeeded: number
+  reused: number
+  retryable: number
+  failed: number
+  blocked: number
+}
+
+export type WorkflowPerformance = {
+  activePerMinute: number | null
+  wallPerMinute: number | null
+  etaMinSeconds: number | null
+  etaMaxSeconds: number | null
+  confidence: 'low' | 'medium' | 'high' | string
+}
+
+export type UserProblem = {
+  code: string
+  category: 'access' | 'network' | 'content' | 'browser' | 'storage'
+    | 'analysis' | 'artifact' | 'delivery' | 'input' | 'unknown'
+  severity: 'info' | 'warning' | 'blocking'
+  userTitle: string
+  userMessage: string
+  preservedResultCount: number
+  automaticAction: string | null
+  retryable: boolean
+  retryAt: string | null
+  requiresUserAction: boolean
+  action: { id: string; label: string } | null
+  affectedStage: string
+  technicalRef: string
+}
+
+export type WorkflowEventV1 = {
+  schemaVersion: 1
+  eventId: string
+  sequence: number
+  jobId: string
+  attemptId: string
+  occurredAt: string
+  type: 'task' | 'stage' | 'item' | 'checkpoint' | 'retry' | 'artifact' | 'warning' | 'error'
+  stage: WorkflowStage | string
+  state: WorkflowStageState
+  progress: WorkflowProgress
+  performance?: WorkflowPerformance
+  message: { code: string; params?: Record<string, string | number | boolean> }
+  problem?: UserProblem
+  checkpoint?: { revision: number; savedAt: string; resumeAvailable: boolean }
+  sourceRevision?: number
+  outputRefs?: string[]
+  technicalRef?: string
+}
+
+export type StageSnapshot = {
+  stage: WorkflowStage | string
+  state: WorkflowStageState
+  headline?: string
+  detail?: string
+  progress: WorkflowProgress
+  performance?: WorkflowPerformance
+  problem?: UserProblem | null
+  updatedAt?: string | null
+}
+
+export type WorkflowConnectionState = 'live' | 'reconnecting' | 'stale' | 'offline'
+
+export type WorkflowSnapshotV3 = {
+  schemaVersion: 3
+  revision: number
+  throughSequence: number
+  jobId: string
+  activeAttemptId: string | null
+  journey: 'job' | 'general' | 'body_import'
+  state: string
+  activeStage: string | null
+  headline: string
+  detail: string
+  stages: StageSnapshot[]
+  counts: {
+    discovered: number
+    fullText: number
+    confirmedJobs: number
+    nonJobs: number
+    matchReady: number
+    draftReady: number
+    applicationReady: number
+    pending: number
+    retryable: number
+    unavailable: number
+  }
+  speed: {
+    activePerMinute: number | null
+    wallPerMinute: number | null
+    cacheHits: number
+    networkSuccess: number
+    etaMinSeconds: number | null
+    etaMaxSeconds: number | null
+    confidence: string
+  }
+  issues: UserProblem[]
+  connection: { state: WorkflowConnectionState; lastEventAt: string }
+  checkpoint: { revision: number; savedAt: string; resumeAvailable: boolean }
+}
+
 export type Artifact = {
   id: string
   name: string
@@ -137,6 +250,8 @@ export type Job = {
   lastResumedAt?: string | null
   revision?: number
   stages?: Record<string, unknown>
+  experienceSnapshot?: WorkflowSnapshotV3 | null
+  workflowSnapshot?: WorkflowSnapshotV3 | null
   attempts?: JobAttempt[]
   legacyResumeLineage?: Record<string, unknown> | null
 }
@@ -995,6 +1110,7 @@ export type ApplicationRoute = {
   source_image_index?: number
   source_image_url?: string
   verification_status?: 'body_verified' | 'body_extracted' | 'image_format_verified' | 'cross_verified' | 'needs_manual_review' | string
+  normalization_applied?: boolean
   actionable?: boolean
 }
 
@@ -1129,6 +1245,8 @@ export type EmailPreview = {
   }
   attachmentBundleHash: string
   previewRevision: string
+  smtpConfigurationRevision: number
+  smtpConfigurationFingerprint: string
   warnings: Array<{ code: string; message: string; blocking: boolean }>
   readiness: 'ready' | 'blocked'
   estimatedMessageSize: number
@@ -1288,6 +1406,12 @@ export type ApplicationResult = {
   }
   draftVersion?: DraftVersionRef
   delivery?: DeliveryState | null
+  attachmentRequirement?: {
+    detected: boolean
+    template: string
+    evidence: string
+    fields: string[]
+  }
   quality: Record<string, boolean>
 }
 
@@ -1345,13 +1469,181 @@ export type ApplicationResultsQuery = {
   timeRange?: 'all' | '1' | '3' | '7' | '30' | '90' | 'unknown'
 }
 
+export type ApplicationContactSource = 'body' | 'image' | 'author_comment' | 'other_comment'
+
+export type ApplicationContactCandidate = {
+  address: string
+  source: ApplicationContactSource
+  noteId: string
+  postId: string
+  commentId: string
+  authorId: string
+  evidenceText: string
+  evidenceHash: string
+  confidence: number
+  collectionStatus: 'pending' | 'partial' | 'complete'
+  verificationStatus: string
+  normalizationApplied?: boolean
+  sourceFields?: string[]
+  actionable?: boolean
+  requiresReview?: boolean
+  ownershipStatus?: string
+}
+
+export type ApplicationContactResolution = {
+  schemaVersion: 1
+  noteId: string
+  postId: string
+  status: 'ready' | 'manual_review' | 'pending' | 'no_email'
+  reason: string
+  source: string
+  collectionStatus: 'pending' | 'partial' | 'complete'
+  commentFallbackUsed: boolean
+  requiresReview: boolean
+  selectedCandidate: ApplicationContactCandidate | null
+  candidates: ApplicationContactCandidate[]
+  issues: Array<{ code: string; artifact?: string; reason?: string }>
+}
+
+export type ApplicationBatchItemStatus = 'resolving' | 'blocked_no_email' | 'blocked_ambiguous'
+  | 'draft_pending' | 'quality_pending' | 'filename_pending' | 'ready' | 'sending'
+  | 'sent' | 'failed_retryable' | 'unknown_manual_review' | 'skipped'
+
+export type ApplicationBatchAttachmentPreview = {
+  attachmentId: string
+  originalName: string
+  currentDisplayName: string
+  finalDisplayName: string
+  sha256: string
+  size?: number
+  mediaType?: string
+}
+
+export type ApplicationBatchPreflightItem = {
+  noteId: string
+  title: string
+  roleName: string
+  status: ApplicationBatchItemStatus
+  canPrepare: boolean
+  blockers: Array<{ code: string; message: string }>
+  contact: ApplicationContactCandidate | null
+  contactResolution: ApplicationContactResolution | null
+  attachments: ApplicationBatchAttachmentPreview[]
+  preview: Pick<EmailPreview, 'recipient' | 'from' | 'replyTo' | 'subject' | 'text' | 'draftId' | 'draftVersion' | 'attachmentSummary' | 'attachmentBundleHash' | 'previewRevision' | 'smtpConfigurationRevision' | 'smtpConfigurationFingerprint' | 'warnings' | 'readiness' | 'estimatedMessageSize'> | null
+  payload?: ApplicationBatchPayload | null
+}
+
+export type ApplicationBatchPreflight = {
+  schemaVersion?: number
+  dryRun?: boolean
+  batchId: string
+  generatedAt?: string
+  maxBatchSize?: number
+  items: ApplicationBatchPreflightItem[]
+  counts: Partial<Record<ApplicationBatchItemStatus, number>>
+  readyNoteIds: string[]
+  preparableNoteIds: string[]
+}
+
+export type ApplicationBatchPayload = {
+  title: string
+  roleName: string
+  recipient: string
+  contact: ApplicationContactCandidate
+  subject: string
+  body: string
+  bodyHash: string
+  draftId: string
+  draftVersion: number
+  contentHash: string
+  qualityReportRef: string | null
+  attachmentBundleHash: string
+  attachments: Array<{ attachmentId: string; filename: string; mediaType: string; size: number; sha256: string }>
+  finalFilenames: string[]
+  previewRevision: string
+  smtpConfigurationRevision: number
+  smtpConfigurationFingerprint: string
+  sendRequest: Record<string, unknown>
+}
+
+export type ApplicationBatchItem = {
+  schemaVersion: number
+  batchId: string
+  itemId: string
+  noteId: string
+  contactCandidateId: string | null
+  status: ApplicationBatchItemStatus
+  payload: ApplicationBatchPayload | (Partial<ApplicationBatchPayload> & Record<string, unknown>)
+  error: { code: string; message: string; attempt?: number; retryAt?: string } | null
+  revision: number
+  createdAt: string
+  updatedAt: string
+  recoveredAt: string | null
+}
+
+export type ApplicationBatchStatus = 'draft' | 'ready' | 'approved' | 'running' | 'paused' | 'completed' | 'cancelled'
+
+export type ApplicationBatch = {
+  schemaVersion: number
+  batchId: string
+  jobId: string
+  title: string
+  metadata: Record<string, unknown>
+  settings: { concurrency?: number; minIntervalMs?: number; maxBatchSize?: number; stagedLimit?: number }
+  status: ApplicationBatchStatus
+  revision: number
+  approvalRevision: number
+  approval: { revision: number; batchRevision: number; snapshotHash: string; approvedAt: string; actor: string; reason: string } | null
+  itemIds: string[]
+  counts: Record<ApplicationBatchItemStatus, number>
+  items: ApplicationBatchItem[]
+  createdAt: string
+  updatedAt: string
+  lastEventSequence: number
+  recoveryCount: number
+}
+
+export type ApplicationBatchRequest = {
+  noteIds: string[]
+  contactApprovals?: Array<{ noteId: string; evidenceHash: string; confirmed: true }>
+  defaultAttachmentTemplate?: string
+  minIntervalMs?: number
+  aiSessionId?: string
+  title?: string
+  idempotencyKey?: string
+}
+
+export type ApplicationBatchCreateResponse = {
+  schemaVersion: number
+  batch: ApplicationBatch
+  preflight: ApplicationBatchPreflight | null
+  idempotentReplay?: boolean
+}
+
+export type ApplicationBatchStreamEvent = {
+  type: 'snapshot' | 'batch' | 'error'
+  sequence?: number
+  throughSequence?: number
+  batch?: ApplicationBatch
+  batchId?: string
+  event?: { sequence: number; type: string; batchRevision: number; at: string; [key: string]: unknown }
+  error?: { code: string; message: string }
+}
+
 export type JobEvent = {
-  type: 'snapshot' | 'status' | 'log' | 'artifacts' | 'done' | 'error'
+  type: 'snapshot' | 'status' | 'log' | 'artifacts' | 'done' | 'error' | 'workflow' | 'problem' | 'heartbeat'
+  sequence?: number
+  revision?: number
+  eventId?: string
+  occurredAt?: string
   job?: Job
   line?: string
   level?: 'info' | 'warn' | 'error' | 'success'
   artifacts?: Artifact[]
   message?: string
+  workflowEvent?: WorkflowEventV1
+  experienceSnapshot?: WorkflowSnapshotV3
+  problem?: UserProblem
 }
 
 export type DataDeletionSpec =

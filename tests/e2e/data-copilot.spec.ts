@@ -327,6 +327,14 @@ test('restores a conversation and supports approval, stop, retry, and mobile pan
 
   const dialog = page.getByRole('dialog', { name: '数据 Copilot' })
   await expect(dialog).toBeVisible()
+  await expect(dialog.getByRole('button', { name: '新建会话', exact: true }).last()).toBeVisible()
+  await expect(dialog.getByRole('button', { name: '选择数据上下文，已选 1 项' })).toBeVisible()
+  for (const mode of ['提问', '分析', '构建']) {
+    await expect(dialog.getByRole('button', { name: mode, exact: true })).toBeVisible()
+  }
+  await dialog.getByRole('button', { name: '收起运行详情' }).click()
+  await expect(dialog.getByRole('button', { name: '展开运行详情' })).toBeVisible()
+  await dialog.getByRole('button', { name: '展开运行详情' }).click()
   await expect(dialog.getByText('既有分析会话', { exact: true }).first()).toBeVisible()
   await dialog.getByText('既有分析会话', { exact: true }).first().click()
   await expect(dialog.getByText('分析当前任务', { exact: true })).toBeVisible()
@@ -338,13 +346,14 @@ test('restores a conversation and supports approval, stop, retry, and mobile pan
   await expect(retry).toBeDisabled()
   await dialog.getByRole('button', { name: '确认执行' }).click()
   await expect.poll(() => state.approvals).toBe(1)
-  await dialog.getByRole('button', { name: '停止生成' }).first().click()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(dialog.getByRole('button', { name: '停止运行' })).toBeVisible()
+  await dialog.getByRole('button', { name: '停止运行' }).click()
   await expect.poll(() => state.cancels).toBe(1)
   await expect(retry).toBeEnabled()
   await retry.click()
   await expect.poll(() => state.retries).toBe(1)
 
-  await page.setViewportSize({ width: 390, height: 844 })
   await expect.poll(async () => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   await dialog.getByRole('button', { name: '显示会话列表' }).click()
   await expect(dialog.locator('.data-copilot-session-rail')).toBeVisible()
@@ -486,6 +495,64 @@ test('keeps a selected historical task bound when the global conversation list r
   ])
 })
 
+test('turns table results into interactive batch email extraction controls', async ({ page }, testInfo) => {
+  const rows = [
+    { noteId: 'note-001', title: 'AI 产品实习生', delivery: { email: 'ai@example.com' } },
+    { noteId: 'note-002', title: '数据分析实习生', delivery: null },
+    { noteId: 'note-003', title: '商业分析实习生', delivery: { email: 'business@example.com' } },
+    ...Array.from({ length: 7 }, (_, index) => ({
+      noteId: `note-${String(index + 4).padStart(3, '0')}`,
+      title: `运营岗位 ${index + 1}`,
+      delivery: null,
+    })),
+  ]
+  const state = baseState({
+    sessions: [conversation(sessionId, 'completed')],
+    messages: [
+      {
+        messageId: 'message-interactive-table',
+        conversationId: sessionId,
+        role: 'tool',
+        content: {
+          type: 'table.result',
+          toolRunId: 'tool-interactive-table',
+          name: 'applications.get_delivery',
+          result: { type: 'table.result', total: rows.length, rows },
+        },
+        createdAt: now,
+      },
+    ],
+  })
+  await installApi(page, state)
+  await page.goto('/')
+  await page.getByRole('button', { name: '数据助手' }).click()
+
+  const dialog = page.getByRole('dialog', { name: '数据 Copilot' })
+  const table = dialog.getByTestId('interactive-result-table')
+  await expect(table).toBeVisible()
+  await expect(table.getByText('共 10 条')).toBeVisible()
+  await expect(table.getByRole('link', { name: 'ai@example.com' })).toBeVisible()
+  await expect(table.getByText('第 1 / 2 页')).toBeVisible()
+
+  const search = table.getByRole('textbox', { name: '搜索表格结果' })
+  await search.fill('商业分析')
+  await expect(table.getByText('筛选到 1 条')).toBeVisible()
+  await expect(table.getByText('商业分析实习生', { exact: true })).toBeVisible()
+  await search.fill('')
+
+  await table.getByRole('checkbox', { name: '选择 AI 产品实习生' }).check()
+  await expect(table.getByText('已选择 1 条', { exact: false })).toBeVisible()
+  await table.screenshot({ path: testInfo.outputPath('interactive-result-table.png') })
+  await table.getByRole('button', { name: '提取邮箱' }).click()
+
+  await expect.poll(() => state.sendBodies.length).toBe(1)
+  const prompt = String(state.sendBodies[0].content)
+  expect(prompt).toContain('applications.extract_email_requirements')
+  expect(prompt).toContain('note-001')
+  expect(prompt).toContain('分页直到完整覆盖')
+  expect(prompt).toContain('不要只返回第一条')
+})
+
 test('renders job delivery results as structured controls and exposes application email actions', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 1200 })
   const sourceUrl = 'https://www.xiaohongshu.com/explore/note-001?xsec_token=secret-token&xsec_source=pc_feed'
@@ -500,6 +567,18 @@ test('renders job delivery results as structured controls and exposes applicatio
         content: {
           type: 'assistant.message',
           text: `可投递岗位\ntalent@example.com | 正文写“已经招到啦” | ${sourceUrl} |\n\n可直接复制的邮箱清单：\n\`\`\`text\ntalent@example.com\nhr@example.com\n\`\`\``,
+        },
+        createdAt: now,
+      },
+      {
+        messageId: 'message-attachment-list',
+        conversationId: sessionId,
+        role: 'tool',
+        content: {
+          type: 'tool.result',
+          toolRunId: 'tool-attachment-list',
+          name: 'attachment.list',
+          result: { count: 0 },
         },
         createdAt: now,
       },
@@ -545,14 +624,16 @@ test('renders job delivery results as structured controls and exposes applicatio
   await page.getByRole('button', { name: '数据助手' }).click()
 
   const dialog = page.getByRole('dialog', { name: '数据 Copilot' })
-  await expect(dialog.getByText('招聘邮箱')).toBeVisible()
+  await expect(dialog.getByText('岗位投递邮件', { exact: true })).toBeVisible()
+  await expect(dialog.getByLabel('批量投递状态')).toBeVisible()
+  await expect(dialog.getByRole('region', { name: '执行步骤' }).getByRole('button', { name: /已完成 1 个步骤/ })).toBeVisible()
   await expect(dialog.getByRole('link', { name: 'talent@example.com' }).first()).toBeVisible()
   await expect(dialog.getByText('secret-token')).toHaveCount(0)
   await expect(dialog.getByRole('button', { name: '写投递邮件' })).toBeVisible()
-  await expect(dialog.getByRole('button', { name: '按要求拟标题' })).toBeVisible()
+  await expect(dialog.getByRole('button', { name: '批量核对格式' })).toBeVisible()
   await expect(dialog.getByRole('button', { name: '发送邮件' })).toBeVisible()
   await expect(dialog.getByRole('button', { name: '生成投递草稿' })).toBeVisible()
-  await expect(dialog.getByRole('button', { name: '生成并预览邮件' })).toBeVisible()
+  await expect(dialog.getByRole('button', { name: '预览邮件' })).toBeVisible()
 
   await expect(dialog.getByText('岗位投递邮件', { exact: true })).toBeVisible()
   await expect(dialog.getByRole('button', { name: /撰写岗位投递邮件/ })).toHaveCount(0)
@@ -592,7 +673,7 @@ test('renders job delivery results as structured controls and exposes applicatio
   expect(String(state.sendBodies[1].content)).toContain('可立即到岗')
   expect(String(state.sendBodies[1].content)).toContain('这是我在卡片中确认后的正文')
 
-  await dialog.getByRole('button', { name: '按要求拟标题' }).click()
+  await dialog.getByRole('button', { name: '批量核对格式' }).click()
   await expect(dialog.getByRole('textbox', { name: '发送给 Data Copilot' })).toHaveValue(/邮件标题或主题格式要求/)
 })
 

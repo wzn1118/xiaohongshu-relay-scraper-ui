@@ -6,6 +6,7 @@ data/
 output/
 test-results/
 tmp/
+deliverables/
 profiles/*.json
 !profiles/candidate_profile.example.json
 docs/RESUME_EVIDENCE.md

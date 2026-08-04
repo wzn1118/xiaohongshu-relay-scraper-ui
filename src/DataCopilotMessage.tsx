@@ -1,10 +1,18 @@
-import { useEffect, useState, type CSSProperties, type ReactElement } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+  type ReactElement,
+} from "react";
 import {
   AlertCircle,
+  ArrowUpDown,
   Bot,
   BriefcaseBusiness,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleStop,
   Clipboard,
@@ -12,10 +20,13 @@ import {
   ExternalLink,
   FileText,
   Image as ImageIcon,
+  Layers3,
   LoaderCircle,
   Mail,
+  Paperclip,
   RefreshCw,
   RotateCcw,
+  Search,
   ShieldCheck,
   Send,
   TerminalSquare,
@@ -29,6 +40,7 @@ import type {
   DataCopilotMessageData,
   DataCopilotToolCall,
 } from "./DataCopilotContext";
+import { parseAnswerAst, type AnswerBlock } from "./copilot/answer-ast";
 
 export type DataCopilotMessageProps = {
   message: DataCopilotMessageData;
@@ -91,6 +103,9 @@ function ToolStatusIcon({ status }: { status: DataCopilotToolCall["status"] }) {
 }
 
 function toolDisplayName(name: string) {
+  if (name === "attachment.parse") return "附件解析";
+  if (name === "attachment.list") return "读取附件";
+  if (name === "applications.extract_email_requirements") return "批量提取邮件要求";
   return (
     {
       "applications.compose_email": "撰写岗位投递邮件",
@@ -176,6 +191,104 @@ function InlineSafeText({ text }: { text: string }) {
   );
 }
 
+function semanticType(toolCall: DataCopilotToolCall) {
+  return String(objectValue(toolCall.result).type ?? "");
+}
+
+function isRichToolCall(toolCall: DataCopilotToolCall) {
+  return [
+    "table.result",
+    "artifact.ready",
+    "email.draft",
+    "email.sent",
+    "application.email_draft",
+    "application.batch_preflight",
+    "application.batch",
+  ].includes(semanticType(toolCall));
+}
+
+function AnswerAstContent({
+  content,
+  busy = false,
+  onAction,
+}: {
+  content: string;
+  busy?: boolean;
+  onAction?: (prompt: string) => void;
+}) {
+  const ast = parseAnswerAst(content);
+  const renderBlock = (block: AnswerBlock, index: number): ReactElement => {
+    const key = block.id || `answer-block-${index}`;
+    const text = typeof block.content === "string" ? block.content : "";
+    if (block.kind === "heading") {
+      const level = Math.min(6, Math.max(2, Number(block.level || 2)));
+      return <h4 key={key} aria-level={level} style={{ ...messageStyles.richHeading, fontSize: level <= 2 ? 16 : level <= 3 ? 14 : 13 }}>{text}</h4>;
+    }
+    if (block.kind === "paragraph") {
+      return <p key={key} style={messageStyles.richParagraph}><InlineSafeText text={text} /></p>;
+    }
+    if (block.kind === "quote") {
+      return <blockquote key={key} style={{ margin: "8px 0", padding: "8px 12px", borderLeft: "3px solid #a8cfc2", background: "#f5faf8", color: "#53625a", whiteSpace: "pre-wrap" }}><InlineSafeText text={text} /></blockquote>;
+    }
+    if (block.kind === "code") {
+      const code = objectValue(block.content);
+      const value = String(code.code ?? text);
+      return <div key={key} style={{ margin: "10px 0", border: "1px solid #d8e2dd", borderRadius: 6, overflow: "hidden", background: "#18221e" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 9px", color: "#b8cbc1", fontSize: 10, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          <span>{String(code.language || "code")}</span>
+          <CopyFieldButton value={value} label="code" />
+        </div>
+        <pre style={{ margin: 0, padding: "10px 12px", overflowX: "auto", color: "#edf7f1", fontSize: 12, lineHeight: 1.55, fontFamily: "ui-monospace, SFMono-Regular, Consolas, monospace" }}>{value}</pre>
+      </div>;
+    }
+    if (block.kind === "table") {
+      const table = objectValue(block.content);
+      const headers = Array.isArray(table.headers) ? table.headers.map(String) : [];
+      const rows = Array.isArray(table.rows) ? table.rows.map((row) => Array.isArray(row) ? row.map(String) : [String(row)]) : [];
+      return <div key={key} style={{ overflowX: "auto", margin: "10px 0" }}><table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+        {headers.length ? <thead><tr>{headers.map((header, cellIndex) => <th key={`${key}-h-${cellIndex}`} style={{ padding: "7px 9px", textAlign: "left", borderBottom: "1px solid #bdcec6", color: "#34483e", background: "#f3f8f5", fontWeight: 700 }}>{header}</th>)}</tr></thead> : null}
+        <tbody>{rows.map((row, rowIndex) => <tr key={`${key}-r-${rowIndex}`}>{row.map((cell, cellIndex) => <td key={`${key}-${rowIndex}-${cellIndex}`} style={{ padding: "7px 9px", borderBottom: "1px solid #e5ece8", verticalAlign: "top" }}><InlineSafeText text={cell} /></td>)}</tr>)}</tbody>
+      </table></div>;
+    }
+    if (block.kind === "list" || block.kind === "checklist") {
+      const items = Array.isArray(block.content) ? block.content : [];
+      return <div key={key} style={{ display: "grid", gap: 6, margin: "8px 0" }}>{items.map((item, itemIndex) => {
+        const entry = objectValue(item);
+        const itemText = String(entry.text ?? item);
+        const checked = Boolean(entry.checked);
+        return <div key={`${key}-${itemIndex}`} style={{ display: "flex", gap: 8, alignItems: "flex-start", lineHeight: 1.55 }}>
+          <span aria-hidden="true" style={{ display: "grid", flex: "0 0 auto", width: 16, height: 16, placeItems: "center", marginTop: 2, border: `1px solid ${checked ? "#2f8b72" : "#aabdb4"}`, borderRadius: 4, background: checked ? "#e4f3ed" : "#fff", color: "#2f8b72" }}>{checked ? <Check size={11} /> : block.kind === "checklist" ? null : <span style={{ width: 4, height: 4, borderRadius: "50%", background: "#5d776b" }} />}</span>
+          <span style={{ textDecoration: checked ? "line-through" : undefined, color: checked ? "#78867f" : undefined }}><InlineSafeText text={itemText} /></span>
+        </div>;
+      })}</div>;
+    }
+    if (block.kind === "callout" || block.kind === "error" || block.kind === "tool_summary") {
+      const value = objectValue(block.content);
+      const label = String(value.title ?? (block.kind === "error" ? "Error" : block.kind === "tool_summary" ? "Tool result" : "Note"));
+      const body = String(value.body ?? value.message ?? text);
+      return <aside key={key} style={{ margin: "10px 0", padding: "9px 11px", border: `1px solid ${block.kind === "error" ? "#e9b8b1" : "#c9ded5"}`, borderRadius: 6, background: block.kind === "error" ? "#fff7f5" : "#f4faf7", color: block.kind === "error" ? "#8a3b31" : "#486257" }}><strong style={{ display: "block", marginBottom: 3, fontSize: 11 }}>{label}</strong><InlineSafeText text={body} /></aside>;
+    }
+    if (block.kind === "citation" || block.kind === "artifact") {
+      const value = objectValue(block.content);
+      const label = String((value.title ?? value.name ?? value.id ?? text) || block.kind);
+      const href = String(value.url ?? "");
+      return <div key={key} style={{ display: "flex", gap: 7, alignItems: "center", margin: "7px 0", color: "#416052", fontSize: 12 }}>{href ? <a href={href} target="_blank" rel="noreferrer" style={messageStyles.inlineLink}>{label}</a> : <span>{label}</span>}</div>;
+    }
+    if (block.kind === "chart" || block.kind === "diff") {
+      return <pre key={key} style={{ margin: "9px 0", padding: "9px 11px", overflowX: "auto", border: "1px solid #d8e2dd", borderRadius: 6, background: "#f7faf8", fontSize: 11, whiteSpace: "pre-wrap" }}>{typeof block.content === "string" ? block.content : JSON.stringify(block.content, null, 2)}</pre>;
+    }
+    return <p key={key} style={messageStyles.richParagraph}><InlineSafeText text={text || JSON.stringify(block.content)} /></p>;
+  };
+  const hasRecruitmentContact = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/iu.test(content);
+  return <div style={messageStyles.richContent} data-answer-schema={ast.schemaVersion}>
+    {ast.blocks.map(renderBlock)}
+    {hasRecruitmentContact && onAction ? <div style={messageStyles.inlineDeliveryActions}>
+      <button type="button" onClick={() => onAction("基于当前结果生成结构化投递草稿，不发送邮件。") } disabled={busy} style={messageStyles.inlineDraftButton}><BriefcaseBusiness size={13} aria-hidden="true" />生成投递草稿</button>
+      <button type="button" onClick={() => onAction("基于当前草稿生成预览，展示收件人、主题、正文和附件，不发送邮件。") } disabled={busy} style={messageStyles.inlinePreviewButton}><Mail size={13} aria-hidden="true" />预览邮件</button>
+    </div> : null}
+  </div>;
+}
+
 function StructuredAssistantContent({
   content,
   busy = false,
@@ -185,6 +298,11 @@ function StructuredAssistantContent({
   busy?: boolean;
   onAction?: (prompt: string) => void;
 }) {
+  if (shouldUseAnswerAst(content)) {
+    return <AnswerAstContent content={content} busy={busy} onAction={onAction} />;
+  }
+
+  /* Legacy email-aware renderer retained below for compatibility with persisted messages. */
   const lines = content
     .replace(/```(?:text|markdown)?/giu, "")
     .replaceAll("```", "")
@@ -323,6 +441,10 @@ function StructuredAssistantContent({
       ) : null}
     </div>
   );
+}
+
+function shouldUseAnswerAst(_content: string) {
+  return true;
 }
 
 function CopyFieldButton({ value, label }: { value: string; label: string }) {
@@ -674,6 +796,536 @@ function ApplicationEmailEditor({
   );
 }
 
+function AttachmentPreparationCard({ preview }: { preview: Record<string, unknown> }) {
+  const summary = objectValue(preview.attachmentSummary ?? preview.attachmentsSummary);
+  const rawAttachments = Array.isArray(summary.attachments)
+    ? summary.attachments
+    : Array.isArray(preview.attachments)
+      ? preview.attachments
+      : [];
+  const attachments = rawAttachments.map(objectValue);
+  const totalBytes = Number(summary.totalBytes ?? preview.attachmentBytes);
+  const count = Number(summary.count ?? attachments.length);
+  if (!count && !attachments.length) {
+    return (
+      <div style={messageStyles.attachmentPreparation} data-testid="attachment-preparation">
+        <div style={messageStyles.attachmentPreparationHeader}>
+          <Paperclip size={14} aria-hidden="true" />
+          <strong>附件准备</strong>
+          <span style={messageStyles.attachmentPreparationBadge}>无附件</span>
+        </div>
+        <span style={messageStyles.attachmentPreparationHint}>当前草稿不包含附件。</span>
+      </div>
+    );
+  }
+  return (
+    <div style={messageStyles.attachmentPreparation} data-testid="attachment-preparation">
+      <div style={messageStyles.attachmentPreparationHeader}>
+        <Paperclip size={14} aria-hidden="true" />
+        <strong>附件准备</strong>
+        <span style={messageStyles.attachmentPreparationBadge}>{count} 个{formatBytes(totalBytes) ? ` · ${formatBytes(totalBytes)}` : ""}</span>
+      </div>
+      <span style={messageStyles.attachmentPreparationHint}>发送前会按投递规则核对文件名、大小和校验；批量冻结时应用最终投递名。</span>
+      <div style={messageStyles.attachmentPreparationList}>
+        {attachments.slice(0, 8).map((attachment, index) => {
+          const currentName = String(attachment.displayName ?? attachment.filename ?? attachment.name ?? `附件 ${index + 1}`);
+          const originalName = String(attachment.originalName ?? attachment.sourceName ?? "");
+          const finalName = String(attachment.finalDisplayName ?? attachment.filename ?? currentName);
+          const hash = String(attachment.sha256 ?? "");
+          const nameChanged = originalName && finalName && originalName !== finalName;
+          return (
+            <div key={String(attachment.attachmentId ?? `${finalName}-${index}`)} style={messageStyles.attachmentPreparationRow}>
+              <span style={messageStyles.attachmentPreparationName}>
+                {nameChanged ? <><s>{originalName}</s><b>{finalName}</b></> : <b>{finalName || currentName}</b>}
+              </span>
+              <span style={messageStyles.attachmentPreparationMeta}>
+                {[formatBytes(attachment.size), hash ? `SHA-256 ${hash.slice(0, 10)}...` : ""].filter(Boolean).join(" · ") || "待校验"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      {attachments.length > 8 ? <span style={messageStyles.attachmentPreparationHint}>另有 {attachments.length - 8} 个附件已收起。</span> : null}
+    </div>
+  );
+}
+
+function BatchDeliveryResult({ result }: { result: unknown }) {
+  const value = objectValue(result);
+  const preflight = objectValue(value.preflight ?? value);
+  const counts = objectValue(preflight.counts ?? value.counts);
+  const items = Array.isArray(preflight.items) ? preflight.items.map(objectValue) : [];
+  const readyNoteIds = Array.isArray(preflight.readyNoteIds) ? preflight.readyNoteIds : [];
+  const ready = Number(counts.ready ?? readyNoteIds.length ?? 0);
+  const blocked = items.filter((item) => String(item.status ?? "") !== "ready").length;
+  return (
+    <div style={messageStyles.batchResult} data-testid="batch-delivery-result">
+      <div style={messageStyles.batchResultHeader}>
+        <Layers3 size={15} aria-hidden="true" />
+        <strong>批量投递准备</strong>
+        <span style={messageStyles.attachmentPreparationBadge}>{ready} 项可发送{blocked ? ` · ${blocked} 项待处理` : ""}</span>
+      </div>
+      <span style={messageStyles.attachmentPreparationHint}>流程：附件准备 → 邮件预览 → 冻结批次 → 审批后发送。</span>
+      {items.length ? (
+        <div style={messageStyles.batchResultList}>
+          {items.slice(0, 6).map((item, index) => {
+            const attachments = Array.isArray(item.attachments) ? item.attachments.map(objectValue) : [];
+            return (
+              <div key={String(item.noteId ?? index)} style={messageStyles.batchResultRow}>
+                <span><b>{String(item.roleName ?? item.title ?? item.noteId ?? `岗位 ${index + 1}`)}</b><small>{String(objectValue(item.contact).address ?? "收件人待核对")}</small></span>
+                <span><b>{String(objectValue(item.preview).subject ?? "主题待生成")}</b><small>{attachments.length ? `${attachments.length} 个附件` : "无附件"}</small></span>
+                <span style={messageStyles.batchResultStatus}>{String(item.status ?? "待处理")}</span>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+type InteractiveTableRow = {
+  key: string;
+  value: Record<string, unknown>;
+};
+
+const TABLE_PAGE_SIZE = 8;
+
+const TABLE_COLUMN_LABELS: Record<string, string> = {
+  noteId: "记录 ID",
+  id: "记录 ID",
+  title: "岗位 / 标题",
+  jobTitle: "岗位",
+  company: "公司",
+  delivery: "投递信息",
+  outreach: "联系信息",
+  recipientEmails: "招聘邮箱",
+  recipientEmail: "招聘邮箱",
+  email: "邮箱",
+  subjectFormat: "邮件标题格式",
+  attachmentNamingRule: "附件命名要求",
+  extractionStatus: "提取状态",
+  missing: "缺失项",
+};
+
+function tableCellText(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "";
+  if (Array.isArray(value)) return value.map(tableCellText).filter(Boolean).join("、");
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function tableEmails(value: unknown): string[] {
+  const matches = tableCellText(value).match(
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/giu,
+  );
+  return [...new Set((matches ?? []).map((email) => email.toLowerCase()))];
+}
+
+function TableCellContent({ column, value }: { column: string; value: unknown }) {
+  const text = tableCellText(value);
+  const emails = tableEmails(value);
+  const record = objectValue(value);
+  const deliveryState = String(record.action ?? record.status ?? "");
+  const deliveryStateLabel =
+    {
+      draft_saved: "草稿已保存",
+      drafted: "草稿已生成",
+      prepared: "已准备",
+      preview_ready: "可预览",
+      sent: "已发送",
+      failed: "处理失败",
+    }[deliveryState] ?? deliveryState;
+  if (emails.length) {
+    return (
+      <span style={messageStyles.tableEmailList}>
+        {emails.map((email) => (
+          <a key={email} href={`mailto:${email}`} style={messageStyles.emailLink}>
+            <Mail size={11} aria-hidden="true" />
+            {email}
+          </a>
+        ))}
+        {deliveryStateLabel ? (
+          <span style={messageStyles.tableStatusCell}>{deliveryStateLabel}</span>
+        ) : null}
+      </span>
+    );
+  }
+  if (column === "delivery" && deliveryStateLabel) {
+    return <span style={messageStyles.tableStatusCell}>{deliveryStateLabel}</span>;
+  }
+  if (!text) {
+    const canExtract = [
+      "delivery",
+      "outreach",
+      "recipientEmails",
+      "recipientEmail",
+      "email",
+    ].includes(column);
+    return (
+      <span style={canExtract ? messageStyles.tablePendingCell : messageStyles.tableEmptyCell}>
+        {canExtract ? "待提取" : "-"}
+      </span>
+    );
+  }
+  return <InlineSafeText text={text.slice(0, 240)} />;
+}
+
+function csvCell(value: unknown) {
+  return `"${tableCellText(value).replaceAll('"', '""')}"`;
+}
+
+function InteractiveResultTable({
+  value,
+  busy = false,
+  onAction,
+  jobId,
+}: {
+  value: Record<string, unknown>;
+  busy?: boolean;
+  onAction?: (prompt: string) => void;
+  jobId?: string;
+}) {
+  const rows = useMemo<InteractiveTableRow[]>(
+    () =>
+      (Array.isArray(value.rows) ? value.rows : [])
+        .filter((row) => row && typeof row === "object" && !Array.isArray(row))
+        .map((row, index) => {
+          const record = row as Record<string, unknown>;
+          const identity = String(record.noteId ?? record.id ?? "row");
+          return { key: `${identity}-${index}`, value: record };
+        }),
+    [value.rows],
+  );
+  const columns = useMemo(() => {
+    const discovered = [...new Set(rows.flatMap((row) => Object.keys(row.value)))];
+    const priority = [
+      "noteId",
+      "id",
+      "title",
+      "jobTitle",
+      "company",
+      "recipientEmails",
+      "recipientEmail",
+      "email",
+      "subjectFormat",
+      "attachmentNamingRule",
+      "delivery",
+      "outreach",
+      "extractionStatus",
+    ];
+    return [
+      ...priority.filter((column) => discovered.includes(column)),
+      ...discovered.filter((column) => !priority.includes(column)),
+    ].slice(0, 12);
+  }, [rows]);
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<{
+    column: string;
+    direction: "asc" | "desc";
+  } | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [page, setPage] = useState(1);
+  const [feedback, setFeedback] = useState("");
+
+  const filteredRows = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase("zh-CN");
+    const matched = needle
+      ? rows.filter((row) =>
+          columns.some((column) =>
+            tableCellText(row.value[column])
+              .toLocaleLowerCase("zh-CN")
+              .includes(needle),
+          ),
+        )
+      : rows;
+    if (!sort) return matched;
+    return [...matched].sort((left, right) => {
+      const a = tableCellText(left.value[sort.column]);
+      const b = tableCellText(right.value[sort.column]);
+      const compared = a.localeCompare(b, "zh-CN", {
+        numeric: true,
+        sensitivity: "base",
+      });
+      return sort.direction === "asc" ? compared : -compared;
+    });
+  }, [columns, query, rows, sort]);
+  const pageCount = Math.max(1, Math.ceil(filteredRows.length / TABLE_PAGE_SIZE));
+  const visiblePage = Math.min(page, pageCount);
+  const visibleRows = filteredRows.slice(
+    (visiblePage - 1) * TABLE_PAGE_SIZE,
+    visiblePage * TABLE_PAGE_SIZE,
+  );
+  const selectedRows = rows.filter((row) => selected.has(row.key));
+  const currentRows = selectedRows.length ? selectedRows : filteredRows;
+  const detectedEmails = [...new Set(rows.flatMap((row) => tableEmails(row.value)))];
+  const allVisibleSelected =
+    visibleRows.length > 0 && visibleRows.every((row) => selected.has(row.key));
+  const coverage = objectValue(value.coverage);
+
+  useEffect(() => {
+    setPage(1);
+  }, [query]);
+
+  const toggleSort = (column: string) => {
+    setSort((current) =>
+      current?.column === column
+        ? { column, direction: current.direction === "asc" ? "desc" : "asc" }
+        : { column, direction: "asc" },
+    );
+  };
+
+  const toggleRow = (rowKey: string) => {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(rowKey)) next.delete(rowKey);
+      else next.add(rowKey);
+      return next;
+    });
+  };
+
+  const toggleVisible = () => {
+    setSelected((current) => {
+      const next = new Set(current);
+      for (const row of visibleRows) {
+        if (allVisibleSelected) next.delete(row.key);
+        else next.add(row.key);
+      }
+      return next;
+    });
+  };
+
+  const copyRows = async () => {
+    if (!currentRows.length) return;
+    const text = [
+      columns.map((column) => TABLE_COLUMN_LABELS[column] ?? column).join("\t"),
+      ...currentRows.map((row) =>
+        columns.map((column) => tableCellText(row.value[column])).join("\t"),
+      ),
+    ].join("\n");
+    await navigator.clipboard.writeText(text);
+    setFeedback(`已复制 ${currentRows.length} 行`);
+  };
+
+  const exportRows = () => {
+    if (!currentRows.length) return;
+    const csv = [
+      columns.map((column) => csvCell(TABLE_COLUMN_LABELS[column] ?? column)).join(","),
+      ...currentRows.map((row) =>
+        columns.map((column) => csvCell(row.value[column])).join(","),
+      ),
+    ].join("\r\n");
+    const href = URL.createObjectURL(
+      new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" }),
+    );
+    const anchor = document.createElement("a");
+    anchor.href = href;
+    anchor.download = `data-copilot-table-${new Date().toISOString().slice(0, 10)}.csv`;
+    anchor.click();
+    URL.revokeObjectURL(href);
+    setFeedback(`已导出 ${currentRows.length} 行`);
+  };
+
+  const extractEmailRequirements = () => {
+    if (!onAction) return;
+    const noteIds = selectedRows
+      .map((row) => String(row.value.noteId ?? row.value.id ?? ""))
+      .filter(Boolean);
+    const target = noteIds.length
+      ? `仅处理这些记录：${noteIds.join("、")}`
+      : "处理当前任务中的全部岗位记录";
+    onAction(
+      `调用 applications.extract_email_requirements，${target}，批量提取招聘邮箱、邮件标题格式和附件命名要求。必须分页直到完整覆盖，报告总数、已扫描数、邮箱命中数和缺失数，每个岗位一行，不要只返回第一条。${jobId ? `任务 ID：${jobId}。` : ""}`,
+    );
+  };
+
+  return (
+    <div style={messageStyles.tableResult} data-testid="interactive-result-table">
+      <div style={messageStyles.resultSummaryRow}>
+        <span style={messageStyles.resultSummary}>
+          共 {Number(value.total ?? rows.length).toLocaleString("zh-CN")} 条
+          {rows.length !== Number(value.total ?? rows.length)
+            ? ` · 已载入 ${rows.length.toLocaleString("zh-CN")} 条`
+            : ""}
+          {value.truncated ? " · 结果可继续加载" : ""}
+        </span>
+        {coverage.scannedRecords !== undefined ? (
+          <span style={messageStyles.resultCoverage}>
+            已扫描 {Number(coverage.scannedRecords).toLocaleString("zh-CN")} · 邮箱命中{" "}
+            {Number(coverage.withRecipient ?? 0).toLocaleString("zh-CN")}
+          </span>
+        ) : detectedEmails.length ? (
+          <span style={messageStyles.resultCoverage}>
+            已识别 {detectedEmails.length} 个邮箱
+          </span>
+        ) : null}
+      </div>
+      {rows.length ? (
+        <>
+          <div style={messageStyles.tableToolbar}>
+            <label style={messageStyles.tableSearch}>
+              <Search size={14} aria-hidden="true" />
+              <input
+                aria-label="搜索表格结果"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="搜索当前结果"
+                style={messageStyles.tableSearchInput}
+              />
+            </label>
+            <div style={messageStyles.tableActions}>
+              <button
+                type="button"
+                style={{
+                  ...messageStyles.tableActionButton,
+                  ...messageStyles.tablePrimaryAction,
+                  opacity: busy || !onAction ? 0.55 : 1,
+                }}
+                disabled={busy || !onAction}
+                onClick={extractEmailRequirements}
+                aria-label="提取邮箱"
+                title={
+                  selectedRows.length
+                    ? "提取所选岗位的邮箱要求"
+                    : "提取全部岗位的邮箱要求"
+                }
+              >
+                <Mail size={13} aria-hidden="true" />
+                提取邮箱{selectedRows.length ? ` (${selectedRows.length})` : ""}
+              </button>
+              <button
+                type="button"
+                style={messageStyles.tableActionButton}
+                disabled={!currentRows.length}
+                onClick={() => void copyRows()}
+                aria-label="复制表格"
+                title="复制所选行；未选择时复制当前筛选结果"
+              >
+                <Clipboard size={13} aria-hidden="true" />
+                复制
+              </button>
+              <button
+                type="button"
+                style={messageStyles.tableActionButton}
+                disabled={!currentRows.length}
+                onClick={exportRows}
+                aria-label="导出 CSV"
+                title="导出所选行；未选择时导出当前筛选结果"
+              >
+                <Download size={13} aria-hidden="true" />
+                CSV
+              </button>
+            </div>
+          </div>
+          <div style={messageStyles.tableSelectionSummary} aria-live="polite">
+            <span>
+              {query ? `筛选到 ${filteredRows.length} 条` : `当前 ${rows.length} 条`}
+              {selectedRows.length ? ` · 已选择 ${selectedRows.length} 条` : ""}
+            </span>
+            <span>{feedback}</span>
+          </div>
+          <div style={messageStyles.tableScroll}>
+            <table style={messageStyles.table}>
+              <thead>
+                <tr>
+                  <th style={messageStyles.tableSelectCell}>
+                    <input
+                      type="checkbox"
+                      aria-label="选择当前页"
+                      checked={allVisibleSelected}
+                      onChange={toggleVisible}
+                    />
+                  </th>
+                  {columns.map((column) => (
+                    <th key={column} style={messageStyles.tableHeadCell}>
+                      <button
+                        type="button"
+                        style={messageStyles.tableSortButton}
+                        onClick={() => toggleSort(column)}
+                        aria-label={`按${TABLE_COLUMN_LABELS[column] ?? column}排序`}
+                      >
+                        {TABLE_COLUMN_LABELS[column] ?? column}
+                        <ArrowUpDown size={11} aria-hidden="true" />
+                        {sort?.column === column ? (
+                          <span style={messageStyles.tableSortDirection}>
+                            {sort.direction === "asc" ? "升序" : "降序"}
+                          </span>
+                        ) : null}
+                      </button>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {visibleRows.map((row) => (
+                  <tr
+                    key={row.key}
+                    style={
+                      selected.has(row.key) ? messageStyles.tableRowSelected : undefined
+                    }
+                  >
+                    <td style={messageStyles.tableSelectCell}>
+                      <input
+                        type="checkbox"
+                        aria-label={`选择 ${tableCellText(row.value.title ?? row.value.noteId ?? row.key)}`}
+                        checked={selected.has(row.key)}
+                        onChange={() => toggleRow(row.key)}
+                      />
+                    </td>
+                    {columns.map((column) => {
+                      const text = tableCellText(row.value[column]);
+                      return (
+                        <td key={column} title={text} style={messageStyles.tableCell}>
+                          <TableCellContent column={column} value={row.value[column]} />
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={messageStyles.tablePagination}>
+            <span>
+              第 {visiblePage} / {pageCount} 页
+            </span>
+            <div style={messageStyles.tablePaginationActions}>
+              <button
+                type="button"
+                style={messageStyles.tableIconButton}
+                disabled={visiblePage <= 1}
+                onClick={() => setPage((current) => Math.max(1, current - 1))}
+                aria-label="上一页"
+                title="上一页"
+              >
+                <ChevronLeft size={14} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                style={messageStyles.tableIconButton}
+                disabled={visiblePage >= pageCount}
+                onClick={() => setPage((current) => Math.min(pageCount, current + 1))}
+                aria-label="下一页"
+                title="下一页"
+              >
+                <ChevronRight size={14} aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        </>
+      ) : (
+        <div style={messageStyles.resultEmpty}>没有匹配记录</div>
+      )}
+    </div>
+  );
+}
+
 function SemanticToolResult({
   result,
   sessionId,
@@ -689,52 +1341,13 @@ function SemanticToolResult({
 }) {
   const value = objectValue(result);
   if (value.type === "table.result" && Array.isArray(value.rows)) {
-    const rows = value.rows
-      .filter((row) => row && typeof row === "object")
-      .slice(0, 8) as Record<string, unknown>[];
-    const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))].slice(
-      0,
-      8,
-    );
     return (
-      <div style={messageStyles.tableResult}>
-        <div style={messageStyles.resultSummary}>
-          共 {Number(value.total ?? value.rows.length).toLocaleString("zh-CN")}{" "}
-          条{value.truncated ? " · 当前仅展示部分结果" : ""}
-        </div>
-        {rows.length ? (
-          <div style={messageStyles.tableScroll}>
-            <table style={messageStyles.table}>
-              <thead>
-                <tr>
-                  {columns.map((column) => (
-                    <th key={column} style={messageStyles.tableHeadCell}>
-                      {column}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((row, rowIndex) => (
-                  <tr key={rowIndex}>
-                    {columns.map((column) => (
-                      <td
-                        key={column}
-                        title={prettyValue(row[column])}
-                        style={messageStyles.tableCell}
-                      >
-                        {prettyValue(row[column]).slice(0, 120) || "-"}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <div style={messageStyles.resultEmpty}>没有匹配记录</div>
-        )}
-      </div>
+      <InteractiveResultTable
+        value={value}
+        busy={busy}
+        onAction={onAction}
+        jobId={jobId}
+      />
     );
   }
   if (value.type === "artifact.ready") {
@@ -798,6 +1411,9 @@ function SemanticToolResult({
       </div>
     );
   }
+  if (value.type === "application.batch_preflight" || value.type === "application.batch") {
+    return <BatchDeliveryResult result={value} />;
+  }
   if (
     value.type === "email.draft" ||
     value.type === "email.sent" ||
@@ -839,6 +1455,7 @@ function SemanticToolResult({
             {value.type === "email.sent" ? "已发送" : preview.sendReady === false ? "待补充" : "草稿"}
           </span>
         </div>
+        <AttachmentPreparationCard preview={preview} />
         <OriginalPostPreview post={post} jobId={jobId} />
         <ApplicationEmailEditor
           preview={preview}
@@ -880,13 +1497,15 @@ function ToolCallCard({
     "email.draft",
     "email.sent",
     "application.email_draft",
+    "application.batch_preflight",
+    "application.batch",
   ].includes(semanticType);
   const [expanded, setExpanded] = useState(
     toolCall.status === "running" ||
       toolCall.status === "failed" ||
       ["email.draft", "email.sent", "application.email_draft"].includes(
         semanticType,
-      ),
+      ) || ["table.result", "artifact.ready", "application.batch_preflight", "application.batch"].includes(semanticType),
   );
   const argumentsText = prettyValue(toolCall.arguments);
   const resultText = prettyValue(toolCall.result);
@@ -902,7 +1521,7 @@ function ToolCallCard({
 
   if (
     toolCall.status === "complete" &&
-    ["email.draft", "email.sent", "application.email_draft"].includes(semanticType)
+    isRichToolCall(toolCall)
   ) {
     return <>{semanticResult}</>;
   }
@@ -961,6 +1580,50 @@ function ToolCallCard({
           {toolCall.error ? (
             <div style={messageStyles.toolError}>{toolCall.error}</div>
           ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ToolCallSummary({
+  toolCalls,
+  sessionId,
+  busy = false,
+  onAction,
+  jobId,
+}: {
+  toolCalls: DataCopilotToolCall[];
+  sessionId: string;
+  busy?: boolean;
+  onAction?: (prompt: string) => void;
+  jobId?: string;
+}) {
+  const hasActive = toolCalls.some((tool) => tool.status === "running" || tool.status === "pending");
+  const hasFailure = toolCalls.some((tool) => tool.status === "failed");
+  const [expanded, setExpanded] = useState(hasActive || hasFailure);
+  const completed = toolCalls.filter((tool) => tool.status === "complete").length;
+  const label = toolCalls.slice(0, 4).map((tool) => toolDisplayName(tool.name)).join("、");
+  return (
+    <section style={messageStyles.toolSummary} aria-label="执行步骤">
+      <button
+        type="button"
+        style={messageStyles.toolSummaryButton}
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+      >
+        <span style={messageStyles.toolSummaryIdentity}>
+          {hasActive ? <LoaderCircle size={14} style={messageStyles.spinningIcon} aria-hidden="true" /> : hasFailure ? <AlertCircle size={14} aria-hidden="true" /> : <Check size={14} aria-hidden="true" />}
+          <strong>{hasActive ? "正在处理" : hasFailure ? "部分步骤需要处理" : `已完成 ${completed || toolCalls.length} 个步骤`}</strong>
+          <span style={messageStyles.toolSummaryCount}>{toolCalls.length}</span>
+        </span>
+        <span style={messageStyles.toolSummaryMeta}>{label}{toolCalls.length > 4 ? " 等" : ""}{expanded ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}</span>
+      </button>
+      {expanded ? (
+        <div style={messageStyles.toolSummaryDetails}>
+          {toolCalls.map((toolCall) => (
+            <ToolCallCard key={toolCall.id} toolCall={toolCall} sessionId={sessionId} busy={busy} onAction={onAction} jobId={jobId} />
+          ))}
         </div>
       ) : null}
     </section>
@@ -1107,7 +1770,7 @@ export function DataCopilotMessage({
 
   if (isCompact) {
     return (
-      <div style={messageStyles.compactRow} role="status">
+      <div className="data-copilot-message-compact" style={messageStyles.compactRow} role="status">
         <span style={messageStyles.compactRule} />
         <span style={messageStyles.compactContent}>
           <span>{message.content}</span>
@@ -1134,6 +1797,7 @@ export function DataCopilotMessage({
 
   return (
     <article
+      className="data-copilot-message-row"
       style={{
         ...messageStyles.row,
         ...(isUser ? messageStyles.userRow : undefined),
@@ -1143,6 +1807,7 @@ export function DataCopilotMessage({
       }
     >
       <div
+        className="data-copilot-message-avatar"
         style={{
           ...messageStyles.avatar,
           ...(isUser ? messageStyles.userAvatar : undefined),
@@ -1213,16 +1878,18 @@ export function DataCopilotMessage({
 
         {message.toolCalls?.length ? (
           <div style={messageStyles.toolStack}>
-            {message.toolCalls.map((toolCall) => (
-              <ToolCallCard
-                key={toolCall.id}
-                toolCall={toolCall}
+            {message.toolCalls.filter((toolCall) => isRichToolCall(toolCall)).map((toolCall) => (
+              <ToolCallCard key={toolCall.id} toolCall={toolCall} sessionId={message.sessionId} busy={busy} onAction={onAction} jobId={jobId} />
+            ))}
+            {message.toolCalls.filter((toolCall) => !isRichToolCall(toolCall)).length ? (
+              <ToolCallSummary
+                toolCalls={message.toolCalls.filter((toolCall) => !isRichToolCall(toolCall))}
                 sessionId={message.sessionId}
                 busy={busy}
                 onAction={onAction}
                 jobId={jobId}
               />
-            ))}
+            ) : null}
           </div>
         ) : null}
 
@@ -1557,6 +2224,94 @@ const messageStyles: Record<string, CSSProperties> = {
     cursor: "pointer",
   },
   toolStack: { display: "grid", gap: 6, marginTop: 8 },
+  toolSummary: {
+    overflow: "hidden",
+    border: "1px solid #d8ded9",
+    borderRadius: 5,
+    background: "#f4f8f5",
+  },
+  toolSummaryButton: {
+    display: "flex",
+    width: "100%",
+    minHeight: 38,
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    padding: "0 10px",
+    border: 0,
+    background: "transparent",
+    color: "#3f4c45",
+    cursor: "pointer",
+  },
+  toolSummaryIdentity: { display: "flex", alignItems: "center", gap: 7, minWidth: 0 },
+  toolSummaryCount: {
+    display: "inline-grid",
+    minWidth: 18,
+    height: 18,
+    placeItems: "center",
+    borderRadius: 9,
+    background: "#dbece4",
+    color: "#16634f",
+    fontSize: 10,
+    fontWeight: 700,
+  },
+  toolSummaryMeta: {
+    display: "flex",
+    minWidth: 0,
+    alignItems: "center",
+    gap: 5,
+    overflow: "hidden",
+    color: "#78817c",
+    fontSize: 10,
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  toolSummaryDetails: { display: "grid", gap: 6, padding: "0 7px 7px" },
+  attachmentPreparation: {
+    display: "grid",
+    gap: 6,
+    marginTop: 9,
+    padding: "9px 10px",
+    border: "1px solid #d9e6df",
+    borderRadius: 5,
+    background: "#f7fbf8",
+  },
+  attachmentPreparationHeader: { display: "flex", alignItems: "center", gap: 6, color: "#245e4d", fontSize: 11 },
+  attachmentPreparationBadge: { marginLeft: "auto", color: "#63736b", fontSize: 10, fontWeight: 600 },
+  attachmentPreparationHint: { color: "#6f7d75", fontSize: 10, lineHeight: 1.45 },
+  attachmentPreparationList: { display: "grid", gap: 4 },
+  attachmentPreparationRow: {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1fr) auto",
+    gap: 8,
+    alignItems: "center",
+    padding: "5px 0",
+    borderTop: "1px solid #e5eee9",
+  },
+  attachmentPreparationName: { display: "grid", minWidth: 0, gap: 1, color: "#33433a", fontSize: 10 },
+  attachmentPreparationMeta: { color: "#7a877f", fontSize: 9, whiteSpace: "nowrap" },
+  batchResult: {
+    display: "grid",
+    gap: 7,
+    padding: "9px 10px",
+    border: "1px solid #d9e6df",
+    borderRadius: 5,
+    background: "#f7fbf8",
+  },
+  batchResultHeader: { display: "flex", alignItems: "center", gap: 6, color: "#245e4d", fontSize: 11 },
+  batchResultList: { display: "grid", gap: 4 },
+  batchResultRow: {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 1.4fr) auto",
+    gap: 8,
+    alignItems: "center",
+    padding: "5px 0",
+    borderTop: "1px solid #e5eee9",
+    fontSize: 10,
+  },
+  "batchResultRow span": { display: "grid", minWidth: 0, gap: 2 },
+  "batchResultRow small": { color: "#7a877f", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  batchResultStatus: { color: "#2c755b", fontWeight: 650, whiteSpace: "nowrap" },
   toolCard: {
     overflow: "hidden",
     border: "1px solid #d8ded9",
@@ -1617,34 +2372,191 @@ const messageStyles: Record<string, CSSProperties> = {
     whiteSpace: "pre-wrap",
   },
   toolError: { color: "#a33d30", fontSize: 11, lineHeight: 1.5 },
-  tableResult: { display: "grid", gap: 6, minWidth: 0 },
-  resultSummary: { color: "#5d6761", fontSize: 10 },
+  tableResult: { display: "grid", gap: 8, minWidth: 0 },
+  resultSummaryRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 6,
+  },
+  resultSummary: { color: "#53615a", fontSize: 10 },
+  resultCoverage: {
+    color: "#17644f",
+    fontSize: 10,
+    fontWeight: 650,
+  },
   resultEmpty: { padding: "12px 0", color: "#7b837f", fontSize: 11 },
+  tableToolbar: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 7,
+  },
+  tableSearch: {
+    display: "flex",
+    minWidth: 190,
+    minHeight: 31,
+    flex: "1 1 220px",
+    alignItems: "center",
+    gap: 6,
+    padding: "0 9px",
+    border: "1px solid #d5ddd8",
+    borderRadius: 5,
+    background: "#fff",
+    color: "#66736c",
+  },
+  tableSearchInput: {
+    width: "100%",
+    minWidth: 0,
+    border: 0,
+    outline: 0,
+    background: "transparent",
+    color: "#2f3933",
+    font: "inherit",
+    fontSize: 11,
+  },
+  tableActions: {
+    display: "flex",
+    flex: "0 0 auto",
+    alignItems: "center",
+    gap: 5,
+  },
+  tableActionButton: {
+    display: "inline-flex",
+    minHeight: 31,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+    padding: "0 9px",
+    border: "1px solid #d4dcd7",
+    borderRadius: 5,
+    background: "#fff",
+    color: "#44524b",
+    fontSize: 10,
+    fontWeight: 600,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
+  tablePrimaryAction: {
+    borderColor: "#0b735c",
+    background: "#0b7a62",
+    color: "#fff",
+  },
+  tableSelectionSummary: {
+    display: "flex",
+    minHeight: 15,
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    color: "#748079",
+    fontSize: 9,
+  },
   tableScroll: {
     maxWidth: "100%",
-    overflowX: "auto",
-    borderTop: "1px solid #e1e5e2",
+    maxHeight: 420,
+    overflow: "auto",
+    border: "1px solid #dde3df",
+    borderRadius: 5,
+    background: "#fff",
   },
   table: {
     width: "100%",
+    minWidth: 660,
     borderCollapse: "collapse",
     color: "#323a35",
     fontSize: 10,
   },
   tableHeadCell: {
-    padding: "6px 8px",
+    position: "sticky",
+    top: 0,
+    zIndex: 1,
+    padding: 0,
     borderBottom: "1px solid #dce1dd",
-    background: "#f2f5f2",
+    background: "#f3f6f4",
     textAlign: "left",
     whiteSpace: "nowrap",
   },
+  tableSortButton: {
+    display: "flex",
+    width: "100%",
+    minHeight: 34,
+    alignItems: "center",
+    gap: 5,
+    padding: "0 8px",
+    border: 0,
+    background: "transparent",
+    color: "#536059",
+    fontSize: 10,
+    fontWeight: 700,
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+  },
+  tableSortDirection: {
+    color: "#0b735c",
+    fontSize: 8,
+    fontWeight: 600,
+  },
+  tableSelectCell: {
+    position: "sticky",
+    left: 0,
+    zIndex: 2,
+    width: 34,
+    minWidth: 34,
+    padding: "0 8px",
+    borderBottom: "1px solid #e7eae7",
+    background: "inherit",
+    textAlign: "center",
+  },
   tableCell: {
-    maxWidth: 220,
-    padding: "6px 8px",
+    maxWidth: 280,
+    padding: "8px",
     borderBottom: "1px solid #e7eae7",
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
+  },
+  tableEmptyCell: { color: "#a0a9a4" },
+  tablePendingCell: { color: "#88713a", fontSize: 9, fontWeight: 600 },
+  tableEmailList: {
+    display: "inline-flex",
+    maxWidth: "100%",
+    alignItems: "center",
+    gap: 5,
+  },
+  tableStatusCell: {
+    display: "inline-flex",
+    alignItems: "center",
+    minHeight: 20,
+    padding: "0 6px",
+    borderRadius: 4,
+    background: "#e8f3ed",
+    color: "#23654f",
+    fontSize: 9,
+    fontWeight: 650,
+  },
+  tableRowSelected: { background: "#edf8f3" },
+  tablePagination: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    color: "#6d7872",
+    fontSize: 9,
+  },
+  tablePaginationActions: { display: "flex", alignItems: "center", gap: 4 },
+  tableIconButton: {
+    display: "inline-grid",
+    width: 27,
+    height: 27,
+    placeItems: "center",
+    padding: 0,
+    border: "1px solid #d5dcd8",
+    borderRadius: 5,
+    background: "#fff",
+    color: "#4f5c55",
+    cursor: "pointer",
   },
   artifactResult: {
     display: "grid",

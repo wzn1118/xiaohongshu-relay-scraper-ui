@@ -235,8 +235,53 @@ export type DataCopilotSendRequest = {
   sessionId: string
   content: string
   modelId: string
+  workspaceMode?: 'ask' | 'analyze' | 'build'
   attachmentIds: string[]
   contextSourceIds: string[]
+}
+
+export type DataCopilotQualityArtifact = {
+  id: string
+  name: string
+  format: string
+  size: number
+  sha256: string
+  status: string
+  url: string
+}
+
+export type DataCopilotQualityEvaluation = {
+  id: string
+  status: string
+  createdAt: string
+  durationMs: number
+  summary: { total: number; passed: number; failed: number; passRate: number }
+}
+
+export type DataCopilotQualityState = {
+  usage: {
+    records: number
+    inputTokens: number
+    outputTokens: number
+    toolCalls: number
+    latencyMs: number
+    estimatedCostUsd: number
+  }
+  traces: Array<{
+    id: string
+    operation: string
+    status: string
+    durationMs: number
+    createdAt: string
+  }>
+  snapshots: Array<{
+    id: string
+    revision: number
+    manifestHash: string
+    createdAt: string
+  }>
+  artifacts: DataCopilotQualityArtifact[]
+  evaluations: DataCopilotQualityEvaluation[]
 }
 
 export type DataCopilotSendResult = {
@@ -298,6 +343,16 @@ export type DataCopilotTransport = {
     sessionId: string,
     handlers: DataCopilotSubscriptionHandlers,
   ) => () => void
+  loadQuality?: (
+    sessionId: string,
+    jobId: string,
+  ) => Promise<DataCopilotQualityState>
+  runGoldenEvaluation?: () => Promise<DataCopilotQualityEvaluation>
+  createArtifact?: (
+    sessionId: string,
+    input: { format: 'json' | 'csv' | 'markdown' | 'xlsx'; name: string; content?: unknown; data?: unknown },
+  ) => Promise<DataCopilotQualityArtifact>
+  upgradeSnapshot?: (sessionId: string) => Promise<DataCopilotSession>
 }
 
 export type DataCopilotRuntimeContext = {

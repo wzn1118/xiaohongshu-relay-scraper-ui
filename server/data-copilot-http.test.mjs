@@ -13,10 +13,12 @@ import { DataCopilotStore } from './data-copilot-store.mjs';
 import { DataPolicyEngine } from './data-policy-engine.mjs';
 import { DataToolRegistry } from './data-tool-registry.mjs';
 import { McpDataAdapter } from './mcp-data-adapter.mjs';
+import { createCopilotProductionStore } from './copilot/production-store.mjs';
 
-async function fixture(t) {
+async function fixture(t, { production = false } = {}) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'data-copilot-http-'));
-  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  let productionStore = null;
+  t.after(async () => { productionStore?.close(); await rm(rootDir, { recursive: true, force: true }); });
   const job = {
     id: 'job-http-001', revision: 3, keyword: 'growth', outputDir: rootDir,
     status: 'completed', createdAt: '2026-08-01T07:00:00.000Z', updatedAt: '2026-08-01T08:00:00.000Z',
@@ -66,8 +68,9 @@ async function fixture(t) {
   const policy = new DataPolicyEngine({ manager });
   const registry = new DataToolRegistry({ manager, policy, artifactService: artifacts });
   const mcpAdapter = new McpDataAdapter({ policy, registry, artifacts });
+  productionStore = production ? createCopilotProductionStore({ rootDir }) : null;
   const service = new DataCopilotService({
-    rootDir, store, approvals, artifacts, runtime, policy, mcpAdapter, manager, aiSessions,
+    rootDir, store, approvals, artifacts, runtime, policy, mcpAdapter, manager, aiSessions, productionStore,
   });
   await service.initialize();
 
@@ -86,7 +89,7 @@ async function fixture(t) {
     server.close(resolve);
   }));
   const address = server.address();
-  return { baseUrl: `http://127.0.0.1:${address.port}`, job, service, artifacts };
+  return { baseUrl: `http://127.0.0.1:${address.port}`, job, service, artifacts, productionStore };
 }
 
 async function createConversation(baseUrl, jobId) {
@@ -145,6 +148,175 @@ test('HTTP capability and tool catalog endpoints expose runtime-safe manifests',
   assert.ok(capabilities.toolCatalog.total >= 25);
   assert.ok(tools.tools.some((tool) => tool.name === 'comments.query'));
   assert.ok(tools.tools.every((tool) => !Object.hasOwn(tool, 'handler')));
+});
+
+test('HTTP workbench executes read-only tools and dependency graphs with usage accounting', async (t) => {
+  const { baseUrl } = await fixture(t);
+  const rows = [
+    { segment: 'A', score: 12 },
+    { segment: 'B', score: 18 },
+  ];
+
+  const profileResponse = await fetch(`${baseUrl}/api/copilot/workbench/tools/dataset.profile`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows }),
+  });
+  assert.equal(profileResponse.status, 200);
+  const profile = await profileResponse.json();
+  assert.equal(profile.output.rowCount, 2);
+  assert.equal(profile.output.columns.find((column) => column.name === 'score').mean, 15);
+
+  const graphResponse = await fetch(`${baseUrl}/api/copilot/workbench/runs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      tasks: [
+        { id: 'profile', toolName: 'dataset.profile', input: { rows } },
+        {
+          id: 'chart',
+          toolName: 'chart.create',
+          dependsOn: ['profile'],
+          input: { rows, type: 'bar', x: 'segment', y: 'score', title: 'Scores' },
+        },
+      ],
+    }),
+  });
+  assert.equal(graphResponse.status, 200);
+  const graph = await graphResponse.json();
+  assert.deepEqual(graph.graph.tasks.map((task) => task.status), ['completed', 'completed']);
+  assert.equal(graph.outputs.chart.kind, 'chart');
+  assert.deepEqual(graph.events.map((event) => event.type), [
+    'task.started',
+    'task.completed',
+    'task.started',
+    'task.completed',
+  ]);
+
+  const deniedResponse = await fetch(`${baseUrl}/api/copilot/workbench/tools/sql.query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rows, sql: 'DELETE FROM data', table: 'data' }),
+  });
+  assert.equal(deniedResponse.status, 400);
+  assert.equal((await deniedResponse.json()).error.code, 'SANDBOX_SQL_READ_ONLY');
+
+  const usageResponse = await fetch(`${baseUrl}/api/copilot/usage`);
+  assert.equal(usageResponse.status, 200);
+  const usage = await usageResponse.json();
+  assert.equal(usage.records, 2);
+  assert.equal(usage.toolCalls, 3);
+});
+
+test('HTTP schema v2 persists agent runs and manages idempotent context pins', async (t) => {
+  const { baseUrl, job } = await fixture(t, { production: true });
+  const capabilities = await (await fetch(`${baseUrl}/api/copilot/capabilities`)).json();
+  assert.equal(capabilities.schemaVersion, 2);
+  assert.equal(capabilities.orchestration.persistentRuns, true);
+  const { conversation } = await createConversation(baseUrl, job.id);
+  const conversationId = conversation.conversationId;
+  const rows = [
+    { segment: 'A', score: 12 },
+    { segment: 'B', score: 18 },
+  ];
+
+  const runResponse = await fetch(`${baseUrl}/api/copilot/workbench/runs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      runId: 'agent-run-http-001',
+      turnId: 'agent-turn-http-001',
+      conversationId,
+      goal: 'Profile and chart the current rows.',
+      tasks: [
+        { id: 'profile', toolName: 'dataset.profile', input: { rows } },
+        {
+          id: 'chart',
+          toolName: 'chart.create',
+          dependsOn: ['profile'],
+          input: { rows, type: 'bar', x: 'segment', y: 'score', title: 'Scores' },
+        },
+      ],
+    }),
+  });
+  assert.equal(runResponse.status, 200);
+  const executed = await runResponse.json();
+  assert.equal(executed.schemaVersion, 2);
+  assert.equal(executed.run.status, 'completed');
+  assert.deepEqual(executed.nodes.map((node) => node.status), ['completed', 'completed']);
+  assert.deepEqual(executed.nodes.map((node) => node.attemptCount), [1, 1]);
+
+  const stateResponse = await fetch(
+    `${baseUrl}/api/copilot/conversations/${conversationId}/runs/agent-run-http-001`,
+  );
+  assert.equal(stateResponse.status, 200);
+  const state = await stateResponse.json();
+  assert.equal(state.run.conversationId, conversationId);
+  assert.equal(state.planRevisions.length, 1);
+  assert.equal(state.attempts.length, 2);
+
+  const pinEndpoint = `${baseUrl}/api/copilot/conversations/${conversationId}/context-pins`;
+  const pinResponse = await fetch(pinEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemType: 'source', itemId: 'note-http-001', value: { label: 'Growth role' } }),
+  });
+  assert.equal(pinResponse.status, 201);
+  const firstPin = (await pinResponse.json()).pin;
+
+  const updatedPinResponse = await fetch(pinEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemType: 'source', itemId: 'note-http-001', value: { label: 'Priority role' } }),
+  });
+  const updatedPin = (await updatedPinResponse.json()).pin;
+  assert.equal(updatedPin.pinId, firstPin.pinId);
+  assert.equal(updatedPin.value.label, 'Priority role');
+
+  const pins = await (await fetch(pinEndpoint)).json();
+  assert.equal(pins.schemaVersion, 2);
+  assert.equal(pins.pins.length, 1);
+  const removed = await fetch(`${pinEndpoint}/${firstPin.pinId}`, { method: 'DELETE' });
+  assert.equal(removed.status, 200);
+  assert.equal((await removed.json()).removed, true);
+});
+
+test('HTTP production routes expose snapshot migration, verified artifacts, traces, and golden evaluations', async (t) => {
+  const { baseUrl, job } = await fixture(t, { production: true });
+  const created = await createConversation(baseUrl, job.id);
+  const conversationId = created.conversation.conversationId;
+
+  const snapshots = await (await fetch(`${baseUrl}/api/copilot/snapshots?jobId=${job.id}`)).json();
+  assert.equal(snapshots.snapshots[0].snapshotId, 'job-r3');
+
+  const artifactResponse = await fetch(`${baseUrl}/api/copilot/conversations/${conversationId}/artifacts`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ format: 'json', name: 'result.json', data: { status: 'verified' } }),
+  });
+  assert.equal(artifactResponse.status, 201);
+  const artifact = await artifactResponse.json();
+  assert.equal(artifact.verification.passed, true);
+  assert.equal((await fetch(`${baseUrl}/api/copilot/conversations/${conversationId}/artifacts/${artifact.artifact.artifactId}`)).status, 200);
+
+  job.revision = 4;
+  job.discoveredCount = 8;
+  const upgradeResponse = await fetch(`${baseUrl}/api/copilot/conversations/${conversationId}/snapshot/upgrade`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ copyMessages: false }),
+  });
+  assert.equal(upgradeResponse.status, 201);
+  const upgrade = await upgradeResponse.json();
+  assert.equal(upgrade.conversation.snapshotId, 'job-r4');
+  const diffResponse = await fetch(`${baseUrl}/api/copilot/snapshots/diff?jobId=${job.id}&from=job-r3&to=job-r4`);
+  assert.equal(diffResponse.status, 200);
+  assert.equal((await diffResponse.json()).changed, true);
+
+  const evaluationResponse = await fetch(`${baseUrl}/api/copilot/evaluations/golden`, { method: 'POST' });
+  assert.equal(evaluationResponse.status, 201);
+  assert.equal((await evaluationResponse.json()).summary.passed, 30);
+  const evaluations = await (await fetch(`${baseUrl}/api/copilot/evaluations`)).json();
+  assert.equal(evaluations.evaluations.length, 1);
+  const traces = await (await fetch(`${baseUrl}/api/copilot/traces?conversationId=${conversationId}`)).json();
+  assert.ok(traces.traces.some((trace) => trace.operation === 'artifact.create:json'));
 });
 
 test('HTTP context catalog lists real task records with counts, search, and stable selectable IDs', async (t) => {

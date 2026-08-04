@@ -12,6 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+try:
+    from note_identity import canonical_note_url, record_key, record_note_id
+except ModuleNotFoundError:
+    from scripts.note_identity import canonical_note_url, record_key, record_note_id
+
 
 SCHEMA_VERSION = 2
 STAGE_NAMES = ("discovery", "bodyCompletion", "analysis", "audience", "artifacts")
@@ -78,14 +83,16 @@ def analysis_source_hash(record: dict[str, Any]) -> str:
             for key, value in media.items()
             if key != "analysis"
         } or None
+    stable_note_id = record_note_id(record)
+    source_url = (
+        record.get("note_url")
+        or record.get("search_result_url")
+        or record.get("card_search_result_url")
+    )
     return stable_hash({
-        "noteId": _record_id(record),
+        "noteId": stable_note_id or record_key(record),
         "title": record.get("title") or record.get("card_title"),
-        "noteUrl": (
-            record.get("note_url")
-            or record.get("search_result_url")
-            or record.get("card_search_result_url")
-        ),
+        "noteUrl": "" if stable_note_id else canonical_note_url(source_url),
         "body": record.get("body"),
         "sourceCardText": record.get("source_card_text"),
         "cardTextSegments": record.get("card_text_segments"),
@@ -1378,7 +1385,7 @@ def open_workflow_state_from_args(
 
 
 def _record_id(record: dict[str, Any]) -> str:
-    return str(record.get("note_id") or record.get("noteId") or record.get("note_url") or "").strip()
+    return record_key(record)
 
 
 def _analysis_record_incomplete(record: dict[str, Any], analysis_mode: Any) -> bool:

@@ -341,6 +341,39 @@ class AiProviderRuntimeTests(unittest.TestCase):
         self.assertEqual(json.loads(request.data)["model"], "gpt-5.5")
         self.assertEqual(json.loads(request.data)["text"]["format"]["type"], "json_object")
 
+    def test_responses_retries_transient_502_then_succeeds(self) -> None:
+        provider = AIProvider(
+            provider="codex",
+            api_key="test-key",
+            base_url="https://relay.example/v1",
+            model="gpt-5.5",
+            wire_api="responses",
+            timeout=30,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"output_text":"{\\"ok\\":true}"}'
+
+        responses = [
+            urllib.error.HTTPError("https://relay.example/v1/responses", 502, "Bad Gateway", {}, io.BytesIO(b"upstream")),
+            Response(),
+        ]
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", side_effect=responses) as open_url, patch(
+            "scripts.ai_provider_runtime.time.sleep"
+        ) as sleep:
+            result = provider.generate_json("system", "user", {"type": "object"})
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(open_url.call_count, 2)
+        sleep.assert_called_once_with(1)
+
     def test_native_codex_binary_is_preferred_on_windows(self) -> None:
         provider = AIProvider(provider="codex", timeout=30)
         lookups: list[str] = []

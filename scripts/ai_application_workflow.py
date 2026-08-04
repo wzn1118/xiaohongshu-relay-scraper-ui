@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -19,8 +20,10 @@ from application_intelligence_agents import (
     OutreachWriterAgent,
     build_job_card,
 )
+from application_generation import build_profile_snapshot
 from artifact_io import atomic_write_json
 from evidence_claim_validator import validate_generated_claims
+from note_identity import record_key as canonical_record_key
 
 
 GUIDE_RULES = [
@@ -45,6 +48,14 @@ CANDIDATE_PROFILE_RULES = [
     "邮件主题优先为：岗位名称申请｜候选人姓名｜最相关的一项能力；缺失信息直接省略，不猜测。",
     "到岗时间、每周可工作天数、地点和联系方式仅在运行时候选人档案存在对应值时使用。",
     "电话/微信和邮箱不得重复堆砌；字段为空时省略，不输出 XX、XXXX 或其他占位符。",
+]
+
+ROLE_EVIDENCE_MAPPING_RULES = [
+    "先按 priority 从高到低选择一至两条核心职责，不按招聘正文顺序机械复述。",
+    "每条入选职责必须绑定一个 candidate_evidence.id，并写清候选人做过的动作、对象、交付物或结果。",
+    "只有项目、沟通、协作、参与等通用词重合不算匹配；必须解释该证据如何支持当前职责的具体工作。",
+    "候选人证据无法支撑某项职责时直接放弃该映射，不把岗位要求改写成候选人经历。",
+    "正文采用‘岗位需要什么 -> 我做过什么 -> 我能如何迁移’的因果链，但不输出分析过程或表格。",
 ]
 
 DEFAULT_APPLICATION_CONTEXT = {
@@ -243,11 +254,16 @@ def writing_schema() -> dict[str, Any]:
     string = _string()
     return {
         "type": "object", "additionalProperties": False,
-        "required": ["greeting", "email_subject", "email_body", "cover_letter", "used_evidence_ids", "capability_matches"],
+        "required": [
+            "greeting", "email_subject", "email_body", "cover_letter",
+            "used_evidence_ids", "capability_matches", "recommended_resume", "resume_reason",
+        ],
         "properties": {
             "greeting": string, "email_subject": string, "email_body": string, "cover_letter": string,
             "used_evidence_ids": {"type": "array", "items": string},
             "capability_matches": {"type": "array", "items": string},
+            "recommended_resume": string,
+            "resume_reason": string,
         },
     }
 
@@ -358,8 +374,80 @@ IMAGE_APPLICATION_PATTERN = re.compile(
     re.I,
 )
 ROUTE_EMAIL_PATTERN = re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I)
+EMAIL_KEYCAP_PATTERN = re.compile(r"([0-9])\ufe0f?\u20e3")
+EMAIL_ZERO_WIDTH_PATTERN = re.compile(r"[\u200b-\u200d\u2060\ufeff\ufe0e\ufe0f]")
+EMAIL_ICON_PATTERN = re.compile(
+    r"(?<=[A-Z0-9._%+-])\s*(?:📧|✉|📨|📩|📤|📮|💌|(?:\[|【)?(?:邮箱|邮件)图标(?:\]|】)?)\s*(?=[A-Z0-9\u4e00-\u9fff])",
+    re.I,
+)
+EMAIL_AT_ALIAS_PATTERN = re.compile(
+    r"(?<=[A-Z0-9._%+-])\s*(?:\(\s*at\s*\)|\[\s*at\s*\]|\{\s*at\s*\}|\s+at\s+|艾特|圈a)\s*(?=[A-Z0-9\u4e00-\u9fff])",
+    re.I,
+)
+EMAIL_DOT_ALIAS_PATTERN = re.compile(
+    r"(?<=[A-Z0-9\u4e00-\u9fff])\s*(?:\(\s*dot\s*\)|\[\s*dot\s*\]|\{\s*dot\s*\}|\s+dot\s+|点|點)\s*(?=[A-Z]{2,63}(?:\b|$))",
+    re.I,
+)
+EMAIL_SYMBOL_DIGIT_TRANSLATION = str.maketrans({
+    **dict(zip("⓪①②③④⑤⑥⑦⑧⑨", "0123456789")),
+    **dict(zip("❶❷❸❹❺❻❼❽❾", "123456789")),
+    **dict(zip("➀➁➂➃➄➅➆➇➈", "123456789")),
+})
 DOMAIN_PATH_PATTERN = re.compile(r"^(?:www\.)?[A-Z0-9-]+(?:\.[A-Z0-9-]+)+(?:[/:?#][^\s]*)?$", re.I)
 URL_EDGE_PUNCTUATION = " \t\r\n<>[]{}()（）【】《》\"'“”‘’，。；;！!？?、"
+
+
+def _valid_route_email(value: str) -> bool:
+    if not value or len(value) > 254 or value.count("@") != 1:
+        return False
+    local, domain = value.rsplit("@", 1)
+    if not local or len(local) > 64 or local.startswith(".") or local.endswith(".") or ".." in local:
+        return False
+    if not re.fullmatch(r"[A-Z0-9._%+-]+", local, re.I):
+        return False
+    labels = domain.split(".")
+    if len(labels) < 2 or not re.fullmatch(r"[A-Z]{2,63}", labels[-1], re.I):
+        return False
+    return all(
+        label
+        and len(label) <= 63
+        and not label.startswith("-")
+        and not label.endswith("-")
+        and re.fullmatch(r"[A-Z0-9-]+", label, re.I)
+        for label in labels
+    )
+
+
+def _normalize_obfuscated_email_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    text = EMAIL_KEYCAP_PATTERN.sub(r"\1", text)
+    text = EMAIL_ZERO_WIDTH_PATTERN.sub("", text).translate(EMAIL_SYMBOL_DIGIT_TRANSLATION)
+    text = EMAIL_ICON_PATTERN.sub("@", text)
+    text = EMAIL_AT_ALIAS_PATTERN.sub("@", text)
+    text = re.sub(r"\s*@\s*", "@", text)
+    text = EMAIL_DOT_ALIAS_PATTERN.sub(".", text)
+    text = re.sub(r"(?<=\d)\s+(?=\d)", "", text)
+    text = re.sub(r"(?<=@)\s*(?:扣扣|企鹅|q\s+q)\s*(?=\.)", "qq", text, flags=re.I)
+    return text
+
+
+def _extract_route_emails(value: Any) -> list[tuple[str, bool]]:
+    original = str(value or "")
+    literal = {
+        match.group(0).casefold()
+        for match in ROUTE_EMAIL_PATTERN.finditer(original)
+        if _valid_route_email(match.group(0))
+    }
+    normalized = _normalize_obfuscated_email_text(original)
+    emails: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for match in ROUTE_EMAIL_PATTERN.finditer(normalized):
+        address = match.group(0).casefold()
+        if address in seen or not _valid_route_email(address):
+            continue
+        seen.add(address)
+        emails.append((address, address not in literal))
+    return emails
 
 
 def _image_application_requested(record: dict[str, Any]) -> bool:
@@ -403,10 +491,17 @@ def _normalized_route(item: dict[str, Any]) -> dict[str, Any] | None:
     channel = str(route.get("channel") or "").strip().lower()
     route_type = str(route.get("type") or "").strip().lower()
     combined = f"{route_type} {raw_value} {evidence}"
-    email = ROUTE_EMAIL_PATTERN.search(combined)
-    if email:
+    value_email_matches = _extract_route_emails(raw_value)
+    evidence_email_matches = _extract_route_emails(evidence)
+    email_matches = value_email_matches or evidence_email_matches
+    normalization_applied = bool(route.get("normalization_applied"))
+    if email_matches:
         channel = "email"
-        value = email.group(0)
+        value, extracted_normalization = email_matches[0]
+        normalization_applied = normalization_applied or extracted_normalization or any(
+            address == value and evidence_normalized
+            for address, evidence_normalized in evidence_email_matches
+        )
     elif channel == "link" or route_type in {"url", "link", "official_site"} or re.search(r"https?://|\bwww\.", raw_value, re.I):
         channel = "link"
         value = _normalize_external_url(raw_value)
@@ -424,12 +519,15 @@ def _normalized_route(item: dict[str, Any]) -> dict[str, Any] | None:
         confidence = max(0, min(100, int(route.get("confidence", 0))))
     except (TypeError, ValueError):
         confidence = 0
+    if normalization_applied:
+        confidence = min(confidence, 90) if confidence else 90
     return {
         "type": route_type or channel,
         "value": value,
         "channel": channel,
         "confidence": confidence,
         "evidence": evidence or value,
+        "normalization_applied": normalization_applied,
     }
 
 
@@ -468,6 +566,8 @@ def _application_route_item(
             if source_field == "body" and start >= 0
             else "body_extracted"
             if source_field == "body"
+            else "image_format_normalized"
+            if image_actionable and route.get("normalization_applied")
             else "image_format_verified"
             if image_actionable
             else "needs_manual_review"
@@ -599,6 +699,7 @@ def _extract(provider: AIProvider, record: dict[str, Any]) -> dict[str, Any]:
                 "image_analysis.status 返回 analyzed；若只能依据 alt 文本则返回 alt_text_only；无可用图片信息返回 unavailable。"
                 "当正文出现‘投递方式见图’、‘扫码申请’等表达时，必须逐张检查投递邮箱、完整可见 URL、站内私信指引和可可靠读出的二维码目标链接。"
                 "图片投递方式逐条写入 image_analysis.application_routes：value 保留邮箱或完整链接，evidence 逐字记录图中文字，source_image_index 从 1 开始。"
+                "若图片使用按键数字 emoji、全角符号、艾特/点、扣扣或邮件图标表达邮箱，evidence 仍逐字保留；只有字符可唯一还原时才把 value 规范为标准邮箱。"
                 "不得补全被遮挡、截断或模糊的邮箱和链接；无法确认时不要生成 route，并在 summary 说明需要人工核对。"
                 "confidence 表示字符识别的确定程度，而不是对岗位的主观判断。"
                 "图片信息与正文冲突时不要覆盖正文事实，在 image_analysis.summary 中说明冲突。"
@@ -646,6 +747,7 @@ def _deterministic_ocr_role(record: dict[str, Any], image_texts: list[tuple[int,
     requirements: list[dict[str, Any]] = []
     routes: list[dict[str, Any]] = []
     signals: list[str] = []
+    seen_email_routes: set[tuple[int, str]] = set()
     role_name = str(record.get("title") or "").strip()
     combined_text = "\n".join(text for _, text in image_texts)
     for image_index, visible_text in image_texts:
@@ -654,6 +756,22 @@ def _deterministic_ocr_role(record: dict[str, Any], image_texts: list[tuple[int,
             line = str(raw_line or "").strip()
             if not line:
                 continue
+            line_emails = _extract_route_emails(line)
+            for address, normalization_applied in line_emails:
+                route_key = (image_index, address)
+                if route_key in seen_email_routes:
+                    continue
+                seen_email_routes.add(route_key)
+                routes.append({
+                    "type": "email",
+                    "value": address,
+                    "channel": "email",
+                    "confidence": 90 if normalization_applied else 100,
+                    "evidence": line,
+                    "normalization_applied": normalization_applied,
+                    "source": "image",
+                    "source_image_index": image_index,
+                })
             if (
                 role_name == str(record.get("title") or "").strip()
                 and 4 <= len(line) <= 60
@@ -684,7 +802,7 @@ def _deterministic_ocr_role(record: dict[str, Any], image_texts: list[tuple[int,
                 continue
             item_text = _clean_ocr_item(line)
             route_line = bool(
-                ROUTE_EMAIL_PATTERN.search(line)
+                line_emails
                 or OCR_URL_PATTERN.search(line)
                 or re.search(r"投递|申请链接|私信|扫码|二维码", line)
             )
@@ -692,16 +810,6 @@ def _deterministic_ocr_role(record: dict[str, Any], image_texts: list[tuple[int,
                 target = responsibilities if section == "responsibilities" else requirements
                 target.append(_image_role_item(item_text, image_index, min(3, len(target) + 1)))
 
-        for match in ROUTE_EMAIL_PATTERN.finditer(visible_text):
-            routes.append({
-                "type": "email",
-                "value": match.group(0),
-                "channel": "email",
-                "confidence": 100,
-                "evidence": match.group(0),
-                "source": "image",
-                "source_image_index": image_index,
-            })
         for match in OCR_URL_PATTERN.finditer(visible_text):
             value = match.group(0).rstrip(URL_EDGE_PUNCTUATION)
             routes.append({
@@ -742,16 +850,57 @@ def _deterministic_ocr_role(record: dict[str, Any], image_texts: list[tuple[int,
     }
 
 
-def _verified_cached_image_role(record: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+def _verified_image_analysis(container: Any) -> bool:
+    if not isinstance(container, dict):
+        return False
+    return (
+        str(container.get("status") or "").strip().lower() == "analyzed"
+        and str(container.get("source") or "").strip().lower()
+        in {"vision_model", "ocr", "image_ocr", "image_ocr_model"}
+    )
+
+
+def _verified_cached_image_texts(record: dict[str, Any]) -> list[tuple[int, str]]:
     media = record.get("media") if isinstance(record.get("media"), dict) else {}
-    analysis = media.get("analysis") if isinstance(media.get("analysis"), dict) else {}
-    visible_text = str(analysis.get("visible_text") or "").strip()
-    if (
-        analysis.get("status") == "analyzed"
-        and analysis.get("source") == "vision_model"
-        and len(visible_text) >= 4
+    media_analysis = media.get("analysis") if isinstance(media.get("analysis"), dict) else {}
+    entries: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+
+    def add(container: Any, image_index: int, inherited_verified: bool = False) -> None:
+        if not isinstance(container, dict):
+            return
+        verified = inherited_verified or _verified_image_analysis(container)
+        if verified:
+            for field in ("visible_text", "ocr_text"):
+                text = str(container.get(field) or "").strip()
+                key = (image_index, text)
+                if len(text) >= 4 and key not in seen:
+                    seen.add(key)
+                    entries.append(key)
+        nested = container.get("analysis")
+        if isinstance(nested, dict):
+            add(nested, image_index, verified)
+
+    media_verified = _verified_image_analysis(media_analysis)
+    add(media_analysis, 1, media_verified)
+    images = media.get("images") if isinstance(media.get("images"), list) else []
+    for image_index, image in enumerate(images[:4], start=1):
+        add(image, image_index, media_verified)
+
+    for container in (
+        record.get("image_analysis"),
+        record.get("application_info", {}).get("image_analysis")
+        if isinstance(record.get("application_info"), dict)
+        else None,
     ):
-        return _deterministic_ocr_role(record, [(1, visible_text)]), True
+        add(container, 1)
+    return entries
+
+
+def _verified_cached_image_role(record: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+    image_texts = _verified_cached_image_texts(record)
+    if image_texts:
+        return _deterministic_ocr_role(record, image_texts), True
     return None, False
 
 
@@ -841,7 +990,8 @@ def _extract_missing_body_images(provider: AIProvider, record: dict[str, Any]) -
         if not image_url:
             continue
         result = provider.generate_json(
-            "你是招聘海报 OCR。只逐字转录图片中肉眼可见的文字，不解释、不概括、不推断、不补全被遮挡内容。",
+            "你是招聘海报 OCR。只逐字转录图片中肉眼可见的文字，不解释、不概括、不推断、不补全被遮挡内容。"
+            "邮件或信封图标若位于两个可见邮箱片段之间，按原位置转录为[邮件图标]；只出现图标而无地址字符时不推断地址。",
             "转录这张图片中的全部可见文字。",
             image_ocr_schema(),
             image_urls=[image_url],
@@ -922,6 +1072,52 @@ def _has_verified_image_enrichment(record: dict[str, Any]) -> bool:
     )
 
 
+def _role_evidence_plan(role: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    role_points: list[dict[str, Any]] = []
+    for kind, field in (
+        ("responsibility", "responsibilities"),
+        ("requirement", "requirements"),
+    ):
+        for index, item in enumerate(role.get(field, []), start=1):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                priority = int(item.get("priority", 3))
+            except (TypeError, ValueError):
+                priority = 3
+            role_points.append({
+                "id": f"{kind}-{index}",
+                "kind": kind,
+                "text": text,
+                "priority": max(1, min(priority, 5)),
+            })
+    role_points.sort(key=lambda item: (item["priority"], item["kind"] != "responsibility", item["id"]))
+
+    evidence_options = []
+    for item in evidence:
+        evidence_id = str(item.get("id") or "").strip()
+        if not evidence_id:
+            continue
+        evidence_options.append({
+            "id": evidence_id,
+            "category": str(item.get("category") or "").strip(),
+            "label": str(item.get("label") or "").strip(),
+            "detail": str(item.get("detail") or "").strip(),
+            "first_person_claim": str(item.get("first_person_claim") or "").strip(),
+            "skills": item.get("skills", []),
+            "outcomes": item.get("outcomes", []),
+        })
+    return {
+        "role_name": str(role.get("role_name") or "").strip(),
+        "priority_role_points": role_points[:6],
+        "candidate_evidence_options": evidence_options,
+        "mapping_rules": ROLE_EVIDENCE_MAPPING_RULES,
+    }
+
+
 def _write(
     provider: AIProvider,
     role: dict[str, Any],
@@ -930,12 +1126,15 @@ def _write(
     feedback: list[str],
     candidate_profile: dict[str, str] | None = None,
     application_context: dict[str, Any] | None = None,
+    candidate_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_context = _normalize_application_context(application_context)
     payload = {
         "role": role,
         "candidate_evidence": evidence,
+        "role_evidence_plan": _role_evidence_plan(role, evidence),
         "candidate_application_profile": candidate_profile or {},
+        "candidate_profile_snapshot": candidate_snapshot or {},
         "candidate_profile_rules": CANDIDATE_PROFILE_RULES,
         "application_context": normalized_context,
         "writing_guide": GUIDE_RULES,
@@ -944,10 +1143,13 @@ def _write(
         "required_revisions": feedback,
         "revision_contract": [
             "逐条满足 required_revisions；如与 acceptance_rules 冲突，以 acceptance_rules 为准；事实库没有所需事实时不得虚构",
-            "先在内部把最高优先级职责映射到证据，再输出行动、交付物、结果及其可迁移价值",
+            "先按 role_evidence_plan 把最高优先级职责映射到具体 evidence id，再输出行动、交付物、结果及其可迁移价值",
+            "若映射只依赖项目、沟通、协作、参与等通用词，视为不匹配并重新选择证据",
             "加入一条针对当前岗位的工作判断或验证方法，并明确它是入职后的做法而非既往业绩",
             "区分直接结果与相关结果，不夸大个人归因",
             "私信、邮件和 Cover Letter 角度互补，避免重复整段内容",
+            "candidate_profile_snapshot.resumeArtifacts 是可供投递选择的简历清单；recommended_resume 只能返回其中一个 id，没有合适版本时返回空字符串",
+            "resume_reason 必须说明所选简历如何承接当前岗位的核心职责和正文实际使用的 evidence id，不得只写泛化的岗位类别",
         ],
     }
     return provider.generate_json(
@@ -956,19 +1158,24 @@ def _write(
 先在内部严格区分三类输入：
 A. 岗位证据：role 中的岗位名、职责、要求、投递方式和来源片段，只能用于理解岗位，不能整段复述。
 B. 候选人证据：candidate_evidence 与 candidate_application_profile，只能引用其中可核验的经历、项目、技能、教育、到岗安排和联系方式。
-  C. 投递上下文：application_context 明确给出 email/direct_message、first_contact/follow_up、formal/natural/concise、实际附件状态和 recipientType。只能按这些值写，不得自行改变联系阶段、语气或附件事实。
+C. 职责证据映射：role_evidence_plan 已按岗位职责和候选人证据整理可选项。先在内部完成“职责 -> evidence id -> 具体行动/交付物/结果 -> 可迁移价值”，再写正文；不要输出分析表。
+D. 投递上下文：application_context 明确给出 email/direct_message、first_contact/follow_up、formal/natural/concise、实际附件状态和 recipientType。只能按这些值写，不得自行改变联系阶段、语气或附件事实。
 
 硬规则：
 1. 每个事实必须能在 A 或 B 中逐项找到。不得把岗位要求写成候选人经历，不得补造公司、工具、数字、成果或联系方式。
 2. 只选一至两项与当前岗位最有关的候选人事实；不复述整份简历，不逐句重复招聘方已经知道的要求。
+2.1 至少有一项证据必须直接对应 priority 最靠前的核心职责：正文要同时出现该职责的工作对象/交付目标，以及候选人证据中的具体行动或结果。仅写“相关、匹配、可以支持、沟通协作、参与项目”不算完成映射。
+2.2 如果所有证据都只能提供通用能力，明确缩小申请主张，只写可验证的相邻经验；不得声称“与岗位直接相关”或“能够胜任”。
 3. 邮件正文 120-260 个中文字符、最多四个短段落。第一段直接说明申请哪个岗位；第二段用一个真实事实说明匹配；第三段仅在有证据时写到岗安排；结尾用一句自然的沟通邀请。每段只承担一个作用。
 4. 主题采用“岗位名称申请｜姓名｜最相关的一项能力”。禁止使用“求职申请”“应聘贵司职位”“优秀候选人”“关于贵司岗位的自荐信”“怀着热忱申请”。
 5. 禁止“高度匹配、深感荣幸、怀着极大热情、赋能、抓手、闭环、协同、全链路、完美契合、我相信凭借我的能力一定能够”等套话；避免连续排比和过度工整句式。
 6. 私信 50-160 字，点名岗位、一个真实匹配点和一个明确问题；作者昵称、发布时间、互动量等来源元数据不得进入正文。
 7. Cover Letter 320-460 字，可以比邮件展开，但仍只使用一至两项证据，不重复邮件整段，不堆砌联系方式。
 8. 过往事实用“我曾/我负责”等准确时态；入职后的做法用“我会”，不得把计划冒充业绩。接触过工具不得改写成精通或熟练。
-9. used_evidence_ids 只能引用给定 id。source_evidence 仅用于核验，不复制文件名、标签或第三人称元叙述。
-10. required_revisions 必须逐条处理；事实不足时缩短表达，不用套话填充。严格输出 JSON。""",
+9. used_evidence_ids 只能引用给定 id。capability_matches 每项写成“岗位职责：证据 id：可迁移价值”的简短映射，且必须与正文实际使用的 evidence id 一致。source_evidence 仅用于核验，不复制文件名、标签或第三人称元叙述。
+10. required_revisions 必须逐条处理；事实不足时缩短表达，不用套话填充。
+11. candidate_profile_snapshot 是本次生成使用的候选人背景快照；其中 evidence 用于核验个人事实，resumeArtifacts 只提供简历版本 id、文件名、摘要哈希和页数，不代表附件已经发送。
+12. recommended_resume 只能填写 resumeArtifacts 中真实存在的 id；resume_reason 要用当前岗位的一项核心职责和 used_evidence_ids 解释选择。只有 application_context.resumeAttached=true 时，正文才可声称已附简历。严格输出 JSON。""",
         json.dumps(payload, ensure_ascii=False),
         writing_schema(),
     )
@@ -1014,6 +1221,23 @@ EVIDENCE_ANCHORS = (
     "可视化", "看板", "舆情监测", "社群运营", "内容运营", "项目管理", "自动化", "跨部门",
     "沟通协作", "活动策划", "增长", "报告", "监测工具", "资料库", "业务分析", "指标",
 )
+ROLE_EVIDENCE_SIGNAL_GROUPS = {
+    "data_analysis": ("数据分析", "业务分析", "经营分析", "商业分析", "数据", "分析", "指标", "报表", "看板", "统计", "sql", "excel", "python"),
+    "research_insight": ("市场调研", "用户调研", "竞品分析", "调研", "研究", "访谈", "洞察", "用户需求", "信息收集", "信息整理"),
+    "product": ("产品", "需求分析", "需求文档", "原型", "迭代", "用户体验"),
+    "content": ("内容运营", "内容", "文案", "选题", "编辑", "社交媒体", "社媒", "小红书"),
+    "growth_marketing": ("增长", "转化", "营销", "市场", "品牌", "投放", "获客", "活动策划"),
+    "user_operations": ("用户运营", "社群", "运营", "用户反馈", "用户分层", "留存"),
+    "customer_sales": ("客户", "销售", "商务", "渠道", "客户成功", "售前", "售后"),
+    "engineering_automation": ("工程", "开发", "编程", "代码", "后端", "前端", "自动化", "agent", "ai", "github"),
+    "design": ("设计", "视觉", "交互", "figma", "ui", "ux"),
+    "finance": ("财务", "金融", "会计", "预算", "审计", "证券", "投资"),
+    "medical": ("医学", "医药", "医疗", "临床", "药品", "患者"),
+    "global_language": ("英语", "英文", "海外", "国际", "跨境"),
+    "communication": ("沟通", "对接", "协调", "协作", "汇报", "跨部门", "宣讲"),
+    "delivery": ("项目管理", "项目", "推进", "交付", "落地", "执行", "策划", "跟进"),
+}
+TRANSFERABLE_SIGNAL_GROUPS = {"communication", "delivery"}
 PLACEHOLDER_PATTERN = re.compile(
     r"(?:X{2,}|候选人姓名|公司名|岗位名|可用天数|实习时长|此处填|待补充|待填写|\[[^\]]*(?:填|公司|岗位|姓名|链接)[^\]]*\])",
     re.I,
@@ -1038,6 +1262,7 @@ def _application_copy_source_hash(
     record: dict[str, Any],
     candidate_profile: dict[str, str] | None = None,
     candidate_evidence: list[dict[str, Any]] | None = None,
+    profile_snapshot_id: str = "",
 ) -> str:
     """Hash only evidence that can legitimately affect application copy."""
     normalized_profile = {
@@ -1064,6 +1289,7 @@ def _application_copy_source_hash(
         "media": media,
         "candidateProfile": normalized_profile,
         "candidateEvidence": evidence,
+        "profileSnapshotId": str(profile_snapshot_id or "").strip(),
     }
     raw_context = record.get("applicationContext")
     if not isinstance(raw_context, dict):
@@ -1118,6 +1344,15 @@ def _compact_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "")).casefold()
 
 
+def _contains_exact_identifier(value: str, identifier: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(identifier)}(?![A-Za-z0-9_-])",
+            value,
+        )
+    )
+
+
 def _evidence_anchor_terms(item: dict[str, Any]) -> set[str]:
     source = " ".join(
         str(item.get(key) or "")
@@ -1130,6 +1365,60 @@ def _evidence_anchor_terms(item: dict[str, Any]) -> set[str]:
     if 2 <= len(label) <= 24:
         terms.add(label)
     return {term for term in terms if len(term) >= 2}
+
+
+def _signal_groups(text: str) -> set[str]:
+    lowered = text.casefold()
+
+    def contains(term: str) -> bool:
+        normalized = term.casefold()
+        if re.fullmatch(r"[a-z0-9+#.-]+", normalized):
+            return bool(re.search(rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])", lowered))
+        return normalized in lowered
+
+    return {
+        group
+        for group, terms in ROLE_EVIDENCE_SIGNAL_GROUPS.items()
+        if any(contains(term) for term in terms)
+    }
+
+
+def _role_evidence_alignment(
+    role: dict[str, Any],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    role_text = " ".join([
+        str(role.get("role_name") or ""),
+        *[
+            str(item.get("text") or "")
+            for field in ("responsibilities", "requirements")
+            for item in role.get(field, [])
+            if isinstance(item, dict)
+        ],
+    ])
+    role_groups = _signal_groups(role_text)
+    core_groups = role_groups - TRANSFERABLE_SIGNAL_GROUPS
+    overlap_by_id: dict[str, list[str]] = {}
+    core_overlap_by_id: dict[str, list[str]] = {}
+    for item in evidence:
+        evidence_id = str(item.get("id") or "").strip()
+        if not evidence_id:
+            continue
+        evidence_text = " ".join(
+            str(item.get(key) or "")
+            for key in ("label", "detail", "first_person_claim", "skills", "outcomes")
+        )
+        evidence_groups = _signal_groups(evidence_text)
+        overlap_by_id[evidence_id] = sorted(role_groups & evidence_groups)
+        core_overlap_by_id[evidence_id] = sorted(core_groups & evidence_groups)
+    return {
+        "role_groups": sorted(role_groups),
+        "core_role_groups": sorted(core_groups),
+        "overlap_by_id": overlap_by_id,
+        "core_overlap_by_id": core_overlap_by_id,
+        "aligned_ids": sorted(evidence_id for evidence_id, groups in overlap_by_id.items() if groups),
+        "core_aligned_ids": sorted(evidence_id for evidence_id, groups in core_overlap_by_id.items() if groups),
+    }
 
 
 def _rubric_for_score(score: int) -> dict[str, int]:
@@ -1206,6 +1495,45 @@ def _deterministic_problems(
             problems.append("正文没有写出所引用经历的可核验证据锚点")
         if any(str(evidence_by_id[evidence_id].get("category") or "").lower() in {"skills", "education"} for evidence_id in used):
             problems.append("单个技能或教育条目不得作为投递文案的独立经历证据")
+        alignment = _role_evidence_alignment(role, [evidence_by_id[evidence_id] for evidence_id in used])
+        if alignment["role_groups"]:
+            aligned_ids = set(alignment["aligned_ids"])
+            unaligned_ids = sorted(used - aligned_ids)
+            if unaligned_ids:
+                problems.append(
+                    "以下经历未与岗位职责形成直接映射，应删除或替换："
+                    + "、".join(unaligned_ids)
+                )
+            if alignment["core_role_groups"] and not alignment["core_aligned_ids"]:
+                problems.append(
+                    "经历与岗位的交集仅停留在沟通、协作或推进等通用能力，"
+                    "必须补充至少一项直接对应岗位核心职责的行动或交付证据"
+                )
+        capability_matches = [
+            str(item).strip()
+            for item in draft.get("capability_matches", [])
+            if str(item).strip()
+        ]
+        role_has_points = any(
+            isinstance(item, dict) and str(item.get("text") or "").strip()
+            for field in ("responsibilities", "requirements")
+            for item in role.get(field, [])
+        )
+        if role_has_points and not capability_matches:
+            problems.append("职责匹配说明为空，必须绑定岗位核心职责与实际使用的经历证据 ID")
+        elif capability_matches:
+            unbound_matches = [
+                item
+                for item in capability_matches
+                if not any(_contains_exact_identifier(item, evidence_id) for evidence_id in used)
+            ]
+            if unbound_matches:
+                problems.append("职责匹配说明未绑定实际使用的经历证据 ID")
+            mapped_groups = set().union(*(_signal_groups(item) for item in capability_matches))
+            if alignment["core_role_groups"] and not (
+                set(alignment["core_role_groups"]) & mapped_groups
+            ):
+                problems.append("职责匹配说明没有点明岗位核心工作，仍是通用能力描述")
 
     if len(cover) < 280 or len(cover) > 520:
         problems.append(f"Cover Letter 当前 {len(cover)} 字，必须重写到 280-520 字，目标 320-460 字")
@@ -1483,6 +1811,17 @@ def _human_quality_dimensions(
     relevance_problems = [] if role_name and role_name in subject else ["主题没有准确点名当前岗位"]
     if templated_subject:
         relevance_problems.append("邮件主题使用了通用模板，未体现当前岗位和候选人证据")
+    alignment = _role_evidence_alignment(
+        role,
+        [evidence_by_id[evidence_id] for evidence_id in grounded_ids],
+    )
+    if alignment["role_groups"] and grounded_ids:
+        aligned_ids = set(alignment["aligned_ids"])
+        unaligned_ids = sorted(set(grounded_ids) - aligned_ids)
+        if unaligned_ids:
+            relevance_problems.append(f"经历未对应任何岗位职责：{'、'.join(unaligned_ids)}")
+        if alignment["core_role_groups"] and not alignment["core_aligned_ids"]:
+            relevance_problems.append("经历只体现通用协作或执行，未对应岗位核心职责")
     naturalness_problems = [f"出现模板化表达：{'、'.join(cliches)}"] if cliches else []
     if empty_company_praise:
         naturalness_problems.append(f"出现无事实依据的公司赞美：{'、'.join(empty_company_praise)}")
@@ -1512,7 +1851,12 @@ def _human_quality_dimensions(
     return {
         "factual_grounding": dimension(100 if not grounding_problems else 60, grounding_problems, grounded_ids or ["无有效证据引用"], "删除无证据事实，只保留 candidate_evidence 中可逐项核验的表述"),
         "specificity": dimension(100 if not specificity_problems else 65, specificity_problems, sorted(evidence_terms)[:6] or ["未检测到证据锚点"], "写明一项真实行动、交付物或结果，不用抽象能力词代替"),
-        "relevance": dimension(100 if not relevance_problems else 70, relevance_problems, [role_name or "岗位名缺失"], "在主题和开头准确点名当前岗位"),
+        "relevance": dimension(
+            100 if not relevance_problems else 70,
+            relevance_problems,
+            [role_name or "岗位名缺失", *[f"{evidence_id}:{'/'.join(groups)}" for evidence_id, groups in alignment["overlap_by_id"].items() if groups]],
+            "准确点名岗位，并用一项候选人行动或交付物直接对应核心职责",
+        ),
         "naturalness": dimension(100 if not naturalness_problems else 55, naturalness_problems, cliches or ["未命中模板化表达"], "改成候选人会直接说出的短句，删除夸张和行业套话"),
         "brevity": dimension(100 if not brevity_problems else 65, brevity_problems, [f"正文 {len(email)} 字，{len(email_paragraphs)} 段"], "压缩到 120-260 字和四个短段落以内"),
         "tone": dimension(100 if not tone_problems else 65, tone_problems, ["克制、直接、第一人称"], "把绝对判断改成可核验事实和自然沟通邀请"),
@@ -1600,6 +1944,8 @@ def _ensure_record_outputs(
     info_agent: ApplicationInfoAgent,
     fit_agent: FitEvidenceAgent,
     writer_agent: OutreachWriterAgent,
+    *,
+    refresh_fit_evidence: bool = False,
 ) -> None:
     application_info = record.get("application_info")
     if not isinstance(application_info, dict):
@@ -1610,12 +1956,12 @@ def _ensure_record_outputs(
     record["application_info"] = application_info
 
     fit_evidence = record.get("fit_evidence")
-    if not isinstance(fit_evidence, list) or not fit_evidence:
+    if refresh_fit_evidence or not isinstance(fit_evidence, list) or not fit_evidence:
         fit_evidence = fit_agent.run(record, application_info["requirements"])
         record["fit_evidence"] = fit_evidence
     fallback = writer_agent.run(record, application_info, fit_evidence)
     existing = record.get("outreach") if isinstance(record.get("outreach"), dict) else {}
-    outreach = {**fallback, **existing}
+    outreach = fallback if refresh_fit_evidence else {**fallback, **existing}
     for field in OUTREACH_TEXT_FIELDS:
         if not str(outreach.get(field) or "").strip():
             outreach[field] = str(fallback.get(field) or "").strip()
@@ -1825,6 +2171,9 @@ def enrich_payload(
     _ = require_application_signal
     provider = provider or AIProvider()
     candidate_profile = candidate_profile or _candidate_application_profile(profile)
+    raw_snapshot = payload.get("profile_snapshot")
+    candidate_snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else build_profile_snapshot(profile)
+    profile_snapshot_id = str(candidate_snapshot.get("profileSnapshotId") or "").strip()
     processed = passed = skipped = total_attempts = 0
     fallback_profile = dict(profile)
     if candidate_profile:
@@ -1835,13 +2184,27 @@ def enrich_payload(
     records = [record for record in payload.get("records", []) if isinstance(record, dict)]
     source_states: dict[int, str] = {}
     for record in records:
-        source_hash = _application_copy_source_hash(record, candidate_profile)
-        source_states[id(record)] = _apply_application_copy_source_state(record, source_hash)
+        source_hash = _application_copy_source_hash(
+            record,
+            candidate_profile,
+            profile_snapshot_id=profile_snapshot_id,
+        )
+        source_state = _apply_application_copy_source_state(record, source_hash)
+        if source_state == "changed":
+            legacy_hash = _application_copy_source_hash(record, candidate_profile)
+            outreach = record.get("outreach")
+            stored_hash = str(outreach.get("sourceHash") or "").strip() if isinstance(outreach, dict) else ""
+            if stored_hash == legacy_hash:
+                _stamp_application_copy_source(record, source_hash)
+                if isinstance(outreach, dict):
+                    outreach["sourceHashStatus"] = "snapshot_migrated"
+                source_state = "current"
+        source_states[id(record)] = source_state
     if target_note_ids is not None:
         target_records = [
             record
             for record in records
-            if str(record.get("note_id") or "") in target_note_ids
+            if canonical_record_key(record) in target_note_ids
         ]
     else:
         target_records = [
@@ -1855,7 +2218,13 @@ def enrich_payload(
     total_records = len(target_records)
     prefilled_records = 0
     for record in target_records:
-        _ensure_record_outputs(record, info_agent, fit_agent, writer_agent)
+        _ensure_record_outputs(
+            record,
+            info_agent,
+            fit_agent,
+            writer_agent,
+            refresh_fit_evidence=target_note_ids is not None,
+        )
         if _prefill_verified_image_record(record, provider, fit_agent, writer_agent):
             prefilled_records += 1
     if prefilled_records and progress_callback:
@@ -1949,7 +2318,11 @@ def enrich_payload(
                 ],
                 "rewrite_instructions": [],
             }
-            source_hash = _application_copy_source_hash(record, candidate_profile)
+            source_hash = _application_copy_source_hash(
+                record,
+                candidate_profile,
+                profile_snapshot_id=profile_snapshot_id,
+            )
             _stamp_application_copy_source(record, source_hash)
             _apply_claim_validation(record, fallback_profile, candidate_profile)
             if progress_callback:
@@ -1960,7 +2333,11 @@ def enrich_payload(
         except (AIProviderError, ValueError, TypeError, KeyError) as error:
             _mark_model_failure(record, error, provider)
             record["cover_letter_evaluation"]["threshold"] = threshold
-            source_hash = _application_copy_source_hash(record, candidate_profile)
+            source_hash = _application_copy_source_hash(
+                record,
+                candidate_profile,
+                profile_snapshot_id=profile_snapshot_id,
+            )
             _stamp_application_copy_source(record, source_hash)
             _apply_claim_validation(record, fallback_profile, candidate_profile)
             if progress_callback:
@@ -2017,6 +2394,7 @@ def enrich_payload(
                     feedback,
                     candidate_profile,
                     application_context,
+                    candidate_snapshot,
                 )
                 if getattr(provider, "provider", "") == "local_qwen":
                     draft = _finalize_local_draft(draft, role, candidate_profile)
@@ -2049,7 +2427,11 @@ def enrich_payload(
             if not draft:
                 _mark_model_failure(record, error, provider)
                 record["cover_letter_evaluation"]["threshold"] = threshold
-                source_hash = _application_copy_source_hash(record, candidate_profile)
+                source_hash = _application_copy_source_hash(
+                    record,
+                    candidate_profile,
+                    profile_snapshot_id=profile_snapshot_id,
+                )
                 _stamp_application_copy_source(record, source_hash)
                 _apply_claim_validation(record, fallback_profile, candidate_profile)
                 if progress_callback:
@@ -2095,6 +2477,15 @@ def enrich_payload(
         for field in OUTREACH_TEXT_FIELDS:
             if not str(draft.get(field) or "").strip():
                 draft[field] = fallback_draft[field]
+        resume_artifact_ids = {
+            str(item.get("id") or "").strip()
+            for item in candidate_snapshot.get("resumeArtifacts", [])
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+        recommended_resume = str(draft.get("recommended_resume") or "").strip()
+        if recommended_resume not in resume_artifact_ids:
+            recommended_resume = ""
+        resume_reason = str(draft.get("resume_reason") or "").strip() if recommended_resume else ""
         record["outreach"] = {
             **fallback_draft,
             **draft,
@@ -2103,6 +2494,9 @@ def enrich_payload(
             "runtime_status": "completed" if ready else "quality_threshold_not_met",
             "status": "ready" if ready else "needs_review",
             "applicationContext": application_context,
+            "profile_snapshot_id": profile_snapshot_id,
+            "recommended_resume": recommended_resume,
+            "resume_reason": resume_reason,
         }
         record["quality"]["job_card_generated"] = True
         record["quality"]["outreach_generated"] = all(
@@ -2113,7 +2507,11 @@ def enrich_payload(
             "application_signal_detected": application_signal_detected,
         }
         record["cover_letter_evaluation"] = {**final_evaluation, "passed": ready, "attempts": final_evaluation.get("attempt", 0)}
-        source_hash = _application_copy_source_hash(record, candidate_profile)
+        source_hash = _application_copy_source_hash(
+            record,
+            candidate_profile,
+            profile_snapshot_id=profile_snapshot_id,
+        )
         _stamp_application_copy_source(record, source_hash)
         _apply_claim_validation(record, fallback_profile, candidate_profile)
         if progress_callback:

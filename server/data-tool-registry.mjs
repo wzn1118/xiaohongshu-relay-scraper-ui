@@ -6,9 +6,11 @@ import { searchToolCatalog } from "./copilot-capability-resolver.mjs";
 import { filterRowsByContextSelection } from "./copilot-context-source.mjs";
 import {
   applicationContactEmails,
+  applicationSubjectRule,
   buildApplicationEmailDraft,
   validateApplicationEmailSubject,
 } from "./lib/application-email-draft.mjs";
+import { detectApplicationAttachmentRule } from "./lib/application-attachment-rule.mjs";
 
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/u;
 const MAX_TOOL_ROWS = 200;
@@ -345,6 +347,66 @@ export class DataToolRegistry {
           outreach: row.outreach || null,
         }));
         return tableResult(rows, loaded.source);
+      },
+    });
+    this.register({
+      name: "applications.extract_email_requirements",
+      description:
+        "Extract recruitment recipients, email subject formats, and attachment naming rules for every matched application record. Use this for all, batch, multiple, or per-job email-format requests; it returns explicit coverage and pagination metadata instead of stopping after one record.",
+      tags: [
+        "applications",
+        "email",
+        "batch",
+        "all",
+        "requirements",
+        "subject format",
+        "邮件格式",
+        "邮件标题",
+        "全部岗位",
+        "批量提取",
+      ],
+      scopes: ["applications:read"],
+      inputSchema: objectSchema({
+        noteIds: arraySchema(stringSchema()),
+        query: stringSchema(),
+        offset: integerSchema(0, 1_000_000),
+        limit: integerSchema(1, MAX_TOOL_ROWS),
+      }),
+      handler: async (input, context) => {
+        const loaded = await this.#dataset("applications", context);
+        const noteIds = new Set(arrayOfStrings(input.noteIds));
+        let matched = noteIds.size
+          ? loaded.rows.filter((row) => noteIds.has(recordId(row)))
+          : loaded.rows;
+        if (input.query) matched = searchRows(matched, input.query);
+        const total = matched.length;
+        const offset = bounded(input.offset, 0, 0, 1_000_000);
+        const limit = bounded(input.limit, MAX_TOOL_ROWS, 1, MAX_TOOL_ROWS);
+        const extracted = matched.map(applicationEmailRequirement);
+        const rows = extracted.slice(offset, offset + limit);
+        const nextOffset = offset + rows.length;
+        const complete = nextOffset >= total;
+        const matchedIds = new Set(matched.map(recordId));
+        return tableResult(rows, loaded.source, total, {
+          offset,
+          limit,
+          truncated: !complete,
+          coverage: {
+            requestedRecords: noteIds.size || null,
+            matchedRecords: total,
+            scannedRecords: total,
+            returnedRecords: rows.length,
+            withRecipient: extracted.filter((row) => row.recipientEmails.length > 0).length,
+            withSubjectRule: extracted.filter((row) => row.subjectRuleDetected).length,
+            withAttachmentRule: extracted.filter((row) => row.attachmentRuleDetected).length,
+            missingAnyEmailRequirement: extracted.filter((row) => row.extractionStatus === "not_found").length,
+            unmatchedNoteIds: noteIds.size
+              ? [...noteIds].filter((noteId) => !matchedIds.has(noteId))
+              : [],
+            complete,
+            nextOffset: complete ? null : nextOffset,
+          },
+        });
       },
     });
     this.register({
@@ -1240,6 +1302,39 @@ function joinRows(left, right, leftKey, rightKey) {
 function findRecord(rows, id) {
   const value = String(id || "");
   return rows.find((row) => recordId(row) === value) || null;
+}
+
+function applicationEmailRequirement(row) {
+  const recipientEmails = applicationContactEmails(row);
+  const subjectRule = applicationSubjectRule(row);
+  const attachmentRule = detectApplicationAttachmentRule(row);
+  const hasAnyRequirement = recipientEmails.length > 0 || subjectRule.detected || attachmentRule.detected;
+  const hasCoreEmailRequirement = recipientEmails.length > 0 && subjectRule.detected;
+  return {
+    noteId: recordId(row),
+    title: firstString(row?.title, row?.job_card?.title, row?.job_card?.role_name),
+    company: firstString(row?.job_card?.company_name, row?.company_name, row?.company),
+    jobTitle: firstString(row?.job_card?.role_name, row?.title, row?.job_card?.title),
+    recipientEmails,
+    subjectRuleDetected: subjectRule.detected,
+    subjectFormat: subjectRule.template,
+    subjectFields: subjectRule.fields,
+    subjectEvidence: subjectRule.evidence,
+    attachmentRuleDetected: attachmentRule.detected,
+    attachmentFormat: attachmentRule.template,
+    attachmentFields: attachmentRule.fields,
+    attachmentEvidence: attachmentRule.evidence,
+    extractionStatus: hasCoreEmailRequirement
+      ? "complete"
+      : hasAnyRequirement
+        ? "partial"
+        : "not_found",
+    missing: [
+      ...(recipientEmails.length ? [] : ["recipientEmail"]),
+      ...(subjectRule.detected ? [] : ["subjectFormat"]),
+    ],
+    sourceUrl: firstString(row?.note_url, row?.source_url, row?.job_card?.source_url),
+  };
 }
 
 function recordId(row) {

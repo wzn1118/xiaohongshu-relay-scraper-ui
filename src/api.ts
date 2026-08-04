@@ -1,4 +1,30 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationAttachment, ApplicationAttachmentList, ApplicationContext, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, BodyImportOptions, BodyImportResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, EmailPreview, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationAttachment, ApplicationAttachmentList, ApplicationBatch, ApplicationBatchCreateResponse, ApplicationBatchPreflight, ApplicationBatchRequest, ApplicationBatchStreamEvent, ApplicationContext, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, BodyImportOptions, BodyImportResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, EmailPreview, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult, UserProblem, WorkflowConnectionState, WorkflowSnapshotV3 } from './types'
+
+export type ApiError = Error & {
+  code?: string
+  status?: number
+  expectedVersion?: number | null
+  currentVersion?: number | null
+  problem?: UserProblem | null
+  details?: unknown
+  retryAt?: string | null
+  action?: UserProblem['action']
+  resumable?: boolean
+}
+
+export type JobSubscriptionOptions = {
+  afterSequence?: number
+  onConnectionChange?: (connection: { state: WorkflowConnectionState; lastEventAt: string | null }) => void
+}
+
+export type JobExperienceActionResponse = {
+  action: 'started' | 'signaled' | 'attached'
+  jobId: string
+  stage: string
+  scope: string
+  job: Job
+  snapshot: WorkflowSnapshotV3 | null
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
@@ -9,17 +35,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }))
-    const errorMessage = typeof body.error === 'string' ? body.error : body.error?.message
-    const error = new Error(body.message || errorMessage || `请求失败 (${response.status})`) as Error & {
-      code?: string
-      status?: number
-      expectedVersion?: number | null
-      currentVersion?: number | null
-    }
-    error.code = typeof body.error === 'object' ? body.error?.code : body.code
+    const nestedError = body.error && typeof body.error === 'object' ? body.error : null
+    const errorMessage = typeof body.error === 'string' ? body.error : nestedError?.message
+    const error = new Error(body.message || errorMessage || `请求失败 (${response.status})`) as ApiError
+    error.code = body.code || nestedError?.code
     error.status = response.status
     error.expectedVersion = typeof body.expectedVersion === 'number' ? body.expectedVersion : null
     error.currentVersion = typeof body.currentVersion === 'number' ? body.currentVersion : null
+    error.problem = body.problem && typeof body.problem === 'object' ? body.problem as UserProblem : null
+    error.details = body.details ?? nestedError?.details
+    error.retryAt = typeof body.retryAt === 'string' ? body.retryAt : error.problem?.retryAt || null
+    error.action = body.action && typeof body.action === 'object' ? body.action : error.problem?.action || null
+    error.resumable = Boolean(body.resumable ?? error.problem?.retryable)
     throw error
   }
   return response.json() as Promise<T>
@@ -78,6 +105,27 @@ export const api = {
   }),
   jobs: () => request<Job[]>('/api/jobs'),
   job: (id: string) => request<Job>(`/api/jobs/${encodeURIComponent(id)}`),
+  jobExperienceSnapshot: (id: string) =>
+    request<WorkflowSnapshotV3>(`/api/jobs/${encodeURIComponent(id)}/experience-snapshot`),
+  jobIssues: (id: string) =>
+    request<{ jobId: string; throughSequence: number; issues: UserProblem[] }>(`/api/jobs/${encodeURIComponent(id)}/issues`),
+  jobTechnicalDiagnostics: (id: string) =>
+    request<Record<string, unknown>>(`/api/jobs/${encodeURIComponent(id)}/technical-diagnostics`),
+  retryJobStage: (id: string, payload: { stage: string; aiSessionId?: string | null; idempotencyKey?: string }) =>
+    request<JobExperienceActionResponse>(`/api/jobs/${encodeURIComponent(id)}/actions/retry-stage`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  checkJobRecovery: (id: string, payload: { idempotencyKey?: string } = {}) =>
+    request<JobExperienceActionResponse>(`/api/jobs/${encodeURIComponent(id)}/actions/check-recovery`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  openJobLogin: (id: string) =>
+    request<{ action: 'opened'; jobId: string; opened: boolean; profile: string; url: string; message: string }>(`/api/jobs/${encodeURIComponent(id)}/actions/open-login`, {
+      method: 'POST',
+      body: '{}',
+    }),
   preflight: (payload: JobRequest) =>
     request<PreflightReport>('/api/preflight', { method: 'POST', body: JSON.stringify(payload) }),
   createJob: (payload: JobRequest) =>
@@ -221,27 +269,105 @@ export const api = {
     request<EmailPreview>(`/api/jobs/${encodeURIComponent(jobId)}/send-email/preview`, { method: 'POST', body: JSON.stringify({ noteId, to, attachmentIds, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
   sendEmail: (jobId: string, noteId: string, to: string, outreach: OutreachDraft, attachmentIds: string[], preview: EmailPreview, draftVersion?: DraftVersionRef) =>
     request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/send-email`, { method: 'POST', body: JSON.stringify({ noteId, to, outreach, attachmentIds, previewRevision: preview.previewRevision, attachmentBundleHash: preview.attachmentBundleHash, idempotencyKey: preview.previewRevision, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
+  dryRunApplicationBatch: (jobId: string, payload: ApplicationBatchRequest) =>
+    request<ApplicationBatchPreflight>(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/dry-run`, { method: 'POST', body: JSON.stringify(payload) }),
+  createApplicationBatch: (jobId: string, payload: ApplicationBatchRequest) =>
+    request<ApplicationBatchCreateResponse>(`/api/jobs/${encodeURIComponent(jobId)}/application-batches`, { method: 'POST', body: JSON.stringify(payload) }),
+  applicationBatches: (jobId: string) =>
+    request<{ batches: ApplicationBatch[] }>(`/api/jobs/${encodeURIComponent(jobId)}/application-batches`),
+  applicationBatch: (jobId: string, batchId: string) =>
+    request<ApplicationBatch>(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/${encodeURIComponent(batchId)}`),
+  approveApplicationBatch: (jobId: string, batchId: string, expectedRevision: number) =>
+    request<ApplicationBatch>(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/${encodeURIComponent(batchId)}/approve`, { method: 'POST', body: JSON.stringify({ expectedRevision }) }),
+  controlApplicationBatch: (jobId: string, batchId: string, action: 'start' | 'pause' | 'resume' | 'cancel', expectedRevision?: number) =>
+    request<ApplicationBatch>(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/${encodeURIComponent(batchId)}/${action}`, { method: 'POST', body: JSON.stringify({ ...(expectedRevision ? { expectedRevision } : {}) }) }),
+  reconcileApplicationBatchItem: (jobId: string, batchId: string, itemId: string, expectedRevision: number, expectedItemRevision: number, outcome: 'sent' | 'not_sent') =>
+    request<ApplicationBatch>(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/reconcile`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expectedRevision,
+        expectedItemRevision,
+        outcome,
+        actor: 'user',
+        reason: outcome === 'sent' ? '已核对发件箱或服务商记录，确认服务器已接收。' : '已核对发件箱或服务商记录，确认未发送。',
+      }),
+    }),
+  subscribeApplicationBatch: (jobId: string, batchId: string, onEvent: (event: ApplicationBatchStreamEvent) => void, onDisconnect: () => void, afterSequence = 0) => {
+    const params = afterSequence > 0 ? `?after=${Math.floor(afterSequence)}` : ''
+    const stream = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/${encodeURIComponent(batchId)}/events${params}`)
+    const receive = (event: Event) => {
+      if (!(event instanceof MessageEvent)) return
+      try {
+        onEvent(JSON.parse(event.data) as ApplicationBatchStreamEvent)
+      } catch {
+        onDisconnect()
+      }
+    }
+    stream.addEventListener('snapshot', receive)
+    stream.addEventListener('batch', receive)
+    stream.addEventListener('error', receive)
+    stream.onerror = onDisconnect
+    return () => stream.close()
+  },
   artifactUrl: (jobId: string, artifact: Artifact) =>
     artifact.url || `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifact.id)}`,
-  subscribe: (id: string, onEvent: (event: JobEvent) => void, onDisconnect: () => void) => {
-    const stream = new EventSource(`/api/jobs/${encodeURIComponent(id)}/events`)
+  subscribe: (id: string, onEvent: (event: JobEvent) => void, onDisconnect: () => void, options: JobSubscriptionOptions = {}) => {
+    const params = new URLSearchParams()
+    const initialSequence = Number(options.afterSequence)
+    if (Number.isFinite(initialSequence) && initialSequence > 0) params.set('after', String(Math.floor(initialSequence)))
+    const query = params.size ? `?${params}` : ''
+    const stream = new EventSource(`/api/jobs/${encodeURIComponent(id)}/events${query}`)
+    let highestSequence = Number.isFinite(initialSequence) ? Math.max(0, Math.floor(initialSequence)) : 0
+    let highestRevision = -1
+    let closed = false
+    let lastEventAt: string | null = null
+    const publishConnection = (state: WorkflowConnectionState, eventAt = lastEventAt) => {
+      if (closed) return
+      lastEventAt = eventAt
+      options.onConnectionChange?.({ state, lastEventAt })
+    }
     const handle = (event: MessageEvent) => {
       try {
-        onEvent(JSON.parse(event.data) as JobEvent)
+        const parsed = JSON.parse(event.data) as JobEvent
+        const eventSequence = Number(parsed.sequence ?? parsed.workflowEvent?.sequence ?? event.lastEventId)
+        const hasSequence = Number.isFinite(eventSequence) && eventSequence > 0
+        if (hasSequence && eventSequence <= highestSequence) return
+        const eventRevision = Number(
+          parsed.revision
+            ?? parsed.job?.revision
+            ?? parsed.experienceSnapshot?.revision
+            ?? parsed.workflowEvent?.sourceRevision,
+        )
+        const hasRevision = Number.isFinite(eventRevision) && eventRevision >= 0
+        const carriesSnapshot = Boolean(parsed.job || parsed.experienceSnapshot)
+        if (carriesSnapshot && hasRevision && eventRevision < highestRevision) return
+        if (hasSequence) highestSequence = eventSequence
+        if (hasRevision) highestRevision = Math.max(highestRevision, eventRevision)
+        const receivedAt = new Date().toISOString()
+        publishConnection('live', receivedAt)
+        onEvent(parsed)
       } catch {
+        publishConnection('live', new Date().toISOString())
         onEvent({ type: 'log', line: event.data })
       }
     }
+    stream.onopen = () => publishConnection('live', new Date().toISOString())
     stream.onmessage = handle
-    for (const name of ['snapshot', 'status', 'log', 'artifacts', 'done', 'error']) {
+    for (const name of ['snapshot', 'status', 'log', 'artifacts', 'done', 'error', 'workflow', 'problem', 'heartbeat']) {
       stream.addEventListener(name, handle as EventListener)
     }
     stream.onerror = () => {
       // Native EventSource reconnects automatically. Keep it open and use the
       // callback only to refresh the latest persisted snapshot while offline.
+      publishConnection('reconnecting')
       onDisconnect()
     }
-    return () => stream.close()
+    publishConnection('reconnecting')
+    return () => {
+      options.onConnectionChange?.({ state: 'offline', lastEventAt })
+      closed = true
+      stream.close()
+    }
   },
 }
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from body_completion_ledger import BodyCompletionLedger, LEDGER_FILENAME
+from note_identity import canonical_note_url, note_id_from_value, record_key
 from workflow_state import open_workflow_state_from_args
 
 
@@ -42,6 +43,7 @@ DEFAULT_UPSTREAM_SCRAPER = default_upstream_scraper()
 FAILURE_STATUSES = {
     "detail_empty",
     "detail_login_required",
+    "detail_note_mismatch",
     "detail_rate_limited",
     "detail_security_verification",
     "detail_unavailable",
@@ -72,6 +74,15 @@ PAGE_CLOSED_MARKERS = (
     "browser has been closed",
 )
 HEAVY_RESOURCE_TYPES = {"image", "media", "font"}
+BLOCKED_FAILURE_STATUSES = {
+    "detail_login_required",
+    "detail_rate_limited",
+    "detail_security_verification",
+}
+TERMINAL_FAILURE_STATUSES = {
+    "detail_note_mismatch",
+    "detail_unavailable",
+}
 
 
 class AdaptivePacer:
@@ -160,6 +171,7 @@ class RateLimitRecovery:
         recovery_spacing_seconds: float = 30,
         max_recovery_spacing_seconds: float = 120,
         stable_successes: int = 3,
+        manual_recovery_path: Path | None = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.initial_delay_seconds = max(0.0, float(initial_delay_seconds))
@@ -171,20 +183,65 @@ class RateLimitRecovery:
             float(max_recovery_spacing_seconds),
         )
         self.stable_successes = max(1, int(stable_successes))
+        self.manual_recovery_path = manual_recovery_path
         self.detected_count = 0
         self.recovery_attempts = 0
         self.episode_attempts = 0
         self.success_streak = 0
         self.blocked_until = 0.0
         self.exhausted = False
+        self.warm_started = False
+        self.resumed_from_rate_limit = False
+        self.cleared = False
         self._probe_pending = False
         self._lock = threading.Lock()
+
+    def _consume_manual_probe_request(self) -> bool:
+        if self.manual_recovery_path is None:
+            return False
+        try:
+            self.manual_recovery_path.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        return True
+
+    def warm_start(self) -> bool:
+        """Resume a previously throttled task with probe spacing already active."""
+        with self._lock:
+            if not self.enabled:
+                return False
+            self.episode_attempts = 1
+            self.success_streak = 0
+            spacing = min(
+                self.max_recovery_spacing_seconds,
+                self.recovery_spacing_seconds,
+            )
+            self.blocked_until = time.monotonic() + spacing
+            self.exhausted = False
+            self.warm_started = True
+            self.resumed_from_rate_limit = True
+            self.cleared = False
+            self._probe_pending = True
+            return True
 
     def register_rate_limit(self) -> dict[str, Any]:
         with self._lock:
             self.detected_count += 1
-            if not self.enabled or self.episode_attempts >= self.max_retries:
+            self.cleared = False
+            # A warm-start process is only a bounded recovery probe. If the
+            # platform is still throttling, hand scheduling back to JobManager
+            # immediately instead of starting a second in-process cooldown.
+            if (
+                not self.enabled
+                or self.resumed_from_rate_limit
+                or self.episode_attempts >= self.max_retries
+            ):
                 self.exhausted = True
+                self.success_streak = 0
+                self.blocked_until = 0.0
+                self._probe_pending = False
                 return {
                     "recoverable": False,
                     "attempt": self.episode_attempts,
@@ -211,11 +268,25 @@ class RateLimitRecovery:
         last_reported_bucket: int | None = None
         while not stop_event.is_set():
             with self._lock:
+                probe_pending = self._probe_pending
+                if not probe_pending:
+                    return True
                 remaining = max(0.0, self.blocked_until - time.monotonic())
                 attempt = self.episode_attempts
-                probe_pending = self._probe_pending
                 if remaining <= 0 and probe_pending:
                     self._probe_pending = False
+            if remaining > 0 and probe_pending and self._consume_manual_probe_request():
+                with self._lock:
+                    if self._probe_pending:
+                        self.blocked_until = 0.0
+                        self._probe_pending = False
+                        attempt = self.episode_attempts
+                print(
+                    "BODY_RATE_LIMIT manual_probe "
+                    f"attempt={attempt}/{self.max_retries}; skipping remaining cooldown",
+                    flush=True,
+                )
+                return True
             if remaining <= 0:
                 if probe_pending:
                     print(
@@ -231,7 +302,8 @@ class RateLimitRecovery:
                     flush=True,
                 )
                 last_reported_bucket = bucket
-            if stop_event.wait(min(5.0, remaining)):
+            poll_seconds = 1.0 if self.manual_recovery_path is not None else 5.0
+            if stop_event.wait(min(poll_seconds, remaining)):
                 return False
         return False
 
@@ -246,6 +318,16 @@ class RateLimitRecovery:
             self.success_streak = 0
             self.blocked_until = 0.0
             self.exhausted = False
+            self.warm_started = False
+            self.cleared = True
+            return True
+
+    def observe_failure(self) -> bool:
+        """Reset a live recovery streak after any unsuccessful network result."""
+        with self._lock:
+            if self.episode_attempts <= 0:
+                return False
+            self.success_streak = 0
             return True
 
     def next_spacing(self) -> float:
@@ -272,7 +354,20 @@ class RateLimitRecovery:
                 "stableSuccesses": self.stable_successes,
                 "successStreak": self.success_streak,
                 "exhausted": self.exhausted,
+                "warmStarted": self.warm_started,
+                "resumedFromRateLimit": self.resumed_from_rate_limit,
+                "cleared": self.cleared,
             }
+
+
+def rate_limit_summary_status(stop_reason: str, state: dict[str, Any]) -> str:
+    if str(stop_reason or "").strip().casefold() == "rate_limited":
+        return "stopped"
+    if bool(state.get("cleared")):
+        return "cleared"
+    if bool(state.get("resumedFromRateLimit")) or int(state.get("detectedCount") or 0) > 0:
+        return "waiting"
+    return "not_detected"
 
 
 def configure_lightweight_detail_page(page: Any) -> None:
@@ -311,8 +406,55 @@ def processed_attempt_count(card_keys: list[str], attempted_keys: set[str]) -> i
     return len(set(card_keys).intersection(attempted_keys))
 
 
-def record_key(record: dict[str, Any]) -> str:
-    return str(record.get("note_id") or record.get("note_url") or "").strip()
+def classify_workflow_outcome(*, succeeded: bool, failure_code: Any = "") -> str:
+    if succeeded:
+        return "succeeded"
+    code = str(failure_code or "missing_record").strip().casefold()
+    if code in BLOCKED_FAILURE_STATUSES:
+        return "blocked"
+    if code in TERMINAL_FAILURE_STATUSES:
+        return "failed"
+    return "retryable"
+
+
+def workflow_progress_counts(
+    *,
+    target_keys: set[str],
+    attempted_keys: set[str],
+    outcomes: dict[str, str],
+    reused: int = 0,
+) -> dict[str, int | str]:
+    """Build exhaustive, mutually exclusive current outcome counters."""
+
+    succeeded = sum(outcomes.get(key) == "succeeded" for key in target_keys)
+    failed = sum(outcomes.get(key) == "failed" for key in target_keys)
+    blocked = sum(outcomes.get(key) == "blocked" for key in target_keys)
+    return {
+        "unit": "body",
+        "done": len(target_keys.intersection(attempted_keys)),
+        "total": len(target_keys),
+        "succeeded": succeeded,
+        "reused": max(0, int(reused)),
+        "retryable": max(0, len(target_keys) - succeeded - failed - blocked),
+        "failed": failed,
+        "blocked": blocked,
+    }
+
+
+def page_recycle_reason(
+    payload: dict[str, Any],
+    *,
+    payload_complete: bool,
+    page_uses: int,
+    page_recycle_every: int,
+) -> str:
+    """Recycle only on a scheduled boundary or a demonstrably broken page."""
+
+    if page_uses >= max(1, int(page_recycle_every)):
+        return "scheduled"
+    if not payload_complete and should_retry_on_fresh_page(payload):
+        return "unhealthy_page"
+    return ""
 
 
 def pending_retry_priority(
@@ -616,6 +758,132 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def workflow_job_id(output_dir: Path) -> str:
+    return output_dir.parent.name if output_dir.name.casefold() == "artifacts" else output_dir.name
+
+
+class WorkflowEventEmitter:
+    """Emit versioned, single-line business events that Node can reduce directly."""
+
+    def __init__(self, *, job_id: str, attempt_id: str) -> None:
+        self.job_id = job_id
+        self.attempt_id = attempt_id
+        self.sequence = 0
+        self._lock = threading.Lock()
+
+    def emit(
+        self,
+        *,
+        event_type: str,
+        state: str,
+        message_code: str,
+        progress: dict[str, Any],
+        performance: dict[str, Any] | None = None,
+        message_params: dict[str, Any] | None = None,
+        problem: dict[str, Any] | None = None,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            self.sequence += 1
+            event_id = f"evt_{uuid.uuid4().hex}"
+            event: dict[str, Any] = {
+                "schemaVersion": 1,
+                "eventId": event_id,
+                "sequence": self.sequence,
+                "jobId": self.job_id,
+                "attemptId": self.attempt_id,
+                "occurredAt": utc_now(),
+                "type": event_type,
+                "stage": "body",
+                "state": state,
+                "progress": progress,
+                "message": {
+                    "code": message_code,
+                    "params": message_params or {},
+                },
+            }
+            if performance is not None:
+                event["performance"] = performance
+            if problem:
+                event["problem"] = {**problem, "technicalRef": event_id}
+                event["technicalRef"] = event_id
+            if checkpoint:
+                event["checkpoint"] = checkpoint
+            print(
+                "WORKFLOW_EVENT " + json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+                flush=True,
+            )
+            return event
+
+
+def body_user_problem(
+    failure_code: str,
+    *,
+    saved: int,
+    total: int,
+) -> dict[str, Any] | None:
+    preserved = max(0, int(saved))
+    total = max(preserved, int(total))
+    problems: dict[str, dict[str, Any]] = {
+        "detail_rate_limited": {
+            "code": "RATE_LIMITED",
+            "category": "access",
+            "severity": "warning",
+            "userTitle": "平台暂时限制访问",
+            "userMessage": f"已保存 {preserved}/{total} 篇，系统会停止普通请求并安排恢复检查。",
+            "automaticAction": "保存进度并安排单次恢复检查",
+            "retryable": True,
+            "retryAt": None,
+            "requiresUserAction": False,
+            "action": {"id": "check_recovery", "label": "立即检查是否恢复"},
+            "affectedStage": "body",
+        },
+        "detail_security_verification": {
+            "code": "SECURITY_VERIFICATION",
+            "category": "access",
+            "severity": "blocking",
+            "userTitle": "需要完成页面验证",
+            "userMessage": f"已保存 {preserved}/{total} 篇；完成验证后会从剩余内容继续。",
+            "automaticAction": "暂停采集并保留检查点",
+            "retryable": True,
+            "retryAt": None,
+            "requiresUserAction": True,
+            "action": {"id": "open_verification", "label": "打开验证页面"},
+            "affectedStage": "body",
+        },
+        "detail_login_required": {
+            "code": "LOGIN_REQUIRED",
+            "category": "access",
+            "severity": "blocking",
+            "userTitle": "登录状态已失效",
+            "userMessage": f"已有 {preserved}/{total} 篇结果不会丢失，重新登录后可继续。",
+            "automaticAction": "暂停正文采集并保留检查点",
+            "retryable": True,
+            "retryAt": None,
+            "requiresUserAction": True,
+            "action": {"id": "open_login", "label": "打开登录页"},
+            "affectedStage": "body",
+        },
+        "detail_note_mismatch": {
+            "code": "NOTE_ID_MISMATCH",
+            "category": "content",
+            "severity": "warning",
+            "userTitle": "这条内容未能正确对应",
+            "userMessage": "系统没有保存错误页面，已将这条内容排入后续重试。",
+            "automaticAction": "保留目标链接并延后重试",
+            "retryable": True,
+            "retryAt": None,
+            "requiresUserAction": False,
+            "action": None,
+            "affectedStage": "body",
+        },
+    }
+    problem = problems.get(str(failure_code or "").strip())
+    if not problem:
+        return None
+    return {**problem, "preservedResultCount": preserved, "technicalRef": ""}
+
+
 def complete_bodies(
     output_dir: Path,
     *,
@@ -634,7 +902,7 @@ def complete_bodies(
     adaptive_pacing: bool = False,
     adaptive_max_delay_seconds: float = 20,
     block_heavy_resources: bool = False,
-    rate_limit_auto_recovery: bool = True,
+    rate_limit_auto_recovery: bool = False,
     rate_limit_initial_delay_seconds: float = 120,
     rate_limit_max_delay_seconds: float = 900,
     rate_limit_max_retries: int = 6,
@@ -652,6 +920,7 @@ def complete_bodies(
     cache_only: bool = False,
     upstream_scraper: Path = DEFAULT_UPSTREAM_SCRAPER,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    attempt_id: str = "",
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     cards_path = output_dir / "xiaohongshu_cards_latest.json"
@@ -679,6 +948,7 @@ def complete_bodies(
     source_card_count = len(cards)
     max_age_days = max(0, min(int(max_age_days), 365))
     scope_reference: datetime | None = None
+    previous_summary: dict[str, Any] = {}
     if summary_path.exists():
         try:
             previous_summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -765,12 +1035,18 @@ def complete_bodies(
         cards,
         complete_by_key.values(),
         existing_failures,
+        key_resolver=record_key,
     )
     ledger_records = ledger.records
     attempted_keys = {
         key for key, record in ledger_records.items()
         if int(record.get("attemptCount") or 0) > 0
     }
+    invocation_attempted_keys: set[str] = set()
+    invocation_target_keys = card_key_set.difference(complete_by_key)
+    invocation_outcomes: dict[str, str] = {}
+    invocation_block_reasons: dict[str, str] = {}
+    invocation_target_count = len(invocation_target_keys)
     round_progress: dict[int, int] = {}
     upstream = None
     lock = threading.RLock()
@@ -778,13 +1054,40 @@ def complete_bodies(
     security_gate = threading.Event()
     security_gate.set()
     successful_since_checkpoint = 0
+    notes_checkpoint_initialized = False
     security_detected_at = ""
     security_status = "not_detected"
     security_owner_id: int | None = None
     rate_limit_detected_at = ""
     stop_reason = ""
+    terminal_checkpoint_persisted = False
     checkpoint_error: BaseException | None = None
     invocation_id = uuid.uuid4().hex
+    invocation_started_monotonic = time.monotonic()
+    active_request_seconds = 0.0
+    workflow_events = WorkflowEventEmitter(
+        job_id=workflow_job_id(output_dir),
+        attempt_id=str(attempt_id or invocation_id),
+    )
+    workflow_events.emit(
+        event_type="stage",
+        state="running",
+        message_code="body.started",
+        progress={
+            "unit": "body",
+            "done": 0,
+            "total": invocation_target_count,
+            "succeeded": 0,
+            "reused": int(body_cache_stats["reusedBodies"]),
+            "retryable": invocation_target_count,
+            "failed": 0,
+            "blocked": 0,
+        },
+        message_params={
+            "coverageDone": len(complete_by_key),
+            "coverageTotal": len(cards),
+        },
+    )
     body_requests_since_pause = 0
     body_requests_since_proactive_rest = 0
     pacer = AdaptivePacer(
@@ -799,7 +1102,28 @@ def complete_bodies(
         recovery_spacing_seconds=rate_limit_recovery_spacing_seconds,
         max_recovery_spacing_seconds=rate_limit_max_recovery_spacing_seconds,
         stable_successes=rate_limit_stable_successes,
+        manual_recovery_path=output_dir / ".rate-limit-recover.request",
     )
+    previous_rate_limit = previous_summary.get("rateLimit", {})
+    resume_from_rate_limit = (
+        str(previous_summary.get("stopReason") or "").strip().casefold() == "rate_limited"
+        or bool(previous_rate_limit.get("exhausted"))
+        or str(previous_rate_limit.get("status") or "").strip().casefold() == "stopped"
+    )
+    if (
+        not cache_only
+        and len(complete_by_key) < len(cards)
+        and resume_from_rate_limit
+        and rate_limit_recovery.warm_start()
+    ):
+        warm_state = rate_limit_recovery.snapshot()
+        print(
+            "BODY_RATE_LIMIT warm-start "
+            f"attempt={warm_state['episodeAttempts']}/{warm_state['maxRetries']} "
+            f"spacing={rate_limit_recovery.next_spacing():.1f}s "
+            f"stable_successes={warm_state['stableSuccesses']}",
+            flush=True,
+        )
 
     def next_body_delay() -> float:
         return pacer.next_delay(
@@ -808,6 +1132,40 @@ def complete_bodies(
             random_delay_min_seconds=random_delay_min_seconds,
             random_delay_max_seconds=random_delay_max_seconds,
         )
+
+    def workflow_progress_snapshot() -> tuple[dict[str, Any], dict[str, int]]:
+        """Read attempt and lifetime counters atomically for one workflow event."""
+        with lock:
+            coverage_done = len(complete_by_key)
+            progress = workflow_progress_counts(
+                target_keys=invocation_target_keys,
+                attempted_keys=invocation_attempted_keys,
+                outcomes=invocation_outcomes,
+                reused=int(body_cache_stats["reusedBodies"]),
+            )
+            coverage = {
+                "coverageDone": coverage_done,
+                "coverageTotal": len(cards),
+            }
+        return progress, coverage
+
+    def workflow_performance_snapshot(progress: dict[str, Any]) -> dict[str, Any]:
+        with lock:
+            active_seconds = max(0.0, active_request_seconds)
+            wall_seconds = max(0.001, time.monotonic() - invocation_started_monotonic)
+            succeeded = max(0, int(progress.get("succeeded") or 0))
+        active_per_minute = (succeeded * 60.0 / active_seconds) if succeeded and active_seconds else None
+        wall_per_minute = (succeeded * 60.0 / wall_seconds) if succeeded else None
+        remaining = max(0, int(progress.get("retryable") or 0))
+        eta_seconds = (remaining * 60.0 / active_per_minute) if active_per_minute else None
+        confidence = "high" if succeeded >= 20 else "medium" if succeeded >= 5 else "low"
+        return {
+            "activePerMinute": round(active_per_minute, 2) if active_per_minute is not None else None,
+            "wallPerMinute": round(wall_per_minute, 2) if wall_per_minute is not None else None,
+            "etaMinSeconds": round(eta_seconds * 0.85, 1) if eta_seconds is not None else None,
+            "etaMaxSeconds": round(eta_seconds * 1.25, 1) if eta_seconds is not None else None,
+            "confidence": confidence,
+        }
 
     source_search_url = next(
         (str(record.get("source_search_url")) for record in existing if record.get("source_search_url")),
@@ -845,11 +1203,13 @@ def complete_bodies(
             raise
 
     def checkpoint(force: bool = False, *, event: str = "checkpoint") -> None:
-        nonlocal successful_since_checkpoint, checkpoint_error
+        nonlocal successful_since_checkpoint, checkpoint_error, notes_checkpoint_initialized
         if not force and successful_since_checkpoint < checkpoint_every:
             return
         records = ordered_complete()
-        atomic_json(notes_path, records)
+        if not notes_checkpoint_initialized or successful_since_checkpoint > 0:
+            atomic_json(notes_path, records)
+            notes_checkpoint_initialized = True
         successful_since_checkpoint = 0
         notify_progress(event=event)
         print(f"PARALLEL_BODY {len(records)}/{len(cards)} checkpoint", flush=True)
@@ -880,13 +1240,16 @@ def complete_bodies(
             notify_progress(event="attempt_finished")
 
     def scrape_with_url_fallback(page: Any, card: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        nonlocal active_request_seconds
         key = record_key(card)
         request_id = f"{invocation_id}:{key}:{uuid.uuid4().hex}"
         with lock:
             if not ledger.start_attempt(key, request_id):
                 raise RuntimeError(f"Body request is not eligible for ledger transition: {key}")
             attempted_keys.add(key)
+            invocation_attempted_keys.add(key)
             notify_progress(event="attempt_started")
+        request_started = time.monotonic()
         try:
             # The upstream scraper already owns signed-URL -> explore fallback.
             # Calling it once avoids multiplying navigation attempts in this layer.
@@ -905,6 +1268,9 @@ def complete_bodies(
                 "access_status": "detail_worker_error",
                 "worker_error": str(error),
             }
+        finally:
+            with lock:
+                active_request_seconds += max(0.0, time.monotonic() - request_started)
         payload.setdefault("note_id", card.get("note_id", ""))
         payload.setdefault("note_url", card.get("note_url", ""))
         return payload, request_id
@@ -918,6 +1284,7 @@ def complete_bodies(
         nonlocal successful_since_checkpoint, security_detected_at, security_status, security_owner_id
         nonlocal rate_limit_detected_at, stop_reason, body_requests_since_pause
         nonlocal body_requests_since_proactive_rest
+        nonlocal terminal_checkpoint_persisted
         try:
             from playwright.sync_api import sync_playwright
 
@@ -968,7 +1335,6 @@ def complete_bodies(
                         key = record_key(card)
                         request_id = ""
                         page_retry = 0
-                        recycled_for_retry = False
                         while True:
                             try:
                                 payload, request_id = scrape_with_url_fallback(page, card)
@@ -999,7 +1365,6 @@ def complete_bodies(
                             )
                             try:
                                 recycle_page("page_closed_retry")
-                                recycled_for_retry = True
                             except Exception as recycle_error:  # noqa: BLE001
                                 payload = {
                                     "note_id": card.get("note_id", ""),
@@ -1057,7 +1422,23 @@ def complete_bodies(
                                 with lock:
                                     last_failures[key] = payload
                                     rate_limit_detected_at = rate_limit_detected_at or utc_now()
+                                    invocation_outcomes[key] = "blocked"
+                                    invocation_block_reasons[key] = "rate_limited"
                                 recovery = rate_limit_recovery.register_rate_limit()
+                                event_progress, event_coverage = workflow_progress_snapshot()
+                                workflow_events.emit(
+                                    event_type="warning",
+                                    state="retrying" if recovery["recoverable"] else "waiting_system",
+                                    message_code="body.rate_limited",
+                                    progress=event_progress,
+                                    performance=workflow_performance_snapshot(event_progress),
+                                    message_params={**event_coverage, "noteId": key},
+                                    problem=body_user_problem(
+                                        "detail_rate_limited",
+                                        saved=event_coverage["coverageDone"],
+                                        total=len(cards),
+                                    ),
+                                )
                                 if recovery["recoverable"]:
                                     with lock:
                                         ledger.queue([key])
@@ -1083,6 +1464,7 @@ def complete_bodies(
                                     stop_event.set()
                                     security_gate.set()
                                     checkpoint(force=True)
+                                    terminal_checkpoint_persisted = True
                                 print(
                                     "BODY_RATE_LIMIT exhausted "
                                     f"attempts={recovery['attempt']}/{recovery['maxRetries']}",
@@ -1106,6 +1488,8 @@ def complete_bodies(
                                 owns_verification = False
                                 with lock:
                                     last_failures[key] = payload
+                                    invocation_outcomes[key] = "blocked"
+                                    invocation_block_reasons[key] = "security_verification"
                                     if security_owner_id is None and not stop_event.is_set():
                                         security_owner_id = worker_id
                                         owns_verification = True
@@ -1113,6 +1497,21 @@ def complete_bodies(
                                             security_detected_at = utc_now()
                                         security_status = "waiting"
                                         security_gate.clear()
+                                if owns_verification:
+                                    event_progress, event_coverage = workflow_progress_snapshot()
+                                    workflow_events.emit(
+                                        event_type="warning",
+                                        state="waiting_user",
+                                        message_code="body.security_verification",
+                                        progress=event_progress,
+                                        performance=workflow_performance_snapshot(event_progress),
+                                        message_params=event_coverage,
+                                        problem=body_user_problem(
+                                            "detail_security_verification",
+                                            saved=event_coverage["coverageDone"],
+                                            total=len(cards),
+                                        ),
+                                    )
                                 if not owns_verification:
                                     print(
                                         f"SECURITY_VERIFICATION worker={worker_id} paused; verifier={security_owner_id}",
@@ -1143,6 +1542,26 @@ def complete_bodies(
                                         security_status = "cleared"
                                         security_owner_id = None
                                         security_gate.set()
+                                        for blocked_key, outcome in tuple(invocation_outcomes.items()):
+                                            if (
+                                                outcome == "blocked"
+                                                and invocation_block_reasons.get(blocked_key)
+                                                == "security_verification"
+                                            ):
+                                                invocation_outcomes[blocked_key] = "retryable"
+                                                invocation_block_reasons.pop(blocked_key, None)
+                                    event_progress, event_coverage = workflow_progress_snapshot()
+                                    workflow_events.emit(
+                                        event_type="stage",
+                                        state="running",
+                                        message_code="body.security_verification_cleared",
+                                        progress=event_progress,
+                                        performance=workflow_performance_snapshot(event_progress),
+                                        message_params={
+                                            **event_coverage,
+                                            "clearedProblemCode": "SECURITY_VERIFICATION",
+                                        },
+                                    )
                                     print("SECURITY_VERIFICATION cleared; resuming collection", flush=True)
                                     work.put(card)
                                     work.task_done()
@@ -1159,6 +1578,7 @@ def complete_bodies(
                                     stop_event.set()
                                     security_gate.set()
                                     checkpoint(force=True)
+                                    terminal_checkpoint_persisted = True
                                 print(
                                     "SECURITY_VERIFICATION timed_out; stopping new collection and preserving checkpoint",
                                     flush=True,
@@ -1166,6 +1586,7 @@ def complete_bodies(
                                 work.task_done()
                                 break
                         payload_complete = record_is_complete(payload)
+                        rate_limit_cleared = False
                         if payload_complete:
                             finish_request(
                                 key,
@@ -1175,14 +1596,20 @@ def complete_bodies(
                                 stop_reason_value="",
                                 recoverable=False,
                             )
-                            if rate_limit_recovery.observe_success():
+                            rate_limit_cleared = rate_limit_recovery.observe_success()
+                            if rate_limit_cleared:
                                 print(
                                     "BODY_RATE_LIMIT cleared "
                                     f"stable_successes={rate_limit_recovery.stable_successes}",
                                     flush=True,
                                 )
                         else:
+                            rate_limit_recovery.observe_failure()
                             failure_code = str(payload.get("access_status") or "missing_record")
+                            failure_outcome = classify_workflow_outcome(
+                                succeeded=False,
+                                failure_code=failure_code,
+                            )
                             finish_request(
                                 key,
                                 request_id,
@@ -1191,20 +1618,36 @@ def complete_bodies(
                                 stop_reason_value=(
                                     "request_timeout" if "timeout" in failure_code else "request_failed"
                                 ),
-                                recoverable=True,
+                                recoverable=failure_outcome != "failed",
                             )
                         pacer.observe(payload_complete)
                         with lock:
                             attempted_keys.add(key)
                             round_progress[round_number] = round_progress.get(round_number, 0) + 1
+                            invocation_outcomes[key] = classify_workflow_outcome(
+                                succeeded=payload_complete,
+                                failure_code=payload.get("access_status"),
+                            )
+                            invocation_block_reasons.pop(key, None)
                             if payload_complete:
                                 complete_by_key[key] = payload
                                 last_failures.pop(key, None)
                                 successful_since_checkpoint += 1
+                                if rate_limit_cleared:
+                                    for blocked_key, outcome in tuple(invocation_outcomes.items()):
+                                        if (
+                                            outcome == "blocked"
+                                            and invocation_block_reasons.get(blocked_key) == "rate_limited"
+                                        ):
+                                            invocation_outcomes[blocked_key] = "retryable"
+                                            invocation_block_reasons.pop(blocked_key, None)
                                 checkpoint()
                             else:
                                 last_failures[key] = payload
-                            processed_count = processed_attempt_count(card_keys, attempted_keys)
+                            processed_count = processed_attempt_count(
+                                card_keys,
+                                invocation_attempted_keys,
+                            )
                             complete_count = len(complete_by_key)
                             round_processed = round_progress[round_number]
                         print(
@@ -1214,13 +1657,43 @@ def complete_bodies(
                             f"round={round_number} round_processed={round_processed} round_total={round_total}",
                             flush=True,
                         )
-                        page_uses += 1
-                        retry_page_is_unhealthy = should_retry_on_fresh_page(payload)
-                        recycle_failed_page = not payload_complete and (
-                            not recycled_for_retry or retry_page_is_unhealthy
+                        failure_code = str(payload.get("access_status") or "missing_record")
+                        problem = body_user_problem(
+                            failure_code,
+                            saved=complete_count,
+                            total=len(cards),
                         )
-                        if page_uses >= page_recycle_every or recycle_failed_page:
-                            recycle_page("scheduled" if page_uses >= page_recycle_every else "failed_record")
+                        event_progress, event_coverage = workflow_progress_snapshot()
+                        workflow_events.emit(
+                            event_type="warning" if problem else "item",
+                            state=(
+                                "waiting_user"
+                                if failure_code in {"detail_login_required", "detail_security_verification"}
+                                else "running"
+                            ),
+                            message_code="body.item.processed",
+                            progress=event_progress,
+                            performance=workflow_performance_snapshot(event_progress),
+                            message_params={
+                                **event_coverage,
+                                "status": failure_code,
+                                **(
+                                    {"clearedProblemCode": "RATE_LIMITED"}
+                                    if rate_limit_cleared
+                                    else {}
+                                ),
+                            },
+                            problem=problem,
+                        )
+                        page_uses += 1
+                        recycle_reason = page_recycle_reason(
+                            payload,
+                            payload_complete=payload_complete,
+                            page_uses=page_uses,
+                            page_recycle_every=page_recycle_every,
+                        )
+                        if recycle_reason:
+                            recycle_page(recycle_reason)
                         work.task_done()
                         if stop_event.is_set():
                             break
@@ -1353,7 +1826,8 @@ def complete_bodies(
         if checkpoint_error is not None:
             ledger.finalize_pending("task_interrupted")
             raise checkpoint_error
-        checkpoint(force=True)
+        if not terminal_checkpoint_persisted:
+            checkpoint(force=True)
         if stop_event.is_set():
             break
 
@@ -1440,11 +1914,7 @@ def complete_bodies(
         "stopReason": stop_reason,
         "rateLimit": {
             "detectedAt": rate_limit_detected_at,
-            "status": (
-                "stopped" if stop_reason == "rate_limited"
-                else "cleared" if rate_limit_state["detectedCount"] > 0
-                else "not_detected"
-            ),
+            "status": rate_limit_summary_status(stop_reason, rate_limit_state),
             "recoveryAction": "wait_then_resume" if stop_reason == "rate_limited" else "",
             **rate_limit_state,
         },
@@ -1457,6 +1927,40 @@ def complete_bodies(
         "passed": not missing,
     }
     atomic_json(summary_path, summary)
+    final_problem_code = {
+        "rate_limited": "detail_rate_limited",
+        "security_verification_timeout": "detail_security_verification",
+    }.get(stop_reason, "")
+    final_progress, final_coverage = workflow_progress_snapshot()
+    workflow_events.emit(
+        event_type="stage",
+        state=(
+            "completed"
+            if not missing
+            else "waiting_system"
+            if stop_reason == "rate_limited"
+            else "waiting_user"
+            if stop_reason == "security_verification_timeout"
+            else "partial"
+        ),
+        message_code="body.completed" if not missing else "body.partial",
+        progress=final_progress,
+        performance=workflow_performance_snapshot(final_progress),
+        message_params={
+            **final_coverage,
+            "stopReason": stop_reason,
+        },
+        problem=body_user_problem(
+            final_problem_code,
+            saved=len(records),
+            total=len(cards),
+        ),
+        checkpoint={
+            "revision": int(ledger_payload.get("revision") or 0),
+            "savedAt": summary["finishedAt"],
+            "resumeAvailable": bool(missing),
+        },
+    )
     notify_progress(
         event="completed",
         status="completed" if not missing else "partial" if cache_only else "blocked" if stop_reason else "partial",
@@ -1490,7 +1994,7 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--rate-limit-auto-recovery",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument("--rate-limit-initial-delay-seconds", type=float, default=120)
     parser.add_argument("--rate-limit-max-delay-seconds", type=float, default=900)
@@ -1583,6 +2087,7 @@ def main(arguments: list[str] | None = None) -> int:
             cache_only=args.cache_only,
             upstream_scraper=Path(args.upstream_scraper),
             progress_callback=update_state,
+            attempt_id=str(args.attempt_id or ""),
         )
     except BaseException as error:
         if isinstance(error, KeyboardInterrupt):

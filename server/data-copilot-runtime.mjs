@@ -85,6 +85,7 @@ export class DataCopilotRuntime {
     const text = String(value.content || '').trim();
     if (!text) throw runtimeError('COPILOT_MESSAGE_EMPTY', 'Message content is required.', 400, false);
     const requestKey = idempotency(value.idempotencyKey || `message:${this.idFactory()}`);
+    const workspaceMode = normalizeWorkspaceMode(value.workspaceMode);
     const existing = await findRequestRun(this.store, reference, requestKey);
     if (existing) return { runId: existing.runId, duplicate: true, conversation: await this.store.getConversation(reference) };
     await this.#drainCancelledExecution(reference.conversationId);
@@ -98,6 +99,7 @@ export class DataCopilotRuntime {
       metadata: {
         modelSessionId: String(value.aiSessionId || ''),
         requestKey,
+        workspaceMode,
         contextSourceIds: normalizeContextSourceIds(value.contextSourceIds),
       },
       idempotencyKey: `${requestKey}:user`,
@@ -108,7 +110,7 @@ export class DataCopilotRuntime {
       status: 'planning',
       event: 'planning',
       attempt: 1,
-      metadata: { requestKey, aiSessionId: String(value.aiSessionId || ''), userMessageId: userMessage.messageId },
+      metadata: { requestKey, aiSessionId: String(value.aiSessionId || ''), workspaceMode, userMessageId: userMessage.messageId },
       idempotencyKey: `${requestKey}:run:planning`,
     });
     this.#event(reference, { type: 'user.message', runId, message: userMessage });
@@ -119,6 +121,7 @@ export class DataCopilotRuntime {
       operationKey: requestKey,
       intentText: text,
       aiSessionId: String(value.aiSessionId || ''),
+      workspaceMode,
       contextSourceIds,
       attempt: 1,
       controller: new AbortController(),
@@ -186,6 +189,7 @@ export class DataCopilotRuntime {
     });
     const execution = {
       runId, requestKey: key, aiSessionId, attempt,
+      workspaceMode: normalizeWorkspaceMode(checkpoint.workspaceMode),
       operationKey: String(checkpoint.operationKey || checkpoint.requestKey || previousRunId),
       intentText: String(checkpoint.intentText || ''),
       contextSourceIds: normalizeContextSourceIds(checkpoint.contextSourceIds),
@@ -236,6 +240,7 @@ export class DataCopilotRuntime {
       operationKey: String(checkpoint.operationKey || checkpoint.requestKey || currentApproval.runId),
       intentText: String(checkpoint.intentText || ''),
       aiSessionId: String(checkpoint.aiSessionId || ''),
+      workspaceMode: normalizeWorkspaceMode(checkpoint.workspaceMode),
       contextSourceIds: normalizeContextSourceIds(checkpoint.contextSourceIds),
       attempt: Number(checkpoint.attempt || conversation.runState?.attempt || 1),
       controller: new AbortController(),
@@ -309,7 +314,7 @@ export class DataCopilotRuntime {
         modelMessages = execution.checkpoint.modelMessages;
         startStep = Number(execution.checkpoint.step || 0);
       } else {
-        modelMessages = await buildModelHistory(this.store, reference, systemPrompt(reference, conversation));
+        modelMessages = await buildModelHistory(this.store, reference, systemPrompt(reference, conversation, execution.workspaceMode));
       }
       if (!execution.state.plan) {
         const plannedTools = this.capabilityResolver.resolve(this.registry.list(), {
@@ -1181,13 +1186,21 @@ async function buildModelHistory(store, reference, system) {
   return [{ role: 'system', content: system }, ...selected];
 }
 
-function systemPrompt(reference, conversation) {
+function systemPrompt(reference, conversation, workspaceMode = 'ask') {
+  const mode = normalizeWorkspaceMode(workspaceMode);
+  const modeInstruction = mode === 'build'
+    ? 'Build mode: produce a reusable artifact or implementation-ready result, and verify it before completion.'
+    : mode === 'analyze'
+      ? 'Analyze mode: inspect the relevant data, use deterministic analysis tools, quantify findings, and cite evidence.'
+      : 'Ask mode: answer directly, using the minimum tool work needed for a grounded response.';
   return [
     'You are the interactive Data Copilot embedded in a local data workbench.',
     'Operate as a Planner, Executor, and Verifier. Keep a concise execution plan, use tools, then verify the result before the final answer.',
     'Use tools for every factual claim about task data. Never invent rows, files, recipients, send results, or tool output.',
     'The available tool list is selected dynamically. If a needed capability is absent, call tool.search and then tool.describe before continuing.',
     'Plan multi-step work, execute independent read tools in parallel, retain the current result across follow-up messages, and cite returned source URIs.',
+    modeInstruction,
+    'For all, batch, multiple, or per-job email requirement requests, call applications.extract_email_requirements. Return one result row for every matched application, report matched/scanned/returned/missing coverage, and continue with nextOffset until coverage.complete is true; never stop after the first record.',
     'For a job-application email, call applications.compose_email before email.prepare. Use the recruitment post subject rule, the extracted recruitment recipient, and the record-specific draft; never dump raw email lists, access-token query strings, or pipe-separated records into prose.',
     'Before email.send, first call email.prepare or email.preview and show the exact recipient, subject, body, and attachments. Email sending requires user approval.',
     'Use artifact.create for requested exports. State missing-field counts and date precision when they affect the result.',
@@ -1275,6 +1288,7 @@ function checkpointFor(execution, step, modelMessages, extra = {}) {
     runId: execution.runId,
     operationKey: execution.operationKey,
     aiSessionId: execution.aiSessionId,
+    workspaceMode: normalizeWorkspaceMode(execution.workspaceMode || previous.workspaceMode),
     contextSourceIds: normalizeContextSourceIds(execution.contextSourceIds),
     attempt: execution.attempt,
     step,
@@ -1380,6 +1394,11 @@ function createExecutionState(checkpoint = null) {
     ...(checkpoint?.emailDeliveryFingerprint ? { emailDeliveryFingerprint: checkpoint.emailDeliveryFingerprint } : {}),
     ...(checkpoint?.applicationEmailDraft ? { applicationEmailDraft: checkpoint.applicationEmailDraft } : {}),
   };
+}
+
+function normalizeWorkspaceMode(value) {
+  const mode = String(value || 'ask').trim().toLowerCase();
+  return ['ask', 'analyze', 'build'].includes(mode) ? mode : 'ask';
 }
 
 function assertApprovalPrerequisites(call, state) {

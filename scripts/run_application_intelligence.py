@@ -19,6 +19,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-cli-bin", default="")
     parser.add_argument("--codex-batch-size", type=int, default=8)
     parser.add_argument("--codex-timeout-seconds", type=int, default=300)
+    parser.add_argument("--writeback-url", default="", help="Relay API base URL or full application-generation/writeback endpoint.")
+    parser.add_argument("--writeback-job-id", default="", help="Job id used when --writeback-url is an API base URL.")
+    parser.add_argument("--writeback-timeout-seconds", type=int, default=30)
+    parser.add_argument("--generation-run-id", default="")
     return parser.parse_args()
 
 
@@ -34,6 +38,10 @@ def main() -> int:
         codex_cli_bin=args.codex_cli_bin,
         codex_batch_size=args.codex_batch_size,
         codex_timeout_seconds=args.codex_timeout_seconds,
+        writeback_url=args.writeback_url,
+        writeback_job_id=args.writeback_job_id,
+        writeback_timeout_seconds=args.writeback_timeout_seconds,
+        generation_run_id=args.generation_run_id,
     )
     gate = result.payload["quality_gate"]
     print(

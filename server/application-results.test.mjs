@@ -365,12 +365,16 @@ test('application results hydrate images and filter the full result set by publi
         title: '最新岗位',
         body: '',
         publish_time: { raw: recent, value: recent, precision: 'minute', is_estimated: false },
-        application_info: { ...base.application_info, responsibilities: [{ text: '图片识别职责' }] },
-        job_card: { parse_basis: 'search_card', enrichment_status: 'image_enriched' },
+        application_info: {
+          ...base.application_info,
+          contacts: [{ type: 'email', value: 'structured.jobs@example.test', evidence: '结构化应聘邮箱' }],
+          responsibilities: [{ text: '图片识别职责' }],
+        },
+        job_card: { role_name: '结构化增长产品经理', parse_basis: 'search_card', enrichment_status: 'image_enriched' },
         media: { analysis: { status: 'analyzed', source: 'vision_model' } },
         outreach: { ...base.outreach, runtime_status: 'image_enriched_missing_job_body' },
       },
-      { ...base, note_id: 'old', title: '较早岗位', body: '完整正文', publish_time: { raw: old, value: old, precision: 'minute', is_estimated: false }, job_card: { parse_basis: 'full_body' } },
+      { ...base, note_id: 'old', title: '较早岗位', body: '完整正文。简历标题备注上：岗位-姓名-最早到岗时间-可实习时长，帖子不删就是还在招', publish_time: { raw: old, value: old, precision: 'minute', is_estimated: false }, job_card: { parse_basis: 'full_body' } },
       { ...base, note_id: 'unknown', title: '日期待确认', body: '', publish_time: { raw: '', value: '', precision: 'unknown', is_estimated: false }, job_card: { parse_basis: 'search_card' }, outreach: { ...base.outreach, runtime_status: 'fallback_missing_job_body' } },
     ],
   }), 'utf8');
@@ -406,6 +410,18 @@ test('application results hydrate images and filter the full result set by publi
     );
     assert.equal(all.filters.stats.withImages, 1);
     assert.equal(all.items[0].media.images.length, 2);
+    assert.deepEqual(all.items.find((item) => item.note_id === 'old').attachmentRequirement, {
+      detected: true,
+      template: '岗位-姓名-最早到岗时间-可实习时长',
+      evidence: '简历标题备注上:岗位-姓名-最早到岗时间-可实习时长',
+      fields: ['jobTitle', 'candidateName', 'arrivalDate', 'internshipDuration'],
+    });
+
+    const roleMatch = await fetch(`${origin}/api/jobs/${id}/results?query=${encodeURIComponent('结构化增长产品经理')}`).then((response) => response.json());
+    assert.deepEqual(roleMatch.items.map((item) => item.note_id), ['recent']);
+
+    const structuredEmailMatch = await fetch(`${origin}/api/jobs/${id}/results?query=structured.jobs%40example.test`).then((response) => response.json());
+    assert.deepEqual(structuredEmailMatch.items.map((item) => item.note_id), ['recent']);
 
     const oldest = await fetch(`${origin}/api/jobs/${id}/results?sort=oldest`).then((response) => response.json());
     assert.deepEqual(oldest.items.map((item) => item.note_id), ['old', 'recent', 'unknown']);
@@ -435,6 +451,50 @@ test('application results hydrate images and filter the full result set by publi
     }), 'utf8');
     const live = await fetch(`${origin}/api/jobs/${id}/results`).then((response) => response.json());
     assert.deepEqual(live.items.map((item) => item.note_id), ['live-checkpoint']);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('application results expose normalized legacy body emails to search and detail views', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-normalized-contact-results-'));
+  const outputDir = path.join(fixture, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  const id = '20260804120000-abcdef12';
+  await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
+    records: [{
+      note_id: 'emoji-contact',
+      title: '内容运营实习',
+      body: '简历fa：📮1️⃣3️⃣9️⃣6️⃣334506️⃣@扣扣点com',
+      application_info: { contacts: [], application_routes: [], responsibilities: [], requirements: [] },
+      outreach: { email_subject: '内容运营实习申请', email_body: '正文', cover_letter: '求职信' },
+    }],
+  }), 'utf8');
+  const internal = { id, outputDir, config: {} };
+  const manager = {
+    active: null,
+    list: () => [],
+    get: (jobId) => jobId === id ? internal : null,
+    getInternal: (jobId) => jobId === id ? internal : null,
+  };
+  const server = http.createServer(createApp({
+    manager,
+    config: { host: '127.0.0.1', port: 0, maxBodyBytes: 4096, runnerAvailable: true },
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const response = await fetch(`${origin}/api/jobs/${id}/results?query=1396334506%40qq.com`);
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.total, 1);
+    const contact = payload.items[0].application_info.contacts[0];
+    assert.equal(contact.value, '1396334506@qq.com');
+    assert.equal(contact.verification_status, 'body_format_normalized');
+    assert.equal(contact.normalization_applied, true);
+    assert.match(contact.evidence, /1️⃣3️⃣9️⃣6️⃣334506️⃣@扣扣点com/u);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(fixture, { recursive: true, force: true });

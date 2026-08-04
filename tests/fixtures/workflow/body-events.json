@@ -1,0 +1,118 @@
+{
+  "events": [
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_fixture_1",
+      "sequence": 1,
+      "jobId": "job-fixture",
+      "attemptId": "attempt-fixture",
+      "occurredAt": "2026-08-03T08:00:00Z",
+      "type": "stage",
+      "stage": "body",
+      "state": "running",
+      "progress": {
+        "unit": "body",
+        "done": 0,
+        "total": 12,
+        "succeeded": 0,
+        "reused": 8,
+        "retryable": 12,
+        "failed": 0,
+        "blocked": 0
+      },
+      "performance": {
+        "activePerMinute": 10.0,
+        "wallPerMinute": 8.0,
+        "etaMinSeconds": 56.1,
+        "etaMaxSeconds": 82.5,
+        "confidence": "low"
+      },
+      "message": {
+        "code": "body.started",
+        "params": { "coverageDone": 8, "coverageTotal": 20 }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_fixture_2",
+      "sequence": 2,
+      "jobId": "job-fixture",
+      "attemptId": "attempt-fixture",
+      "occurredAt": "2026-08-03T08:00:06Z",
+      "type": "item",
+      "stage": "body",
+      "state": "running",
+      "progress": {
+        "unit": "body",
+        "done": 1,
+        "total": 12,
+        "succeeded": 1,
+        "reused": 8,
+        "retryable": 11,
+        "failed": 0,
+        "blocked": 0
+      },
+      "message": {
+        "code": "body.item.processed",
+        "params": { "status": "detail_ok", "coverageDone": 9, "coverageTotal": 20 }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_fixture_3",
+      "sequence": 3,
+      "jobId": "job-fixture",
+      "attemptId": "attempt-fixture",
+      "occurredAt": "2026-08-03T08:00:07Z",
+      "type": "warning",
+      "stage": "body",
+      "state": "waiting_system",
+      "progress": {
+        "unit": "body",
+        "done": 2,
+        "total": 12,
+        "succeeded": 1,
+        "reused": 8,
+        "retryable": 11,
+        "failed": 0,
+        "blocked": 1
+      },
+      "performance": {
+        "activePerMinute": 9.5,
+        "wallPerMinute": 7.2,
+        "etaMinSeconds": 59.1,
+        "etaMaxSeconds": 86.8,
+        "confidence": "low"
+      },
+      "message": {
+        "code": "body.rate_limited",
+        "params": { "coverageDone": 9, "coverageTotal": 20 }
+      },
+      "problem": {
+        "code": "RATE_LIMITED",
+        "category": "access",
+        "severity": "warning",
+        "userTitle": "平台暂时限制访问",
+        "userMessage": "已保存 9/20 篇，系统会停止普通请求并安排恢复检查。",
+        "preservedResultCount": 9,
+        "automaticAction": "保存进度并安排单次恢复检查",
+        "retryable": true,
+        "retryAt": null,
+        "requiresUserAction": false,
+        "action": { "id": "check_recovery", "label": "立即检查是否恢复" },
+        "affectedStage": "body",
+        "technicalRef": "evt_fixture_3"
+      },
+      "technicalRef": "evt_fixture_3"
+    }
+  ],
+  "expected": {
+    "throughSequence": 3,
+    "attemptDone": 2,
+    "attemptTotal": 12,
+    "coverageDone": 9,
+    "coverageTotal": 20,
+    "issueCode": "RATE_LIMITED",
+    "activePerMinute": 9.5
+  }
+}

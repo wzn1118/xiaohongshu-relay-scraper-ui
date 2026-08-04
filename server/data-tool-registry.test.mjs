@@ -235,9 +235,77 @@ test("tool catalog exposes manifests and activates dynamically discovered capabi
   assert.ok(manifest.every((tool) => tool.version && tool.category && tool.inputSchema));
   assert.ok(audience.some((tool) => tool.name === "comments.query"));
   assert.ok(manifest.some((tool) => tool.name === "applications.compose_email"));
+  assert.ok(manifest.some((tool) => tool.name === "applications.extract_email_requirements"));
   assert.equal(discovered.type, "tool.catalog");
   assert.ok(state.activeToolNames.includes("comments.query"));
   assert.ok(registry.describe(["comments.query"])[0].scopes.includes("audience:read"));
+});
+
+test("batch email requirement extraction returns every application with auditable coverage", async (t) => {
+  const outputDir = await mkdtemp(path.join(tmpdir(), "copilot-email-requirements-"));
+  t.after(() => rm(outputDir, { recursive: true, force: true }));
+  await writeFile(
+    path.join(outputDir, "application_intelligence.json"),
+    JSON.stringify({
+      records: [
+        {
+          note_id: "note-format-001",
+          title: "AI 产品实习生",
+          body: "投递邮箱 first@example.test\n邮件标题：姓名-学校-应聘岗位",
+          application_info: {
+            contacts: [{ type: "email", value: "first@example.test" }],
+          },
+          job_card: { role_name: "AI 产品实习生", company_name: "甲公司" },
+        },
+        {
+          note_id: "note-format-002",
+          title: "数据分析实习生",
+          body: "投递邮箱 second@example.test\n投递主题：应聘岗位｜姓名｜每周实习天数\n简历命名为：姓名-岗位-简历",
+          application_info: {
+            contacts: [{ type: "email", value: "second@example.test" }],
+          },
+          job_card: { role_name: "数据分析实习生", company_name: "乙公司" },
+        },
+        {
+          note_id: "note-format-003",
+          title: "商业分析实习生",
+          body: "请通过招聘平台私信沟通。",
+          job_card: { role_name: "商业分析实习生", company_name: "丙公司" },
+        },
+      ],
+    }),
+    "utf8",
+  );
+  const { registry } = fixture({ outputDir });
+  const firstPage = await registry.execute(
+    "applications.extract_email_requirements",
+    { offset: 0, limit: 2 },
+    { reference: REFERENCE, state: {} },
+  );
+
+  assert.equal(firstPage.total, 3);
+  assert.equal(firstPage.rows.length, 2);
+  assert.equal(firstPage.coverage.scannedRecords, 3);
+  assert.equal(firstPage.coverage.withRecipient, 2);
+  assert.equal(firstPage.coverage.withSubjectRule, 2);
+  assert.equal(firstPage.coverage.withAttachmentRule, 1);
+  assert.equal(firstPage.coverage.missingAnyEmailRequirement, 1);
+  assert.equal(firstPage.coverage.complete, false);
+  assert.equal(firstPage.coverage.nextOffset, 2);
+  assert.equal(firstPage.rows[0].subjectFormat, "姓名-学校-应聘岗位");
+  assert.equal(firstPage.rows[1].subjectFormat, "应聘岗位｜姓名｜每周实习天数");
+
+  const secondPage = await registry.execute(
+    "applications.extract_email_requirements",
+    { offset: firstPage.coverage.nextOffset, limit: 2 },
+    { reference: REFERENCE, state: {} },
+  );
+  assert.deepEqual(secondPage.rows.map((row) => row.noteId), ["note-format-003"]);
+  assert.equal(secondPage.rows[0].extractionStatus, "not_found");
+  assert.deepEqual(secondPage.rows[0].missing, ["recipientEmail", "subjectFormat"]);
+  assert.equal(secondPage.coverage.complete, true);
+  assert.equal(secondPage.coverage.nextOffset, null);
+  assert.equal(secondPage.truncated, false);
 });
 
 test("job email composition and delivery preview preserve the recruitment subject rule", async (t) => {

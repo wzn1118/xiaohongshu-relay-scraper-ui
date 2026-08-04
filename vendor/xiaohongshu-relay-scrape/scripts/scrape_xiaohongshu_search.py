@@ -35,6 +35,47 @@ SEARCH_URL = (
 )
 RELAY_PORT = 18800
 CHECKPOINT_EVERY = 5
+DETAIL_BODY_MIN_NORMALIZED_LENGTH = 4
+
+DETAIL_BODY_TEXT_JS = r"""
+() => {
+  function normalizeText(value) {
+    return (value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  const selectors = [
+    '#detail-desc',
+    '[data-testid="note-content"]',
+    '.note-content',
+    '[class*=note-content]',
+    'article',
+  ];
+  const removable = [
+    '#detail-title',
+    'h1',
+    '.author-container',
+    '.author-wrapper',
+    '.interact-container',
+    '[class*=comment]',
+    'nav',
+    'footer',
+  ].join(',');
+  const candidates = [];
+  const seen = new Set();
+  for (const selector of selectors) {
+    for (const node of document.querySelectorAll(selector)) {
+      if (seen.has(node)) continue;
+      seen.add(node);
+      const clone = node.cloneNode(true);
+      for (const excluded of clone.querySelectorAll(removable)) excluded.remove();
+      const text = normalizeText(clone.innerText || clone.textContent || '');
+      if (text) candidates.push(text);
+    }
+  }
+  candidates.sort((left, right) => right.length - left.length);
+  return candidates[0] || '';
+}
+"""
 
 RATE_LIMIT_MARKERS = (
     "error_code=300013",
@@ -60,6 +101,11 @@ LOGIN_REQUIRED_MARKERS = (
     "登录后查看",
     "手机号登录",
     "请先登录",
+)
+DETAIL_UNAVAILABLE_MARKERS = (
+    "当前笔记暂时无法浏览",
+    "当前内容暂时无法展示",
+    "内容暂时无法展示",
 )
 
 LATEST_SORT_SELECTED_JS = r"""
@@ -805,13 +851,66 @@ def wait_for_search_page_to_settle(page: Page) -> None:
     wait_for_search_results(page)
 
 
-def wait_for_note_ready(page: Page) -> None:
-    selector = ":is(#detail-title, #detail-desc, .note-content, article, h1):visible"
+def normalize_detail_body_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def is_detail_body_ready(value: Any) -> bool:
+    normalized = re.sub(r"\s+", "", normalize_detail_body_text(value))
+    return len(normalized) >= DETAIL_BODY_MIN_NORMALIZED_LENGTH
+
+
+def detail_note_id_from_url(page_url: str) -> str:
+    """Extract a note id only from a recognized detail-page path."""
     try:
-        page.locator(selector).first.wait_for(state="visible", timeout=3000)
-        page.wait_for_timeout(250)
-    except Exception:  # noqa: BLE001
-        page.wait_for_timeout(500)
+        segments = [unquote(segment) for segment in urlsplit(page_url).path.split("/") if segment]
+    except ValueError:
+        return ""
+    for index, segment in enumerate(segments[:-1]):
+        normalized_segment = segment.casefold()
+        if (
+            normalized_segment == "discovery"
+            and index + 2 < len(segments)
+            and segments[index + 1].casefold() == "item"
+        ):
+            candidate = segments[index + 2]
+        elif normalized_segment in {"explore", "search_result"}:
+            candidate = segments[index + 1]
+        else:
+            continue
+        if re.fullmatch(r"[a-zA-Z0-9_-]+", candidate):
+            return candidate
+    return ""
+
+
+def detail_note_id_mismatch(page_url: str, expected_note_id: str) -> bool:
+    actual_note_id = detail_note_id_from_url(page_url)
+    expected = str(expected_note_id or "").strip()
+    return bool(expected and actual_note_id and actual_note_id.casefold() != expected.casefold())
+
+
+def wait_for_note_ready(
+    page: Page,
+    *,
+    timeout_ms: int = 3000,
+    poll_interval_ms: int = 250,
+) -> str:
+    """Wait for real body text or a terminal, visibly rendered detail state."""
+    interval = max(50, int(poll_interval_ms))
+    attempts = max(1, (max(0, int(timeout_ms)) + interval - 1) // interval)
+    for attempt in range(attempts):
+        terminal_status = classify_visible_detail_restriction(page)
+        if terminal_status:
+            return terminal_status
+        try:
+            body_text = page.evaluate(DETAIL_BODY_TEXT_JS)
+        except Exception:  # noqa: BLE001
+            body_text = ""
+        if is_detail_body_ready(body_text):
+            return "detail_body_ready"
+        if attempt + 1 < attempts:
+            page.wait_for_timeout(interval)
+    return "detail_wait_timeout"
 
 
 def extract_cards(page: Page) -> list[dict[str, Any]]:
@@ -1155,14 +1254,38 @@ def extract_note_payload(page: Page) -> dict[str, Any]:
     return '';
   }
 
-  function firstHtml(selectors) {
+  function detailBody() {
+    const selectors = [
+      '#detail-desc',
+      '[data-testid="note-content"]',
+      '.note-content',
+      '[class*=note-content]',
+      'article',
+    ];
+    const removable = [
+      '#detail-title',
+      'h1',
+      '.author-container',
+      '.author-wrapper',
+      '.interact-container',
+      '[class*=comment]',
+      'nav',
+      'footer',
+    ].join(',');
+    const candidates = [];
+    const seen = new Set();
     for (const selector of selectors) {
-      const node = document.querySelector(selector);
-      if (!node) continue;
-      const html = (node.innerHTML || '').trim();
-      if (html) return html;
+      for (const node of document.querySelectorAll(selector)) {
+        if (seen.has(node)) continue;
+        seen.add(node);
+        const clone = node.cloneNode(true);
+        for (const excluded of clone.querySelectorAll(removable)) excluded.remove();
+        const text = normalizeText(clone.innerText || clone.textContent || '');
+        if (text) candidates.push({ text, html: (clone.innerHTML || '').trim() });
+      }
     }
-    return '';
+    candidates.sort((left, right) => right.text.length - left.text.length);
+    return candidates[0] || { text: '', html: '' };
   }
 
   function collectCounts() {
@@ -1232,15 +1355,6 @@ def extract_note_payload(page: Page) -> dict[str, Any]:
     '[class*=title]',
     '[class*=Title]',
   ];
-  const bodySelectors = [
-    '#detail-desc',
-    '.note-content',
-    '.note-scroller',
-    '#noteContainer',
-    '[class*=note-content]',
-    '[class*=desc]',
-    'article',
-  ];
   const authorSelectors = [
     '.author-container .name',
     '.author-wrapper .name',
@@ -1258,11 +1372,12 @@ def extract_note_payload(page: Page) -> dict[str, Any]:
   const metaTitle = document.querySelector("meta[property='og:title']")?.getAttribute('content') || '';
   const counts = collectCounts();
   const detailImages = collectDetailImages();
+  const body = detailBody();
 
   return {
     title: firstText(titleSelectors) || normalizeText(metaTitle),
-    body: firstText(bodySelectors),
-    body_html: firstHtml(bodySelectors),
+    body: body.text,
+    body_html: body.html,
     detail_image_urls: detailImages.map((item) => item.url),
     detail_image_alts: detailImages.map((item) => item.alt),
     author: firstText(authorSelectors),
@@ -1380,28 +1495,40 @@ def build_card_record(card: dict[str, Any], *, access_status: str, source_search
 
 def extract_note(page: Page, fallback_card: dict[str, Any]) -> NoteRecord:
     dismiss_common_popups(page)
-    for _ in range(5):
+    last_record: NoteRecord | None = None
+    for attempt in range(6):
         record = extract_note_from_dom(page, fallback_card)
-        if record.title or record.body or record.author:
+        last_record = record
+        if is_detail_body_ready(record.body):
             return record
-        page.wait_for_timeout(500)
-        dismiss_common_popups(page)
-    return extract_note_from_dom(page, fallback_card)
+        access_status = classify_detail_access(
+            page.url,
+            record,
+            expected_note_id=str(fallback_card.get("note_id", "") or ""),
+        )
+        if access_status != "detail_empty":
+            record.access_status = access_status
+            return record
+        if attempt < 5:
+            page.wait_for_timeout(500)
+            dismiss_common_popups(page)
+    assert last_record is not None
+    return last_record
 
 
 def is_unavailable_record(record: NoteRecord) -> bool:
-    markers = {
-        "当前笔记暂时无法浏览",
-        "当前内容暂时无法展示",
-        "内容暂时无法展示",
-    }
     haystack = " ".join(
         part for part in [record.title, record.body, record.source_card_text] if part
     )
-    return any(marker in haystack for marker in markers)
+    return any(marker in haystack for marker in DETAIL_UNAVAILABLE_MARKERS)
 
 
-def classify_detail_access(page_url: str, record: NoteRecord) -> str:
+def classify_detail_access(
+    page_url: str,
+    record: NoteRecord,
+    *,
+    expected_note_id: str = "",
+) -> str:
     """Classify pages that rendered HTML but did not expose a usable note body."""
     combined = unquote(
         " ".join(
@@ -1418,7 +1545,9 @@ def classify_detail_access(page_url: str, record: NoteRecord) -> str:
         return "detail_login_required"
     if is_unavailable_record(record) or "/404" in combined:
         return "detail_unavailable"
-    if not record.body.strip():
+    if detail_note_id_mismatch(page_url, expected_note_id):
+        return "detail_note_mismatch"
+    if not is_detail_body_ready(record.body):
         return "detail_empty"
     return "detail_ok"
 
@@ -1437,6 +1566,8 @@ def classify_visible_detail_restriction(page: Page, *, timeout_ms: int = 400) ->
         return "detail_security_verification"
     if any(marker.casefold() in normalized for marker in LOGIN_REQUIRED_MARKERS):
         return "detail_login_required"
+    if any(marker.casefold() in normalized for marker in DETAIL_UNAVAILABLE_MARKERS) or "/404" in normalized:
+        return "detail_unavailable"
     return ""
 
 
@@ -1447,7 +1578,7 @@ def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, sourc
         goto_started_at = time.time()
         navigation_candidates = list(dict.fromkeys(filter(None, [target_url, card.get("explore_url", "")])))
         navigation_error: Exception | None = None
-        for candidate_url in navigation_candidates:
+        for candidate_index, candidate_url in enumerate(navigation_candidates):
             try:
                 page.goto(candidate_url, wait_until="commit", timeout=goto_timeout_ms)
                 navigation_error = None
@@ -1457,6 +1588,20 @@ def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, sourc
                     return build_card_record(
                         card,
                         access_status=restriction,
+                        source_search_url=source_search_url,
+                    )
+                if detail_note_id_mismatch(page.url, str(card.get("note_id", "") or "")):
+                    log(
+                        "detail note id mismatch after navigation: "
+                        f"expected={card.get('note_id', '')} "
+                        f"actual={detail_note_id_from_url(page.url)}"
+                    )
+                    if candidate_index + 1 < len(navigation_candidates):
+                        log(f"detail note id mismatch, trying fallback: {candidate_url}")
+                        continue
+                    return build_card_record(
+                        card,
+                        access_status="detail_note_mismatch",
                         source_search_url=source_search_url,
                     )
                 break
@@ -1474,19 +1619,41 @@ def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, sourc
                         access_status=restriction,
                         source_search_url=source_search_url,
                     )
-                if card.get("note_id") and card["note_id"] in page.url:
+                if (
+                    card.get("note_id")
+                    and detail_note_id_from_url(page.url).casefold()
+                    == str(card["note_id"]).casefold()
+                ):
                     navigation_error = None
                     break
                 log(f"detail navigation failed, trying fallback: {candidate_url}: {exc}")
         if navigation_error is not None:
             raise navigation_error
-        wait_for_note_ready(page)
+        readiness_status = wait_for_note_ready(page)
+        if readiness_status not in {"detail_body_ready", "detail_wait_timeout", ""}:
+            log(f"detail readiness stopped as {readiness_status}: {target_url}")
+            return build_card_record(
+                card,
+                access_status=readiness_status,
+                source_search_url=source_search_url,
+            )
         restriction = classify_visible_detail_restriction(page)
         if restriction:
             log(f"detail restriction detected before extraction as {restriction}: {target_url}")
             return build_card_record(
                 card,
                 access_status=restriction,
+                source_search_url=source_search_url,
+            )
+        if detail_note_id_mismatch(page.url, str(card.get("note_id", "") or "")):
+            log(
+                "detail note id mismatch before extraction: "
+                f"expected={card.get('note_id', '')} "
+                f"actual={detail_note_id_from_url(page.url)}"
+            )
+            return build_card_record(
+                card,
+                access_status="detail_note_mismatch",
                 source_search_url=source_search_url,
             )
         goto_elapsed = time.time() - goto_started_at
@@ -1497,7 +1664,11 @@ def scrape_note(page: Page, card: dict[str, Any], *, goto_timeout_ms: int, sourc
         extract_elapsed = time.time() - extract_started_at
         total_elapsed = time.time() - started_at
         log(f"detail extract finished in {extract_elapsed:.1f}s (total {total_elapsed:.1f}s): {target_url}")
-        access_status = classify_detail_access(page.url, record)
+        access_status = classify_detail_access(
+            page.url,
+            record,
+            expected_note_id=str(card.get("note_id", "") or ""),
+        )
         if access_status != "detail_ok":
             log(f"detail access classified as {access_status}: {target_url}")
             return build_card_record(card, access_status=access_status, source_search_url=source_search_url)

@@ -4,7 +4,6 @@ import {
   Activity,
   Archive,
   ArrowUpDown,
-  BellRing,
   CalendarDays,
   CalendarClock,
   Check,
@@ -26,6 +25,7 @@ import {
   BrainCircuit,
   BookOpenCheck,
   KeyRound,
+  Layers3,
   LoaderCircle,
   Mail,
   Maximize2,
@@ -60,14 +60,18 @@ import {
   X,
 } from 'lucide-react'
 import { api } from './api'
+import type { ApiError } from './api'
 import { draftContentHash } from './draft-state.mjs'
 import { AudienceAiPanel } from './AudienceAiPanel'
 import { BodyImportPanel } from './BodyImportPanel'
+import { BatchApplicationPanel } from './BatchApplicationPanel'
 import type { BodyImportRecord } from './body-import'
 import { DataCopilotPanel, type DataCopilotModelConnectionInput } from './DataCopilotPanel'
 import { createDataCopilotTransport } from './data-copilot-transport'
 import type { DataCopilotContextSource, DataCopilotModel } from './DataCopilotContext'
 import { ExpansionWorkspace } from './ExpansionWorkspace'
+import { JobJourneyPanel } from './JobJourneyPanel'
+import { experienceSnapshotForJob } from './job-experience'
 import { UnsavedDraftDialog } from './UnsavedDraftDialog'
 import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
 import type { DraftSaveRequest } from './useUnsavedDraftGuard'
@@ -110,6 +114,8 @@ import type {
   DataDeletionPreview,
   DataDeletionSpec,
   ResumeScope,
+  UserProblem,
+  WorkflowConnectionState,
   WorkspaceView,
 } from './types'
 
@@ -389,61 +395,6 @@ const statusText: Record<JobStatus, string> = {
   interrupted: '未完成 · 已中断',
 }
 
-const progressByStatus: Record<JobStatus, number> = {
-  queued: 4,
-  resuming: 48,
-  running: 48,
-  completed: 100,
-  incomplete: 82,
-  blocked: 82,
-  failed: 0,
-  cancelled: 0,
-  interrupted: 0,
-}
-
-const jobAgentStages = [
-  {
-    name: '全量正文 Agent',
-    description: '滚动到结果稳定，逐篇打开并记录正文抓取状态',
-    matcher: /全量正文|body|正文|scrape/i,
-  },
-  {
-    name: '时间归一化 Agent',
-    description: '以每篇采集时间换算“昨天 / x天前”等相对时间',
-    matcher: /时间归一化|time.?normal/i,
-  },
-  {
-    name: '背景记忆 Agent',
-    description: '读取已整理的个人事实记忆，仅保留可验证经历',
-    matcher: /background.?memory|背景记忆|profile/i,
-  },
-  {
-    name: '投递信息 Agent',
-    description: '分别提取岗位职责、要求、联系邮箱和投递入口',
-    matcher: /投递信息|application.?info|contact/i,
-  },
-  {
-    name: '岗位能力 Agent',
-    description: '从正文提炼用人方真正需要的能力与优先级',
-    matcher: /job.?capabilit|岗位能力|capability/i,
-  },
-  {
-    name: 'AI 写作 Agent',
-    description: '依据岗位能力与经历事实生成第一人称专属文案',
-    matcher: /沟通文案|outreach|招呼|邮件/i,
-  },
-  {
-    name: '用人单位评分 Agent',
-    description: '低于 90 分自动带评语重写，达标后才可投递',
-    matcher: /employer|score|rewrite|评分|重写/i,
-  },
-  {
-    name: '质量门禁 Agent',
-    description: '检查正文、时间、来源、事实边界与缺失原因',
-    matcher: /质量门禁|quality.?gate|verify/i,
-  },
-]
-
 const humanQualityLabels: Record<string, string> = {
   factual_grounding: '事实依据',
   specificity: '具体程度',
@@ -456,17 +407,6 @@ const humanQualityLabels: Record<string, string> = {
   call_to_action: '下一步',
   ai_cliche_score: '模板腔',
 }
-
-const generalAgentStages = [
-  { name: '全量正文 Agent', description: '滚动到结果稳定，逐篇打开并保存正文与原图', matcher: /全量正文|body|正文|scrape/i },
-  { name: '时间归一化 Agent', description: '统一相对时间、发布日期与采集时间', matcher: /时间归一化|time.?normal/i },
-  { name: '关键词蓝图 Agent', description: '根据关键词和真实样本生成本次专属分析栏目', matcher: /keyword.?blueprint|关键词蓝图/i },
-  { name: '图片与正文 Agent', description: '读取原文并用视觉模型转录、理解采集图片', matcher: /image.?and.?content|图片与正文|ocr/i },
-  { name: '动态栏目 Agent', description: '按 AI 生成的页面蓝图逐条组织内容模块', matcher: /dynamic.?module|动态栏目/i },
-  { name: 'AI 内容分析 Agent', description: '围绕关键词提炼事实、观点、实体与图片线索', matcher: /content.?analysis|内容分析/i },
-  { name: '内容质量 Agent', description: '检查证据、关键词相关性和图片理解完整度', matcher: /content.?quality|内容质量/i },
-  { name: '质量门禁 Agent', description: '检查采集覆盖、分析覆盖和缺失原因', matcher: /质量门禁|quality.?gate|verify/i },
-]
 
 function formatTime(value?: string) {
   if (!value) return '-'
@@ -827,6 +767,8 @@ function isUnsafeIpv4(hostname: string) {
 
 function routeVerificationLabel(route: DeliveryRouteView) {
   if (route.verificationStatus === 'cross_verified') return '正文与图片一致'
+  if (route.verificationStatus === 'image_format_normalized') return '图中识别 · 已自动还原'
+  if (route.verificationStatus === 'body_format_normalized') return '正文识别 · 已自动还原'
   if (route.verificationStatus === 'image_format_verified') return '图中识别 · 格式已复核'
   if (route.verificationStatus === 'needs_manual_review') return '图中识别 · 待人工核对'
   if (route.sourceField.includes('image')) return '来自岗位图片'
@@ -913,14 +855,6 @@ function elapsed(job?: Job) {
   const seconds = Math.max(0, Math.round((end - new Date(job.startedAt).getTime()) / 1000))
   if (seconds < 60) return `${seconds} 秒`
   return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
-}
-
-function progressUpdateAge(value: string | null | undefined, now: Date) {
-  if (!value) return '等待首条进度'
-  const seconds = Math.max(0, Math.floor((now.getTime() - new Date(value).getTime()) / 1000))
-  if (seconds < 3) return '刚刚更新'
-  if (seconds < 60) return `${seconds} 秒前更新`
-  return `${Math.floor(seconds / 60)} 分钟前更新`
 }
 
 function artifactIcon(name: string) {
@@ -1114,7 +1048,7 @@ function GeneralResultsWorkspace({
             <div className="content-module-grid">{analysisReady && analysis?.modules?.length ? analysis.modules.map((module) => <section className="content-module" key={module.id}><div><BookOpenCheck size={16} /><h4>{module.title}</h4></div><p>{module.summary}</p>{module.items.length > 0 && <ul>{module.items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul>}{module.evidence.length > 0 && <details><summary>查看原文依据</summary>{module.evidence.map((item, index) => <blockquote key={`${item}-${index}`}>{item}</blockquote>)}</details>}</section>) : <section className="content-module pending"><LoaderCircle size={18} /><h4>等待动态栏目分析</h4><p>AI 会根据本次关键词决定栏目，而不是套用岗位模板。</p></section>}</div>
             {analysisReady && analysis?.image_insights?.length ? <section className="image-insight-list"><h4>图片线索</h4><ul>{analysis.image_insights.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section> : null}
           </AiSectionBoundary>
-          <section className="body-section general-body"><div><h4>采集正文</h4><button type="button" title="复制采集正文" onClick={() => onCopy(selectedResult.body || '')}><Copy size={14} /></button></div><p>{selectedResult.body || '正文尚未采集；已保留图片和卡片文字供 AI 分析。'}</p></section>
+          <section className="body-section general-body" aria-label="采集正文"><div><h4>采集正文</h4><button type="button" title="复制采集正文" aria-label="复制采集正文" disabled={!selectedResult.body?.trim()} onClick={() => onCopy(selectedResult.body || '')}><Copy size={14} /></button></div>{selectedResult.body?.trim() ? <pre className="body-text-block">{selectedResult.body.trim()}</pre> : <p className="body-empty">正文尚未采集；已保留图片和卡片文字供 AI 分析。</p>}</section>
         </article> : <div className="result-empty"><FileText size={28} /><strong>选择一条内容查看 AI 分析</strong></div>}
       </div>
     </>
@@ -1529,7 +1463,18 @@ function fileBase64(file: File) {
 function replaceJobInPlace(jobs: Job[], next: Job) {
   const index = jobs.findIndex((job) => job.id === next.id)
   if (index < 0) return [next, ...jobs]
-  return jobs.map((job, itemIndex) => itemIndex === index ? next : job)
+  return jobs.map((job, itemIndex) => itemIndex === index ? mergeJobUpdate(job, next) : job)
+}
+
+function mergeJobUpdate(current: Job, next: Job) {
+  const currentRevision = Number(current.revision)
+  const nextRevision = Number(next.revision)
+  if (Number.isFinite(currentRevision) && Number.isFinite(nextRevision) && nextRevision < currentRevision) return current
+  return {
+    ...next,
+    experienceSnapshot: next.experienceSnapshot ?? current.experienceSnapshot,
+    workflowSnapshot: next.workflowSnapshot ?? current.workflowSnapshot,
+  }
 }
 
 function newResumeIdempotencyKey(jobId: string, scope: ResumeScope) {
@@ -1582,13 +1527,21 @@ function audienceSnapshotRegressed(current: AudienceResultsResponse, next: Audie
     || next.summary.usersDiscovered < current.summary.usersDiscovered
 }
 
+type ApplicationView = 'jobs' | 'batch'
+
 function workspaceModeFromLocation(): AnalysisMode {
   if (typeof window === 'undefined') return 'job'
   return window.location.pathname.replace(/\/+$/, '') === '/content' ? 'general' : 'job'
 }
 
-function workspacePath(mode: AnalysisMode) {
-  return mode === 'general' ? '/content' : '/'
+function applicationViewFromLocation(): ApplicationView {
+  if (typeof window === 'undefined') return 'jobs'
+  return window.location.pathname.replace(/\/+$/, '') === '/batch' ? 'batch' : 'jobs'
+}
+
+function workspacePath(mode: AnalysisMode, applicationView: ApplicationView = 'jobs') {
+  if (mode === 'general') return '/content'
+  return applicationView === 'batch' ? '/batch' : '/'
 }
 
 function generalResultModuleFromLocation(): GeneralResultModule {
@@ -1669,6 +1622,7 @@ function isIncompleteApplicationResult(result: ApplicationResult) {
 
 function App() {
   const [workspaceMode, setWorkspaceMode] = useState<AnalysisMode>(() => workspaceModeFromLocation())
+  const [applicationView, setApplicationView] = useState<ApplicationView>(() => applicationViewFromLocation())
   const [generalResultModule, setGeneralResultModule] = useState<GeneralResultModule>(() => generalResultModuleFromLocation())
   const requestCache = useRef<Record<AnalysisMode, JobRequest>>({
     job: { ...defaultRequest, analysisMode: 'job', candidateProfile: loadCandidateProfile() },
@@ -1692,6 +1646,8 @@ function App() {
   const [smtpSaving, setSmtpSaving] = useState(false)
   const [jobs, setJobs] = useState<Job[]>([])
   const [activeJob, setActiveJob] = useState<Job | null>(null)
+  const [jobConnectionState, setJobConnectionState] = useState<WorkflowConnectionState>('offline')
+  const [jobLastEventAt, setJobLastEventAt] = useState<string | null>(null)
   const [dataCopilotOpen, setDataCopilotOpen] = useState(false)
   const [historyScope, setHistoryScope] = useState<HistoryScope>('all')
   const [historyPage, setHistoryPage] = useState(1)
@@ -1744,6 +1700,7 @@ function App() {
   const [relayConnecting, setRelayConnecting] = useState(false)
   const [relaySettingUp, setRelaySettingUp] = useState(false)
   const [securityRecovering, setSecurityRecovering] = useState(false)
+  const [journeyActionBusy, setJourneyActionBusy] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [dataManaging, setDataManaging] = useState(false)
   const [completingMissing, setCompletingMissing] = useState(false)
@@ -1859,9 +1816,10 @@ function App() {
     streamGeneration.current += 1
     cleanupStream.current?.()
     cleanupStream.current = null
+    setJobConnectionState('offline')
   }, [])
 
-  const performSwitchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true) => {
+  const performSwitchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true, targetApplicationView: ApplicationView = 'jobs') => {
     if (mode === workspaceMode) return
     draftViewRevisionRef.current += 1
     disconnectJobStream()
@@ -1889,9 +1847,11 @@ function App() {
       browserProfile: request.browserProfile,
       aiSessionId: request.aiSessionId,
     }
-    if (updateHistory && window.location.pathname !== workspacePath(mode)) {
-      window.history.pushState({ workspaceMode: mode }, '', workspacePath(mode))
+    const nextApplicationView: ApplicationView = mode === 'job' ? targetApplicationView : 'jobs'
+    if (updateHistory && window.location.pathname !== workspacePath(mode, nextApplicationView)) {
+      window.history.pushState({ workspaceMode: mode, applicationView: nextApplicationView }, '', workspacePath(mode, nextApplicationView))
     }
+    setApplicationView(nextApplicationView)
     if (mode === 'general') setGeneralResultModule(updateHistory ? 'insights' : generalResultModuleFromLocation())
     setWorkspaceMode(mode)
     setRequest({ ...requestCache.current[mode] })
@@ -1929,9 +1889,24 @@ function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }, [activeJob, disconnectJobStream, jobs, request, resultOffset, results, resultSort, resultTimeRange, selectedResult, workspaceMode])
 
-  const switchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true) => (
-    draftGuard.requestTransition('切换工作台', () => performSwitchWorkspace(mode, updateHistory))
+  const switchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true, targetApplicationView: ApplicationView = 'jobs') => (
+    draftGuard.requestTransition('切换工作台', () => performSwitchWorkspace(mode, updateHistory, targetApplicationView))
   ), [draftGuard.requestTransition, performSwitchWorkspace])
+
+  const performSwitchApplicationView = useCallback((view: ApplicationView, updateHistory = true) => {
+    if (workspaceMode !== 'job' || view === applicationView) return
+    const nextPath = workspacePath('job', view)
+    if (updateHistory && window.location.pathname !== nextPath) {
+      window.history.pushState({ workspaceMode: 'job', applicationView: view }, '', nextPath)
+    }
+    setApplicationView(view)
+    setNotice(null)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }, [applicationView, workspaceMode])
+
+  const switchApplicationView = useCallback((view: ApplicationView, updateHistory = true) => {
+    performSwitchApplicationView(view, updateHistory)
+  }, [performSwitchApplicationView])
 
   const performSwitchGeneralResultModule = useCallback((module: GeneralResultModule, preferredJobId = '') => {
     const currentScroll = window.scrollY
@@ -1991,6 +1966,7 @@ function App() {
     const handlePopState = () => {
       const targetUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
       const targetMode = workspaceModeFromLocation()
+      const targetApplicationView = applicationViewFromLocation()
       const targetModule = generalResultModuleFromLocation()
       const applyTarget = () => {
         setGeneralResultModule(targetModule)
@@ -2002,14 +1978,24 @@ function App() {
         } else {
           setAudienceDataJobId('')
         }
-        performSwitchWorkspace(targetMode, false)
+        if (targetMode !== workspaceMode) {
+          performSwitchWorkspace(targetMode, false, targetApplicationView)
+        } else if (targetMode === 'job' && targetApplicationView !== applicationView) {
+          performSwitchApplicationView(targetApplicationView, false)
+        } else {
+          performSwitchWorkspace(targetMode, false)
+        }
+      }
+      if (targetMode === workspaceMode && targetMode === 'job' && targetApplicationView !== applicationView) {
+        applyTarget()
+        return
       }
       if (!draftDirtyRef.current) {
         applyTarget()
         return
       }
       const currentUrl = new URL(window.location.href)
-      currentUrl.pathname = workspacePath(workspaceMode)
+      currentUrl.pathname = workspacePath(workspaceMode, workspaceMode === 'job' ? applicationView : 'jobs')
       if (workspaceMode !== 'general' || generalResultModule === 'insights') {
         currentUrl.searchParams.delete('module')
         currentUrl.searchParams.delete('job')
@@ -2022,17 +2008,21 @@ function App() {
       }
       window.history.pushState({ workspaceMode, generalResultModule }, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
       void draftGuard.requestTransition('浏览器返回', () => {
-        window.history.pushState({ workspaceMode: targetMode, generalResultModule: targetModule }, '', targetUrl)
+        window.history.pushState({ workspaceMode: targetMode, applicationView: targetApplicationView, generalResultModule: targetModule }, '', targetUrl)
         applyTarget()
       })
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [activeJob, audienceDataJobId, draftGuard.requestTransition, generalResultModule, jobs, performSwitchWorkspace, workspaceMode])
+  }, [activeJob, applicationView, audienceDataJobId, draftGuard.requestTransition, generalResultModule, jobs, performSwitchApplicationView, performSwitchWorkspace, workspaceMode])
 
   useEffect(() => {
-    document.title = workspaceMode === 'general' ? '继任非岗位内容研究工作台' : '继任采集与投递工作台'
-  }, [workspaceMode])
+    document.title = workspaceMode === 'general'
+      ? '今天你投了吗？｜内容研究工作台'
+      : applicationView === 'batch'
+        ? '今天你投了吗？｜批量投递工作台'
+        : '今天你投了吗？｜岗位与投递'
+  }, [applicationView, workspaceMode])
 
   useEffect(() => {
     const provider = detectedSmtpPreset?.provider || smtpConfig.provider
@@ -3233,6 +3223,7 @@ function App() {
   const applyEvent = useCallback((event: JobEvent) => {
     if (event.line) setLogs((current) => [...current.slice(-399), event.line!])
     const eventJob = event.job
+    const eventSnapshot = event.experienceSnapshot
     const currentAttempt = eventJob?.attempts?.find((attempt) => attempt.attemptId === eventJob.currentAttemptId)
       || eventJob?.attempts?.at(-1)
     const legacyAudienceEvent = isAudienceOnlyJob(eventJob)
@@ -3240,11 +3231,19 @@ function App() {
     if (eventJob) {
       if (audienceEvent) setAudienceTask(eventJob)
       setActiveJob((current) => {
-        if (current?.id === eventJob.id) return eventJob
+        if (current?.id === eventJob.id) return mergeJobUpdate(current, eventJob)
         if (legacyAudienceEvent) return current
         return jobAnalysisMode(eventJob) === workspaceMode ? eventJob : current
       })
       setJobs((current) => replaceJobInPlace(current, eventJob))
+    }
+    if (eventSnapshot) {
+      setActiveJob((current) => current?.id === eventSnapshot.jobId
+        ? { ...current, experienceSnapshot: eventSnapshot, revision: Math.max(Number(current.revision || 0), Number(eventSnapshot.revision || 0)) }
+        : current)
+      setJobs((current) => current.map((job) => job.id === eventSnapshot.jobId
+        ? { ...job, experienceSnapshot: eventSnapshot, revision: Math.max(Number(job.revision || 0), Number(eventSnapshot.revision || 0)) }
+        : job))
     }
     if (event.artifacts && !legacyAudienceEvent) setArtifacts(event.artifacts)
     if (event.message && event.type === 'error') setNotice(event.message)
@@ -3259,13 +3258,24 @@ function App() {
     streamGeneration.current = generation
     cleanupStream.current?.()
     const expectedJobId = job.id
+    const snapshot = experienceSnapshotForJob(job)
+    setJobConnectionState('reconnecting')
+    setJobLastEventAt(snapshot?.connection?.lastEventAt || job.progressUpdatedAt || null)
     cleanupStream.current = api.subscribe(job.id, (event) => {
       if (streamGeneration.current !== generation) return
       if (event.job && event.job.id !== expectedJobId) return
+      if (event.experienceSnapshot && event.experienceSnapshot.jobId !== expectedJobId) return
       applyEvent(event)
     }, () => {
       if (streamGeneration.current !== generation) return
       window.setTimeout(() => void loadJobs(), 800)
+    }, {
+      afterSequence: snapshot?.throughSequence,
+      onConnectionChange: (connection) => {
+        if (streamGeneration.current !== generation) return
+        setJobConnectionState(connection.state)
+        if (connection.lastEventAt) setJobLastEventAt(connection.lastEventAt)
+      },
     })
     return generation
   }, [applyEvent, loadJobs])
@@ -3454,7 +3464,7 @@ function App() {
 
   const resumeAudienceCollection = (forceRateLimitRecovery = false, forcedJobId?: string) => (
     draftGuard.requestTransition(
-      forceRateLimitRecovery ? '一键解除限流并继续' : '恢复其他任务',
+      forceRateLimitRecovery ? '立即检查平台是否恢复' : '恢复其他任务',
       () => performResumeAudienceCollection(forceRateLimitRecovery, forcedJobId),
     )
   )
@@ -3646,6 +3656,59 @@ function App() {
       setNotice((error as Error).message)
     } finally {
       setSecurityRecovering(false)
+    }
+  }
+
+  const performJourneyProblemAction = async (job: Job, problem: UserProblem, actionId: 'open_login' | 'check_recovery' | 'resume') => {
+    if (journeyActionBusy) return
+    setJourneyActionBusy(true)
+    setNotice(null)
+    let operationId = ''
+    let idempotencyKey = ''
+    try {
+      if (actionId === 'open_login') {
+        const result = await api.openJobLogin(job.id)
+        setNotice(result.message || '验证页面已打开；完成页面操作后可回到这里继续。')
+        window.setTimeout(() => void refreshRelay(), 1500)
+        return
+      }
+
+      operationId = `${job.id}:journey:${actionId}:${problem.affectedStage}`
+      idempotencyKey = resumeIdempotencyKeys.current.get(operationId)
+        || newResumeIdempotencyKey(job.id, 'full')
+      resumeIdempotencyKeys.current.set(operationId, idempotencyKey)
+      const response = actionId === 'check_recovery'
+        ? await api.checkJobRecovery(job.id, { idempotencyKey })
+        : await api.retryJobStage(job.id, {
+            stage: problem.affectedStage || 'task',
+            idempotencyKey,
+            ...(aiSession ? { aiSessionId: aiSession.id } : {}),
+          })
+      const nextJob = response.job
+      setActiveJob((current) => current?.id === nextJob.id ? mergeJobUpdate(current, nextJob) : current)
+      setJobs((current) => replaceJobInPlace(current, nextJob))
+      if (response.scope === 'audience') setAudienceTask(nextJob)
+      if (['queued', 'resuming', 'running'].includes(nextJob.status)) connectJob(nextJob)
+      const message = response.action === 'signaled'
+        ? '已安排一次立即恢复检查；通过后会从已保存位置继续。'
+        : response.action === 'attached'
+          ? '任务仍在运行，已重新连接当前进度。'
+          : actionId === 'check_recovery'
+            ? '恢复检查已启动，只处理尚未完成的内容。'
+            : '当前步骤已从已保存位置重新启动。'
+      setNotice(message)
+    } catch (error) {
+      const apiError = error as ApiError
+      setNotice(apiError.problem?.userMessage || apiError.message)
+    } finally {
+      setJourneyActionBusy(false)
+      if (operationId && idempotencyKey) {
+        window.setTimeout(() => {
+          if (resumeIdempotencyKeys.current.get(operationId) === idempotencyKey) {
+            resumeIdempotencyKeys.current.delete(operationId)
+          }
+        }, 5_000)
+      }
     }
   }
 
@@ -3887,54 +3950,29 @@ function App() {
   useEffect(() => {
     setHistoryPage(1)
   }, [historyScope, historyPageSize])
-  const progress = activeJob?.progress ?? (activeJob ? progressByStatus[activeJob.status] : 0)
-  const progressCurrent = Number(activeJob?.progressCurrent || 0)
-  const progressTotal = Number(activeJob?.progressTotal || 0)
-  const officialBodyMetrics = activeJob?.bodyMetrics
-  const discoveredCount = Number(officialBodyMetrics?.discovered ?? activeJob?.discoveredCount ?? 0)
-  const scrapedCount = Number(activeJob?.scrapedCount || 0)
-  const bodyProcessedCount = Number(officialBodyMetrics?.attempted ?? activeJob?.bodyProcessedCount ?? 0)
-  const bodySucceededCount = Number(officialBodyMetrics?.succeeded ?? scrapedCount)
-  const remainingCount = officialBodyMetrics
-    ? officialBodyMetrics.failed + officialBodyMetrics.notAttempted + officialBodyMetrics.blocked
-      + officialBodyMetrics.cancelled + officialBodyMetrics.pending
-    : Math.max(0, discoveredCount - bodySucceededCount)
-  const progressLabel = activeJob?.progressLabel || (({
-    queued: '任务已排队，等待启动',
-    resuming: '正在恢复原任务',
-    running: '正在等待下一条实时进度',
-    completed: '任务已完成',
-    incomplete: `未完成：当前检查点已分析，可继续补全剩余${workspaceMode === 'general' ? '内容' : '岗位'}`,
-    interrupted: '未完成：任务已中断，检查点已保留',
-    blocked: '任务已暂停，等待人工处理',
-    failed: '执行失败：请查看失败原因',
-    cancelled: '未完成：任务已取消',
-  } as Record<string, string>)[activeJob?.status || ''] ?? '尚未开始')
-  const progressAge = progressUpdateAge(activeJob?.progressUpdatedAt, clock)
   const runningCount = workspaceJobs.filter((job) => ['queued', 'resuming', 'running'].includes(job.status)).length
   const completedCount = workspaceJobs.filter((job) => job.status === 'completed').length
   const failedCount = workspaceJobs.filter((job) => job.status === 'failed').length
   const incompleteCount = workspaceJobs.filter((job) => ['incomplete', 'cancelled', 'interrupted', 'blocked'].includes(job.status)).length
-  const activeOutcome = activeJob?.status === 'failed'
-    ? 'failed'
-    : activeJob?.status === 'incomplete' || activeJob?.status === 'cancelled' || activeJob?.status === 'interrupted' || activeJob?.status === 'blocked'
-      ? 'incomplete'
-      : activeJob?.status || 'idle'
   const currentArtifacts = artifacts.length ? artifacts : activeJob?.artifacts || []
+  const discoveredCount = Number(
+    experienceSnapshotForJob(activeJob)?.counts.discovered
+      ?? activeJob?.bodyMetrics?.discovered
+      ?? activeJob?.discoveredCount
+      ?? 0,
+  )
   const exportCount = useMemo(() => workspaceJobs.reduce((sum, job) => sum + (job.artifactCount ?? job.artifacts?.length ?? 0), 0), [workspaceJobs])
   const activeAllMode = activeJob?.config?.limit === 0
   const activeBodyImport = activeJob?.config?.bodyOnly === true
-  const runningLog = logs.slice(-120).join('\n')
-  const terminalAnalysisReady = Boolean(activeJob && ['completed', 'incomplete'].includes(activeJob.status) && coverage)
   const activeAnalysisMode = workspaceMode
+  const batchSurfaceActive = activeAnalysisMode === 'job' && applicationView === 'batch'
   const audienceModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'audience'
   const expansionModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'expansion'
-  const activeAgentStages = activeAnalysisMode === 'general' ? generalAgentStages : jobAgentStages
-  const activeAgentIndex = terminalAnalysisReady
-    ? activeAgentStages.length
-    : activeJob?.status === 'running'
-      ? activeAgentStages.reduce((last, stage, index) => stage.matcher.test(runningLog) ? index : last, 0)
-      : -1
+  const displayJobConnectionState: WorkflowConnectionState = jobConnectionState === 'live'
+    && jobLastEventAt
+    && clock.getTime() - new Date(jobLastEventAt).getTime() > 30_000
+    ? 'stale'
+    : jobConnectionState
   const workflowSummary = activeJob?.workflowSummary || {}
   const expansionSummary = workflowSummary.expansion && typeof workflowSummary.expansion === 'object'
     ? workflowSummary.expansion as Record<string, unknown>
@@ -3947,30 +3985,12 @@ function App() {
   const securityStatus = activeJob?.securityRestriction?.status || String(securityVerification.status || '')
   const securityJobRunning = Boolean(activeJob && ['queued', 'resuming', 'running'].includes(activeJob.status))
   const securityReportedWaiting = securityStatus === 'waiting'
-  const securityWaiting = securityReportedWaiting && securityJobRunning
   const securityTimedOut = securityStatus === 'timed_out' || (
     partialAnalysis
     && (workflowSummary.collectionStopReason === 'security_verification_timeout' || securityVerification.status === 'timed_out')
   ) || (securityReportedWaiting && !securityJobRunning)
-  const securityNeedsAttention = securityWaiting || securityTimedOut
   const securityTimeoutSeconds = Number(activeJob?.securityRestriction?.timeoutSeconds || securityVerification.timeoutSeconds || activeJob?.config?.securityVerificationTimeoutSeconds || 600)
   const securityTimeoutLabel = securityTimeoutSeconds % 60 === 0 ? `${securityTimeoutSeconds / 60} 分钟` : `${securityTimeoutSeconds} 秒`
-  const workflowRateLimit = (workflowSummary.rateLimit || {}) as Record<string, unknown>
-  const rateLimitStatus = activeJob?.rateLimit?.status || String(workflowRateLimit.status || '')
-  const rateLimitWaiting = rateLimitStatus === 'waiting'
-  const rateLimitScheduled = rateLimitStatus === 'scheduled'
-  const rateLimitResuming = rateLimitStatus === 'resuming'
-  const rateLimitRecovering = rateLimitWaiting || rateLimitScheduled || rateLimitResuming
-  const rateLimitDetected = rateLimitStatus
-    ? rateLimitStatus !== 'cleared'
-    : activeJob?.progressPhase === 'rate_limited'
-      || workflowSummary.analysisMode === 'rate_limited_partial'
-  const rateLimitDetectedAt = activeJob?.rateLimit?.detectedAt || String(workflowRateLimit.detectedAt || '')
-  const rateLimitReadyToResume = Boolean(activeJob?.resumeAvailable && !securityNeedsAttention)
-  const rateLimitManualAvailable = Boolean(activeJob && rateLimitDetected && !rateLimitResuming && !securityNeedsAttention)
-  const rateLimitAutoAttempt = activeJob?.rateLimit?.autoResumeAttempt || 0
-  const rateLimitAutoMax = activeJob?.rateLimit?.maxAutoResumeAttempts || 6
-  const rateLimitNextRetryAt = activeJob?.rateLimit?.nextRetryAt || null
   const codexRuntime = results?.codexRuntime || (workflowSummary.codexRuntime as Record<string, unknown> | undefined)
   const selectedProvider = providers.find((item) => item.id === providerId)
   const selectedLocalModel = localModelStatus?.catalog.find((item) => item.id === localModelChoice)
@@ -4529,28 +4549,30 @@ function App() {
   ]
 
   return (
-    <div className={`app-shell ${expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
+    <div className={`app-shell ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
       <aside className="side-rail">
-        <div className="brand-mark" aria-label="继任工作台">继</div>
+        <div className="brand-mark" aria-label="今天你投了吗？">投</div>
         <nav aria-label="主导航">
-          <button className={`nav-button ${workspaceMode === 'job' ? 'active' : ''}`} type="button" title="岗位投递工作台" aria-current={workspaceMode === 'job' ? 'page' : undefined} onClick={() => switchWorkspace('job')}><Target size={20} /><span>岗位台</span></button>
+          <button className={`nav-button ${workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''}`} type="button" title="岗位投递工作台" aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={20} /><span>岗位台</span></button>
+          <button className={`nav-button ${workspaceMode === 'job' && applicationView === 'batch' ? 'active' : ''}`} type="button" title="批量投递工作台" aria-current={workspaceMode === 'job' && applicationView === 'batch' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><Layers3 size={20} /><span>批量投递</span></button>
           <button className={`nav-button ${workspaceMode === 'general' ? 'active' : ''}`} type="button" title="非岗位信息研究工作台" aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={20} /><span>研究台</span></button>
-          <button className="nav-button" title="任务历史" onClick={() => document.getElementById('history')?.scrollIntoView({ behavior: 'smooth' })}><Clock3 size={20} /><span>历史</span></button>
-          <button className="nav-button" title="导出文件" onClick={() => document.getElementById('artifacts')?.scrollIntoView({ behavior: 'smooth' })}><Table2 size={20} /><span>产物</span></button>
+          {!batchSurfaceActive && <button className="nav-button" title="任务历史" onClick={() => document.getElementById('history')?.scrollIntoView({ behavior: 'smooth' })}><Clock3 size={20} /><span>历史</span></button>}
+          {!batchSurfaceActive && <button className="nav-button" title="导出文件" onClick={() => document.getElementById('artifacts')?.scrollIntoView({ behavior: 'smooth' })}><Table2 size={20} /><span>产物</span></button>}
         </nav>
-        {workspaceMode === 'job' && <button className="nav-button rail-settings" title="发件邮箱设置" onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={20} /><span>设置</span></button>}
+        {workspaceMode === 'job' && !batchSurfaceActive && <button className="nav-button rail-settings" title="发件邮箱设置" onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={20} /><span>设置</span></button>}
       </aside>
 
       <div className="workspace">
         <header className="topbar">
           <div className="topbar-leading">
             <div className="product-title">
-              <span className="eyebrow">{workspaceMode === 'general' ? 'CONTENT INTELLIGENCE' : 'APPLICATION INTELLIGENCE'}</span>
-              <h1>{workspaceMode === 'general' ? '继任非岗位内容研究工作台' : '继任采集与投递工作台'}</h1>
+              <span className="eyebrow">{workspaceMode === 'general' ? 'CONTENT INTELLIGENCE' : applicationView === 'batch' ? 'BATCH APPLICATION WORKBENCH' : 'APPLICATION INTELLIGENCE'}</span>
+              <h1>{workspaceMode === 'general' ? '今天你投了吗？｜内容研究工作台' : applicationView === 'batch' ? '今天你投了吗？｜批量投递工作台' : '今天你投了吗？｜岗位与投递'}</h1>
               <span className="version">v3.0</span>
             </div>
             <nav className="workspace-switcher" aria-label="切换工作台">
-              <button type="button" className={workspaceMode === 'job' ? 'active' : ''} aria-current={workspaceMode === 'job' ? 'page' : undefined} onClick={() => switchWorkspace('job')}><Target size={15} /><span>岗位投递</span></button>
+              <button type="button" className={workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={15} /><span>岗位投递</span></button>
+              <button type="button" className={workspaceMode === 'job' && applicationView === 'batch' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'batch' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><Layers3 size={15} /><span>批量投递</span></button>
               <button type="button" className={workspaceMode === 'general' ? 'active' : ''} aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={15} /><span>非岗位研究</span></button>
             </nav>
           </div>
@@ -4587,7 +4609,7 @@ function App() {
             <div className="product-hero-copy">
               <span className="marketing-kicker">{activeAnalysisMode === 'general' ? 'FROM DISCOVERY TO STRUCTURE' : 'FROM DISCOVERY TO DELIVERY'}</span>
               <h2 id="product-hero-title">{activeAnalysisMode === 'general' ? '研究经验、人群、趋势、产品或地点，不再被岗位模板限制。' : '别再在碎片信息里找机会，把每次发现都变成更有把握的投递。🚀'}</h2>
-              <p className="product-hero-lede">{activeAnalysisMode === 'general' ? '选择研究场景和目标后，全量保存正文与原图；AI 会结合关键词、OCR 与逐条证据，动态生成本次专属栏目和结构化结论。' : '继任采集台把“发现岗位 🔎、读懂正文 🧠、匹配经历、写好求职信 ✍️、完成投递 📮”串成一条本地可复核的求职工作流。'}</p>
+              <p className="product-hero-lede">{activeAnalysisMode === 'general' ? '选择研究场景和目标后，全量保存正文与原图；AI 会结合关键词、OCR 与逐条证据，动态生成本次专属栏目和结构化结论。' : '今天你投了吗？把“发现岗位 🔎、读懂正文 🧠、匹配经历、写好求职信 ✍️、完成投递 📮”放在同一条求职流程里。'}</p>
               <div className="product-hero-actions">
                 <button type="button" className="primary-button" onClick={() => document.getElementById('task-config')?.scrollIntoView({ behavior: 'smooth' })}><Play size={16} />{activeAnalysisMode === 'general' ? '创建非岗位研究' : '马上开始采集 🚀'}</button>
               </div>
@@ -5017,103 +5039,59 @@ function App() {
                 <>
                   <div className="mission-title"><span>{activeBodyImport ? '批次' : '关键词'}</span><strong>{activeJob.keyword}</strong><small>#{activeJob.id.slice(0, 8)}</small></div>
                   <div className="scope-stamp"><Target size={15} /><span><strong>{activeBodyImport ? '指定链接批量正文' : activeAllMode ? '范围内全量采集' : '历史限定任务'}</strong><small>{activeBodyImport ? `导入 ${activeJob.config?.importedBodyCount ?? activeJob.progressTotal ?? '-'} 条 · ${activeJob.config?.maxAgeDays ? `近 ${activeJob.config.maxAgeDays} 天` : '不限时间'} · 不重新搜索 · 断点续跑` : activeAllMode ? `最新优先 · ${activeJob.config?.maxAgeDays ? `近 ${activeJob.config.maxAgeDays} 天` : '不限时间'} · 最多 ${activeJob.config?.maxScrolls ?? '-'} 轮发现 · 单路采正文` : '历史任务按原检查点展示'}</small></span></div>
-                  <div className={`progress-block outcome-${activeOutcome}`} aria-live="polite">
-                    <div className="progress-heading">
-                      <span className={['resuming', 'running'].includes(activeJob.status) ? 'live-progress-title active' : 'live-progress-title'}><i />实时进度<small>{progressAge}</small></span>
-                      <strong>{Math.round(progress)}%</strong>
-                    </div>
-                    <div className="progress-track"><i style={{ width: `${Math.min(100, progress)}%` }} /></div>
-                    <div className="live-progress-status">
-                      <Activity size={16} />
-                      <span><b>{progressLabel}</b><small>{['resuming', 'running'].includes(activeJob.status) ? 'SSE 实时推送中' : activeOutcome === 'failed' ? '错误终止 · 查看失败原因' : activeOutcome === 'incomplete' ? '流程未走完 · 可从检查点继续' : '任务状态快照'}</small></span>
-                      {progressTotal > 0 && <em>{Math.min(progressCurrent, progressTotal)} / {progressTotal}</em>}
-                    </div>
-                    <div className="live-progress-counts">
-                      <span><small>已发现</small><b>{discoveredCount || '-'}</b></span>
-                      <span><small>已检查正文</small><b>{bodyProcessedCount || '-'}</b></span>
-                      <span><small>成功保存</small><b>{bodySucceededCount || '-'}</b></span>
-                      <span><small>待处理正文</small><b>{discoveredCount ? remainingCount : '-'}</b></span>
-                    </div>
-                  </div>
-                  {securityNeedsAttention && (
-                    <div className={`security-recovery-panel ${securityWaiting ? 'waiting' : 'timed-out'}`} role="status">
-                      <div className="security-recovery-heading">
-                        <ShieldAlert size={20} />
-                        <span>
-                          <strong>{securityWaiting ? '等待人工完成安全验证' : '安全限制未解除，任务未完成'}</strong>
-                          <small>{securityWaiting ? '所有新增访问已暂停；在受管浏览器完成验证后，本任务会自动继续。' : `已等待 ${securityTimeoutLabel}并停止新增访问；现有岗位卡和检查点均已保留。`}</small>
-                        </span>
-                        <em>{securityWaiting ? '等待中' : '待恢复'}</em>
-                      </div>
-                      <ol className="security-recovery-steps">
-                        <li className="done"><span><Check size={13} /></span><div><strong>访问熔断</strong><small>暂停所有采集 worker，避免继续触发限制</small></div></li>
-                        <li className="current"><span>2</span><div><strong>完成页面验证</strong><small>在受管浏览器中完成登录或安全验证</small></div></li>
-                        <li className={relaySiteReady ? 'done' : ''}><span>{relaySiteReady ? <Check size={13} /> : 3}</span><div><strong>检测 Relay</strong><small>{relaySiteReady ? 'Relay 与小红书页面已连通' : '确认 Relay 和小红书页面均可访问'}</small></div></li>
-                        <li className={securityTimedOut && activeJob.resumeAvailable && relaySiteReady ? 'current' : ''}><span>4</span><div><strong>{securityWaiting ? '自动恢复' : '检查点续跑'}</strong><small>{securityWaiting ? '验证解除后从当前任务继续' : '跳过已完成正文，仅采集剩余岗位'}</small></div></li>
-                      </ol>
-                      <div className="security-recovery-actions">
-                        <button type="button" onClick={() => void openRelayLogin()} disabled={relayLoginOpening}><ExternalLink size={15} />{relayLoginOpening ? '正在打开' : '打开验证页'}</button>
-                        <button type="button" className="primary-button" onClick={() => void draftGuard.requestTransition('刷新验证并继续原任务', () => refreshSecurityAndContinue(activeJob))} disabled={securityRecovering || submitting || (!securityJobRunning && !activeJob.resumeAvailable)} title={securityJobRunning ? '完成页面验证后刷新状态，当前任务会自动继续' : '完成页面验证后刷新 Relay，并自动从检查点续跑'}><RefreshCw className={securityRecovering ? 'spin' : ''} size={15} />{securityRecovering ? '正在刷新并恢复' : securityJobRunning ? '我已完成验证，刷新状态' : '我已完成验证，刷新并继续'}</button>
-                      </div>
-                      <p><ShieldCheck size={14} />不自动绕过验证，不在受限状态下反复请求；恢复时沿用已保存检查点。</p>
-                    </div>
-                  )}
-                  {rateLimitDetected && (
-                    <div className="rate-limit-recovery-panel" role="alert" aria-live="assertive">
-                      <div className="security-recovery-heading">
-                        <BellRing size={20} />
-                        <span>
-                          <strong>{rateLimitResuming ? '正在从限流检查点续跑' : rateLimitScheduled ? '平台限流，已排定自动续跑' : rateLimitWaiting ? '检测到平台限流，正在自动冷却' : '自动恢复次数已用完'}</strong>
-                          <small>{rateLimitResuming ? `正在执行第 ${Math.max(1, rateLimitAutoAttempt)} / ${rateLimitAutoMax} 轮检查点续跑，已有结果不会丢失。` : rateLimitScheduled ? `将执行第 ${rateLimitAutoAttempt + 1} / ${rateLimitAutoMax} 轮自动续跑，也可一键取消倒计时。` : rateLimitWaiting ? `进程内正在进行第 ${activeJob.rateLimit?.retryAttempt || 1} / ${activeJob.rateLimit?.maxRetries || 5} 次恢复探测，可一键跳过剩余冷却。` : '已完成内容和检查点均已保留，可一键重新探测并续跑。'}</small>
-                        </span>
-                        <em>{rateLimitResuming ? '续跑中' : rateLimitRecovering ? '自动处理' : '可手动恢复'}</em>
-                      </div>
-                      <ol className="security-recovery-steps rate-limit-recovery-steps">
-                        <li className="done"><span><Check size={13} /></span><div><strong>保存检查点</strong><small>帖子、评论与用户结果已落盘，不会重复丢失</small></div></li>
-                        <li className={rateLimitWaiting || rateLimitScheduled ? 'current' : 'done'}><span>{rateLimitWaiting || rateLimitScheduled ? '2' : <Check size={13} />}</span><div><strong>递增冷却</strong><small>{rateLimitWaiting ? `剩余约 ${activeJob.rateLimit?.retryAfterSeconds || 0} 秒后探测页面恢复` : rateLimitScheduled ? `自动续跑时间：${rateLimitNextRetryAt ? formatTime(rateLimitNextRetryAt) : '即将执行'}` : '自动冷却与探测已执行'}</small></div></li>
-                        <li className={rateLimitResuming || (!rateLimitRecovering && rateLimitReadyToResume) ? 'current' : ''}><span>3</span><div><strong>{rateLimitResuming ? '检查点续跑' : rateLimitRecovering ? '自动续采' : '一键续跑'}</strong><small>{rateLimitResuming ? '只处理未完成帖子、评论与用户资料' : rateLimitRecovering ? '页面恢复后自动从当前位置继续' : '重新探测并从未完成位置续跑'}</small></div></li>
-                      </ol>
-                      {!rateLimitResuming && <div className="security-recovery-actions">
-                        <button type="button" onClick={() => void openRelayLogin()} disabled={relayLoginOpening}><ExternalLink size={15} />{relayLoginOpening ? '正在打开' : '打开小红书检查页'}</button>
-                        <button type="button" className="primary-button" onClick={() => void resumeAudienceCollection(true, activeJob.id)} disabled={submitting || audienceResuming || !rateLimitManualAvailable} title="保留原任务与检查点，立即探测并续跑"><Play size={15} fill="currentColor" />{audienceResuming ? '正在执行' : rateLimitWaiting ? '跳过等待，立即探测' : rateLimitScheduled ? '取消倒计时并续跑' : '一键解除限流并继续'}</button>
-                      </div>}
-                      <p><Clock3 size={14} />{rateLimitDetectedAt ? `限流触发时间：${formatTime(rateLimitDetectedAt)}。` : ''}自动模式使用递增冷却、有限探测和持久化断点；手动按钮只跳过当前等待，不清空已采集结果。</p>
-                    </div>
-                  )}
-                  {activeOutcome === 'failed' && !rateLimitDetected && <div className="task-outcome-callout failed"><CircleAlert size={18} /><span><strong>执行失败</strong><small>{activeJob.message || (activeJob.resumeAvailable ? '任务因错误终止，检查点仍可用于重试。' : '任务因错误终止，请查看运行日志定位原因。')}</small></span></div>}
-                  {activeOutcome === 'incomplete' && !rateLimitDetected && <div className="task-outcome-callout incomplete"><Pause size={18} /><span><strong>任务未完成</strong><small>{activeJob.status === 'incomplete' ? activeAnalysisMode === 'general' ? '当前内容分析已生成，仍有正文、图片理解或 AI 模块待补全。' : '当前岗位卡与投递文案已生成，仍有岗位正文待补全。' : activeJob.status === 'interrupted' ? '运行被中断，已完成内容和检查点仍然保留。' : '任务被主动取消，已完成内容仍然保留。'}{activeJob.resumeAvailable ? ' 可从检查点续跑。' : ''}</small></span></div>}
-                  <ol className="pipeline agent-pipeline">
-                    {activeAgentStages.map((stage, index) => {
-                      const gateFailed = index === activeAgentStages.length - 1 && terminalAnalysisReady && coverage?.gatePassed === false
-                      const done = (terminalAnalysisReady || index < activeAgentIndex) && !gateFailed
-                      const current = activeJob.status === 'running' && activeAgentIndex === index
-                      return <li key={stage.name} className={gateFailed ? 'failed-stage' : done ? 'done' : current ? 'current' : ''}><span>{done ? <Check size={14} /> : gateFailed ? <CircleAlert size={14} /> : index + 1}</span><div><strong>{stage.name}</strong><small>{stage.description}</small></div>{current && <em>执行中</em>}{gateFailed && <em>{coverage?.issueCount ?? '-'} 项待复核</em>}</li>
-                    })}
-                  </ol>
+                  <JobJourneyPanel
+                    job={activeJob}
+                    mode={activeAnalysisMode}
+                    connectionState={displayJobConnectionState}
+                    lastEventAt={jobLastEventAt}
+                    now={clock}
+                    actionBusy={submitting || audienceResuming || relayLoginOpening || securityRecovering || journeyActionBusy}
+                    isProblemActionDisabled={(_problem, actionId) => actionId === 'open_login'
+                      ? relayLoginOpening || journeyActionBusy
+                      : actionId === 'check_recovery'
+                        ? submitting || audienceResuming || journeyActionBusy
+                        : submitting || journeyActionBusy || !activeJob.resumeAvailable}
+                    onProblemAction={(problem: UserProblem, actionId) => {
+                      if (actionId === 'open_login') {
+                        void performJourneyProblemAction(activeJob, problem, actionId)
+                        return
+                      }
+                      if (actionId === 'refresh_security') {
+                        void draftGuard.requestTransition('刷新验证并继续原任务', () => refreshSecurityAndContinue(activeJob))
+                        return
+                      }
+                      if (actionId === 'check_recovery' || actionId === 'resume') {
+                        void performJourneyProblemAction(activeJob, problem, actionId)
+                      }
+                    }}
+                  />
                   <div className="mission-meta"><div><span>开始时间（北京时间）</span><strong>{formatTime(activeJob.startedAt || activeJob.createdAt)}</strong></div><div><span>运行时长</span><strong>{elapsed(activeJob)}</strong></div></div>
                   {['queued', 'resuming', 'running'].includes(activeJob.status) && <button className="cancel-button" onClick={cancel}><Pause size={16} />终止任务</button>}
-                  {activeJob.resumeAvailable && !rateLimitDetected && (
-                    <div className="resume-strip">
-                      <span><RotateCcw size={18} /><span><strong>{activeJob.status === 'failed' ? '失败检查点已保留' : '未完成检查点已保留'}</strong><small>已采集 {activeJob.scrapedCount ?? 0} / {activeJob.discoveredCount ?? 0} 篇，{activeJob.status === 'failed' ? '重试' : '续跑'}会跳过已完成正文。</small></span></span>
-                      <button type="button" onClick={() => void resumeJob(activeJob)} disabled={submitting}><Play size={16} fill="currentColor" />{activeJob.status === 'failed' ? '从检查点重试' : '从检查点续跑'}</button>
-                    </div>
-                  )}
                 </>
               ) : (
                 <div className="empty-state"><SquareTerminal size={32} /><strong>等待任务</strong><span>配置关键词与采集参数后启动</span></div>
               )}
             </section>
 
-            <section className="panel log-panel">
-              <div className="panel-heading dark-heading">
-                <div><span className="step-label">LIVE OUTPUT</span><h2>运行日志</h2></div>
-                <span className="live-dot"><i />LIVE</span>
-              </div>
-              <div className="log-console" ref={logConsole} aria-live="polite">
-                {logs.length ? logs.map((line, index) => <p key={`${index}-${line}`}><span>{String(index + 1).padStart(2, '0')}</span>{line}</p>) : <div className="log-placeholder"><SquareTerminal size={25} /><span>任务日志将在这里实时流入</span></div>}
+            <details className="panel log-panel technical-details-panel">
+              <summary className="panel-heading dark-heading">
+                <div><span className="step-label">TECHNICAL DETAILS</span><h2>技术详情</h2><small>排查问题时再展开查看</small></div>
+                <span className="technical-details-toggle">{logs.length} 条记录<ChevronDown size={17} /></span>
+              </summary>
+              {activeJob && (
+                <dl className="technical-job-meta">
+                  <div><dt>任务 ID</dt><dd>{activeJob.id}</dd></div>
+                  <div><dt>运行批次</dt><dd>{activeJob.currentAttemptId || '-'}</dd></div>
+                  <div><dt>数据版本</dt><dd>{activeJob.revision ?? '-'}</dd></div>
+                  <div><dt>内部阶段</dt><dd>{activeJob.progressPhase || '-'}</dd></div>
+                  {activeJob.message && <div className="technical-job-error"><dt>原始信息</dt><dd>{activeJob.message}</dd></div>}
+                </dl>
+              )}
+              <div className="log-console" ref={logConsole}>
+                {logs.length ? logs.map((line, index) => <p key={`${index}-${line}`}><span>{String(index + 1).padStart(2, '0')}</span>{line}</p>) : <div className="log-placeholder"><SquareTerminal size={25} /><span>暂无技术日志</span></div>}
                 <div ref={logEnd} />
               </div>
-            </section>
+            </details>
           </div>
 
           <section className="panel coverage-panel" aria-label="结果覆盖">
@@ -5129,11 +5107,11 @@ function App() {
             </div>
           </section>
 
-          <section className="panel results-panel" id="results" aria-label={expansionModuleActive ? '关系扩散工作台' : audienceModuleActive ? '受众及用户界面结果' : activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
+          <section className="panel results-panel" id="results" aria-label={batchSurfaceActive ? '批量投递界面' : expansionModuleActive ? '关系扩散工作台' : audienceModuleActive ? '受众及用户界面结果' : activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
             <div className="panel-heading compact">
-              <div><span className="step-label">{expansionModuleActive ? 'RELATIONSHIP EXPANSION WORKSPACE' : audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{expansionModuleActive ? '关系扩散' : audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{expansionModuleActive ? <p className="result-heading-description">从当前任务已保存的帖子出发，多轮采集公开用户、帖子、评论与关系，并持续写回同一任务。</p> : audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
+              <div><span className="step-label">{batchSurfaceActive ? 'BATCH APPLICATION DELIVERY' : expansionModuleActive ? 'RELATIONSHIP EXPANSION WORKSPACE' : audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{batchSurfaceActive ? '批量投递工作台' : expansionModuleActive ? '关系扩散' : audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{batchSurfaceActive ? <p className="result-heading-description">从已保存正文中选择岗位，预检收件人、文案和附件后再分批发送。</p> : expansionModuleActive ? <p className="result-heading-description">从当前任务已保存的帖子出发，多轮采集公开用户、帖子、评论与关系，并持续写回同一任务。</p> : audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
               <div className="result-heading-meta">
-                <span className={`runtime-badge ${expansionStatus === 'completed' || audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{expansionModuleActive ? `多轮扩散 · ${expansionStatusText}` : audienceModuleActive ? `全量评论流 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · ${String(codexRuntime?.status || '等待结果')}`}</span>
+                <span className={`runtime-badge ${batchSurfaceActive || expansionStatus === 'completed' || audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{batchSurfaceActive ? '投递批次 · 发送前预检' : expansionModuleActive ? `多轮扩散 · ${expansionStatusText}` : audienceModuleActive ? `全量评论流 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · ${String(codexRuntime?.status || '等待结果')}`}</span>
                 <span className="count-badge">{expansionModuleActive ? Number((expansionSummary?.counters as Record<string, unknown> | undefined)?.users || 0) : audienceModuleActive ? audienceResults?.total ?? 0 : results?.total ?? activeJob?.applicationCount ?? 0}</span>
               </div>
             </div>
@@ -5194,13 +5172,36 @@ function App() {
                   anchor: target.anchor,
                 })
               }}
-            /> : <>{completionFlow && <MissingCompletionFlowPanel
+            /> : <>{!batchSurfaceActive && completionFlow && <MissingCompletionFlowPanel
               flow={completionFlow}
               job={completionFlow.jobId === activeJob?.id ? activeJob : null}
               noun={activeAnalysisMode === 'general' ? '内容分析' : '岗位信息'}
               onDismiss={() => setCompletionFlow(null)}
             />}
-            {!results?.available ? (
+            {batchSurfaceActive && <div className="batch-workspace-screen">
+              <div className="batch-screen-toolbar">
+                <div><span className="step-label">独立投递界面</span><h3>选择、预检、审批、发送</h3><p>岗位正文和已生成文案继续使用当前任务的已保存版本，不会重新采集或覆盖。</p></div>
+                <div className="batch-screen-actions">
+                  <label><span>岗位任务</span><select aria-label="批量投递使用的岗位任务" value={activeJob?.id || ''} onChange={(event) => {
+                    const nextJob = workspaceJobs.find((job) => job.id === event.target.value)
+                    if (nextJob) void selectJob(nextJob)
+                  }}><option value="" disabled>选择岗位任务</option>{workspaceJobs.map((job) => <option key={job.id} value={job.id}>{job.keyword || '未命名任务'} · {statusText[job.status]}</option>)}</select></label>
+                  <button type="button" onClick={() => switchApplicationView('jobs')}><Target size={15} />返回岗位投递</button>
+                </div>
+              </div>
+              {activeJob ? <BatchApplicationPanel
+                standalone
+                jobId={activeJob.id}
+                items={results?.items || []}
+                aiSessionId={aiSession?.id}
+                onOpenItem={(item) => {
+                  performChooseResult(item)
+                  performSwitchApplicationView('jobs')
+                  window.requestAnimationFrame(() => document.querySelector('.result-detail')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+                }}
+              /> : <div className="result-empty"><Send size={28} /><strong>请先在岗位投递界面选择一个任务</strong></div>}
+            </div>}
+            {!batchSurfaceActive && (!results?.available ? (
               <div className="result-empty">{activeAnalysisMode === 'general' ? <BookOpenCheck size={28} /> : <UserRoundSearch size={28} />}<strong>{resultsLoading ? '正在读取分析结果' : ['resuming', 'running'].includes(activeJob?.status || '') ? activeAnalysisMode === 'general' ? '发现内容后将自动采集正文、图片并生成 AI 模块' : '发现岗位后将自动解析到这里' : '当前任务还没有结构化分析结果'}</strong></div>
             ) : activeAnalysisMode === 'general' ? (
               <GeneralResultsWorkspace
@@ -5280,6 +5281,7 @@ function App() {
                               <i className={item.delivery?.action === 'email_sent' ? 'sent' : draftQualityVerified ? 'ready' : ''}>{draftState}</i>
                             </span>
                             <small>{item.publish_time?.value || '日期待核验'} · {missingJobBody || draftQualityStale ? '-' : item.cover_letter_evaluation?.score ?? '-'} 分 · {routeLabels.length ? [...new Set(routeLabels)].join(' / ') : '投递方式待确认'}</small>
+                            <small className={`result-card-body-status ${item.body?.trim() ? 'ready' : 'pending'}`}>{item.body?.trim() ? `正文已保存 · ${item.body.trim().replace(/\s+/gu, ' ').slice(0, 140)}${item.body.trim().length > 140 ? '…' : ''}` : '正文待续采'}</small>
                             </span>
                           </button>
                         </div>
@@ -5330,7 +5332,10 @@ function App() {
                       <section><h4>岗位要求</h4>{selectedResult.application_info.requirements.length ? <ul>{selectedResult.application_info.requirements.map((item, index) => <li key={index}>{item.text}</li>)}</ul> : <p>正文未识别到明确要求</p>}</section>
                       <section className="capability-section"><h4>关键能力</h4>{selectedResult.job_capabilities?.length ? <ul>{selectedResult.job_capabilities.map((item) => <li key={item.id}><strong>{item.capability}</strong><span>{item.why_it_matters}</span></li>)}</ul> : <p>等待 AI 提炼岗位能力</p>}</section>
                       <section className="route-section"><h4>AI 提取并复核的投递方式</h4>{selectedDeliveryRoutes.length ? <ul>{selectedDeliveryRoutes.map((route, index) => <li key={`${route.channel}-${route.target}-${index}`} className={route.actionable ? '' : 'needs-review'}><strong>{route.channel === 'email' ? <Mail size={14} /> : route.channel === 'direct_message' ? <MessageSquare size={14} /> : <ExternalLink size={14} />}{route.label}</strong><span><span className="route-target-row">{route.channel === 'link' && route.actionable ? <a href={route.target} target="_blank" rel="noreferrer">{route.target}<ExternalLink size={12} /></a> : <b>{route.target}</b>}<i className={route.actionable ? 'verified' : 'review'}>{routeVerificationLabel(route)}</i>{route.sourceImageIndex ? <button type="button" onClick={() => openImagePreview(selectedResult.title || '未命名岗位', selectedResult.media?.images || [], route.sourceImageIndex! - 1)}>查看图 {route.sourceImageIndex}</button> : null}</span><small>{route.confidence !== undefined ? `AI 置信度 ${route.confidence}% · ` : ''}{route.evidence || routeVerificationLabel(route)}</small></span></li>)}</ul> : <p>{selectedResult.media?.analysis?.application_requested_in_image ? '原文提示投递方式见图，但图片中没有识别到足够清晰的邮箱或链接，请打开原图人工核对。' : '原文未提供明确投递方式，发送操作保持关闭。'}</p>}</section>
-                      <section className="body-section"><h4>采集正文</h4><p>{selectedResult.body || '正文尚未采集'}</p></section>
+                      <section className="body-section full-body-section" aria-label="采集正文">
+                        <div className="body-section-heading"><span><FileText size={14} /><h4>采集正文</h4><small>{selectedResult.body?.trim() ? `${selectedResult.body.trim().length} 字 · 已保存` : '尚未采集'}</small></span><button type="button" title="复制采集正文" aria-label="复制采集正文" disabled={!selectedResult.body?.trim()} onClick={() => copyText(selectedResult.body?.trim() || '')}><Copy size={14} /></button></div>
+                        {selectedResult.body?.trim() ? <pre className="body-text-block">{selectedResult.body.trim()}</pre> : <p className="body-empty">正文尚未采集；卡片和图片结果仍已保留，可从“续采正文并解析”继续。</p>}
+                      </section>
                     </div>
                     <div className="draft-stack">
                       <div className="draft-toolbar">
@@ -5403,7 +5408,7 @@ function App() {
                 ) : <div className="result-empty"><FileText size={28} /><strong>选择一个岗位查看详情</strong></div>}
               </div>
               </>
-            )}</>)}
+            ))}</>)}
           </section>
 
           <div className="secondary-grid">

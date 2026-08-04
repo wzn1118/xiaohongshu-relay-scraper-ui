@@ -17,6 +17,33 @@ def _toml_value(value: Any) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def current_codex_provider_settings() -> dict[str, Any]:
+    """Load the active relay and login used by isolated Codex runs."""
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    try:
+        config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, tomllib.TOMLDecodeError):
+        return {}
+
+    provider_name = _text(config.get("model_provider"))
+    provider = (config.get("model_providers") or {}).get(provider_name, {})
+    if not provider_name or not isinstance(provider, dict):
+        return {}
+    try:
+        auth = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        auth = {}
+
+    return {
+        "provider": "codex",
+        "provider_name": provider_name,
+        "api_key": _text(auth.get("OPENAI_API_KEY")) if isinstance(auth, dict) else "",
+        "base_url": _text(provider.get("base_url")),
+        "model": _text(config.get("model")),
+        "wire_api": _text(provider.get("wire_api")) or "responses",
+    }
+
+
 def current_codex_runtime_args() -> list[str]:
     """Forward the supported local config.toml settings to an isolated CLI call."""
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))

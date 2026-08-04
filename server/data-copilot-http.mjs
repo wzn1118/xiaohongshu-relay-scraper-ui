@@ -39,6 +39,91 @@ export async function handleDataCopilotRequest({
       return true;
     }
 
+    if (parts.length === 3 && parts[2] === 'usage' && method === 'GET') {
+      writeJson(res, 200, service.getUsage({
+        conversationId: url.searchParams.get('conversationId'),
+        runId: url.searchParams.get('runId'),
+      }));
+      return true;
+    }
+
+    if (parts.length === 3 && parts[2] === 'traces' && method === 'GET') {
+      writeJson(res, 200, service.listTraces({
+        conversationId: url.searchParams.get('conversationId'),
+        runId: url.searchParams.get('runId'),
+        limit: url.searchParams.get('limit'),
+      }));
+      return true;
+    }
+
+    if (parts.length === 3 && parts[2] === 'snapshots' && method === 'GET') {
+      writeJson(res, 200, service.listSnapshots({
+        jobId: url.searchParams.get('jobId'),
+        limit: url.searchParams.get('limit'),
+      }));
+      return true;
+    }
+
+    if (parts.length === 4 && parts[2] === 'snapshots' && parts[3] === 'diff' && method === 'GET') {
+      writeJson(res, 200, service.diffSnapshots({
+        jobId: url.searchParams.get('jobId'),
+        from: url.searchParams.get('from'),
+        to: url.searchParams.get('to'),
+      }));
+      return true;
+    }
+
+    if (parts.length === 5 && parts[2] === 'snapshots' && method === 'GET') {
+      writeJson(res, 200, service.getSnapshot(parts[3], parts[4]));
+      return true;
+    }
+
+    if (parts.length === 3 && parts[2] === 'evaluations' && method === 'GET') {
+      writeJson(res, 200, service.listEvaluations({
+        suite: url.searchParams.get('suite'),
+        limit: url.searchParams.get('limit'),
+      }));
+      return true;
+    }
+
+    if (parts.length === 4 && parts[2] === 'evaluations' && parts[3] === 'golden' && method === 'POST') {
+      writeJson(res, 201, await service.runGoldenEvaluation());
+      return true;
+    }
+
+    if (parts.length === 5 && parts[2] === 'workbench' && parts[3] === 'tools' && method === 'POST') {
+      writeJson(res, 200, await service.executeWorkbenchTool(parts[4], await readJsonBody(req, maxBodyBytes)));
+      return true;
+    }
+
+    if (parts.length === 4 && parts[2] === 'workbench' && parts[3] === 'runs' && method === 'POST') {
+      writeJson(res, 200, await service.executeWorkbenchGraph(await readJsonBody(req, maxBodyBytes)));
+      return true;
+    }
+
+    if (parts.length === 4 && parts[2] === 'agent-runs' && method === 'GET') {
+      writeJson(res, 200, service.getWorkbenchRun(parts[3]));
+      return true;
+    }
+
+    if (parts.length === 5 && parts[2] === 'agent-runs' && method === 'POST') {
+      const body = await readJsonBody(req, maxBodyBytes);
+      if (parts[4] === 'pause') writeJson(res, 202, service.pauseWorkbenchRun(parts[3]));
+      else if (parts[4] === 'resume') writeJson(res, 200, await service.resumeWorkbenchRun(parts[3], body));
+      else if (parts[4] === 'cancel') writeJson(res, 202, service.cancelWorkbenchRun(parts[3]));
+      else if (parts[4] === 'steer') writeJson(res, 200, await service.steerWorkbenchRun(parts[3], body));
+      else writeJson(res, 404, { error: { code: 'COPILOT_ROUTE_NOT_FOUND', message: 'Data Copilot run action was not found.' } });
+      return true;
+    }
+
+    if (parts.length === 5 && parts[2] === 'runs' && parts[3] && parts[4] === 'events' && method === 'GET') {
+      writeJson(res, 200, await service.listRunEvents(parts[3], {
+        afterSeq: url.searchParams.get('afterSeq'),
+        limit: url.searchParams.get('limit'),
+      }));
+      return true;
+    }
+
     if (parts.length === 3 && parts[2] === 'context' && method === 'GET') {
       writeJson(res, 200, await service.listContextRecords({
         jobId: url.searchParams.get('jobId'),
@@ -83,6 +168,14 @@ export async function handleDataCopilotRequest({
         writeJson(res, 200, await service.getConversation(conversationId));
         return true;
       }
+      if (parts.length === 4 && method === 'PATCH') {
+        writeJson(res, 200, await service.updateConversation(conversationId, await readJsonBody(req, maxBodyBytes)));
+        return true;
+      }
+      if (parts.length === 4 && method === 'DELETE') {
+        writeJson(res, 200, await service.deleteConversation(conversationId));
+        return true;
+      }
       if (parts.length === 5 && parts[4] === 'messages') {
         if (method === 'GET') {
           writeJson(res, 200, await service.listMessages(conversationId, {
@@ -97,8 +190,64 @@ export async function handleDataCopilotRequest({
           return true;
         }
       }
+      if (parts.length === 5 && parts[4] === 'runs' && method === 'GET') {
+        writeJson(res, 200, await service.listRuns(conversationId, {
+          afterSequence: url.searchParams.get('afterSequence'),
+          limit: url.searchParams.get('limit'),
+        }));
+        return true;
+      }
       if (parts.length === 5 && parts[4] === 'events' && method === 'GET') {
-        await openEventStream(req, res, service, conversationId);
+        if (url.searchParams.get('format') === 'json' || url.searchParams.get('stream') === '0') {
+          writeJson(res, 200, await service.listEvents(conversationId, {
+            afterSeq: url.searchParams.get('afterSeq') || url.searchParams.get('afterEventId'),
+            limit: url.searchParams.get('limit'),
+          }));
+        } else {
+          await openEventStream(req, res, service, conversationId);
+        }
+        return true;
+      }
+      if (parts.length === 5 && parts[4] === 'context' && method === 'GET') {
+        writeJson(res, 200, await service.buildWorkingSet(conversationId, {
+          kind: url.searchParams.get('kind'),
+          query: url.searchParams.get('query'),
+          tools: url.searchParams.getAll('tool'),
+          budget: url.searchParams.get('budget'),
+        }));
+        return true;
+      }
+      if (parts.length === 5 && parts[4] === 'context-pins') {
+        if (method === 'GET') {
+          writeJson(res, 200, await service.listContextPins(conversationId));
+          return true;
+        }
+        if (method === 'POST') {
+          writeJson(res, 201, await service.pinContext(conversationId, await readJsonBody(req, maxBodyBytes)));
+          return true;
+        }
+      }
+      if (parts.length === 6 && parts[4] === 'context-pins' && method === 'DELETE') {
+        writeJson(res, 200, await service.removeContextPin(conversationId, parts[5]));
+        return true;
+      }
+      if (parts.length === 6 && parts[4] === 'runs' && method === 'GET') {
+        writeJson(res, 200, service.getWorkbenchRun(parts[5], conversationId));
+        return true;
+      }
+      if (parts.length === 7 && parts[4] === 'runs' && method === 'POST') {
+        const runId = parts[5];
+        const body = await readJsonBody(req, maxBodyBytes);
+        const state = service.getWorkbenchRun(runId, conversationId);
+        if (parts[6] === 'pause') writeJson(res, 202, service.pauseWorkbenchRun(state.run.runId));
+        else if (parts[6] === 'resume') writeJson(res, 200, await service.resumeWorkbenchRun(state.run.runId, body));
+        else if (parts[6] === 'cancel') writeJson(res, 202, service.cancelWorkbenchRun(state.run.runId));
+        else if (parts[6] === 'steer') writeJson(res, 200, await service.steerWorkbenchRun(state.run.runId, body));
+        else writeJson(res, 404, { error: { code: 'COPILOT_ROUTE_NOT_FOUND', message: 'Data Copilot run action was not found.' } });
+        return true;
+      }
+      if (parts.length === 5 && parts[4] === 'verify' && method === 'POST') {
+        writeJson(res, 200, service.verifyAnswer(await readJsonBody(req, maxBodyBytes)));
         return true;
       }
       if (parts.length === 5 && parts[4] === 'mcp' && method === 'POST') {
@@ -127,6 +276,14 @@ export async function handleDataCopilotRequest({
           idempotencyKey: header(req, 'idempotency-key') || undefined,
         });
         writeJson(res, 201, result);
+        return true;
+      }
+      if (parts.length === 5 && parts[4] === 'artifacts' && method === 'POST') {
+        writeJson(res, 201, await service.createArtifact(conversationId, await readJsonBody(req, maxBodyBytes)));
+        return true;
+      }
+      if (parts.length === 6 && parts[4] === 'snapshot' && parts[5] === 'upgrade' && method === 'POST') {
+        writeJson(res, 201, await service.upgradeConversationSnapshot(conversationId, await readJsonBody(req, maxBodyBytes)));
         return true;
       }
       if (

@@ -49,6 +49,11 @@ import { createPreflightService } from './preflight-service.mjs';
 import { AudienceAiService } from './audience-ai-service.mjs';
 import { createAudienceAiProfileRunner } from './lib/audience-ai-profile-runner.mjs';
 import { handleDataCopilotRequest } from './data-copilot-http.mjs';
+import { writeCopilotJsonAtomically } from './data-copilot-store.mjs';
+import { ApplicationBatchManager } from './application-batch-manager.mjs';
+import { ApplicationBatchService, ApplicationBatchServiceError } from './application-batch-service.mjs';
+import { detectApplicationAttachmentRule } from './lib/application-attachment-rule.mjs';
+import { enrichApplicationRecordContacts } from './lib/application-contact-resolver.mjs';
 import {
   AudienceAiValidationError,
   validateAudienceAiEmptyRequest,
@@ -76,6 +81,85 @@ const APPLICATION_ATTACHMENT_MEDIA_TYPES = Object.freeze({
   '.jpeg': 'image/jpeg',
 });
 const APPLICATION_RECORD_INDEX = Symbol('applicationRecordIndex');
+
+export function createPersistentSmtpSendGate({
+  filePath,
+  withLock = async (operation) => operation(),
+  now = () => new Date(),
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+} = {}) {
+  const target = String(filePath || '').trim();
+  if (!target) throw smtpSendGateError('SMTP_SEND_GATE_PATH_REQUIRED', 'SMTP send gate path is required.');
+  if (typeof withLock !== 'function' || typeof now !== 'function' || typeof sleep !== 'function') {
+    throw smtpSendGateError('SMTP_SEND_GATE_CONFIG_INVALID', 'SMTP send gate callbacks are invalid.');
+  }
+  const resolvedPath = path.resolve(target);
+  const acquire = async (rawMinIntervalMs = 0) => {
+    const parsedInterval = Number(rawMinIntervalMs);
+    const minIntervalMs = Number.isSafeInteger(parsedInterval)
+      ? Math.min(60_000, Math.max(0, parsedInterval))
+      : 0;
+    const scheduledAtMs = await withLock(async () => {
+      const currentMs = smtpSendGateClock(now);
+      const state = await readSmtpSendGateState(resolvedPath);
+      const scheduled = Math.max(currentMs, state?.nextAllowedAtMs || 0);
+      await writeCopilotJsonAtomically(resolvedPath, {
+        schemaVersion: 1,
+        nextAllowedAt: new Date(scheduled + minIntervalMs).toISOString(),
+        reservedAt: new Date(currentMs).toISOString(),
+        minIntervalMs,
+      });
+      return scheduled;
+    });
+    const waitMs = Math.max(0, scheduledAtMs - smtpSendGateClock(now));
+    if (waitMs > 0) await sleep(waitMs);
+    return {
+      scheduledAt: new Date(scheduledAtMs).toISOString(),
+      minIntervalMs,
+      waitedMs: waitMs,
+    };
+  };
+  return { filePath: resolvedPath, acquire };
+}
+
+async function readSmtpSendGateState(filePath) {
+  let text;
+  try {
+    text = await readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw smtpSendGateError('SMTP_SEND_GATE_READ_FAILED', 'SMTP send gate state could not be read.', error);
+  }
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw smtpSendGateError('SMTP_SEND_GATE_STATE_INVALID', 'SMTP send gate state is invalid JSON.', error);
+  }
+  const nextAllowedAtMs = Date.parse(String(value?.nextAllowedAt || ''));
+  if (value?.schemaVersion !== 1 || !Number.isFinite(nextAllowedAtMs)) {
+    throw smtpSendGateError('SMTP_SEND_GATE_STATE_INVALID', 'SMTP send gate state is invalid.');
+  }
+  return { nextAllowedAtMs };
+}
+
+function smtpSendGateClock(now) {
+  const value = now();
+  const milliseconds = (value instanceof Date ? value : new Date(value)).getTime();
+  if (!Number.isFinite(milliseconds)) {
+    throw smtpSendGateError('SMTP_SEND_GATE_CLOCK_INVALID', 'SMTP send gate clock returned an invalid value.');
+  }
+  return milliseconds;
+}
+
+function smtpSendGateError(code, message, cause = undefined) {
+  const error = new Error(message, cause === undefined ? undefined : { cause });
+  error.code = code;
+  error.status = 500;
+  error.safeToRetry = true;
+  error.deliveryStatus = 'not_sent';
+  return error;
+}
 const APPLICATION_ARTIFACT_FILENAME = Symbol('applicationArtifactFilename');
 const CONTENT_RESEARCH_LABELS = Object.freeze({
   auto: 'AI 自动识别',
@@ -145,6 +229,111 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     const current = smtpOperationTail.catch(() => {}).then(operation);
     smtpOperationTail = current.catch(() => {});
     return current;
+  };
+  const smtpSendGate = String(config?.smtpConfigPath || '').trim()
+    ? createPersistentSmtpSendGate({
+        filePath: path.join(path.dirname(config.smtpConfigPath), 'smtp-send-gate.json'),
+        withLock: withSmtpOperationLock,
+      })
+    : null;
+  const applicationBatchServices = new Map();
+  const getApplicationBatchService = async (jobId, internal) => {
+    const cacheKey = path.resolve(internal.outputDir);
+    if (!applicationBatchServices.has(cacheKey)) {
+      const pending = (async () => {
+        const batchManager = new ApplicationBatchManager({ rootDir: internal.outputDir });
+        await batchManager.initialize();
+        const fallbackOutputDirs = audienceHistoryJobIds(
+          manager,
+          audienceContentSourceJobId(manager, jobId),
+          jobId,
+        )
+          .map((historyJobId) => manager.getInternal(historyJobId)?.outputDir)
+          .filter((outputDir) => outputDir && path.resolve(outputDir) !== cacheKey);
+        const loadRecord = async (noteId) => {
+          const record = await readApplicationRecord(internal.outputDir, noteId);
+          const state = await readDeliveryState(internal.outputDir);
+          return mergeApplicationState(
+            record,
+            state[noteId],
+            record[APPLICATION_RECORD_INDEX],
+            record[APPLICATION_ARTIFACT_FILENAME],
+          );
+        };
+        const replyTo = String(internal.params?.candidateProfile?.email || '').trim();
+        return new ApplicationBatchService({
+          jobId,
+          outputDir: internal.outputDir,
+          manager: batchManager,
+          candidateProfile: internal.params?.candidateProfile,
+          fallbackOutputDirs,
+          loadRecord,
+          listAttachments: (noteId) => listApplicationAttachments(
+            internal.outputDir,
+            noteId,
+            deliveryAttachmentLimits,
+          ),
+          renameAttachment: (attachmentId, displayName) => mutateApplicationAttachments(
+            internal.outputDir,
+            deliveryStateWriter,
+            () => updateApplicationAttachment(
+              internal.outputDir,
+              attachmentId,
+              { displayName },
+              deliveryAttachmentLimits,
+            ),
+          ),
+          checkQuality: async (noteId, attachmentIds, aiSessionId) => {
+            const record = await loadRecord(noteId);
+            const ai = resolveDraftAiRuntime(aiSessions, internal, { aiSessionId });
+            return recheckApplicationDraft(
+              internal.outputDir,
+              {
+                noteId,
+                draftId: record.draftVersion?.draftId,
+                version: record.draftVersion?.version,
+                attachmentIds,
+              },
+              checkDraftQuality,
+              ai,
+              internal.params?.candidateProfile,
+              deliveryStateWriter,
+              deliveryAttachmentLimits,
+            );
+          },
+          previewEmail: (value, allowedRecipients) => previewApplicationEmail(
+            internal.outputDir,
+            value,
+            replyTo,
+            deliveryMailer,
+            smtpConfig,
+            deliveryAttachmentLimits,
+            deliveryStateWriter,
+            { allowedRecipients },
+          ),
+          sendEmail: (value, allowedRecipients) => withSmtpOperationLock(() => sendApplicationEmail(
+            internal.outputDir,
+            value,
+            deliveryMailer,
+            replyTo,
+            smtpConfig,
+            {
+              writeState: deliveryStateWriter,
+              appendAudit: sendAuditAppender,
+              readAudit: sendAuditReader,
+              attachmentLimits: deliveryAttachmentLimits,
+              allowedRecipients,
+            },
+          )),
+          acquireSendSlot: smtpSendGate?.acquire,
+        });
+      })().catch((error) => {
+        applicationBatchServices.delete(cacheKey);
+        throw error;
+      });
+      applicationBatchServices.set(cacheKey, pending);
+    }
+    return applicationBatchServices.get(cacheKey);
   };
   return async function app(req, res) {
     const requestStartedAt = performance.now();
@@ -439,6 +628,167 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           return json(res, 404, errorBody('NOT_FOUND', 'Task not found.'));
         }
         if (req.method === 'GET' && parts.length === 3) return json(res, 200, manager.get(id));
+        if (req.method === 'GET' && parts[3] === 'experience-snapshot' && parts.length === 4) {
+          const job = manager.get(id);
+          return json(res, 200, job.experienceSnapshot || job.experience);
+        }
+        if (req.method === 'GET' && parts[3] === 'issues' && parts.length === 4) {
+          const job = manager.get(id);
+          const snapshot = job.experienceSnapshot || job.experience;
+          return json(res, 200, {
+            jobId: id,
+            throughSequence: Number(snapshot?.throughSequence || 0),
+            issues: Array.isArray(snapshot?.issues) ? snapshot.issues : [],
+          });
+        }
+        if (req.method === 'GET' && parts[3] === 'technical-diagnostics' && parts.length === 4) {
+          return json(res, 200, experienceDiagnostics(manager.get(id), diagnostics));
+        }
+        if (req.method === 'POST' && parts[3] === 'actions' && parts[4] === 'retry-stage' && parts.length === 5) {
+          const body = validateExperienceActionBody(
+            await readJsonBody(req, config.maxBodyBytes),
+            new Set(['stage', 'aiSessionId', 'idempotencyKey']),
+          );
+          const currentJob = manager.get(id);
+          const snapshot = currentJob.experienceSnapshot || currentJob.experience;
+          const stage = validateExperienceStage(
+            body.stage || snapshot?.activeStage || snapshot?.issues?.[0]?.affectedStage || 'task',
+          );
+          const scope = experienceResumeScope(stage);
+          const options = validateResumeRequest({
+            scope,
+            ...(Object.hasOwn(body, 'aiSessionId') ? { aiSessionId: body.aiSessionId } : {}),
+            ...(Object.hasOwn(body, 'idempotencyKey') ? { idempotencyKey: body.idempotencyKey } : {}),
+          });
+          try {
+            const resumeCheckpointJobIds = scope === 'audience'
+              ? (await resolveAudienceResumeOwner(manager, id)).readThroughJobIds
+              : [];
+            const job = await manager.resume(id, {
+              ...options,
+              requestedBy: 'experience_retry_stage_api',
+              ...(resumeCheckpointJobIds.length ? { resumeCheckpointJobIds } : {}),
+            });
+            return json(res, 202, {
+              action: 'started',
+              jobId: id,
+              stage,
+              scope,
+              job,
+              snapshot: job.experienceSnapshot || job.experience || snapshot,
+            });
+          } catch (error) {
+            const failure = experienceActionFailure(error, currentJob);
+            if (!failure) throw error;
+            return json(res, failure.status, failure.body);
+          }
+        }
+        if (req.method === 'POST' && parts[3] === 'actions' && parts[4] === 'check-recovery' && parts.length === 5) {
+          const body = validateExperienceActionBody(
+            await readJsonBody(req, config.maxBodyBytes),
+            new Set(['idempotencyKey']),
+          );
+          const currentJob = manager.get(id);
+          const snapshot = currentJob.experienceSnapshot || currentJob.experience;
+          const issue = Array.isArray(snapshot?.issues)
+            ? snapshot.issues.find((item) => item?.code === 'RATE_LIMITED') || snapshot.issues[0]
+            : null;
+          const stage = validateExperienceStage(issue?.affectedStage || snapshot?.activeStage || 'body');
+          const scope = experienceResumeScope(stage);
+          try {
+            if (typeof manager.signalRateLimitRecovery === 'function') {
+              const signal = await manager.signalRateLimitRecovery(id, {
+                idempotencyKey: body.idempotencyKey,
+              });
+              if (signal?.signaled) {
+                const job = signal.job || manager.get(id);
+                return json(res, 202, {
+                  action: 'signaled',
+                  jobId: id,
+                  stage,
+                  scope,
+                  job,
+                  snapshot: job?.experienceSnapshot || job?.experience || snapshot,
+                });
+              }
+            }
+            if (ACTIVE_JOB_STATUSES.has(currentJob.status)) {
+              return json(res, 200, {
+                action: 'attached',
+                jobId: id,
+                stage,
+                scope,
+                job: currentJob,
+                snapshot,
+              });
+            }
+            const options = validateResumeRequest({
+              scope,
+              ...(Object.hasOwn(body, 'idempotencyKey') ? { idempotencyKey: body.idempotencyKey } : {}),
+            });
+            const resumeCheckpointJobIds = scope === 'audience'
+              ? (await resolveAudienceResumeOwner(manager, id)).readThroughJobIds
+              : [];
+            const job = await manager.resume(id, {
+              ...options,
+              requestedBy: 'experience_check_recovery_api',
+              forceCompleted: true,
+              rateLimitRecoveryMode: 'manual',
+              ...(resumeCheckpointJobIds.length ? { resumeCheckpointJobIds } : {}),
+            });
+            return json(res, 202, {
+              action: 'started',
+              jobId: id,
+              stage,
+              scope,
+              job,
+              snapshot: job.experienceSnapshot || job.experience || snapshot,
+            });
+          } catch (error) {
+            const failure = experienceActionFailure(error, currentJob);
+            if (!failure) throw error;
+            return json(res, failure.status, failure.body);
+          }
+        }
+        if (req.method === 'POST' && parts[3] === 'actions' && parts[4] === 'open-login' && parts.length === 5) {
+          validateExperienceActionBody(await readJsonBody(req, config.maxBodyBytes), new Set());
+          const currentJob = manager.get(id);
+          const configured = getRelayConfig();
+          const profile = String(configured.profile || 'openclaw').trim();
+          const urlToOpen = 'https://www.xiaohongshu.com';
+          if (!/^[\p{L}\p{N}_.-]+$/u.test(profile)) {
+            return json(res, 400, experienceErrorPayload('INVALID_PROFILE', 'Invalid browser profile.', currentJob));
+          }
+          const connection = await relayRuntime.connect({ port: Number(configured.port), profile });
+          if (!connection.ready && !(connection.running && connection.cdpReady)) {
+            return json(res, 503, experienceErrorPayload(
+              'RELAY_DISCONNECTED',
+              connection.message || 'The collection browser is not ready.',
+              currentJob,
+            ));
+          }
+          const opened = await relayLoginOpener({
+            port: Number(configured.port),
+            openClawConfigPath: config.openClawConfigPath,
+            profile,
+            url: urlToOpen,
+          });
+          if (!opened.opened) {
+            return json(res, 503, experienceErrorPayload(
+              'LOGIN_PAGE_UNAVAILABLE',
+              opened.message || 'The login page could not be opened.',
+              currentJob,
+            ));
+          }
+          return json(res, 200, {
+            action: 'opened',
+            jobId: id,
+            opened: true,
+            profile,
+            url: urlToOpen,
+            message: opened.message || 'Login page opened.',
+          });
+        }
         if (req.method === 'POST' && parts[3] === 'resume' && parts.length === 4) {
           const options = validateResumeRequest(await readJsonBody(req, config.maxBodyBytes));
           const resumeCheckpointJobIds = ['audience', 'full'].includes(options.scope)
@@ -527,7 +877,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           const result = await manager.cancel(id);
           return json(res, 202, { ...result.job, cancelRequested: result.changed });
         }
-        if (req.method === 'GET' && parts[3] === 'events' && parts.length === 4) return streamEvents(req, res, manager, id);
+        if (req.method === 'GET' && parts[3] === 'events' && parts.length === 4) return streamEvents(req, res, manager, id, url.searchParams);
         if (req.method === 'GET' && parts[3] === 'logs' && parts.length === 4) {
           const maxBytes = 256 * 1024;
           try {
@@ -665,7 +1015,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             throw error;
           }
           if (rateLimitRecovery && typeof manager.signalRateLimitRecovery === 'function') {
-            const recoverySignal = await manager.signalRateLimitRecovery(id);
+            const recoverySignal = await manager.signalRateLimitRecovery(id, {
+              idempotencyKey: resumeOptions.idempotencyKey,
+            });
             if (recoverySignal.signaled) {
               return json(res, 202, {
                 action: 'signaled',
@@ -972,6 +1324,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           const body = await readJsonBody(req, config.maxBodyBytes);
           return json(res, 200, await updateApplicationDraft(internal.outputDir, body, deliveryStateWriter));
         }
+        if (req.method === 'POST' && parts[3] === 'application-generation' && parts[4] === 'writeback' && parts.length === 5) {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          return json(res, 200, await writeApplicationGeneration(internal.outputDir, body, deliveryStateWriter));
+        }
         if (req.method === 'POST' && parts[3] === 'draft' && parts[4] === 'quality' && parts.length === 5) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           const ai = resolveDraftAiRuntime(aiSessions, internal, body);
@@ -984,6 +1340,49 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             deliveryStateWriter,
             deliveryAttachmentLimits,
           ));
+        }
+        if (parts[3] === 'application-batches') {
+          const service = await getApplicationBatchService(id, internal);
+          if (req.method === 'POST' && parts[4] === 'dry-run' && parts.length === 5) {
+            return json(res, 200, await service.dryRun(await readJsonBody(req, config.maxBodyBytes)));
+          }
+          if (req.method === 'GET' && parts.length === 4) {
+            return json(res, 200, { batches: await service.listBatches() });
+          }
+          if (req.method === 'POST' && parts.length === 4) {
+            const result = await service.createBatch(await readJsonBody(req, config.maxBodyBytes));
+            return json(res, result.idempotentReplay ? 200 : 201, result);
+          }
+          const batchId = String(parts[4] || '').trim();
+          if (req.method === 'GET' && batchId && parts.length === 5) {
+            return json(res, 200, await service.getBatch(batchId));
+          }
+          if (req.method === 'GET' && batchId && parts[5] === 'events' && parts.length === 6) {
+            return await streamApplicationBatchEvents(req, res, service, batchId, url.searchParams);
+          }
+          if (
+            req.method === 'POST'
+            && batchId
+            && parts[5] === 'items'
+            && parts[6]
+            && parts[7] === 'reconcile'
+            && parts.length === 8
+          ) {
+            return json(
+              res,
+              200,
+              await service.reconcileItem(batchId, String(parts[6]).trim(), await readJsonBody(req, config.maxBodyBytes)),
+            );
+          }
+          if (req.method === 'POST' && batchId && parts.length === 6) {
+            const body = await readJsonBody(req, config.maxBodyBytes);
+            if (parts[5] === 'approve') return json(res, 200, await service.approveBatch(batchId, body));
+            if (parts[5] === 'start' || parts[5] === 'resume') {
+              return json(res, 202, await service.startBatch(batchId, body));
+            }
+            if (parts[5] === 'pause') return json(res, 202, await service.pauseBatch(batchId, body));
+            if (parts[5] === 'cancel') return json(res, 202, await service.cancelBatch(batchId, body));
+          }
         }
         if (req.method === 'POST' && parts[3] === 'send-email' && parts[4] === 'preview' && parts.length === 5) {
           const body = await readJsonBody(req, config.maxBodyBytes);
@@ -1050,6 +1449,12 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           runId: error.runId || (parts[7] === 'runs' && parts[8] ? safeDecodePathSegment(parts[8]) : null),
         }));
       }
+      if (error instanceof ApplicationBatchServiceError || String(error.code || '').startsWith('APPLICATION_BATCH_')) {
+        return json(res, Number(error.status || 400), {
+          ...errorBody(error.code || 'APPLICATION_BATCH_FAILED', error.message),
+          ...(error.details !== undefined ? { details: error.details } : {}),
+        });
+      }
       if (error instanceof AttachmentError || String(error.code || '').startsWith('ATTACHMENT_')) {
         return json(res, Number(error.status || 400), errorBody(error.code || 'ATTACHMENT_INVALID', error.message));
       }
@@ -1064,6 +1469,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (String(error.code || '').startsWith('DRAFT_')) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'JOB_BUSY') return json(res, 409, { ...errorBody('JOB_BUSY', error.message), activeJob: error.activeJob });
       if (error.code === 'JOB_NOT_FOUND') return json(res, 404, errorBody(error.code, error.message));
+      if (error.code === 'EVENT_CURSOR_INVALID') return json(res, 400, errorBody(error.code, error.message));
       if (['ARTIFACT_NOT_FOUND', 'DRAFT_NOT_FOUND'].includes(error.code)) return json(res, 404, errorBody(error.code, error.message));
       if (['DELETION_BLOCKED', 'DELETION_PLAN_CHANGED', 'JOB_STOP_TIMEOUT', 'JOB_RESOURCES_BUSY', 'JOB_ACTIVE_RETENTION'].includes(error.code)) {
         return json(res, 409, { ...errorBody(error.code, error.message), ...(error.plan ? { plan: error.plan } : {}) });
@@ -1198,6 +1604,136 @@ function validateResumeRequest(body, { fixedScope } = {}) {
     ...(Object.hasOwn(body, 'aiSessionId') ? { aiSessionId: body.aiSessionId } : {}),
     ...(Object.hasOwn(body, 'idempotencyKey') ? { idempotencyKey: body.idempotencyKey.trim() } : {}),
   };
+}
+
+const EXPERIENCE_STAGES = new Set([
+  'preflight', 'discovery', 'body', 'classify', 'extract', 'match', 'draft', 'quality',
+  'audience', 'artifact', 'delivery', 'checkpoint', 'task',
+]);
+
+function validateExperienceActionBody(body, allowed) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ValidationError('Request body must be a JSON object.');
+  }
+  const unsupported = Object.keys(body).filter((field) => !allowed.has(field));
+  if (unsupported.length) {
+    throw new ValidationError(
+      'Unsupported job action parameters.',
+      unsupported.map((field) => ({ field, reason: 'not_allowed' })),
+    );
+  }
+  return body;
+}
+
+function validateExperienceStage(value) {
+  const stage = String(value || '').trim();
+  if (!EXPERIENCE_STAGES.has(stage)) {
+    throw new ValidationError('Unsupported workflow stage.', [{ field: 'stage', reason: 'unsupported_stage' }]);
+  }
+  return stage;
+}
+
+function experienceResumeScope(stage) {
+  if (stage === 'discovery') return 'discovery';
+  if (stage === 'body') return 'body_completion';
+  if (['classify', 'extract', 'match', 'draft', 'quality'].includes(stage)) return 'analysis';
+  if (stage === 'audience') return 'audience';
+  if (stage === 'artifact') return 'artifacts';
+  return 'full';
+}
+
+function experienceActionFailure(error, job) {
+  const code = String(error?.code || '');
+  const status = code === 'JOB_NOT_FOUND'
+    ? 404
+    : ['RESUME_SOURCE_NOT_FOUND', 'RESUME_CHECKPOINTS_MISSING', 'RESUME_SCOPE_INVALID', 'IDEMPOTENCY_KEY_INVALID'].includes(code)
+      ? 400
+      : [
+          'JOB_BUSY',
+          'JOB_ALREADY_RUNNING',
+          'JOB_ALREADY_COMPLETED',
+          'JOB_ATTEMPT_ACTIVE',
+          'JOB_DELETION_IN_PROGRESS',
+          'JOB_NOT_RESUMABLE',
+          'RESUME_CONTEXT_UNAVAILABLE',
+          'RESUME_OUTPUT_MISSING',
+          'WORKFLOW_STATE_INVALID',
+          'WORKFLOW_REVISION_CONFLICT',
+          'JOB_RECOVERY_INCOMPLETE',
+          'AI_SESSION_UNAVAILABLE',
+          'PROFILE_UNAVAILABLE',
+        ].includes(code)
+        ? 409
+        : 0;
+  if (!status) return null;
+  return {
+    status,
+    body: experienceErrorPayload(code, String(error.message || 'The job action failed.'), job, error.details),
+  };
+}
+
+function experienceErrorPayload(code, message, job, details) {
+  const snapshot = job?.experienceSnapshot || job?.experience;
+  const issues = Array.isArray(snapshot?.issues) ? snapshot.issues : [];
+  const problem = issues.find((item) => item?.code === code) || issues[0] || null;
+  return {
+    code,
+    message,
+    ...(problem ? {
+      problem,
+      retryAt: problem.retryAt || null,
+      action: problem.action || null,
+    } : {}),
+    resumable: problem?.retryable === true || snapshot?.checkpoint?.resumeAvailable === true || job?.resumeAvailable === true,
+    ...(details !== undefined ? { details } : {}),
+    error: {
+      code,
+      message,
+      ...(details !== undefined ? { details } : {}),
+    },
+  };
+}
+
+function experienceDiagnostics(job, diagnostics) {
+  const snapshot = job?.experienceSnapshot || job?.experience || {};
+  const bundle = diagnostics?.bundle?.() || {};
+  const events = Array.isArray(bundle.events)
+    ? bundle.events.filter((event) => event?.jobId === job.id).slice(-100)
+    : [];
+  return {
+    schemaVersion: 1,
+    generatedAt: bundle.generatedAt || new Date().toISOString(),
+    jobId: job.id,
+    status: job.status,
+    state: snapshot.state || null,
+    activeStage: snapshot.activeStage || null,
+    activeAttemptId: snapshot.activeAttemptId || job.activeAttemptId || null,
+    currentAttemptId: job.currentAttemptId || null,
+    revision: Number(snapshot.revision || job.revision || 0),
+    throughSequence: Number(snapshot.throughSequence || job.throughSequence || 0),
+    checkpoint: snapshot.checkpoint || null,
+    connection: snapshot.connection || null,
+    issues: Array.isArray(snapshot.issues)
+      ? snapshot.issues.map((issue) => ({
+          code: String(issue.code || ''),
+          affectedStage: String(issue.affectedStage || ''),
+          technicalRef: String(issue.technicalRef || ''),
+        }))
+      : [],
+    rateLimit: publicAccessRestriction(job.rateLimit, [
+      'detected', 'status', 'detectedAt', 'nextRetryAt', 'retryAfterSeconds', 'stableSuccesses', 'recoveryAction',
+    ]),
+    securityRestriction: publicAccessRestriction(job.securityRestriction, [
+      'detected', 'status', 'detectedAt', 'timeoutSeconds', 'recoveryAction',
+    ]),
+    runtime: bundle.runtime || { node: process.version, platform: process.platform, architecture: process.arch },
+    events,
+  };
+}
+
+function publicAccessRestriction(value, fields) {
+  if (!value || typeof value !== 'object') return null;
+  return Object.fromEntries(fields.filter((field) => value[field] !== undefined).map((field) => [field, value[field]]));
 }
 
 function toGeneralContentRecord(record) {
@@ -1410,6 +1946,41 @@ function audienceJobLineage(manager, jobId) {
   return lineage;
 }
 
+function applicationResultSearchText(record) {
+  const applicationInfo = record?.application_info || {};
+  const contactsAndRoutes = [
+    ...(Array.isArray(applicationInfo.contacts) ? applicationInfo.contacts : []),
+    ...(Array.isArray(applicationInfo.application_routes) ? applicationInfo.application_routes : []),
+    ...(Array.isArray(applicationInfo.routes) ? applicationInfo.routes : []),
+  ];
+  return [
+    record?.note_id,
+    record?.title,
+    record?.body,
+    record?.job_card?.role_name,
+    record?.job_card?.title,
+    ...contactsAndRoutes.flatMap((item) => [item?.value, item?.evidence]),
+    record?.outreach?.email_subject,
+    record?.outreach?.email_body,
+  ]
+    .map((value) => String(value ?? ''))
+    .join('\n')
+    .toLocaleLowerCase('zh-CN');
+}
+
+function withApplicationAttachmentRequirement(record) {
+  const rule = detectApplicationAttachmentRule(record);
+  return {
+    ...record,
+    attachmentRequirement: {
+      detected: rule.detected,
+      template: rule.template,
+      evidence: rule.evidence,
+      fields: rule.fields,
+    },
+  };
+}
+
 async function readApplicationResults(outputDir, searchParams, task = {}) {
   const offset = boundedInteger(searchParams.get('offset'), 0, 0, 1000000);
   const limit = boundedInteger(searchParams.get('limit'), 50, 1, 100);
@@ -1433,13 +2004,13 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
         delivery[record.note_id],
         recordIndex,
         payload[APPLICATION_ARTIFACT_FILENAME],
-      )).map((record) => localizeApplicationMedia(record, task.id))
+      )).map((record) => enrichApplicationRecordContacts(localizeApplicationMedia(record, task.id)))
       : [];
     const source = analysisMode === 'general'
       ? hydratedSource.map(toGeneralContentRecord)
       : hydratedSource;
     const queried = query
-      ? source.filter((record) => `${record.title || ''}\n${record.body || ''}`.toLocaleLowerCase('zh-CN').includes(query))
+      ? source.filter((record) => applicationResultSearchText(record).includes(query))
       : source;
     const filterStats = {
       all: queried.length,
@@ -1478,7 +2049,7 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
       total: records.length,
       offset,
       limit,
-      items: records.slice(offset, offset + limit),
+      items: records.slice(offset, offset + limit).map(withApplicationAttachmentRequirement),
       filters: { sort, timeRange, stats: filterStats },
       codexRuntime: payload.ai_workflow || payload.codex_runtime || null,
       qualityGate: payload.quality_gate || null,
@@ -2014,6 +2585,7 @@ async function updateApplicationDraft(outputDir, value, writeState = writeDelive
       ? staleCurrentDraftQuality(savedStore, new Date().toISOString())
       : savedStore;
     const updated = currentDraftVersion(updatedStore);
+    const generation = normalizeGenerationMetadata(value?.generation);
     state[noteId] = {
       ...existing,
       action: 'draft_saved',
@@ -2022,6 +2594,7 @@ async function updateApplicationDraft(outputDir, value, writeState = writeDelive
       draftStore: updatedStore,
       draftWriteProtocol: isVersionedWrite ? 'versioned' : (writeProtocol || 'legacy'),
       ...(hasApplicationContext ? { applicationContext, applicationContextHash } : {}),
+      ...(generation ? { generation } : {}),
     };
     await writeState(outputDir, state);
     return {
@@ -2034,6 +2607,111 @@ async function updateApplicationDraft(outputDir, value, writeState = writeDelive
       delivery: publicDeliveryState(state[noteId]),
     };
   });
+}
+
+function normalizeGenerationMetadata(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const bounded = (input, limit) => String(input || '').trim().slice(0, limit);
+  const usedEvidenceIds = Array.isArray(value.usedEvidenceIds)
+    ? [...new Set(value.usedEvidenceIds.map((item) => bounded(item, 120)).filter(Boolean))].slice(0, 2)
+    : [];
+  const resumeArtifactIds = Array.isArray(value.resumeArtifactIds)
+    ? [...new Set(value.resumeArtifactIds.map((item) => bounded(item, 100)).filter(Boolean))].slice(0, 6)
+    : [];
+  const metadata = {
+    runId: bounded(value.runId, 160),
+    promptVersion: bounded(value.promptVersion, 120),
+    model: bounded(value.model, 160),
+    provider: bounded(value.provider, 120),
+    profileSnapshotId: bounded(value.profileSnapshotId, 128),
+    inputHash: bounded(value.inputHash, 128),
+    usedEvidenceIds,
+    resumeArtifactIds,
+    recommendedResumeId: bounded(value.recommendedResumeId, 120),
+    resumeReason: bounded(value.resumeReason, 600),
+    status: bounded(value.status, 40) || 'validated',
+    generatedAt: bounded(value.generatedAt, 40) || new Date().toISOString(),
+  };
+  if (!metadata.runId || !metadata.profileSnapshotId) {
+    throw new ValidationError('Generation metadata requires runId and profileSnapshotId.');
+  }
+  if (metadata.recommendedResumeId && !metadata.resumeArtifactIds.includes(metadata.recommendedResumeId)) {
+    throw new ValidationError('Recommended resume must reference a resumeArtifactIds entry.');
+  }
+  if (!['validated', 'saved'].includes(metadata.status)) {
+    throw new ValidationError('Generation metadata status is invalid.');
+  }
+  return metadata;
+}
+
+async function writeApplicationGeneration(outputDir, value, writeState = writeDeliveryState) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ValidationError('Generation writeback body must be an object.');
+  }
+  const runId = String(value.runId || '').trim();
+  const items = Array.isArray(value.items) ? value.items : [];
+  if (!runId || runId.length > 160) throw new ValidationError('A valid generation runId is required.');
+  if (!items.length || items.length > 100) throw new ValidationError('Generation writeback requires 1-100 items.');
+  const results = [];
+  for (const item of items) {
+    const noteId = String(item?.noteId || '').trim();
+    try {
+      if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+      const generation = {
+        ...(item.generation || {}),
+        runId,
+        promptVersion: item.generation?.promptVersion || value.promptVersion,
+        model: item.generation?.model || value.model,
+        provider: item.generation?.provider || value.provider,
+        profileSnapshotId: item.generation?.profileSnapshotId || value.profileSnapshotId,
+        status: 'validated',
+      };
+      const saved = await updateApplicationDraft(outputDir, {
+        noteId,
+        draftId: item.draftId,
+        baseVersion: item.baseVersion,
+        outreach: item.outreach,
+        generation,
+      }, writeState);
+      results.push({
+        noteId,
+        status: 'saved',
+        draftVersion: saved.draftVersion,
+        generation: saved.delivery?.generation || null,
+      });
+    } catch (error) {
+      if (error?.code === 'DRAFT_VERSION_CONFLICT') {
+        results.push({
+          noteId,
+          status: 'writeback_conflict',
+          error: {
+            code: error.code,
+            message: error.message,
+            expectedVersion: error.expectedVersion ?? null,
+            currentVersion: error.currentVersion ?? null,
+          },
+        });
+      } else {
+        results.push({
+          noteId,
+          status: 'writeback_failed',
+          error: { code: error?.code || 'WRITEBACK_FAILED', message: String(error?.message || error) },
+        });
+      }
+    }
+  }
+  const saved = results.filter((item) => item.status === 'saved').length;
+  const conflicts = results.filter((item) => item.status === 'writeback_conflict').length;
+  const failed = results.length - saved - conflicts;
+  return {
+    runId,
+    status: saved === results.length ? 'completed' : saved ? 'partial' : 'failed',
+    requested: results.length,
+    saved,
+    conflicts,
+    failed,
+    items: results,
+  };
 }
 
 async function recheckApplicationDraft(
@@ -2201,11 +2879,20 @@ async function recheckApplicationDraft(
   });
 }
 
-export async function previewApplicationEmail(outputDir, value, replyTo, mailer, smtpConfig, limits, writeState = writeDeliveryState) {
+export async function previewApplicationEmail(
+  outputDir,
+  value,
+  replyTo,
+  mailer,
+  smtpConfig,
+  limits,
+  writeState = writeDeliveryState,
+  options = {},
+) {
   const noteId = String(value?.noteId || '').trim();
   if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
   const record = await readApplicationRecord(outputDir, noteId);
-  const extracted = extractedEmails(record);
+  const extracted = extractedEmails(record, options.allowedRecipients);
   const requested = String(value?.to || '').trim().toLowerCase();
   const recipient = extracted.find((item) => item.toLowerCase() === requested) || (!requested ? extracted[0] : '');
   if (!recipient) throw new ValidationError('Recipient must be an email extracted from this application record.');
@@ -2453,7 +3140,7 @@ export async function sendApplicationEmail(outputDir, value, mailer, replyTo, sm
     );
   }
   const record = await readApplicationRecord(outputDir, noteId);
-  const extracted = extractedEmails(record);
+  const extracted = extractedEmails(record, options.allowedRecipients);
   const requested = String(value?.to || '').trim().toLowerCase();
   const to = extracted.find((item) => item.toLowerCase() === requested) || (!requested ? extracted[0] : '');
   if (!to) throw new ValidationError('Recipient must be an email extracted from this application record.');
@@ -3629,7 +4316,7 @@ function validateDeliveryDraft(draft, record) {
   }
 }
 
-function extractedEmails(record) {
+function extractedEmails(record, allowedRecipients = []) {
   const routes = [...(record.application_info?.contacts || []), ...(record.application_info?.application_routes || [])];
   const values = routes.flatMap((route) => {
     const routeType = `${route?.type || ''} ${route?.channel || ''}`;
@@ -3640,7 +4327,10 @@ function extractedEmails(record) {
     if (['invalid', 'rejected', 'unverified'].includes(verificationStatus)) return [];
     return `${routeValue}\n${route?.evidence || ''}`.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
   });
-  return [...new Set(values.map((value) => value.toLowerCase()))];
+  const serverAllowed = (Array.isArray(allowedRecipients) ? allowedRecipients : [])
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter((value) => EMAIL.test(value));
+  return [...new Set([...values.map((value) => value.toLowerCase()), ...serverAllowed])];
 }
 
 function mergeApplicationState(record, state, recordIndex, artifactFilename) {
@@ -3838,17 +4528,102 @@ function decodePathSegment(value) {
   }
 }
 
-function streamEvents(req, res, manager, id) {
+export async function streamApplicationBatchEvents(
+  req,
+  res,
+  service,
+  batchId,
+  searchParams = new URL(req.url || '/', 'http://localhost').searchParams,
+) {
+  const cursorValue = req.headers?.['last-event-id'] || searchParams.get('after') || '0';
+  let cursor = Number(cursorValue);
+  if (!Number.isSafeInteger(cursor) || cursor < 0) {
+    const error = new Error('Application batch event cursor must be a non-negative safe integer.');
+    error.code = 'APPLICATION_BATCH_SEQUENCE_INVALID';
+    error.status = 400;
+    throw error;
+  }
+  const batch = await service.getBatch(batchId);
+  let closed = false;
+  let polling = false;
+  let pollTimer;
+  let heartbeat;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(pollTimer);
+    clearInterval(heartbeat);
+    if (!res.writableEnded) res.end();
+  };
+  req.once('close', close);
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  writeEvent(res, 'snapshot', { type: 'snapshot', job: manager.get(id) });
+  writeEvent(res, 'snapshot', {
+    type: 'snapshot',
+    batch,
+    sequence: cursor,
+    throughSequence: Number(batch.lastEventSequence || 0),
+  });
+
+  const publish = async () => {
+    if (closed || polling) return;
+    polling = true;
+    try {
+      const events = await service.listEvents(batchId, { afterSequence: cursor });
+      for (const event of events) {
+        if (closed || !Number.isSafeInteger(event.sequence) || event.sequence <= cursor) continue;
+        res.write(`id: ${event.sequence}\nevent: batch\ndata: ${JSON.stringify({
+          type: 'batch',
+          batchId,
+          sequence: event.sequence,
+          event,
+        })}\n\n`);
+        cursor = event.sequence;
+      }
+    } catch (error) {
+      if (!closed) {
+        writeEvent(res, 'error', {
+          type: 'error',
+          error: {
+            code: String(error?.code || 'APPLICATION_BATCH_EVENTS_FAILED'),
+            message: String(error?.message || 'Application batch event stream failed.'),
+          },
+        });
+        close();
+      }
+    } finally {
+      polling = false;
+    }
+  };
+  await publish();
+  if (closed) return;
+  pollTimer = setInterval(() => void publish(), 750);
+  heartbeat = setInterval(() => {
+    if (!closed) res.write(': keep-alive\n\n');
+  }, 15_000);
+}
+
+export async function streamEvents(req, res, manager, id, searchParams = new URL(req.url || '/', 'http://localhost').searchParams) {
+  const lastEventId = req.headers?.['last-event-id'];
+  const afterRaw = lastEventId !== undefined && lastEventId !== ''
+    ? lastEventId
+    : searchParams.get('after') || '0';
+  const after = Number(afterRaw);
+  if (!Number.isSafeInteger(after) || after < 0) {
+    const error = new Error('Event cursor must be a non-negative safe integer.');
+    error.code = 'EVENT_CURSOR_INVALID';
+    throw error;
+  }
   let closed = false;
   let heartbeat;
   let unsubscribe = () => {};
+  let live = false;
+  let lastSent = after;
+  const buffered = [];
   const close = () => {
     if (closed) return;
     closed = true;
@@ -3856,20 +4631,146 @@ function streamEvents(req, res, manager, id) {
     unsubscribe();
     res.end();
   };
-  unsubscribe = manager.subscribe(id, ({ type, data }) => {
-    if (type === 'log') {
-      const level = data.stream === 'stderr' ? 'error' : data.stream === 'system' ? 'info' : 'info';
-      return writeEvent(res, 'log', { type: 'log', line: data.message, level });
-    }
-    if (type === 'state') return writeEvent(res, 'status', { type: 'status', job: data });
-    if (type === 'closing') {
-      writeEvent(res, 'status', { type: 'status', job: manager.get(id), lifecycle: 'closing' });
-      return close();
-    }
-    if (type === 'end') return writeEvent(res, 'done', { type: 'done', job: manager.get(id) });
-  });
-  heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15000);
   req.on('close', close);
+  const deliver = (incoming) => {
+    if (closed) return;
+    const event = Number.isSafeInteger(incoming?.sequence)
+      ? incoming
+      : {
+          ...incoming,
+          sequence: lastSent + buffered.length + 1,
+          eventId: `${id}:${lastSent + buffered.length + 1}`,
+          jobId: id,
+          attemptId: manager.get(id)?.activeAttemptId || `${id}:legacy`,
+          occurredAt: new Date().toISOString(),
+        };
+    if (event.sequence <= lastSent) return;
+    if (!live) {
+      buffered.push(event);
+      return;
+    }
+    writeJobSequencedEvent(res, event, manager, id);
+    lastSent = event.sequence;
+    if (event.type === 'closing') close();
+  };
+  unsubscribe = manager.subscribe(id, deliver);
+  try {
+    const throughSequence = typeof manager.getEventHighWater === 'function'
+      ? await manager.getEventHighWater(id)
+      : Number(manager.get(id)?.throughSequence || 0);
+    const job = manager.get(id);
+    if (closed) return;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    const experienceSnapshot = job?.experienceSnapshot || job?.experience || null;
+    writeEvent(res, 'snapshot', {
+      type: 'snapshot',
+      sequence: after,
+      throughSequence,
+      job,
+      snapshot: experienceSnapshot,
+      experienceSnapshot,
+    });
+
+    let cursor = after;
+    while (cursor < throughSequence && typeof manager.listEventPage === 'function') {
+      const page = await manager.listEventPage(id, cursor, { limit: 500, throughSequence });
+      if (closed) return;
+      for (const event of page.events) {
+        if (event.sequence <= lastSent) continue;
+        writeJobSequencedEvent(res, event, manager, id);
+        lastSent = event.sequence;
+      }
+      if (!page.hasMore || page.nextAfter <= cursor) break;
+      cursor = page.nextAfter;
+    }
+
+    buffered.sort((left, right) => left.sequence - right.sequence);
+    for (const event of buffered) {
+      if (event.sequence <= lastSent) continue;
+      writeJobSequencedEvent(res, event, manager, id);
+      lastSent = event.sequence;
+      if (event.type === 'closing') {
+        close();
+        return;
+      }
+    }
+    buffered.length = 0;
+    live = true;
+    heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
+  } catch (error) {
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+    req.off('close', close);
+    throw error;
+  }
+}
+
+function writeJobSequencedEvent(res, event, manager, id) {
+  const currentJob = manager.get(id);
+  const experienceSnapshot = event.data?.experienceSnapshot
+    || event.data?.experience
+    || currentJob?.experienceSnapshot
+    || currentJob?.experience
+    || null;
+  let eventName = 'workflow';
+  let payload = {
+    type: 'workflow',
+    snapshot: experienceSnapshot,
+    experienceSnapshot,
+  };
+  if (event.type === 'log') {
+    eventName = 'log';
+    payload = {
+      type: 'log',
+      line: event.data?.message,
+      level: event.data?.stream === 'stderr' ? 'error' : 'info',
+      snapshot: experienceSnapshot,
+      experienceSnapshot,
+    };
+  } else if (event.type === 'state') {
+    eventName = 'status';
+    payload = {
+      type: 'status',
+      job: event.data,
+      snapshot: experienceSnapshot,
+      experienceSnapshot,
+    };
+  } else if (event.type === 'closing') {
+    eventName = 'status';
+    const job = manager.get(id);
+    payload = {
+      type: 'status',
+      job,
+      snapshot: experienceSnapshot,
+      experienceSnapshot,
+      lifecycle: 'closing',
+    };
+  } else if (event.type === 'end') {
+    eventName = 'done';
+    const job = manager.get(id);
+    payload = {
+      type: 'done',
+      job,
+      snapshot: experienceSnapshot,
+      experienceSnapshot,
+    };
+  }
+  res.write(`id: ${event.sequence}\nevent: ${eventName}\ndata: ${JSON.stringify({
+    ...payload,
+    sequence: event.sequence,
+    eventId: event.eventId,
+    jobId: event.jobId,
+    attemptId: event.attemptId,
+    occurredAt: event.occurredAt,
+    workflowEvent: event.workflowEvent,
+    problem: event.workflowEvent?.problem || null,
+  })}\n\n`);
 }
 
 async function streamAudienceAiEvents(req, res, service, jobId, postId, searchParams) {

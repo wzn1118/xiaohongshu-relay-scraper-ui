@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "workflow-event-v1.schema.json",
+  "title": "WorkflowEventV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "sequence",
+    "jobId",
+    "attemptId",
+    "occurredAt",
+    "type",
+    "stage",
+    "state",
+    "progress",
+    "message"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "eventId": { "type": "string", "minLength": 1 },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "jobId": { "type": "string", "minLength": 1 },
+    "attemptId": { "type": "string", "minLength": 1 },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "type": {
+      "enum": ["task", "stage", "item", "checkpoint", "retry", "artifact", "warning", "error"]
+    },
+    "stage": {
+      "enum": [
+        "preflight",
+        "discovery",
+        "body",
+        "classify",
+        "extract",
+        "match",
+        "draft",
+        "quality",
+        "audience",
+        "artifact",
+        "delivery"
+      ]
+    },
+    "state": {
+      "enum": [
+        "queued",
+        "running",
+        "waiting_system",
+        "waiting_user",
+        "retrying",
+        "partial",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "done", "total", "succeeded", "reused", "retryable", "failed", "blocked"],
+      "properties": {
+        "unit": { "enum": ["card", "body", "job", "draft", "file", "email"] },
+        "done": { "type": "integer", "minimum": 0 },
+        "total": { "type": ["integer", "null"], "minimum": 0 },
+        "succeeded": { "type": "integer", "minimum": 0 },
+        "reused": { "type": "integer", "minimum": 0 },
+        "retryable": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "blocked": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["activePerMinute", "wallPerMinute", "etaMinSeconds", "etaMaxSeconds", "confidence"],
+      "properties": {
+        "activePerMinute": { "type": ["number", "null"], "minimum": 0 },
+        "wallPerMinute": { "type": ["number", "null"], "minimum": 0 },
+        "etaMinSeconds": { "type": ["number", "null"], "minimum": 0 },
+        "etaMaxSeconds": { "type": ["number", "null"], "minimum": 0 },
+        "confidence": { "enum": ["low", "medium", "high"] }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "params": { "type": "object" }
+      }
+    },
+    "problem": { "$ref": "user-problem-v1.schema.json" },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "savedAt", "resumeAvailable"],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "savedAt": { "type": "string", "format": "date-time" },
+        "resumeAvailable": { "type": "boolean" }
+      }
+    },
+    "sourceRevision": { "type": "integer", "minimum": 0 },
+    "outputRefs": { "type": "array", "items": { "type": "string" } },
+    "technicalRef": { "type": "string" }
+  }
+}

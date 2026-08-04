@@ -7,6 +7,9 @@ import type {
   DataCopilotRecordKind,
   DataCopilotTaskCatalog,
   DataCopilotMessageData,
+  DataCopilotQualityArtifact,
+  DataCopilotQualityEvaluation,
+  DataCopilotQualityState,
   DataCopilotRunStatus,
   DataCopilotSession,
   DataCopilotSubscriptionHandlers,
@@ -105,6 +108,7 @@ export function createDataCopilotTransport(
           body: JSON.stringify({
             content: input.content,
             aiSessionId: input.modelId || options.aiSessionId || '',
+            workspaceMode: input.workspaceMode || 'ask',
             attachmentIds: input.attachmentIds,
             contextSourceIds: input.contextSourceIds,
             idempotencyKey: createIdempotencyKey('message'),
@@ -170,8 +174,105 @@ export function createDataCopilotTransport(
       return mapSendResult(payload, sessionId)
     },
 
+    async loadQuality(sessionId, jobId) {
+      const encodedSessionId = encodeURIComponent(sessionId)
+      const encodedJobId = encodeURIComponent(jobId)
+      const [usageValue, traceValue, snapshotValue, conversationValue, evaluationValue] = await Promise.all([
+        requestJson(`${baseUrl}/api/copilot/usage?conversationId=${encodedSessionId}`),
+        requestJson(`${baseUrl}/api/copilot/traces?conversationId=${encodedSessionId}&limit=50`),
+        requestJson(`${baseUrl}/api/copilot/snapshots?jobId=${encodedJobId}&limit=50`),
+        requestJson(route(`/${encodedSessionId}`)),
+        requestJson(`${baseUrl}/api/copilot/evaluations?limit=10`),
+      ])
+      const usage = asObject(usageValue)
+      const traces = asObject(traceValue)
+      const snapshots = asObject(snapshotValue)
+      const conversation = asObject(conversationValue)
+      const evaluations = asObject(evaluationValue)
+      return {
+        usage: {
+          records: numberValue(usage.records, 0),
+          inputTokens: numberValue(usage.inputTokens, 0),
+          outputTokens: numberValue(usage.outputTokens, 0),
+          toolCalls: numberValue(usage.toolCalls, 0),
+          latencyMs: numberValue(usage.latencyMs, 0),
+          estimatedCostUsd: numberValue(usage.estimatedCostUsd, 0),
+        },
+        traces: arrayFrom(traces, 'traces').map((item) => {
+          const trace = asObject(item)
+          return {
+            id: stringValue(trace.traceId),
+            operation: stringValue(trace.operation),
+            status: stringValue(trace.status),
+            durationMs: numberValue(trace.durationMs, 0),
+            createdAt: stringValue(trace.createdAt),
+          }
+        }),
+        snapshots: arrayFrom(snapshots, 'snapshots').map((item) => {
+          const snapshot = asObject(item)
+          return {
+            id: stringValue(snapshot.snapshotId),
+            revision: numberValue(snapshot.revision, 0),
+            manifestHash: stringValue(snapshot.manifestHash),
+            createdAt: stringValue(snapshot.createdAt),
+          }
+        }),
+        artifacts: arrayFrom(conversation, 'artifacts').map((item) => mapQualityArtifact(item, baseUrl, sessionId)),
+        evaluations: arrayFrom(evaluations, 'evaluations').map(mapQualityEvaluation),
+      } satisfies DataCopilotQualityState
+    },
+
+    async runGoldenEvaluation() {
+      return mapQualityEvaluation(await requestJson(`${baseUrl}/api/copilot/evaluations/golden`, { method: 'POST', body: '{}' }))
+    },
+
+    async createArtifact(sessionId, input) {
+      const payload = asObject(await requestJson(route(`/${encodeURIComponent(sessionId)}/artifacts`), {
+        method: 'POST', body: JSON.stringify(input),
+      }))
+      return mapQualityArtifact(payload.artifact, baseUrl, sessionId)
+    },
+
+    async upgradeSnapshot(sessionId) {
+      const payload = await requestJson(route(`/${encodeURIComponent(sessionId)}/snapshot/upgrade`), {
+        method: 'POST', body: JSON.stringify({ copyMessages: true }),
+      })
+      return mapConversation(objectFrom(payload, 'conversation'))
+    },
+
     subscribe(sessionId, handlers) {
       return subscribeToConversation(route, sessionId, handlers)
+    },
+  }
+}
+
+function mapQualityArtifact(value: unknown, baseUrl: string, sessionId: string): DataCopilotQualityArtifact {
+  const artifact = asObject(value)
+  const id = stringValue(artifact.artifactId) || stringValue(artifact.id)
+  return {
+    id,
+    name: stringValue(artifact.displayName) || stringValue(artifact.name) || id,
+    format: stringValue(artifact.format) || stringValue(artifact.extension),
+    size: numberValue(artifact.size, 0),
+    sha256: stringValue(artifact.sha256),
+    status: stringValue(artifact.status) || 'ready',
+    url: `${baseUrl}${COPILOT_PATH}/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(id)}`,
+  }
+}
+
+function mapQualityEvaluation(value: unknown): DataCopilotQualityEvaluation {
+  const evaluation = asObject(value)
+  const summary = asObject(evaluation.summary)
+  return {
+    id: stringValue(evaluation.evaluationId),
+    status: stringValue(evaluation.status),
+    createdAt: stringValue(evaluation.createdAt),
+    durationMs: numberValue(evaluation.durationMs, 0),
+    summary: {
+      total: numberValue(summary.total, 0),
+      passed: numberValue(summary.passed, 0),
+      failed: numberValue(summary.failed, 0),
+      passRate: numberValue(summary.passRate, 0),
     },
   }
 }
@@ -455,7 +556,10 @@ export function mapDataCopilotEvent(
     type === 'source.list' ||
     type === 'artifact.ready' ||
     type === 'email.draft' ||
-    type === 'email.sent'
+    type === 'email.sent' ||
+    type === 'application.email_draft' ||
+    type === 'application.batch_preflight' ||
+    type === 'application.batch'
   ) {
     return {
       message: mapDataCopilotMessage({
@@ -513,7 +617,8 @@ function subscribeToConversation(
     'ready',
     'user.message', 'assistant.message', 'assistant.plan', 'tool.started',
     'tool.progress', 'tool.result', 'table.result', 'source.list', 'artifact.ready',
-    'email.draft', 'email.sent', 'approval.required', 'approval.confirmed', 'approval.rejected',
+    'email.draft', 'email.sent', 'application.email_draft', 'application.batch_preflight', 'application.batch',
+    'approval.required', 'approval.confirmed', 'approval.rejected',
     'verification.failed', 'verification.passed',
     'run.paused', 'run.failed', 'run.completed',
   ]) {
@@ -733,6 +838,10 @@ function messageText(type: string, content: JsonObject) {
   if (type === 'artifact.ready') return stringValue(content.message) || '文件已生成，可在产物中查看。'
   if (type === 'table.result') return stringValue(content.message) || '表格结果已返回。'
   if (type === 'source.list') return stringValue(content.message) || '已列出本次使用的数据来源。'
+  if (type === 'application.email_draft') return stringValue(content.message) || 'Application email prepared.'
+  if (type === 'application.batch_preflight' || type === 'application.batch') {
+    return stringValue(content.message) || 'Batch delivery preparation is ready for review.'
+  }
   return stringValue(content.text) || stringValue(content.message)
 }
 

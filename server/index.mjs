@@ -22,6 +22,7 @@ import { DataToolRegistry } from './data-tool-registry.mjs';
 import { McpDataAdapter } from './mcp-data-adapter.mjs';
 import { DataCopilotRuntime } from './data-copilot-runtime.mjs';
 import { DataCopilotService } from './data-copilot-service.mjs';
+import { createCopilotProductionStore } from './copilot/production-store.mjs';
 
 const diagnostics = createDiagnostics({ filePath: config.diagnosticsPath });
 
@@ -52,6 +53,7 @@ const audienceAi = new AudienceAiService({
 });
 await audienceAi.initialize();
 const copilotRoot = path.dirname(config.dataDir);
+const copilotProductionStore = createCopilotProductionStore({ rootDir: copilotRoot });
 const copilotStore = new DataCopilotStore({ rootDir: copilotRoot });
 const copilotApprovals = new CopilotApprovalStore({ rootDir: copilotRoot });
 const copilotArtifacts = new CopilotArtifactService({
@@ -70,6 +72,7 @@ const copilotRuntime = new DataCopilotRuntime({
   approvals: copilotApprovals,
   registry: copilotTools,
   aiSessions,
+  productionStore: copilotProductionStore,
 });
 const copilotMcp = new McpDataAdapter({
   policy: copilotPolicy,
@@ -86,6 +89,7 @@ const dataCopilot = new DataCopilotService({
   mcpAdapter: copilotMcp,
   manager,
   aiSessions,
+  productionStore: copilotProductionStore,
 });
 await dataCopilot.initialize();
 const dataLifecycle = new DataLifecycleService({
@@ -141,6 +145,7 @@ async function shutdown(signal) {
     const shutdownErrors = [];
     try { await audienceAi.close(); } catch (error) { shutdownErrors.push(error); }
     try { await manager.shutdown(); } catch (error) { shutdownErrors.push(error); }
+    try { copilotProductionStore.close(); } catch (error) { shutdownErrors.push(error); }
     await diagnostics.flush();
     if (shutdownErrors.length) throw shutdownErrors[0];
     clearTimeout(forcedExit);

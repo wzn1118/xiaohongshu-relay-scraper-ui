@@ -224,21 +224,38 @@ test('buildRunnerArgs applies adaptive high-throughput pacing to imported body t
   assert.equal(args[args.indexOf('--random-delay-min-seconds') + 1], '0.8');
   assert.equal(args[args.indexOf('--random-delay-max-seconds') + 1], '2.4');
   assert.equal(args[args.indexOf('--page-recovery-delay-seconds') + 1], '0.5');
-  assert.equal(args[args.indexOf('--body-batch-size') + 1], '6');
-  assert.equal(args[args.indexOf('--body-batch-pause-min-seconds') + 1], '8');
-  assert.equal(args[args.indexOf('--body-batch-pause-max-seconds') + 1], '15');
-  assert.equal(args[args.indexOf('--proactive-rest-every') + 1], '120');
-  assert.equal(args[args.indexOf('--proactive-rest-seconds') + 1], '600');
+  assert.equal(args[args.indexOf('--body-batch-size') + 1], '0');
+  assert.equal(args[args.indexOf('--body-batch-pause-min-seconds') + 1], '0');
+  assert.equal(args[args.indexOf('--body-batch-pause-max-seconds') + 1], '0');
+  assert.equal(args[args.indexOf('--proactive-rest-every') + 1], '0');
+  assert.equal(args[args.indexOf('--proactive-rest-seconds') + 1], '0');
   assert.equal(args.includes('--adaptive-pacing'), true);
   assert.equal(args[args.indexOf('--adaptive-max-delay-seconds') + 1], '20');
   assert.equal(args.includes('--block-heavy-resources'), true);
-  assert.equal(args.includes('--rate-limit-auto-recovery'), true);
+  assert.equal(args.includes('--no-rate-limit-auto-recovery'), true);
   assert.equal(args[args.indexOf('--rate-limit-initial-delay-seconds') + 1], '120');
   assert.equal(args[args.indexOf('--rate-limit-max-delay-seconds') + 1], '900');
   assert.equal(args[args.indexOf('--rate-limit-recovery-spacing-seconds') + 1], '30');
   assert.equal(args[args.indexOf('--rate-limit-max-recovery-spacing-seconds') + 1], '120');
   assert.equal(args.includes('--reuse-body-cache'), true);
   assert.equal(args[args.indexOf('--body-cache-max-age-days') + 1], '30');
+});
+
+test('buildRunnerArgs enables Python recovery only for an internal rate-limit resume', () => {
+  const params = validateRunRequest({ analysisMode: 'general', keyword: 'resume body collection' });
+  const ordinaryArgs = buildRunnerArgs(params, path.resolve('output'));
+  const recoveryArgs = buildRunnerArgs({
+    ...params,
+    mode: 'resume',
+    completeMissingOnly: true,
+    rateLimitRecoveryResume: true,
+  }, path.resolve('output'));
+
+  assert.equal(ordinaryArgs.includes('--no-rate-limit-auto-recovery'), true);
+  assert.equal(ordinaryArgs.includes('--rate-limit-auto-recovery'), false);
+  assert.equal(recoveryArgs.includes('--rate-limit-auto-recovery'), true);
+  assert.equal(recoveryArgs.includes('--no-rate-limit-auto-recovery'), false);
+  assert.equal(recoveryArgs[recoveryArgs.indexOf('--rate-limit-stable-successes') + 1], '3');
 });
 
 test('audience growth requests are bounded and emit a dedicated runner flag', () => {

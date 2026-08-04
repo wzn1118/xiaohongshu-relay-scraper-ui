@@ -8,6 +8,7 @@ const CATALOG = [
   tool('tool.describe', 'Describe tools'),
   tool('dataset.list', 'List datasets'),
   tool('records.query', 'Query records'),
+  tool('applications.extract_email_requirements', 'Batch extract every job email subject format, recipient, attachment naming rule, and coverage. 邮件格式 邮件标题 全部岗位 批量提取'),
   tool('audience.comments', 'Read audience comments'),
   tool('audience.users', 'Read commenting users'),
   tool('audience.coverage', 'Inspect audience collection coverage'),
@@ -47,6 +48,14 @@ test('catalog search ranks export and email capabilities for delivery requests',
   assert.ok(names.includes('artifact.create'));
   assert.ok(names.includes('email.prepare'));
   assert.ok(names.includes('email.send'));
+});
+
+test('resolver selects the batch requirement tool for all-job email format extraction', () => {
+  const resolver = new CopilotCapabilityResolver({ maximumTools: 8, minimumTools: 6 });
+  const selected = resolver.resolve(CATALOG, { query: '提取当前任务全部岗位的邮件格式，不要只返回一个' });
+  const names = selected.map((item) => item.name);
+
+  assert.ok(names.includes('applications.extract_email_requirements'));
 });
 
 function tool(name, description) {

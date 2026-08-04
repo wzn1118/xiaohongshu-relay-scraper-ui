@@ -7,6 +7,11 @@ import path from 'node:path';
 import os from 'node:os';
 import { JobManager, bodyMetricsForJob, publicJob, updateProgressFromLog } from './job-manager.mjs';
 import { validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
+import {
+  WORKFLOW_EVENT_LINE_PREFIX,
+  adaptLegacyJobSnapshot,
+  mapUserProblem,
+} from './lib/job-experience.mjs';
 import { emptyWorkflowStages, initializeWorkflowState } from './lib/workflow-state.mjs';
 
 function createFakeChild(pid) {
@@ -109,6 +114,15 @@ test('body rate-limit recovery logs keep the task running through cooldown and p
   const job = { status: 'running', params: { keyword: 'test' }, progress: 0 };
 
   assert.equal(
+    updateProgressFromLog(job, 'BODY_RATE_LIMIT warm-start attempt=1/6 spacing=30.0s stable_successes=3'),
+    true,
+  );
+  assert.equal(job.progressPhase, 'body_rate_limit_probe');
+  assert.equal(job.rateLimit.status, 'waiting');
+  assert.equal(job.rateLimit.retryAfterSeconds, 30);
+  assert.equal(job.rateLimit.recoveryAction, 'warm_start_probe');
+
+  assert.equal(
     updateProgressFromLog(job, 'BODY_RATE_LIMIT cooldown attempt=1/6 wait=120.0s note=n1'),
     true,
   );
@@ -120,6 +134,11 @@ test('body rate-limit recovery logs keep the task running through cooldown and p
   updateProgressFromLog(job, 'BODY_RATE_LIMIT waiting attempt=1/6 remaining=45.0s');
   assert.equal(job.rateLimit.retryAfterSeconds, 45);
 
+  updateProgressFromLog(job, 'BODY_RATE_LIMIT manual_probe attempt=1/6; skipping remaining cooldown');
+  assert.equal(job.progressPhase, 'body_rate_limit_probe');
+  assert.equal(job.rateLimit.retryAfterSeconds, 0);
+  assert.equal(job.rateLimit.recoveryAction, 'manual_probe');
+
   updateProgressFromLog(job, 'BODY_RATE_LIMIT probe attempt=1/6');
   assert.equal(job.progressPhase, 'body_rate_limit_probe');
   assert.equal(job.rateLimit.recoveryAction, 'automatic_probe');
@@ -130,7 +149,7 @@ test('body rate-limit recovery logs keep the task running through cooldown and p
   assert.equal(job.rateLimit.retryAfterSeconds, 0);
 });
 
-test('successful body progress clears a stale rate-limit state', () => {
+test('body rate limit clears only after three consecutive network successes', () => {
   const job = {
     status: 'running',
     params: { keyword: 'test' },
@@ -152,11 +171,173 @@ test('successful body progress clears a stale rate-limit state', () => {
     true,
   );
   assert.equal(job.progressPhase, 'scraping');
+  assert.equal(job.rateLimit.status, 'waiting');
+  assert.equal(job.rateLimit.stableSuccesses, 1);
+
+  updateProgressFromLog(
+    job,
+    'PARALLEL_PROGRESS processed=13 total=20 complete=9 status=cached round=1 round_processed=13 round_total=20',
+  );
+  assert.equal(job.rateLimit.stableSuccesses, 1);
+
+  updateProgressFromLog(
+    job,
+    'PARALLEL_PROGRESS processed=14 total=20 complete=9 status=detail_error round=1 round_processed=14 round_total=20',
+  );
+  assert.equal(job.rateLimit.stableSuccesses, 0);
+
+  for (let processed = 15; processed <= 17; processed += 1) {
+    updateProgressFromLog(
+      job,
+      `PARALLEL_PROGRESS processed=${processed} total=20 complete=${processed - 5} status=detail_ok round=1 round_processed=${processed} round_total=20`,
+    );
+  }
   assert.equal(job.rateLimit.status, 'cleared');
+  assert.equal(job.rateLimit.stableSuccesses, 3);
   assert.equal(job.rateLimit.nextRetryAt, null);
   assert.equal(job.rateLimit.retryAfterSeconds, 0);
   assert.equal(job.rateLimit.recoveryAction, null);
   assert.ok(job.rateLimit.clearedAt);
+});
+
+test('JobManager persists monotonic workflow events and replays them after restart', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-events-'));
+  const jobId = '20260803090000-events01';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'succeeded',
+    outputDir,
+    params: { keyword: 'ai产品经理', analysisMode: 'job' },
+    createdAt: '2026-08-03T08:00:00.000Z',
+    updatedAt: '2026-08-03T08:01:00.000Z',
+    finishedAt: '2026-08-03T08:01:00.000Z',
+    stages: emptyWorkflowStages(),
+  }]), 'utf8');
+
+  try {
+    const first = new JobManager({ dataDir, pythonBin: 'python', runnerPath: path.join(dataDir, 'runner.py') });
+    await first.initialize();
+    const observed = [];
+    const unsubscribe = first.subscribe(jobId, (event) => observed.push(event));
+    await first.refreshArtifactCount(jobId);
+    unsubscribe();
+
+    const firstHighWater = await first.getEventHighWater(jobId);
+    assert.equal(firstHighWater, 1);
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0].sequence, 1);
+    assert.equal(observed[0].eventId, `${jobId}:1`);
+    assert.equal(observed[0].workflowEvent.schemaVersion, 1);
+    assert.equal(observed[0].workflowEvent.sequence, 1);
+    assert.equal(observed[0].data.experienceSnapshot.throughSequence, 1);
+
+    const firstPage = await first.listEventPage(jobId, 0, { limit: 1, throughSequence: firstHighWater });
+    assert.equal(firstPage.events.length, 1);
+    assert.equal(firstPage.nextAfter, 1);
+    assert.equal(firstPage.hasMore, false);
+
+    const journalPath = path.join(dataDir, 'job-events', `${encodeURIComponent(jobId)}.jsonl`);
+    const durableLines = (await readFile(journalPath, 'utf8')).trim().split(/\r?\n/).map(JSON.parse);
+    assert.deepEqual(durableLines.map((event) => event.sequence), [1]);
+
+    const restarted = new JobManager({ dataDir, pythonBin: 'python', runnerPath: path.join(dataDir, 'runner.py') });
+    await restarted.initialize();
+    assert.equal(await restarted.getEventHighWater(jobId), 1);
+    const replay = await restarted.listEventPage(jobId, 0, { throughSequence: 1 });
+    assert.deepEqual(replay.events.map((event) => event.eventId), [`${jobId}:1`]);
+
+    await restarted.refreshArtifactCount(jobId);
+    assert.equal(await restarted.getEventHighWater(jobId), 2);
+    const secondPage = await restarted.listEventPage(jobId, 1, { throughSequence: 2 });
+    assert.deepEqual(secondPage.events.map((event) => event.sequence), [2]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager replays a journal tail into the authoritative experience snapshot after restart', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-workflow-reducer-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  await writeFile(fakeRunner, '', 'utf8');
+  const child = createFakeChild(230803);
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => child,
+    terminateImpl: async (target) => target.kill('SIGTERM'),
+  });
+
+  try {
+    const fixture = JSON.parse(
+      await readFile(new URL('../tests/fixtures/workflow/body-events.json', import.meta.url), 'utf8'),
+    );
+    await manager.initialize();
+    const started = await manager.start(validateRunRequest({ checkOnly: true, keyword: 'ai product manager' }));
+
+    child.stdout.write(`${WORKFLOW_EVENT_LINE_PREFIX}${JSON.stringify(fixture.events[0])}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    const checkpointSnapshot = manager.get(started.id).experienceSnapshot;
+    await manager.persist();
+    const checkpointHistory = await readFile(path.join(dataDir, 'jobs.json'), 'utf8');
+
+    for (const source of fixture.events.slice(1)) {
+      child.stdout.write(`${WORKFLOW_EVENT_LINE_PREFIX}${JSON.stringify(source)}\n`);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    let expected = manager.get(started.id).experienceSnapshot;
+    assert.ok(expected.throughSequence > checkpointSnapshot.throughSequence);
+    assert.equal(expected.issues[0].code, fixture.expected.issueCode);
+    const liveHighWater = await manager.getEventHighWater(started.id);
+    const livePage = await manager.listEventPage(started.id, 0, { limit: 500, throughSequence: liveHighWater });
+    const workflowEvents = livePage.events.filter((event) => event.type === 'workflow');
+    assert.equal(workflowEvents.length, fixture.events.length);
+    for (const event of workflowEvents) {
+      assert.equal(event.data.experienceSnapshot.throughSequence, event.sequence);
+      assert.equal(event.data.experienceSnapshot.jobId, started.id);
+    }
+    child.stdout.write('AGENT_STAGE 1/8\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    expected = manager.get(started.id).experienceSnapshot;
+    assert.equal(expected.state, 'running');
+    assert.equal(expected.activeStage, 'classify');
+    assert.equal(expected.stages.find((stage) => stage.stage === 'body').state, 'waiting_system');
+
+    const ended = waitForEnd(manager, started.id);
+    child.emit('close', 0, null);
+    await ended;
+    await manager.getEventHighWater(started.id);
+    expected = manager.get(started.id).experienceSnapshot;
+    assert.equal(expected.state, 'completed');
+    assert.equal(expected.activeStage, null);
+
+    // Simulate a crash after the event journal reached disk but before jobs.json caught up.
+    await writeFile(path.join(dataDir, 'jobs.json'), checkpointHistory, 'utf8');
+    const restarted = new JobManager({
+      dataDir,
+      pythonBin: 'python',
+      runnerPath: fakeRunner,
+      recoverImpl: async () => ({ matched: 0, terminated: 0 }),
+    });
+    await restarted.initialize();
+
+    const replayed = restarted.get(started.id).experienceSnapshot;
+    const body = replayed.stages.find((stage) => stage.stage === 'body');
+    assert.equal(replayed.throughSequence, expected.throughSequence);
+    assert.equal(replayed.activeStage, expected.activeStage);
+    assert.equal(replayed.state, expected.state);
+    assert.equal(replayed.counts.fullText, fixture.expected.coverageDone);
+    assert.equal(replayed.counts.discovered, fixture.expected.coverageTotal);
+    assert.equal(body.progress.done, fixture.expected.attemptDone);
+    assert.equal(body.progress.total, fixture.expected.attemptTotal);
+    assert.equal(body.progress.coverageDone, fixture.expected.coverageDone);
+    assert.equal(body.progress.coverageTotal, fixture.expected.coverageTotal);
+    assert.deepEqual(replayed.issues, []);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });
 
 test('proactive body cooldown is exposed as a resumable protection wait', () => {
@@ -333,13 +514,27 @@ test('manual rate-limit recovery signals a running audience collector without re
     child.stdout.write('AUDIENCE_RATE_LIMIT retry=1/5 wait=30s; checkpoint preserved\n');
     await waitForJob(manager, jobId, (job) => job.rateLimit?.status === 'waiting');
 
-    const recovery = await manager.signalRateLimitRecovery(jobId);
+    const recovery = await manager.signalRateLimitRecovery(jobId, {
+      idempotencyKey: 'manual-probe-1',
+    });
     assert.equal(recovery.signaled, true);
+    assert.equal(recovery.duplicate, false);
     assert.equal(recovery.job.id, jobId);
     assert.equal(manager.list().length, 1);
     assert.match(
       await readFile(path.join(outputDir, '.rate-limit-recover.request'), 'utf8'),
       /^\d{4}-\d{2}-\d{2}T/,
+    );
+
+    await rm(path.join(outputDir, '.rate-limit-recover.request'), { force: true });
+    const replay = await manager.signalRateLimitRecovery(jobId, {
+      idempotencyKey: 'manual-probe-1',
+    });
+    assert.equal(replay.signaled, true);
+    assert.equal(replay.duplicate, true);
+    await assert.rejects(
+      readFile(path.join(outputDir, '.rate-limit-recover.request'), 'utf8'),
+      (error) => error?.code === 'ENOENT',
     );
 
     child.stdout.write('AUDIENCE_RATE_LIMIT manual_probe attempt=1/5; skipping remaining cooldown\n');
@@ -352,6 +547,63 @@ test('manual rate-limit recovery signals a running audience collector without re
     await ended;
     assert.equal(manager.get(jobId).status, 'completed');
     assert.equal(manager.get(jobId).rateLimit.status, 'cleared');
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('manual body recovery uses the same bounded warm-start probe as automatic recovery', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-rate-limit-manual-body-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260801090500-a11a0002';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1' },
+    { note_id: 'post-2', note_url: 'https://example.test/explore/post-2' },
+  ]), 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1', body: 'Saved body', access_status: 'detail_ok' },
+  ]), 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'incomplete',
+    outputDir,
+    params: { analysisMode: 'job', keyword: 'ai product manager' },
+    rateLimit: { detected: true, status: 'stopped', resumeScope: 'body_completion' },
+  }]), 'utf8');
+
+  const child = createFakeChild(81011);
+  let spawnedArgs = [];
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: (_command, args) => {
+      spawnedArgs = args;
+      return child;
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const started = await manager.resume(jobId, {
+      scope: 'body_completion',
+      forceCompleted: true,
+      requestedBy: 'manual_recovery_test',
+      rateLimitRecoveryMode: 'manual',
+    });
+    await waitForJob(manager, started.id, (job) => job.status === 'running');
+
+    assert.equal(spawnedArgs.includes('--rate-limit-auto-recovery'), true);
+    assert.equal(spawnedArgs.includes('--no-rate-limit-auto-recovery'), false);
+    assert.equal(spawnedArgs[spawnedArgs.indexOf('--resume-scope') + 1], 'body_completion');
+
+    const ended = waitForEnd(manager, jobId);
+    child.emit('close', 0, null);
+    await ended;
   } finally {
     await manager.shutdown();
     await rm(dataDir, { recursive: true, force: true });
@@ -380,11 +632,15 @@ test('exhausted audience rate limits automatically resume the same task from its
 
   const children = [createFakeChild(81002), createFakeChild(81003)];
   let spawnCount = 0;
+  const spawnedArgs = [];
   const manager = new JobManager({
     dataDir,
     pythonBin: 'python',
     runnerPath: fakeRunner,
-    spawnImpl: () => children[spawnCount++],
+    spawnImpl: (_command, args) => {
+      spawnedArgs.push(args);
+      return children[spawnCount++];
+    },
     rateLimitRecovery: {
       enabled: true,
       initialDelayMs: 250,
@@ -409,6 +665,8 @@ test('exhausted audience rate limits automatically resume the same task from its
       }),
     });
     await waitForJob(manager, first.id, (job) => job.status === 'running');
+    assert.equal(spawnedArgs[0].includes('--no-rate-limit-auto-recovery'), true);
+    assert.equal(spawnedArgs[0].includes('--rate-limit-auto-recovery'), false);
     const firstEnded = waitForEnd(manager, jobId);
     children[0].stdout.write('AUDIENCE_RATE_LIMIT exhausted retries=5; checkpoint preserved\n');
     children[0].emit('close', 1, null);
@@ -428,6 +686,15 @@ test('exhausted audience rate limits automatically resume the same task from its
     );
     await waitForCondition(() => spawnCount === 2);
     assert.equal(spawnCount, 2);
+    assert.equal(spawnedArgs[1].includes('--rate-limit-auto-recovery'), true);
+    assert.equal(spawnedArgs[1].includes('--no-rate-limit-auto-recovery'), false);
+    assert.equal(spawnedArgs[1].includes('--resume'), true);
+    assert.equal(spawnedArgs[1].includes('--audience-only'), true);
+    assert.equal(spawnedArgs[1].includes('--collect-audience'), true);
+    assert.equal(
+      spawnedArgs[1][spawnedArgs[1].indexOf('--rate-limit-stable-successes') + 1],
+      '3',
+    );
     assert.equal(automaticallyResumed.id, jobId);
     assert.equal(automaticallyResumed.outputDir, outputDir);
     assert.equal(automaticallyResumed.attempts.at(-1).requestedBy, 'rate_limit_auto_recovery');
@@ -873,6 +1140,45 @@ test('security timeout can resume before the first card is discovered', () => {
   assert.equal(job.resumeAvailable, true);
 });
 
+test('public job refreshes stale unknown runner failures from persisted snapshots', () => {
+  const source = {
+    id: 'stale-runner-failure',
+    status: 'failed',
+    params: { keyword: 'test', analysisMode: 'job' },
+    bodyMetrics: {
+      discovered: 0,
+      attempted: 0,
+      succeeded: 0,
+      failed: 0,
+      notAttempted: 0,
+      blocked: 0,
+      cancelled: 0,
+      pending: 0,
+    },
+    attempts: [{
+      attemptId: 'attempt-1',
+      status: 'failed',
+      errorCode: 'RUNNER_FAILED',
+      errorMessage: 'Runner exited with code 1.',
+    }],
+    currentAttemptId: 'attempt-1',
+  };
+  const staleSnapshot = adaptLegacyJobSnapshot(source);
+  staleSnapshot.headline = '当前步骤遇到未识别问题';
+  staleSnapshot.issues = [mapUserProblem('UNKNOWN_ERROR', {
+    saved: 0,
+    total: 0,
+    technicalRef: 'RUNNER_FAILED',
+  })];
+
+  const job = publicJob({ ...source, experienceSnapshot: staleSnapshot });
+
+  assert.equal(job.experienceSnapshot.headline, '采集任务意外停止');
+  assert.equal(job.experienceSnapshot.issues[0].code, 'RUNNER_FAILED');
+  assert.equal(job.experienceSnapshot.issues[0].action.id, 'resume');
+  assert.doesNotMatch(job.experienceSnapshot.headline, /未识别|未知/);
+});
+
 test('public job derives body progress only from the persisted per-note ledger', () => {
   const job = publicJob({
     id: 'persisted-body-progress',
@@ -1316,6 +1622,9 @@ test('JobManager repairs a terminal task whose audience stage was left running',
     assert.equal(job.stages.audience.status, 'partial');
     assert.equal(job.stages.audience.stopReason, 'runner_failed');
     assert.equal(job.stages.audience.lastCheckpointAt, '2026-07-31T20:11:59.302Z');
+    assert.equal(job.experienceSnapshot.headline, '采集任务意外停止');
+    assert.equal(job.experienceSnapshot.issues[0].code, 'RUNNER_FAILED');
+    assert.equal(job.experienceSnapshot.issues[0].action.id, 'resume');
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1391,6 +1700,19 @@ test('JobManager resumes in place with a stable Job identity and a new Attempt',
     assert.equal(started.resumeCount, 1);
     assert.equal(started.attempts.length, originalAttemptCount + 1);
     assert.equal(started.attemptId, started.currentAttemptId);
+    assert.equal(started.progress, 0);
+    assert.equal(started.attemptProgress.done, 0);
+    assert.equal(started.attemptProgress.total, 1);
+    assert.equal(started.attemptProgress.coverageCountAtStart, 1);
+    assert.equal(started.bodyMetrics.succeeded, 1);
+    assert.equal(started.bodyMetrics.discovered, 2);
+    assert.equal(started.experienceSnapshot.counts.fullText, 1);
+    assert.equal(started.experienceSnapshot.counts.discovered, 2);
+    const bodyStage = started.experienceSnapshot.stages.find((stage) => stage.stage === 'body');
+    assert.equal(bodyStage.progress.done, 0);
+    assert.equal(bodyStage.progress.total, 1);
+    assert.equal(bodyStage.progress.coverageDone, 1);
+    assert.equal(bodyStage.progress.coverageTotal, 2);
     assert.deepEqual(
       JSON.parse(await readFile(path.join(resumedOutputDir, 'xiaohongshu_cards_discovered.json'), 'utf8')),
       cards,

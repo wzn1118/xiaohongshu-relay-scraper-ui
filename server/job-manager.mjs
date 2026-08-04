@@ -2,11 +2,17 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createWriteStream } from 'node:fs';
-import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { buildRunnerArgs } from './lib/contracts.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
 import { readPersistedExpansion } from './lib/expansion-results.mjs';
+import {
+  adaptLegacyJobSnapshot,
+  createWorkflowEvent,
+  parseWorkflowEventLine,
+  reduceWorkflowSnapshot,
+} from './lib/job-experience.mjs';
 import {
   WORKFLOW_STATE_SCHEMA_VERSION,
   emptyWorkflowStages,
@@ -23,6 +29,7 @@ const RESUMABLE_JOB_STATUSES = new Set(['incomplete', 'interrupted', 'failed', '
 const RESUME_SCOPES = new Set(['full', 'discovery', 'body_completion', 'analysis', 'audience', 'artifacts']);
 const RATE_LIMIT_RECOVERY_STATUSES = new Set(['waiting', 'stopped', 'scheduled', 'resuming']);
 const RATE_LIMIT_TERMINAL_STATUSES = new Set(['stopped', 'scheduled']);
+const BODY_RATE_LIMIT_STABLE_SUCCESSES = 3;
 
 export class JobManager {
   constructor({
@@ -54,6 +61,9 @@ export class JobManager {
     this.processes = new Map();
     this.events = new EventEmitter();
     this.events.setMaxListeners(0);
+    this.eventJournalDir = path.join(dataDir, 'job-events');
+    this.jobEventJournals = new Map();
+    this.jobEventWriteQueues = new Map();
     this.writeQueue = Promise.resolve();
     this.aiSessions = aiSessions;
     this.profileStore = profileStore;
@@ -70,6 +80,7 @@ export class JobManager {
 
   async initialize() {
     await mkdir(this.dataDir, { recursive: true });
+    await mkdir(this.eventJournalDir, { recursive: true });
     try {
       const parsed = JSON.parse(await readFile(this.historyPath, 'utf8'));
       this.jobs = Array.isArray(parsed) ? parsed : [];
@@ -80,6 +91,7 @@ export class JobManager {
     let changed = false;
     for (const job of this.jobs) {
       changed = migrateLegacyJob(job, this.dataDir, now) || changed;
+      changed = await this.#loadEventJournal(job) || changed;
       const expansionBeforeState = job.workflowSummary?.expansion;
       const state = await initializeWorkflowState(job.statePath, workflowStateFromJob(job));
       changed = applyWorkflowStateToJob(job, state) || changed;
@@ -314,6 +326,9 @@ export class JobManager {
       checkpointRevisionAtStart: 0,
       entryStatus: 'queued',
       processedCountAtStart: 0,
+      coverageCountAtStart: 0,
+      targetCount: importedCards?.length || 0,
+      progressUnit: importedCards ? 'body' : 'card',
     });
     await mkdir(path.dirname(attempt.logPath), { recursive: true });
     const job = {
@@ -479,6 +494,7 @@ export class JobManager {
       }
 
       const runnerParams = resumeRunnerParams(job.params, options.params, scope);
+      runnerParams.rateLimitRecoveryResume = Boolean(options.rateLimitRecoveryMode);
       const resumeCheckpointJobIds = normalizeInPlaceCheckpointJobIds(
         job.id,
         options.resumeCheckpointJobIds,
@@ -506,6 +522,7 @@ export class JobManager {
         };
       }
       const sequence = nextAttemptSequence(job.attempts);
+      const attemptBaseline = attemptBaselineForJob(job, scope);
       const attempt = createAttempt({
         jobId: job.id,
         jobDir: path.dirname(job.outputDir),
@@ -517,6 +534,9 @@ export class JobManager {
         checkpointRevisionAtStart: state.revision,
         entryStatus: job.status,
         processedCountAtStart: processedCountForJob(job),
+        coverageCountAtStart: attemptBaseline.coverageCountAtStart,
+        targetCount: attemptBaseline.targetCount,
+        progressUnit: attemptBaseline.unit,
       });
       await mkdir(path.dirname(attempt.logPath), { recursive: true });
       backfillLatestAttemptOutcome(job);
@@ -528,13 +548,24 @@ export class JobManager {
       job.pid = null;
       job.cancelRequested = false;
       job.interruptRequested = false;
+      job.progress = 0;
       job.progressPhase = 'resuming';
       job.progressLabel = '正在恢复原任务';
+      job.progressCurrent = 0;
+      job.progressTotal = attempt.targetCount;
       job.progressUpdatedAt = now;
       job.currentAttemptId = attempt.attemptId;
       job.activeAttemptId = attempt.attemptId;
       job.resumeCount = Number(job.resumeCount || 0) + 1;
       job.lastResumedAt = now;
+      job.attemptProgress = {
+        attemptId: attempt.attemptId,
+        unit: attempt.progressUnit,
+        done: 0,
+        total: attempt.targetCount,
+        coverageCountAtStart: attempt.coverageCountAtStart,
+        startedAt: now,
+      };
       job.attempts.push(attempt);
       const nextState = await this.#commitWorkflowState(job, { expectedRevision: state.revision });
       applyWorkflowStateToJob(job, nextState);
@@ -545,6 +576,9 @@ export class JobManager {
         resumeScope: scope,
         resumeCheckpointDirs,
       });
+      await unlink(path.join(job.outputDir, '.rate-limit-recover.request')).catch((error) => {
+        if (error?.code !== 'ENOENT') throw error;
+      });
       this.active = job;
       await this.#markAttemptRunning(job);
       await this.persist();
@@ -554,25 +588,32 @@ export class JobManager {
     });
   }
 
-  async signalRateLimitRecovery(id) {
-    const job = this.getInternal(id);
-    if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
-    if (this.active?.id !== id || job.rateLimit?.status !== 'waiting') {
-      return { signaled: false, job: publicJob(job) };
-    }
-    const now = new Date().toISOString();
-    await writeFile(path.join(job.outputDir, '.rate-limit-recover.request'), `${now}\n`, 'utf8');
-    job.rateLimit = {
-      ...job.rateLimit,
-      manualProbeRequestedAt: now,
-      recoveryAction: 'manual_probe',
-    };
-    job.progressLabel = '已收到手动恢复指令，正在跳过剩余冷却并立即探测页面';
-    job.progressUpdatedAt = now;
-    job.updatedAt = now;
-    await this.persist();
-    this.#emit(id, 'state', publicJob(job));
-    return { signaled: true, job: publicJob(job) };
+  async signalRateLimitRecovery(id, options = {}) {
+    return this.#withJobLock(id, async () => {
+      const job = this.getInternal(id);
+      if (!job) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+      const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
+      if (idempotencyKey && job.manualProbeIdempotencyKey === idempotencyKey) {
+        return { signaled: true, duplicate: true, job: publicJob(job) };
+      }
+      if (this.active?.id !== id || job.rateLimit?.status !== 'waiting') {
+        return { signaled: false, duplicate: false, job: publicJob(job) };
+      }
+      const now = new Date().toISOString();
+      await writeFile(path.join(job.outputDir, '.rate-limit-recover.request'), `${now}\n`, 'utf8');
+      job.manualProbeIdempotencyKey = idempotencyKey;
+      job.rateLimit = {
+        ...job.rateLimit,
+        manualProbeRequestedAt: now,
+        recoveryAction: 'manual_probe',
+      };
+      job.progressLabel = '已收到手动恢复指令，正在跳过剩余冷却并立即探测页面';
+      job.progressUpdatedAt = now;
+      job.updatedAt = now;
+      await this.persist();
+      this.#emit(id, 'state', publicJob(job));
+      return { signaled: true, duplicate: false, job: publicJob(job) };
+    });
   }
 
   #cancelRateLimitRecovery(id) {
@@ -581,12 +622,14 @@ export class JobManager {
     this.rateLimitRecoveryTimers.delete(id);
   }
 
-  #armRateLimitRecovery(job, { restore = false, busy = false } = {}) {
+  #armRateLimitRecovery(job, { restore = false, busy = false, deferTimer = false } = {}) {
     this.#cancelRateLimitRecovery(job.id);
     const resumeScope = rateLimitResumeScope(job);
+    const rateLimitStatus = job.rateLimit?.status;
+    const waitingRecovery = ['waiting', 'resuming'].includes(rateLimitStatus);
     if (
       !this.rateLimitRecovery.enabled
-      || !RATE_LIMIT_TERMINAL_STATUSES.has(job.rateLimit?.status)
+      || (!RATE_LIMIT_TERMINAL_STATUSES.has(rateLimitStatus) && !waitingRecovery)
       || !RESUMABLE_JOB_STATUSES.has(job.status)
       || !resumeScope
     ) return false;
@@ -614,10 +657,15 @@ export class JobManager {
       this.rateLimitRecovery.maxDelayMs,
       this.rateLimitRecovery.initialDelayMs * (2 ** completedAttempts),
     );
+    const waitingDelayMs = waitingRecovery
+      ? Math.max(0, Number(job.rateLimit?.retryAfterSeconds || 0) * 1000)
+      : 0;
     const delayMs = busy
       ? this.rateLimitRecovery.busyDelayMs
       : restore && Number.isFinite(persistedDueAt)
         ? Math.max(0, persistedDueAt - now)
+        : waitingDelayMs > 0
+          ? waitingDelayMs
         : exponentialDelay;
     const nextRetryAt = new Date(now + delayMs).toISOString();
     job.rateLimit = {
@@ -637,6 +685,15 @@ export class JobManager {
       ? '其他任务正在运行，限流断点续跑已顺延且不会丢失'
       : `平台限流冷却中，将自动进行第 ${completedAttempts + 1} / ${this.rateLimitRecovery.maxAttempts} 轮断点续跑`;
     job.progressUpdatedAt = new Date().toISOString();
+    if (!deferTimer) this.#startRateLimitRecoveryTimer(job);
+    return true;
+  }
+
+  #startRateLimitRecoveryTimer(job) {
+    this.#cancelRateLimitRecovery(job.id);
+    if (job.rateLimit?.status !== 'scheduled') return false;
+    const dueAt = Date.parse(job.rateLimit.nextRetryAt || '');
+    const delayMs = Number.isFinite(dueAt) ? Math.max(0, dueAt - Date.now()) : 0;
     const timer = setTimeout(() => {
       void this.#runScheduledRateLimitRecovery(job.id);
     }, delayMs);
@@ -726,7 +783,7 @@ export class JobManager {
       applyWorkflowStateToJob(job, state);
       this.runtimeContexts.delete(id);
       this.#emit(id, 'state', publicJob(job));
-      this.#emit(id, 'end', { status: job.status, exitCode: job.exitCode });
+      await this.#emit(id, 'end', { status: job.status, exitCode: job.exitCode }, { durable: true });
       await this.persist();
       if (!this.active && !this.relaySubtask) queueMicrotask(() => this.#startNextQueued());
       return { found: true, job: publicJob(job), changed: true };
@@ -892,7 +949,7 @@ export class JobManager {
         throw jobError('JOB_ACTIVE_RETENTION', 'Automatic cleanup skipped a task that became active.');
       }
       this.deletingJobs.add(id);
-      this.#emit(id, 'closing', { reason: 'deletion' });
+      await this.#emit(id, 'closing', { reason: 'deletion' }, { durable: true });
       try {
         if (TERMINAL.has(job.status) && !this.processes.has(id) && this.active?.id !== id && !this.liveCheckpointAnalyses.has(id)) {
           this.runtimeContexts.delete(id);
@@ -976,9 +1033,15 @@ export class JobManager {
     if (!removed.length) return [];
     this.jobs = this.jobs.filter((job) => !selected.has(job.id));
     for (const job of removed) {
+      await this.jobEventWriteQueues.get(job.id)?.catch(() => {});
       this.deletingJobs.delete(job.id);
       this.runtimeContexts.delete(job.id);
       this.liveCheckpointAnalyses.delete(job.id);
+      this.jobEventJournals.delete(job.id);
+      this.jobEventWriteQueues.delete(job.id);
+      await unlink(this.#eventJournalPath(job.id)).catch((error) => {
+        if (error.code !== 'ENOENT') throw error;
+      });
       this.events.removeAllListeners(`job:${job.id}`);
     }
     await this.persist();
@@ -1041,89 +1104,209 @@ export class JobManager {
   async shutdown() {
     for (const timer of this.rateLimitRecoveryTimers.values()) clearTimeout(timer);
     this.rateLimitRecoveryTimers.clear();
-    const job = this.active;
-    if (!job) return { interrupted: false };
-    const expansion = job.workflowSummary?.expansion;
-    if (TERMINAL.has(job.status) && ['running', 'cancelling'].includes(expansion?.runtimeStatus)) {
-      const settled = new Promise((resolve) => {
+    try {
+      const job = this.active;
+      if (!job) return { interrupted: false };
+      const expansion = job.workflowSummary?.expansion;
+      if (TERMINAL.has(job.status) && ['running', 'cancelling'].includes(expansion?.runtimeStatus)) {
+        const settled = new Promise((resolve) => {
+          const unsubscribe = this.subscribe(job.id, (event) => {
+            if (event.type !== 'state' || ['running', 'cancelling'].includes(event.data?.workflowSummary?.expansion?.runtimeStatus)) return;
+            unsubscribe();
+            resolve(true);
+          });
+        });
+        job.expansionInterruptRequested = true;
+        await writeFile(expansion.cancelPath, 'cancel\n', 'utf8').catch(() => {});
+        const child = this.processes.get(job.id);
+        if (child) await this.terminateImpl(child);
+        const completed = await Promise.race([settled, new Promise((resolve) => setTimeout(() => resolve(false), 10000))]);
+        if (!completed) {
+          const now = new Date().toISOString();
+          job.workflowSummary = {
+            ...(job.workflowSummary || {}),
+            expansion: { ...expansion, runtimeStatus: 'interrupted', status: 'interrupted', stopReason: 'server_shutdown', resumable: true, finishedAt: now, updatedAt: now },
+          };
+          job.updatedAt = now;
+          job.expansionPid = null;
+          this.processes.delete(job.id);
+          if (this.active?.id === job.id) this.active = null;
+          await this.persist();
+          this.#emit(job.id, 'state', publicJob(job));
+        }
+        return { interrupted: true };
+      }
+      if (TERMINAL.has(job.status)) return { interrupted: false };
+      const ended = new Promise((resolve) => {
         const unsubscribe = this.subscribe(job.id, (event) => {
-          if (event.type !== 'state' || ['running', 'cancelling'].includes(event.data?.workflowSummary?.expansion?.runtimeStatus)) return;
-          unsubscribe();
-          resolve(true);
+          if (event.type === 'end') {
+            unsubscribe();
+            resolve(true);
+          }
         });
       });
-      job.expansionInterruptRequested = true;
-      await writeFile(expansion.cancelPath, 'cancel\n', 'utf8').catch(() => {});
+      job.interruptRequested = true;
       const child = this.processes.get(job.id);
       if (child) await this.terminateImpl(child);
-      const completed = await Promise.race([settled, new Promise((resolve) => setTimeout(() => resolve(false), 10000))]);
+      this.#emit(job.id, 'state', publicJob(job));
+      await this.persist();
+      let timeoutId;
+      const completed = await Promise.race([
+        ended,
+        new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve(false), 10000);
+        }),
+      ]);
+      clearTimeout(timeoutId);
       if (!completed) {
-        const now = new Date().toISOString();
-        job.workflowSummary = {
-          ...(job.workflowSummary || {}),
-          expansion: { ...expansion, runtimeStatus: 'interrupted', status: 'interrupted', stopReason: 'server_shutdown', resumable: true, finishedAt: now, updatedAt: now },
-        };
-        job.updatedAt = now;
-        job.expansionPid = null;
-        this.processes.delete(job.id);
+        await this.recoverImpl(job);
+        job.status = 'interrupted';
+        job.error = 'Server shutdown interrupted the task; resume is available from its checkpoint.';
+        job.finishedAt = new Date().toISOString();
+        job.updatedAt = job.finishedAt;
+        job.pid = null;
+        finalizeRunningAudienceStage(job, 'server_shutdown', job.finishedAt);
+        finishAttempt(currentAttempt(job), {
+          status: 'interrupted',
+          finishedAt: job.finishedAt,
+          stopReason: 'server_shutdown',
+          errorCode: 'SERVER_SHUTDOWN',
+          errorMessage: job.error,
+          processedCount: attemptProcessedCount(currentAttempt(job), job),
+          checkpointRevisionAtEnd: Number(job.revision || 0) + 1,
+        });
+        job.activeAttemptId = null;
+        const state = await this.#commitWorkflowState(job, { expectedRevision: job.revision });
+        applyWorkflowStateToJob(job, state);
         if (this.active?.id === job.id) this.active = null;
         await this.persist();
-        this.#emit(job.id, 'state', publicJob(job));
       }
-      return { interrupted: true };
+      return { interrupted: true, job: publicJob(job) };
+    } finally {
+      await this.#drainWrites();
     }
-    if (TERMINAL.has(job.status)) return { interrupted: false };
-    const ended = new Promise((resolve) => {
-      const unsubscribe = this.subscribe(job.id, (event) => {
-        if (event.type === 'end') {
-          unsubscribe();
-          resolve(true);
-        }
-      });
-    });
-    job.interruptRequested = true;
-    const child = this.processes.get(job.id);
-    if (child) await this.terminateImpl(child);
-    this.#emit(job.id, 'state', publicJob(job));
-    await this.persist();
-    let timeoutId;
-    const completed = await Promise.race([
-      ended,
-      new Promise((resolve) => {
-        timeoutId = setTimeout(() => resolve(false), 10000);
-      }),
-    ]);
-    clearTimeout(timeoutId);
-    if (!completed) {
-      await this.recoverImpl(job);
-      job.status = 'interrupted';
-      job.error = 'Server shutdown interrupted the task; resume is available from its checkpoint.';
-      job.finishedAt = new Date().toISOString();
-      job.updatedAt = job.finishedAt;
-      job.pid = null;
-      finalizeRunningAudienceStage(job, 'server_shutdown', job.finishedAt);
-      finishAttempt(currentAttempt(job), {
-        status: 'interrupted',
-        finishedAt: job.finishedAt,
-        stopReason: 'server_shutdown',
-        errorCode: 'SERVER_SHUTDOWN',
-        errorMessage: job.error,
-        processedCount: attemptProcessedCount(currentAttempt(job), job),
-        checkpointRevisionAtEnd: Number(job.revision || 0) + 1,
-      });
-      job.activeAttemptId = null;
-      const state = await this.#commitWorkflowState(job, { expectedRevision: job.revision });
-      applyWorkflowStateToJob(job, state);
-      if (this.active?.id === job.id) this.active = null;
-      await this.persist();
+  }
+
+  async #drainWrites() {
+    while (true) {
+      const historyWrite = this.writeQueue;
+      const eventWrites = [...this.jobEventWriteQueues.entries()];
+      await Promise.all([
+        historyWrite.catch(() => {}),
+        ...eventWrites.map(([, write]) => write.catch(() => {})),
+      ]);
+      if (
+        historyWrite === this.writeQueue
+        && eventWrites.every(([id, write]) => this.jobEventWriteQueues.get(id) === write)
+      ) return;
     }
-    return { interrupted: true, job: publicJob(job) };
   }
 
   subscribe(id, listener) {
     const event = `job:${id}`;
     this.events.on(event, listener);
     return () => this.events.off(event, listener);
+  }
+
+  async getEventHighWater(id) {
+    if (!this.getInternal(id)) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+    await this.jobEventWriteQueues.get(id)?.catch(() => {});
+    const journal = this.jobEventJournals.get(id) || [];
+    return Math.max(
+      0,
+      Number(this.getInternal(id)?.eventSequence || 0),
+      Number(journal.at(-1)?.sequence || 0),
+    );
+  }
+
+  async listEventPage(id, after = 0, { limit = 500, throughSequence = Number.MAX_SAFE_INTEGER } = {}) {
+    if (!this.getInternal(id)) throw jobError('JOB_NOT_FOUND', 'Task not found.');
+    await this.jobEventWriteQueues.get(id)?.catch(() => {});
+    const cursor = Math.max(0, Number(after || 0));
+    const currentHighWater = Math.max(
+      0,
+      Number(this.getInternal(id)?.eventSequence || 0),
+      Number(this.jobEventJournals.get(id)?.at(-1)?.sequence || 0),
+    );
+    const requestedHighWater = Number.isSafeInteger(Number(throughSequence))
+      ? Number(throughSequence)
+      : currentHighWater;
+    const highWater = Math.max(0, Math.min(currentHighWater, requestedHighWater));
+    const pageSize = Math.min(1_000, Math.max(1, Number(limit || 500)));
+    const eligible = (this.jobEventJournals.get(id) || [])
+      .filter((event) => event.sequence > cursor && event.sequence <= highWater);
+    const events = eligible.slice(0, pageSize).map((event) => structuredClone(event));
+    const nextAfter = events.at(-1)?.sequence || cursor;
+    return {
+      events,
+      nextAfter,
+      hasMore: eligible.length > events.length,
+      throughSequence: highWater,
+    };
+  }
+
+  async #loadEventJournal(job) {
+    const journalPath = this.#eventJournalPath(job.id);
+    let text;
+    try {
+      text = await readFile(journalPath, 'utf8');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      this.jobEventJournals.set(job.id, []);
+      return false;
+    }
+    const bySequence = new Map();
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        if (
+          event?.jobId === job.id
+          && Number.isSafeInteger(event.sequence)
+          && event.sequence > 0
+          && typeof event.eventId === 'string'
+        ) bySequence.set(event.sequence, event);
+      } catch {
+        // A partially written final line is ignored; prior durable events remain replayable.
+      }
+    }
+    const events = [...bySequence.values()].sort((left, right) => left.sequence - right.sequence);
+    this.jobEventJournals.set(job.id, events);
+    const storedSnapshot = job.experienceSnapshot?.schemaVersion === 3
+      ? job.experienceSnapshot
+      : null;
+    let reducedSnapshot = storedSnapshot || adaptLegacyJobSnapshot(job, { throughSequence: 0 });
+    let hasWorkflowProjection = Boolean(storedSnapshot);
+    const storedThroughSequence = Math.max(0, Number(storedSnapshot?.throughSequence || 0));
+    for (const event of events) {
+      const eventSnapshot = event.data?.experienceSnapshot || event.data?.experience;
+      if (
+        eventSnapshot?.schemaVersion === 3
+        && eventSnapshot.jobId === job.id
+        && Number(eventSnapshot.throughSequence) === event.sequence
+        && event.sequence > Number(reducedSnapshot.throughSequence || 0)
+      ) {
+        reducedSnapshot = eventSnapshot;
+        hasWorkflowProjection = true;
+        continue;
+      }
+      if (event.type === 'workflow' && event.workflowEvent?.schemaVersion === 1) {
+        reducedSnapshot = reduceWorkflowSnapshot(reducedSnapshot, event.workflowEvent);
+        hasWorkflowProjection = true;
+      }
+    }
+    if (hasWorkflowProjection) job.experienceSnapshot = reducedSnapshot;
+    const projectionChanged = hasWorkflowProjection && (
+      !storedSnapshot || reducedSnapshot.throughSequence !== storedThroughSequence
+    );
+    const sequence = Math.max(Number(job.eventSequence || 0), Number(events.at(-1)?.sequence || 0));
+    if (sequence === Number(job.eventSequence || 0)) return projectionChanged;
+    job.eventSequence = sequence;
+    return true;
+  }
+
+  #eventJournalPath(id) {
+    return path.join(this.eventJournalDir, `${encodeURIComponent(String(id))}.jsonl`);
   }
 
   async #prepareInPlaceResume(job, params, checkpointJobIds = []) {
@@ -1221,7 +1404,9 @@ export class JobManager {
       ? Math.max(0, Number(job.params?.importedBodyCount || job.progressTotal || 0))
       : 0;
     job.status = 'running';
-    job.progress = Math.max(10, Number(job.progress || 0));
+    job.progress = attempt?.kind === 'initial'
+      ? Math.max(10, Number(job.progress || 0))
+      : 0;
     job.startedAt ||= now;
     job.updatedAt = now;
     job.progressPhase = 'starting';
@@ -1229,7 +1414,7 @@ export class JobManager {
       ? `正在启动采集器，准备采集 ${importedBodyTotal} 条正文`
       : '正在启动采集器并连接 Relay';
     job.progressCurrent = 0;
-    job.progressTotal = importedBodyTotal;
+    job.progressTotal = importedBodyTotal || Math.max(0, Number(attempt?.targetCount || 0));
     job.progressUpdatedAt = now;
     if (attempt) {
       attempt.status = 'running';
@@ -1252,7 +1437,13 @@ export class JobManager {
       const buffered = `${buffers.get(stream) || ''}${message}`;
       const lines = buffered.split(/\r?\n/);
       buffers.set(stream, lines.pop() || '');
-      if (lines.some((line) => updateProgressFromLog(job, line))) {
+      let progressChanged = false;
+      for (const line of lines) {
+        progressChanged = updateProgressFromLog(job, line) || progressChanged;
+        const workflowEvent = parseWorkflowEventLine(line);
+        if (workflowEvent) this.#emit(job.id, 'workflow', workflowEvent);
+      }
+      if (progressChanged) {
         job.updatedAt = new Date().toISOString();
         this.#emit(job.id, 'state', publicJob(job));
         void this.persist();
@@ -1350,7 +1541,13 @@ export class JobManager {
       const buffered = `${progressBuffers.get(stream) || ''}${message}`;
       const lines = buffered.split(/\r?\n/);
       progressBuffers.set(stream, lines.pop() || '');
-      if (lines.some((line) => updateProgressFromLog(job, line))) {
+      let progressChanged = false;
+      for (const line of lines) {
+        progressChanged = updateProgressFromLog(job, line) || progressChanged;
+        const workflowEvent = parseWorkflowEventLine(line);
+        if (workflowEvent) this.#emit(job.id, 'workflow', workflowEvent);
+      }
+      if (progressChanged) {
         this.#emit(job.id, 'state', publicJob(job));
       }
       if (
@@ -1457,6 +1654,7 @@ export class JobManager {
       } else {
         job.status = 'failed';
         job.error = `Runner exited with code ${result.code ?? 'unknown'}.`;
+        append('system', `${job.error}\n`);
       }
     } catch (error) {
       job.status = job.interruptRequested ? 'interrupted' : job.cancelRequested ? 'cancelled' : 'failed';
@@ -1531,11 +1729,12 @@ export class JobManager {
         job.error = String(error?.message || error);
         append('system', `${job.error}\n`);
       }
-      this.#armRateLimitRecovery(job);
+      this.#armRateLimitRecovery(job, { deferTimer: true });
       await this.persist();
       this.#emit(job.id, 'state', publicJob(job));
       await Promise.all([closeWriteStream(log), closeWriteStream(attemptLog)]);
-      this.#emit(job.id, 'end', { status: job.status, exitCode: job.exitCode });
+      await this.#emit(job.id, 'end', { status: job.status, exitCode: job.exitCode }, { durable: true });
+      this.#startRateLimitRecoveryTimer(job);
       queueMicrotask(() => this.#startNextQueued());
     }
   }
@@ -1632,9 +1831,92 @@ export class JobManager {
     return job.cleanupResult;
   }
 
-  #emit(id, type, data) {
-    this.diagnostics?.recordJobEvent?.(id, type, data);
-    this.events.emit(`job:${id}`, { type, data });
+  #emit(id, type, data, { durable = false } = {}) {
+    const job = this.getInternal(id);
+    const journal = this.jobEventJournals.get(id) || [];
+    if (!this.jobEventJournals.has(id)) this.jobEventJournals.set(id, journal);
+    const sequence = Math.max(
+      0,
+      Number(job?.eventSequence || 0),
+      Number(journal.at(-1)?.sequence || 0),
+    ) + 1;
+    const occurredAt = new Date().toISOString();
+    if (job) job.eventSequence = sequence;
+
+    let eventData = data;
+    if (type === 'state' && data && typeof data === 'object' && job) {
+      const legacySnapshot = adaptLegacyJobSnapshot(data, {
+        throughSequence: sequence,
+        lastEventAt: occurredAt,
+      });
+      job.experienceSnapshot = mergeLegacyExperienceSnapshot(job.experienceSnapshot, legacySnapshot);
+    }
+
+    const eventId = `${id}:${sequence}`;
+    const exposedJob = type === 'state'
+      ? eventData
+      : job
+        ? publicJob(job)
+        : { id, status: 'running' };
+    const workflowEvent = createWorkflowEvent(exposedJob, {
+      type,
+      sequence,
+      eventId,
+      jobId: id,
+      attemptId: job?.activeAttemptId || job?.currentAttemptId || '',
+      occurredAt,
+      supplied: type === 'workflow' ? data : null,
+    });
+    if (type === 'workflow' && job) {
+      const currentSnapshot = job.experienceSnapshot?.schemaVersion === 3
+        ? job.experienceSnapshot
+        : exposedJob.experienceSnapshot || adaptLegacyJobSnapshot(exposedJob);
+      job.experienceSnapshot = reduceWorkflowSnapshot(currentSnapshot, workflowEvent);
+    }
+    if (job?.experienceSnapshot?.schemaVersion === 3) {
+      const experienceSnapshot = {
+        ...job.experienceSnapshot,
+        throughSequence: sequence,
+        connection: {
+          ...job.experienceSnapshot.connection,
+          state: 'live',
+          lastEventAt: occurredAt,
+        },
+      };
+      job.experienceSnapshot = experienceSnapshot;
+      eventData = eventData && typeof eventData === 'object'
+        ? { ...eventData, experienceSnapshot, experience: experienceSnapshot }
+        : { experienceSnapshot, experience: experienceSnapshot };
+    }
+    const event = {
+      schemaVersion: 1,
+      eventId,
+      sequence,
+      jobId: id,
+      attemptId: workflowEvent.attemptId,
+      occurredAt,
+      type,
+      data: eventData,
+      workflowEvent,
+    };
+    journal.push(event);
+    const previousWrite = this.jobEventWriteQueues.get(id) || Promise.resolve();
+    const write = previousWrite
+      .catch(() => {})
+      .then(() => appendFile(this.#eventJournalPath(id), `${JSON.stringify(event)}\n`, 'utf8'));
+    const settledWrite = write.catch((error) => {
+      if (job) job.eventJournalError = String(error?.message || error);
+      this.diagnostics?.recordJobEvent?.(id, 'event_journal_error', {
+        sequence,
+        message: String(error?.message || error),
+      });
+    });
+    this.jobEventWriteQueues.set(id, settledWrite);
+    this.diagnostics?.recordJobEvent?.(id, type, eventData);
+    const publish = () => this.events.emit(`job:${id}`, event);
+    if (durable) return settledWrite.then(publish);
+    publish();
+    return settledWrite;
   }
 
   persist() {
@@ -1772,6 +2054,9 @@ function createAttempt({
   checkpointRevisionAtStart,
   entryStatus,
   processedCountAtStart,
+  coverageCountAtStart,
+  targetCount,
+  progressUnit,
   attemptId,
   status,
 }) {
@@ -1796,6 +2081,9 @@ function createAttempt({
     checkpointRevisionAtEnd: null,
     processedCountAtStart: Math.max(0, Number(processedCountAtStart || 0)),
     processedCount: 0,
+    coverageCountAtStart: Math.max(0, Number(coverageCountAtStart || 0)),
+    targetCount: Math.max(0, Number(targetCount || 0)),
+    progressUnit: progressUnit || 'job',
     requestedBy: requestedBy || 'user',
     idempotencyKey: idempotencyKey || null,
   };
@@ -2035,6 +2323,94 @@ function finishAttempt(attempt, values = {}) {
     checkpointRevisionAtEnd: values.checkpointRevisionAtEnd ?? attempt.checkpointRevisionAtEnd ?? null,
     processedCount: Math.max(0, Number(values.processedCount ?? attempt.processedCount ?? 0)),
   });
+}
+
+function attemptBaselineForJob(job, scope) {
+  const bodyMetrics = bodyMetricsForJob(job);
+  if (scope === 'body_completion' || scope === 'full') {
+    const coverageCountAtStart = Math.max(
+      bodyMetrics.succeeded,
+      Math.max(0, Number(job.scrapedCount || 0)),
+    );
+    return {
+      unit: 'body',
+      coverageCountAtStart,
+      targetCount: Math.max(0, bodyMetrics.discovered - coverageCountAtStart),
+    };
+  }
+  if (scope === 'audience') {
+    const audience = job.workflowSummary?.audience || {};
+    const coverageCountAtStart = Math.max(0, Number(audience.postsAttempted || 0));
+    return {
+      unit: 'job',
+      coverageCountAtStart,
+      targetCount: Math.max(0, Number(audience.postsTotal || 0) - coverageCountAtStart),
+    };
+  }
+  if (scope === 'analysis') {
+    const coverageCountAtStart = Math.max(0, Number(job.checkpointAnalysisCount || job.workflowSummary?.applicationCopyGenerated || 0));
+    return {
+      unit: 'job',
+      coverageCountAtStart,
+      targetCount: Math.max(0, bodyMetrics.succeeded - coverageCountAtStart),
+    };
+  }
+  if (scope === 'artifacts') {
+    return {
+      unit: 'file',
+      coverageCountAtStart: Math.max(0, Number(job.artifactCount || 0)),
+      targetCount: 1,
+    };
+  }
+  return {
+    unit: 'card',
+    coverageCountAtStart: Math.max(0, Number(job.discoveredCount || bodyMetrics.discovered || 0)),
+    targetCount: 0,
+  };
+}
+
+function attemptProgressForJob(job, bodyMetrics = bodyMetricsForJob(job)) {
+  const attempt = currentAttempt(job);
+  if (!attempt) {
+    return {
+      attemptId: null,
+      unit: 'job',
+      done: 0,
+      total: 0,
+      percent: null,
+      coverageCountAtStart: 0,
+      startedAt: null,
+    };
+  }
+  const scope = attempt.resumeScope || inferResumeScope(job.params);
+  const baseline = Math.max(0, Number(attempt.coverageCountAtStart || 0));
+  let coverageNow;
+  if (scope === 'body_completion' || scope === 'full') {
+    coverageNow = Math.max(bodyMetrics.succeeded, Math.max(0, Number(job.scrapedCount || 0)));
+  } else if (scope === 'audience') {
+    coverageNow = Math.max(0, Number(job.workflowSummary?.audience?.postsAttempted || 0));
+  } else if (scope === 'analysis') {
+    coverageNow = Math.max(0, Number(job.checkpointAnalysisCount || job.workflowSummary?.applicationCopyGenerated || 0));
+  } else if (scope === 'artifacts') {
+    coverageNow = Math.max(0, Number(job.artifactCount || 0));
+  } else {
+    coverageNow = Math.max(0, Number(job.discoveredCount || bodyMetrics.discovered || 0));
+  }
+  const total = Math.max(0, Number(attempt.targetCount || job.attemptProgress?.total || 0));
+  const calculated = Math.max(0, coverageNow - baseline);
+  const done = Math.min(
+    total || Number.MAX_SAFE_INTEGER,
+    Math.max(calculated, Math.max(0, Number(job.attemptProgress?.done || 0))),
+  );
+  return {
+    attemptId: attempt.attemptId,
+    unit: attempt.progressUnit || job.attemptProgress?.unit || 'job',
+    done,
+    total,
+    percent: total > 0 ? Math.round((done / total) * 10000) / 100 : null,
+    coverageCountAtStart: baseline,
+    startedAt: attempt.startedAt || job.attemptProgress?.startedAt || null,
+  };
 }
 
 function processedCountForJob(job) {
@@ -2340,6 +2716,66 @@ function applySourceCoverageStatus(job) {
   return true;
 }
 
+function mergeLegacyExperienceSnapshot(current, legacy) {
+  if (current?.schemaVersion !== 3) return legacy;
+  const currentStages = new Map(current.stages.map((stage) => [stage.stage || stage.id, stage]));
+  const stages = legacy.stages.map((stage) => {
+    const id = stage.stage || stage.id;
+    if (id === 'body' && currentStages.has(id)) {
+      const currentBody = currentStages.get(id);
+      return legacy.state === 'completed'
+        ? { ...currentBody, state: 'completed', detail: '已完成并保存' }
+        : currentBody;
+    }
+    return stage;
+  });
+  const discovered = Math.max(Number(current.counts?.discovered || 0), Number(legacy.counts?.discovered || 0));
+  const fullText = Math.min(
+    discovered || Number.MAX_SAFE_INTEGER,
+    Math.max(Number(current.counts?.fullText || 0), Number(legacy.counts?.fullText || 0)),
+  );
+  return {
+    ...current,
+    revision: Math.max(Number(current.revision || 0), Number(legacy.revision || 0)),
+    throughSequence: legacy.throughSequence,
+    activeAttemptId: legacy.activeAttemptId,
+    journey: legacy.journey,
+    state: legacy.state,
+    activeStage: legacy.activeStage,
+    headline: legacy.headline,
+    detail: legacy.detail,
+    stages,
+    counts: {
+      ...current.counts,
+      confirmedJobs: Math.max(Number(current.counts?.confirmedJobs || 0), Number(legacy.counts?.confirmedJobs || 0)),
+      nonJobs: Math.max(Number(current.counts?.nonJobs || 0), Number(legacy.counts?.nonJobs || 0)),
+      matchReady: Math.max(Number(current.counts?.matchReady || 0), Number(legacy.counts?.matchReady || 0)),
+      draftReady: Math.max(Number(current.counts?.draftReady || 0), Number(legacy.counts?.draftReady || 0)),
+      applicationReady: Math.max(Number(current.counts?.applicationReady || 0), Number(legacy.counts?.applicationReady || 0)),
+      discovered,
+      fullText,
+      pending: Math.max(0, discovered - fullText),
+    },
+    speed: {
+      ...legacy.speed,
+      activePerMinute: legacy.speed.activePerMinute ?? current.speed.activePerMinute,
+      wallPerMinute: legacy.speed.wallPerMinute ?? current.speed.wallPerMinute,
+      cacheHits: Math.max(Number(current.speed?.cacheHits || 0), Number(legacy.speed?.cacheHits || 0)),
+      networkSuccess: Math.max(Number(current.speed?.networkSuccess || 0), Number(legacy.speed?.networkSuccess || 0)),
+      etaMinSeconds: legacy.speed.etaMinSeconds ?? current.speed.etaMinSeconds,
+      etaMaxSeconds: legacy.speed.etaMaxSeconds ?? current.speed.etaMaxSeconds,
+      confidence: legacy.speed.confidence === 'low' ? current.speed.confidence : legacy.speed.confidence,
+    },
+    issues: legacy.issues.length > 0 || ['completed', 'failed', 'cancelled'].includes(legacy.state)
+      ? legacy.issues
+      : current.issues,
+    connection: legacy.connection,
+    checkpoint: Number(legacy.checkpoint?.revision || 0) >= Number(current.checkpoint?.revision || 0)
+      ? legacy.checkpoint
+      : current.checkpoint,
+  };
+}
+
 export function publicJob(job) {
   const status = job.status === 'succeeded' ? 'completed' : job.status;
   const bodyMetrics = bodyMetricsForJob(job);
@@ -2383,7 +2819,7 @@ export function publicJob(job) {
     || RATE_LIMIT_RECOVERY_STATUSES.has(rateLimit?.status)
     || hasRecoverableStageState(job.stages)
   );
-  return {
+  const exposed = {
     id: job.id,
     schemaVersion: Number(job.schemaVersion || 1),
     keyword: job.params?.keyword,
@@ -2417,6 +2853,8 @@ export function publicJob(job) {
     progressCurrent: Number(job.progressCurrent || 0),
     progressTotal: Number(job.progressTotal || 0),
     progressUpdatedAt: job.progressUpdatedAt || null,
+    throughSequence: Math.max(0, Number(job.eventSequence || 0)),
+    attemptProgress: attemptProgressForJob(job, bodyMetrics),
     bodyMetrics,
     workflowSummary: job.workflowSummary && typeof job.workflowSummary === 'object'
       ? {
@@ -2428,6 +2866,18 @@ export function publicJob(job) {
     securityRestriction,
     rateLimit,
     resumeAvailable,
+  };
+  const legacySnapshot = adaptLegacyJobSnapshot(exposed, {
+    throughSequence: exposed.throughSequence,
+    lastEventAt: exposed.updatedAt || exposed.progressUpdatedAt || exposed.createdAt,
+  });
+  const experienceSnapshot = job.experienceSnapshot?.schemaVersion === 3
+    ? structuredClone(mergeLegacyExperienceSnapshot(job.experienceSnapshot, legacySnapshot))
+    : legacySnapshot;
+  return {
+    ...exposed,
+    experienceSnapshot,
+    experience: experienceSnapshot,
   };
 }
 
@@ -2574,6 +3024,25 @@ export function updateProgressFromLog(job, message) {
     });
   }
 
+  for (const match of message.matchAll(/BODY_RATE_LIMIT warm-start attempt=(\d+)\/(\d+) spacing=([\d.]+)s stable_successes=(\d+)/gi)) {
+    update({
+      progressPhase: 'body_rate_limit_probe',
+      progressLabel: `正在以 ${match[3]} 秒间隔恢复正文访问，连续成功 ${match[4]} 次后自动升速`,
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'waiting',
+        resumeScope: 'body_completion',
+        retryAttempt: Number(match[1]),
+        maxRetries: Number(match[2]),
+        retryAfterSeconds: Number(match[3]),
+        stableSuccesses: 0,
+        stableSuccessThreshold: BODY_RATE_LIMIT_STABLE_SUCCESSES,
+        warmStartTargetSuccesses: Number(match[4]),
+        recoveryAction: 'warm_start_probe',
+      },
+    });
+  }
   for (const match of message.matchAll(/BODY_RATE_LIMIT cooldown attempt=(\d+)\/(\d+) wait=([\d.]+)s/gi)) {
     update({
       progressPhase: 'body_rate_limit_backoff',
@@ -2587,6 +3056,8 @@ export function updateProgressFromLog(job, message) {
         retryAttempt: Number(match[1]),
         maxRetries: Number(match[2]),
         retryAfterSeconds: Number(match[3]),
+        stableSuccesses: 0,
+        stableSuccessThreshold: BODY_RATE_LIMIT_STABLE_SUCCESSES,
         recoveryAction: 'automatic_backoff',
       },
     });
@@ -2603,7 +3074,28 @@ export function updateProgressFromLog(job, message) {
         retryAttempt: Number(match[1]),
         maxRetries: Number(match[2]),
         retryAfterSeconds: Number(match[3]),
+        stableSuccesses: 0,
+        stableSuccessThreshold: BODY_RATE_LIMIT_STABLE_SUCCESSES,
         recoveryAction: 'automatic_backoff',
+      },
+    });
+  }
+  for (const match of message.matchAll(/BODY_RATE_LIMIT manual_probe attempt=(\d+)\/(\d+)/gi)) {
+    update({
+      progressPhase: 'body_rate_limit_probe',
+      progressLabel: `已跳过剩余冷却，正在执行第 ${match[1]} / ${match[2]} 次正文恢复探测`,
+      rateLimit: {
+        ...(job.rateLimit || {}),
+        detected: true,
+        status: 'waiting',
+        resumeScope: 'body_completion',
+        retryAttempt: Number(match[1]),
+        maxRetries: Number(match[2]),
+        retryAfterSeconds: 0,
+        stableSuccesses: 0,
+        stableSuccessThreshold: BODY_RATE_LIMIT_STABLE_SUCCESSES,
+        manualProbeConsumedAt: new Date().toISOString(),
+        recoveryAction: 'manual_probe',
       },
     });
   }
@@ -2619,22 +3111,31 @@ export function updateProgressFromLog(job, message) {
         retryAttempt: Number(match[1]),
         maxRetries: Number(match[2]),
         retryAfterSeconds: 0,
+        stableSuccesses: 0,
+        stableSuccessThreshold: BODY_RATE_LIMIT_STABLE_SUCCESSES,
         recoveryAction: 'automatic_probe',
       },
     });
   }
-  if (/BODY_RATE_LIMIT cleared/gi.test(message)) {
+  const bodyRateLimitCleared = /BODY_RATE_LIMIT cleared(?:\s+stable_successes=(\d+))?/i.exec(message);
+  if (bodyRateLimitCleared) {
+    const stableSuccesses = Number(bodyRateLimitCleared[1] ?? job.rateLimit?.stableSuccesses ?? 0);
+    const recovered = stableSuccesses >= BODY_RATE_LIMIT_STABLE_SUCCESSES;
     update({
-      progressPhase: 'scraping',
-      progressLabel: '正文访问已恢复，正在从当前检查点继续采集',
+      progressPhase: recovered ? 'scraping' : 'body_rate_limit_probe',
+      progressLabel: recovered
+        ? '正文访问已连续稳定成功，正在从当前检查点继续采集'
+        : `恢复探测已成功 ${stableSuccesses} / ${BODY_RATE_LIMIT_STABLE_SUCCESSES} 次，继续低速确认`,
       rateLimit: {
         ...(job.rateLimit || {}),
         detected: true,
-        status: 'cleared',
+        status: recovered ? 'cleared' : 'waiting',
         resumeScope: 'body_completion',
-        clearedAt: new Date().toISOString(),
+        stableSuccesses,
+        stableSuccessThreshold: BODY_RATE_LIMIT_STABLE_SUCCESSES,
+        ...(recovered ? { clearedAt: new Date().toISOString() } : {}),
         retryAfterSeconds: 0,
-        recoveryAction: null,
+        recoveryAction: recovered ? null : 'warm_start_probe',
       },
     });
   }
@@ -2877,17 +3378,26 @@ export function updateProgressFromLog(job, message) {
     const round = Number(match[5] || 1);
     const roundProcessed = Number(match[6] || 0);
     const roundTotal = Number(match[7] || 0);
-    const recoveredRateLimit = status === 'detail_ok'
-      && RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)
-      ? {
-          ...job.rateLimit,
-          status: 'cleared',
-          clearedAt: new Date().toISOString(),
-          nextRetryAt: null,
-          retryAfterSeconds: 0,
-          recoveryAction: null,
-        }
-      : job.rateLimit;
+    let recoveredRateLimit = job.rateLimit;
+    if (RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)) {
+      const previousStableSuccesses = Math.max(0, Number(job.rateLimit?.stableSuccesses || 0));
+      const stableSuccesses = status === 'detail_ok'
+        ? previousStableSuccesses + 1
+        : ['cached', 'skipped'].includes(status)
+          ? previousStableSuccesses
+          : 0;
+      const recovered = stableSuccesses >= BODY_RATE_LIMIT_STABLE_SUCCESSES;
+      recoveredRateLimit = {
+        ...job.rateLimit,
+        status: recovered ? 'cleared' : 'waiting',
+        stableSuccesses,
+        stableSuccessThreshold: BODY_RATE_LIMIT_STABLE_SUCCESSES,
+        ...(recovered ? { clearedAt: new Date().toISOString() } : {}),
+        nextRetryAt: recovered ? null : job.rateLimit?.nextRetryAt || null,
+        retryAfterSeconds: recovered ? 0 : Number(job.rateLimit?.retryAfterSeconds || 0),
+        recoveryAction: recovered ? null : 'warm_start_probe',
+      };
+    }
     const recoveredProactiveCooldown = status === 'detail_ok'
       && job.proactiveCooldown?.status === 'waiting'
       ? {
@@ -2896,10 +3406,15 @@ export function updateProgressFromLog(job, message) {
           clearedAt: new Date().toISOString(),
         }
       : job.proactiveCooldown;
+    const activeAttempt = currentAttempt(job);
+    const attemptBaseline = Math.max(0, Number(activeAttempt?.coverageCountAtStart || job.attemptProgress?.coverageCountAtStart || 0));
+    const attemptDone = Math.max(0, complete - attemptBaseline);
     update({
       progressPhase: 'scraping',
       progressLabel: round > 1
         ? `第 ${round} 轮补采 ${roundProcessed} / ${roundTotal} · 正文 ${complete} / ${total} 篇`
+        : status === 'detail_ok' && recoveredRateLimit?.status === 'waiting'
+          ? `恢复确认 ${recoveredRateLimit.stableSuccesses} / ${BODY_RATE_LIMIT_STABLE_SUCCESSES} 次 · 正文 ${complete} / ${total} 篇`
         : status === 'detail_ok'
           ? `正文已保存 · 已检查 ${processed} / ${total} 篇`
           : `已记录 ${status} · 已检查 ${processed} / ${total} 篇`,
@@ -2908,6 +3423,17 @@ export function updateProgressFromLog(job, message) {
       discoveredCount: total,
       scrapedCount: complete,
       bodyProcessedCount: processed,
+      ...(activeAttempt ? {
+        attemptProgress: {
+          ...(job.attemptProgress || {}),
+          attemptId: activeAttempt.attemptId,
+          unit: activeAttempt.progressUnit || 'body',
+          done: Math.min(Math.max(0, Number(activeAttempt.targetCount || attemptDone)), attemptDone),
+          total: Math.max(0, Number(activeAttempt.targetCount || 0)),
+          coverageCountAtStart: attemptBaseline,
+          startedAt: activeAttempt.startedAt || job.attemptProgress?.startedAt || null,
+        },
+      } : {}),
       rateLimit: recoveredRateLimit,
       proactiveCooldown: recoveredProactiveCooldown,
     });

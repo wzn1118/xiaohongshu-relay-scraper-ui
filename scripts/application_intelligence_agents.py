@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from codex_runtime_outreach import PROMPT_VERSION
+from application_generation import build_generation_payload, build_profile_snapshot, writeback_generated_drafts
+from note_identity import record_key as canonical_record_key, record_note_id
 
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -657,6 +659,12 @@ MATCH_TERMS = (
     "github",
     "项目",
     "调研",
+    "用户需求",
+    "用户反馈",
+    "访谈",
+    "深访",
+    "问卷",
+    "需求",
     "kol",
     "小红书",
     "自动化",
@@ -679,15 +687,34 @@ TOKEN_STOPWORDS = {
 ROLE_MATCH_EXPANSIONS = (
     (re.compile(r"(?:商业分析|业务分析|经营分析|咨询)", re.I), "数据分析 市场调研 用户需求 竞品分析 研究报告 指标"),
     (re.compile(r"(?:市场研究|市场分析)", re.I), "市场调研 用户需求 竞品分析 数据分析 研究报告"),
+    (re.compile(r"(?:用户洞察|用户\s*query|用户痛点|高频场景|案例库)", re.I), "用户调研 用户需求 用户反馈 访谈 深访 问卷 需求"),
     (re.compile(r"(?:品牌|公关)", re.I), "品牌 市场 舆情监测 分析 报告"),
     (re.compile(r"(?:内容运营|社媒运营)", re.I), "内容运营 社群运营 用户反馈 数据分析"),
 )
 NON_NARRATIVE_EVIDENCE_CATEGORIES = {"skills", "education"}
-OUTREACH_FORMAT_VERSION = "fixed-cn-application-v1"
+OUTREACH_FORMAT_VERSION = "fixed-cn-application-v2"
+
+AI_PRODUCT_EXPLICIT_PATTERN = re.compile(r"AI\s*产品", re.I)
+AI_CONTEXT_PATTERN = re.compile(r"(?:\bAI\b|BA\s*Agent|Agent|智能体|大模型|LLM|vibe\s*coding)", re.I)
+PRODUCT_OPERATIONS_CONTEXT_PATTERN = re.compile(
+    r"(?:产品运营|用户运营|增长|拉新|留存|召回|用户洞察|用户\s*query|案例库|运营活动|运营策略)",
+    re.I,
+)
+AI_PRODUCT_EVIDENCE_PATTERN = re.compile(
+    r"(?:\bAI\b|Agent|智能体|大模型|LLM|Asteria|产品链路|数据分析交付系统|工作台|vibe)",
+    re.I,
+)
+AI_PRODUCT_BUILD_PATTERN = re.compile(r"(?:Asteria|产品链路|数据分析交付系统|数据到决策工作台)", re.I)
+USER_INSIGHT_EVIDENCE_PATTERN = re.compile(r"(?:用户洞察|用户需求|用户反馈|访谈|深访|问卷|痛点|场景)", re.I)
+USER_INSIGHT_APPLICATION_PATTERN = re.compile(r"(?:转化为|内容策略|栏目结构|创作者指南|案例库)", re.I)
+OPERATIONS_EVIDENCE_PATTERN = re.compile(r"(?:社群|拉新|留存|召回|活动|运营|SOP|推广)", re.I)
+AI_PRODUCT_MATCH_EXPANSION = "数据分析 产品链路 用户洞察 用户反馈 用户需求 场景 指标 迭代 自动化 agent"
 
 
 def _expand_role_target(target: str) -> str:
     expansions = [terms for pattern, terms in ROLE_MATCH_EXPANSIONS if pattern.search(target)]
+    if _is_ai_product_role(target):
+        expansions.append(AI_PRODUCT_MATCH_EXPANSION)
     return " ".join([target, *expansions])
 
 
@@ -701,10 +728,75 @@ def _is_writable_evidence(item: dict[str, Any]) -> bool:
         return False
     return bool(
         re.search(
-            r"(?:负责|搭建|分析|整理|优化|推进|开展|撰写|输出|设计|协同|完成|支持|支撑|运营|监测|调研|抓取|策划|对接|访谈|梳理|促成)",
+            r"(?:负责|搭建|分析|整理|优化|推进|开展|撰写|输出|设计|协同|完成|支持|支撑|运营|监测|调研|抓取|策划|对接|访谈|梳理|促成|封装|落地)",
             f"{detail} {first_person_claim}",
         )
     )
+
+
+def _evidence_search_text(item: dict[str, Any]) -> str:
+    values = [item.get("label"), item.get("detail"), item.get("first_person_claim")]
+    for key in ("skills", "outcomes"):
+        value = item.get(key)
+        if isinstance(value, list):
+            values.extend(value)
+    return " ".join(_text(value) for value in values if _text(value))
+
+
+def _is_ai_product_role(target: str) -> bool:
+    return bool(
+        AI_PRODUCT_EXPLICIT_PATTERN.search(target)
+        or (AI_CONTEXT_PATTERN.search(target) and PRODUCT_OPERATIONS_CONTEXT_PATTERN.search(target))
+    )
+
+
+def _select_role_aware_evidence(target: str, evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not _is_ai_product_role(target):
+        return evidence[:3]
+
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+
+    def add(item: dict[str, Any] | None, axis: str) -> None:
+        if not item or item["id"] in selected_ids:
+            return
+        selected.append(dict(item, role_axis=axis))
+        selected_ids.add(item["id"])
+
+    ai_candidates = [item for item in evidence if AI_PRODUCT_EVIDENCE_PATTERN.search(_evidence_search_text(item))]
+    ai_product_build = next(
+        (item for item in ai_candidates if AI_PRODUCT_BUILD_PATTERN.search(_evidence_search_text(item))),
+        None,
+    )
+    add(ai_product_build or (ai_candidates[0] if ai_candidates else None), "ai_product")
+    insight_candidates = [
+        item
+        for item in evidence
+        if item["id"] not in selected_ids
+        and USER_INSIGHT_EVIDENCE_PATTERN.search(_evidence_search_text(item))
+    ]
+    applied_insight = next(
+        (item for item in insight_candidates if USER_INSIGHT_APPLICATION_PATTERN.search(_evidence_search_text(item))),
+        None,
+    )
+    add(applied_insight or (insight_candidates[0] if insight_candidates else None), "user_insight")
+    add(
+        next(
+            (
+                item
+                for item in evidence
+                if item["id"] not in selected_ids
+                and OPERATIONS_EVIDENCE_PATTERN.search(_evidence_search_text(item))
+            ),
+            None,
+        ),
+        "operations",
+    )
+    for item in evidence:
+        if len(selected) >= 3:
+            break
+        add(item, "supporting")
+    return selected[:3]
 
 
 def _match_metrics(target: str, evidence: dict[str, str]) -> dict[str, Any]:
@@ -749,10 +841,11 @@ class FitEvidenceAgent:
 
     def run(self, note: dict[str, Any], requirements: list[dict[str, Any]]) -> list[dict[str, Any]]:
         job_card = note.get("job_card") if isinstance(note.get("job_card"), dict) else {}
-        target = _expand_role_target(" ".join(
+        raw_target = " ".join(
             [_text(note.get("title")), _text(job_card.get("role_name")), _text(note.get("body"))]
             + [_text(item.get("text")) for item in requirements]
-        ))
+        )
+        target = _expand_role_target(raw_target)
         ranked = sorted(
             ((_match_metrics(target, item), item) for item in self.evidence),
             key=lambda pair: (
@@ -774,7 +867,7 @@ class FitEvidenceAgent:
             if metrics["accepted"]
         ]
         narrative = [item for item in accepted if _is_writable_evidence(item)]
-        return (narrative or accepted)[:3]
+        return _select_role_aware_evidence(raw_target, narrative or accepted)
 
 
 class OutreachWriterAgent:
@@ -870,14 +963,11 @@ class OutreachWriterAgent:
 
     @staticmethod
     def _evidence_lead(item: dict[str, Any]) -> str:
-        label = _text(item.get("label")) or "相关实践"
-        if label.lower() in {"skills", "education", "experience", "experiences", "projects", "evidence"}:
-            label = "相关项目"
-        if label.endswith("实习生"):
-            label = label[:-1]
-        if any(marker in label for marker in ("实习", "项目", "经历", "工作")):
-            return f"在{label}期间，我"
-        return f"在{label}相关实践中，我"
+        # Evidence labels are retrieval metadata, not prose-ready employment facts.
+        # Start from the verified action so a role label cannot become a vague
+        # or fabricated phrase such as "在市场营销实习期间".
+        del item
+        return "我"
 
     @staticmethod
     def _work_method(focus: str) -> str:
@@ -1127,7 +1217,7 @@ def build_job_card(
 
 
 def _record_key(item: dict[str, Any]) -> str:
-    return _text(item.get("note_id")) or _text(item.get("note_url")) or _text(item.get("search_result_url")) or _text(item.get("card_search_result_url"))
+    return canonical_record_key(item)
 
 
 @dataclass
@@ -1239,7 +1329,7 @@ class ApplicationIntelligencePipeline:
             )
             results.append(
                 {
-                    "note_id": _text(note.get("note_id")),
+                    "note_id": record_note_id(note),
                     "title": _text(note.get("title")) or _text(note.get("card_title")),
                     "note_url": _text(note.get("note_url")) or _text(note.get("search_result_url")) or _text(note.get("card_search_result_url")),
                     "body": _text(note.get("body")),
@@ -1435,6 +1525,10 @@ def run_pipeline(
     codex_cli_bin: str = "",
     codex_batch_size: int = 8,
     codex_timeout_seconds: int = 300,
+    writeback_url: str = "",
+    writeback_job_id: str = "",
+    writeback_timeout_seconds: int = 30,
+    generation_run_id: str = "",
     persist: bool = True,
 ) -> PipelineResult:
     cards = _load_json(output_dir / "xiaohongshu_cards_latest.json", [])
@@ -1442,6 +1536,7 @@ def run_pipeline(
     profile = _load_json(candidate_profile_path, {})
     if not isinstance(cards, list) or not isinstance(notes, list) or not isinstance(profile, dict):
         raise ValueError("Cards and notes must be JSON arrays; candidate profile must be a JSON object")
+    profile_snapshot = build_profile_snapshot(profile, output_dir)
     runtime_agent = None
     runtime_error = ""
     if use_codex_runtime:
@@ -1452,6 +1547,7 @@ def run_pipeline(
                 output_dir,
                 candidate_name=_candidate_name(profile),
                 candidate_profile=_candidate_application_profile(profile),
+                candidate_snapshot=profile_snapshot,
                 cli_bin=codex_cli_bin,
                 batch_size=codex_batch_size,
                 timeout_seconds=codex_timeout_seconds,
@@ -1465,6 +1561,40 @@ def run_pipeline(
         runtime_required=use_codex_runtime,
         runtime_initialization_error=runtime_error,
     ).run(cards, notes)
+    result.payload["profile_snapshot"] = profile_snapshot
+    if writeback_url:
+        generation_payload = build_generation_payload(
+            result.payload["records"],
+            profile_snapshot,
+            run_id=generation_run_id,
+            prompt_version=PROMPT_VERSION,
+            model=_text(getattr(getattr(runtime_agent, "builtin_provider", None), "model", "")),
+            provider=_text(getattr(getattr(runtime_agent, "builtin_provider", None), "provider", "")),
+        )
+        writeback = writeback_generated_drafts(
+            generation_payload,
+            writeback_url=writeback_url,
+            writeback_job_id=writeback_job_id,
+            timeout_seconds=writeback_timeout_seconds,
+        )
+        result.payload["generation_writeback"] = {
+            "runId": generation_payload["runId"],
+            "profileSnapshotId": generation_payload.get("profileSnapshotId", ""),
+            **writeback,
+        }
+        item_results = {
+            _text(item.get("noteId")): item
+            for item in writeback.get("items", [])
+            if isinstance(item, dict) and _text(item.get("noteId"))
+        }
+        for record in result.payload["records"]:
+            item = item_results.get(_text(record.get("note_id")))
+            if not item:
+                continue
+            record["outreach"].update(
+                writeback_status=_text(item.get("status")) or "unknown",
+                **({"draftVersion": item["draftVersion"]} if isinstance(item.get("draftVersion"), dict) else {}),
+            )
     if persist:
         write_pipeline_artifacts(output_dir, result.payload)
     return result

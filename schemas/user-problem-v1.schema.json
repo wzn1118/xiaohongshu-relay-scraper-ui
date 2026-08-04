@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "user-problem-v1.schema.json",
+  "title": "UserProblemV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "code",
+    "category",
+    "severity",
+    "userTitle",
+    "userMessage",
+    "preservedResultCount",
+    "automaticAction",
+    "retryable",
+    "retryAt",
+    "requiresUserAction",
+    "action",
+    "affectedStage",
+    "technicalRef"
+  ],
+  "properties": {
+    "code": { "type": "string", "minLength": 1 },
+    "category": {
+      "enum": [
+        "access",
+        "network",
+        "content",
+        "browser",
+        "storage",
+        "analysis",
+        "artifact",
+        "delivery",
+        "input",
+        "unknown"
+      ]
+    },
+    "severity": { "enum": ["info", "warning", "blocking"] },
+    "userTitle": { "type": "string", "minLength": 1 },
+    "userMessage": { "type": "string", "minLength": 1 },
+    "preservedResultCount": { "type": "integer", "minimum": 0 },
+    "automaticAction": { "type": ["string", "null"] },
+    "retryable": { "type": "boolean" },
+    "retryAt": { "type": ["string", "null"], "format": "date-time" },
+    "requiresUserAction": { "type": "boolean" },
+    "action": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "label"],
+          "properties": {
+            "id": { "type": "string", "minLength": 1 },
+            "label": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "affectedStage": { "type": "string", "minLength": 1 },
+    "technicalRef": { "type": "string", "minLength": 1 }
+  }
+}

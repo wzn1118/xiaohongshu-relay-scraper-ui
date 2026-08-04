@@ -14,16 +14,25 @@ from ai_application_workflow import (  # noqa: E402
     _apply_application_copy_source_state,
     _deterministic_ocr_role,
     _deterministic_problems,
+    _ensure_record_outputs,
     _evaluate,
     _finalize_local_draft,
     _human_quality_dimensions,
     _merge_feedback,
     _normalize_external_url,
+    _normalized_route,
+    _verified_cached_image_role,
     _write,
     enrich_general_payload,
     enrich_payload,
     record_needs_completion,
     record_needs_content_completion,
+    writing_schema,
+)
+from application_intelligence_agents import (  # noqa: E402
+    ApplicationInfoAgent,
+    FitEvidenceAgent,
+    OutreachWriterAgent,
 )
 
 
@@ -71,6 +80,8 @@ class FakeProvider:
                     "cover_letter": "附件是我的简历。",
                     "used_evidence_ids": ["project-1"],
                     "capability_matches": ["cap-1"],
+                    "recommended_resume": "resume-ops",
+                    "resume_reason": "运营版简历中的 project-1 对应岗位增长分析职责。",
                 }
             cover = (
                 "主题：应聘增长运营实习｜测试用户｜每周可实习5天\n"
@@ -91,7 +102,9 @@ class FakeProvider:
                 "email_body": "尊敬的招聘负责人：\n您好！我是测试用户，希望申请增长运营实习。\n\n我曾负责校园活动的用户调研与转化数据复盘，并协同团队根据反馈迭代执行方案，相关经历与岗位的增长分析和协作推进要求匹配。\n\n目前我每周可实习5天，可连续实习6个月。简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n此致\n敬礼！\n测试用户",
                 "cover_letter": cover,
                 "used_evidence_ids": ["project-1"],
-                "capability_matches": ["cap-1"],
+                "capability_matches": ["增长分析与协作推进：project-1：用户调研和转化数据复盘经验可迁移"],
+                "recommended_resume": "resume-ops",
+                "resume_reason": "运营版简历中的 project-1 对应岗位增长分析职责。",
             }
         return {
             "score": 94,
@@ -178,8 +191,10 @@ class CapturingWriterProvider:
 
     def __init__(self) -> None:
         self.payloads: list[dict] = []
+        self.system_prompts: list[str] = []
 
-    def generate_json(self, _system, user, _schema, image_urls=None):
+    def generate_json(self, system, user, _schema, image_urls=None):
+        self.system_prompts.append(system)
         self.payloads.append(json.loads(user))
         return {
             "greeting": "您好，我想了解这个岗位。",
@@ -188,6 +203,8 @@ class CapturingWriterProvider:
             "cover_letter": "您好，我想申请数据分析实习，并进一步介绍 SQL 项目经历。",
             "used_evidence_ids": ["evidence-1"],
             "capability_matches": [],
+            "recommended_resume": "resume-ops",
+            "resume_reason": "运营版简历中的 evidence-1 对应岗位核心职责。",
         }
 
 
@@ -318,6 +335,54 @@ class UnreadablePosterProvider(FakeProvider):
 
 
 class AiApplicationWorkflowTests(unittest.TestCase):
+    def test_explicit_refresh_replaces_stale_profile_evidence_and_outreach(self) -> None:
+        profile = {
+            "candidate_application": {"name": "测试候选人"},
+            "evidence_items": [{
+                "id": "current-user-research",
+                "category": "project",
+                "label": "用户需求调研",
+                "detail": "通过1v1访谈及问卷系统收集520位用户反馈，归纳5类用户需求。",
+                "source": "current-resume.pdf",
+            }],
+        }
+        record = {
+            "note_id": "n1",
+            "title": "AI产品运营实习",
+            "body": "分析用户query、用户痛点与高频场景，沉淀案例库。",
+            "application_info": {
+                "contacts": [],
+                "application_routes": [],
+                "responsibilities": [{"text": "分析用户query与用户痛点"}],
+                "requirements": [],
+            },
+            "fit_evidence": [{
+                "id": "stale-evidence",
+                "category": "project",
+                "label": "旧版经历",
+                "detail": "旧档案中的项目经历。",
+            }],
+            "outreach": {
+                "greeting": "旧版招呼语",
+                "email_subject": "旧版主题",
+                "email_body": "旧版邮件",
+                "cover_letter": "旧版求职信",
+                "used_evidence_ids": ["stale-evidence"],
+            },
+        }
+
+        _ensure_record_outputs(
+            record,
+            ApplicationInfoAgent(),
+            FitEvidenceAgent(profile),
+            OutreachWriterAgent(profile),
+            refresh_fit_evidence=True,
+        )
+
+        self.assertEqual([item["id"] for item in record["fit_evidence"]], ["current-user-research"])
+        self.assertNotEqual(record["outreach"]["greeting"], "旧版招呼语")
+        self.assertNotIn("stale-evidence", record["outreach"]["used_evidence_ids"])
+
     def test_general_mode_generates_keyword_modules_and_understands_images(self) -> None:
         payload = {
             "quality_gate": {"passed": True, "discovered_count": 1, "record_count": 1, "checks": {}, "issues": []},
@@ -490,6 +555,12 @@ class AiApplicationWorkflowTests(unittest.TestCase):
                     "coverLetterAttached": tone == "formal",
                     "recipientType": "hiring_manager",
                 },
+                {
+                    "profileSnapshotId": "snapshot-1",
+                    "resumeArtifacts": [
+                        {"id": "resume-ops", "filename": "运营简历.pdf", "sha256": "abc123"},
+                    ],
+                },
             )
 
         contexts = [payload["application_context"] for payload in provider.payloads]
@@ -497,6 +568,187 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertTrue(all(item["contactStage"] == "follow_up" for item in contexts))
         self.assertTrue(all(item["resumeAttached"] for item in contexts))
         self.assertEqual(contexts[0]["recipientType"], "hiring_manager")
+        snapshots = [payload["candidate_profile_snapshot"] for payload in provider.payloads]
+        self.assertTrue(all(item["profileSnapshotId"] == "snapshot-1" for item in snapshots))
+        self.assertTrue(all(item["resumeArtifacts"][0]["id"] == "resume-ops" for item in snapshots))
+        self.assertIn("recommended_resume", writing_schema()["required"])
+
+    def test_enrichment_keeps_only_a_resume_id_from_the_profile_snapshot(self) -> None:
+        profile = {
+            "candidate_application": {"name": "测试用户"},
+            "evidence_items": [{
+                "id": "project-1",
+                "category": "project",
+                "label": "校园活动增长",
+                "detail": "负责用户调研与转化数据复盘，并根据结果调整触达方案。",
+                "skills": ["数据分析", "增长运营"],
+            }],
+            "sources": [{
+                "id": "resume-ops",
+                "filename": "运营简历.pdf",
+                "variant": "运营与增长",
+                "sha256": "abc123",
+                "pages": 2,
+            }],
+        }
+        payload = {
+            "quality_gate": {"passed": True, "checks": {}, "issues": []},
+            "records": [{
+                "note_id": "resume-selection",
+                "title": "增长运营实习",
+                "body": "负责分析活动数据并推动优化，要求具备数据分析和跨团队协作能力。",
+            }],
+        }
+
+        enrich_payload(payload, profile, provider=FakeProvider(), max_attempts=2)
+
+        outreach = payload["records"][0]["outreach"]
+        self.assertEqual(outreach["recommended_resume"], "resume-ops")
+        self.assertIn("project-1", outreach["resume_reason"])
+        self.assertTrue(outreach["profile_snapshot_id"])
+
+    def test_writer_contract_maps_priority_responsibilities_to_evidence_ids(self) -> None:
+        provider = CapturingWriterProvider()
+        _write(
+            provider,
+            {
+                "role_name": "增长运营实习",
+                "responsibilities": [
+                    {"text": "复盘转化数据并提出增长动作", "priority": 1},
+                    {"text": "维护社群日常运营", "priority": 2},
+                ],
+                "requirements": [
+                    {"text": "具备跨团队沟通能力", "priority": 1},
+                ],
+            },
+            [{
+                "id": "project-1",
+                "category": "projects",
+                "label": "校园活动增长",
+                "detail": "复盘转化数据并根据结果调整触达方案",
+                "skills": ["数据分析", "增长运营"],
+            }],
+            None,
+            [],
+            {"name": "候选人"},
+        )
+
+        plan = provider.payloads[0]["role_evidence_plan"]
+        self.assertEqual(
+            [item["id"] for item in plan["priority_role_points"]],
+            ["responsibility-1", "requirement-1", "responsibility-2"],
+        )
+        self.assertEqual(plan["priority_role_points"][0]["text"], "复盘转化数据并提出增长动作")
+        self.assertEqual(plan["candidate_evidence_options"][0]["id"], "project-1")
+        self.assertIn("职责 -> evidence id", provider.system_prompts[0])
+        self.assertIn("沟通协作", provider.system_prompts[0])
+
+    def test_quality_gate_rejects_experience_without_role_mapping(self) -> None:
+        role = {
+            "role_name": "数据分析实习",
+            "responsibilities": [{"text": "搭建经营指标看板并复盘业务数据", "priority": 1}],
+            "requirements": [],
+        }
+        evidence = [{
+            "id": "content-1",
+            "category": "projects",
+            "label": "校园内容项目",
+            "detail": "负责公众号选题与文案编辑，完成内容发布",
+            "skills": ["内容运营"],
+        }]
+        draft = {
+            "greeting": "您好，我是候选人，想申请数据分析实习。我曾负责公众号选题与文案编辑。",
+            "email_subject": "数据分析实习申请｜候选人｜内容运营",
+            "email_body": "您好，我是候选人，想申请数据分析实习。我曾在校园内容项目中负责公众号选题与文案编辑，并完成内容发布。这段经历锻炼了我的项目执行能力，希望进一步了解岗位安排并沟通团队当前的工作重点。",
+            "cover_letter": "我曾在校园内容项目中负责公众号选题与文案编辑，并完成内容发布。" * 15,
+            "used_evidence_ids": ["content-1"],
+            "capability_matches": ["经营指标看板：content-1：内容发布经验可迁移"],
+        }
+
+        problems = _deterministic_problems(draft, role, evidence, {"name": "候选人"})
+
+        self.assertTrue(any("未与岗位职责形成直接映射" in problem for problem in problems))
+
+    def test_quality_gate_accepts_direct_role_evidence_mapping(self) -> None:
+        role = {
+            "role_name": "数据分析实习",
+            "responsibilities": [{"text": "搭建经营指标看板并复盘业务数据", "priority": 1}],
+            "requirements": [],
+        }
+        evidence = [{
+            "id": "data-1",
+            "category": "projects",
+            "label": "经营分析项目",
+            "detail": "使用 SQL 整理业务数据，搭建指标报表并完成复盘",
+            "skills": ["SQL", "数据分析"],
+        }]
+        draft = {
+            "greeting": "您好，我是候选人，想申请数据分析实习。我曾使用 SQL 整理业务数据。",
+            "email_subject": "数据分析实习申请｜候选人｜SQL",
+            "email_body": "您好，我是候选人，想申请数据分析实习。我曾在经营分析项目中使用 SQL 整理业务数据，搭建指标报表并完成复盘。这项经历可支持岗位的经营指标看板和业务数据复盘工作，希望进一步沟通团队目前的分析重点。",
+            "cover_letter": "我曾在经营分析项目中使用 SQL 整理业务数据，搭建指标报表并完成复盘。" * 12,
+            "used_evidence_ids": ["data-1"],
+            "capability_matches": ["经营指标复盘：data-1：指标报表与数据复盘经验可迁移"],
+        }
+
+        problems = _deterministic_problems(draft, role, evidence, {"name": "候选人"})
+        alignment_markers = ("未与岗位职责形成直接映射", "交集仅停留", "职责匹配说明")
+
+        self.assertFalse([
+            problem
+            for problem in problems
+            if any(marker in problem for marker in alignment_markers)
+        ])
+
+    def test_quality_gate_requires_capability_match_to_bind_used_evidence_id(self) -> None:
+        role = {
+            "role_name": "数据分析实习",
+            "responsibilities": [{"text": "复盘业务数据", "priority": 1}],
+            "requirements": [],
+        }
+        evidence = [{
+            "id": "data-1",
+            "category": "projects",
+            "label": "经营分析项目",
+            "detail": "使用 SQL 整理业务数据并完成复盘",
+        }]
+        draft = {
+            "greeting": "您好，我是候选人，想申请数据分析实习。我曾使用 SQL 复盘业务数据。",
+            "email_subject": "数据分析实习申请｜候选人｜SQL",
+            "email_body": "您好，我是候选人，想申请数据分析实习。我曾在经营分析项目中使用 SQL 整理业务数据并完成复盘，希望进一步沟通岗位的数据分析重点与实际安排。" * 2,
+            "cover_letter": "我曾在经营分析项目中使用 SQL 整理业务数据并完成复盘。" * 15,
+            "used_evidence_ids": ["data-1"],
+            "capability_matches": ["业务数据复盘：分析经验可迁移"],
+        }
+
+        problems = _deterministic_problems(draft, role, evidence, {"name": "候选人"})
+
+        self.assertIn("职责匹配说明未绑定实际使用的经历证据 ID", problems)
+
+    def test_quality_gate_requires_capability_match_for_role_points(self) -> None:
+        role = {
+            "role_name": "数据分析实习",
+            "responsibilities": [{"text": "复盘业务数据", "priority": 1}],
+            "requirements": [],
+        }
+        evidence = [{
+            "id": "data-1",
+            "category": "projects",
+            "label": "经营分析项目",
+            "detail": "使用 SQL 整理业务数据并完成复盘",
+        }]
+        draft = {
+            "greeting": "您好，我是候选人，想申请数据分析实习。我曾使用 SQL 复盘业务数据。",
+            "email_subject": "数据分析实习申请｜候选人｜SQL",
+            "email_body": "您好，我是候选人，想申请数据分析实习。我曾在经营分析项目中使用 SQL 整理业务数据并完成复盘，希望进一步沟通岗位的数据分析重点与实际安排。" * 2,
+            "cover_letter": "我曾在经营分析项目中使用 SQL 整理业务数据并完成复盘。" * 15,
+            "used_evidence_ids": ["data-1"],
+            "capability_matches": [],
+        }
+
+        problems = _deterministic_problems(draft, role, evidence, {"name": "候选人"})
+
+        self.assertTrue(any("职责匹配说明为空" in problem for problem in problems))
 
     def test_human_quality_detects_peer_similarity_and_repeated_contact(self) -> None:
         email = (
@@ -1038,6 +1290,108 @@ class AiApplicationWorkflowTests(unittest.TestCase):
 
         self.assertEqual([item["text"] for item in role["requirements"]], ["熟悉 SQL 和 Excel"])
         self.assertEqual([item["text"] for item in role["responsibilities"]], ["负责业务数据整理与分析"])
+
+    def test_poster_ocr_normalizes_emoji_and_icon_obfuscated_emails(self) -> None:
+        qq_evidence = "简历fa：📮1️⃣3️⃣9️⃣6️⃣334506️⃣@扣扣点com 简历标题备注：岗位-姓名"
+        icon_evidence = "投递邮箱：talent📧example点com"
+        role = _deterministic_ocr_role(
+            {"title": "招聘海报"},
+            [(1, f"{qq_evidence}\n{icon_evidence}\n备用：ｊｏｂｓ＠ｅｘａｍｐｌｅ．ｃｏｍ")],
+        )
+
+        routes = role["image_analysis"]["application_routes"]
+        by_address = {route["value"]: route for route in routes}
+        self.assertEqual(set(by_address), {
+            "1396334506@qq.com",
+            "talent@example.com",
+            "jobs@example.com",
+        })
+        self.assertEqual(by_address["1396334506@qq.com"]["evidence"], qq_evidence)
+        self.assertEqual(by_address["talent@example.com"]["evidence"], icon_evidence)
+        self.assertTrue(by_address["1396334506@qq.com"]["normalization_applied"])
+        self.assertTrue(by_address["talent@example.com"]["normalization_applied"])
+        self.assertEqual(by_address["1396334506@qq.com"]["confidence"], 90)
+
+    def test_poster_ocr_does_not_invent_address_from_standalone_mail_icon(self) -> None:
+        role = _deterministic_ocr_role(
+            {"title": "招聘海报"},
+            [(1, "投递邮箱：📧")],
+        )
+
+        self.assertEqual(role["image_analysis"]["application_routes"], [])
+
+    def test_model_route_normalization_preserves_obfuscated_evidence(self) -> None:
+        evidence = "📮1️⃣3️⃣9️⃣6️⃣334506️⃣@扣扣点com"
+        route = _normalized_route({
+            "type": "email",
+            "channel": "email",
+            "value": evidence,
+            "confidence": 100,
+            "evidence": evidence,
+        })
+
+        self.assertEqual(route["value"], "1396334506@qq.com")
+        self.assertEqual(route["evidence"], evidence)
+        self.assertTrue(route["normalization_applied"])
+        self.assertEqual(route["confidence"], 90)
+
+    def test_cached_visible_and_ocr_text_share_email_normalizer(self) -> None:
+        evidence = "📮1️⃣3️⃣9️⃣6️⃣334506️⃣@扣扣点com"
+        records = [
+            {
+                "media": {
+                    "analysis": {
+                        "status": "analyzed",
+                        "source": "vision_model",
+                        "visible_text": evidence,
+                    },
+                },
+            },
+            {
+                "media": {
+                    "analysis": {
+                        "status": "analyzed",
+                        "source": "vision_model",
+                        "ocr_text": evidence,
+                    },
+                },
+            },
+            {
+                "media": {
+                    "images": [{
+                        "analysis": {
+                            "status": "analyzed",
+                            "source": "ocr",
+                            "ocr_text": evidence,
+                        },
+                    }],
+                },
+            },
+            {
+                "image_analysis": {
+                    "status": "analyzed",
+                    "source": "image_ocr",
+                    "visible_text": evidence,
+                },
+            },
+            {
+                "application_info": {
+                    "image_analysis": {
+                        "status": "analyzed",
+                        "source": "vision_model",
+                        "ocr_text": evidence,
+                    },
+                },
+            },
+        ]
+        for index, record in enumerate(records):
+            with self.subTest(index=index):
+                role, used = _verified_cached_image_role({"title": "招聘海报", **record})
+                self.assertTrue(used)
+                self.assertEqual(
+                    role["image_analysis"]["application_routes"][0]["value"],
+                    "1396334506@qq.com",
+                )
 
     def test_real_poster_labels_refresh_job_card_and_clean_private_message(self) -> None:
         payload = {

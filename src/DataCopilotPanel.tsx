@@ -11,12 +11,15 @@ import {
 } from 'react'
 import {
   AlertCircle,
+  ArrowDown,
   Bot,
   BriefcaseBusiness,
   CheckCircle2,
   Database,
   FileText,
+  Gauge,
   KeyRound,
+  Layers3,
   LoaderCircle,
   Link2,
   Mail,
@@ -40,7 +43,8 @@ import {
   Users,
   X,
 } from 'lucide-react'
-import type { AiModelDiscovery, AiProviderOption } from './types'
+import type { AiModelDiscovery, AiProviderOption, ApplicationBatch } from './types'
+import { api } from './api'
 import {
   DataCopilotContextProvider,
   type DataCopilotAttachment,
@@ -56,6 +60,9 @@ import {
 } from './DataCopilotContext'
 import { DataCopilotContextBrowser } from './DataCopilotContextBrowser'
 import { DataCopilotMessage } from './DataCopilotMessage'
+import { AgentWorkbench } from './copilot/AgentWorkbench'
+import { DataCopilotQualityPanel } from './copilot/QualityPanel'
+import { useCopilotEventProjection } from './copilot/useCopilotEventProjection'
 
 type PendingFile = {
   id: string
@@ -63,6 +70,7 @@ type PendingFile = {
 }
 
 type MobilePane = 'sessions' | 'conversation' | 'context'
+type WorkspaceMode = 'ask' | 'analyze' | 'build'
 
 export type DataCopilotModelConnectionInput = {
   provider: AiProviderOption['id']
@@ -301,6 +309,7 @@ export function DataCopilotPanel({
   const [mobilePane, setMobilePane] = useState<MobilePane>('conversation')
   const [sessionsCollapsed, setSessionsCollapsed] = useState(false)
   const [contextCollapsed, setContextCollapsed] = useState(false)
+  const [qualityOpen, setQualityOpen] = useState(false)
   const [modelConnectorOpen, setModelConnectorOpen] = useState(false)
   const [modelConnectorBusy, setModelConnectorBusy] = useState<'discover' | 'connect' | null>(null)
   const [modelConnectorStatus, setModelConnectorStatus] = useState<{
@@ -320,6 +329,7 @@ export function DataCopilotPanel({
   const [selectedContextSourceIds, setSelectedContextSourceIds] =
     useState<string[]>(defaultContextSourceIds)
   const [modelId, setModelId] = useState(fallbackModelId)
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>('ask')
   const [composerValue, setComposerValue] = useState('')
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([])
   const [sessionQuery, setSessionQuery] = useState('')
@@ -329,6 +339,7 @@ export function DataCopilotPanel({
   const [creatingSession, setCreatingSession] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [draggingFiles, setDraggingFiles] = useState(false)
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false)
   const [localError, setLocalError] = useState<string | null>(null)
   const loadedSessionIdsRef = useRef(new Set(Object.keys(initialMessages)))
   const boundSessionIdRef = useRef<string | null>(null)
@@ -341,6 +352,7 @@ export function DataCopilotPanel({
   const onErrorRef = useRef(onError)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const composerRef = useRef<HTMLTextAreaElement>(null)
+  const messageAreaRef = useRef<HTMLDivElement>(null)
   const messageEndRef = useRef<HTMLDivElement>(null)
 
   const openModelConnector = useCallback(() => {
@@ -443,6 +455,7 @@ export function DataCopilotPanel({
     ? runStatus
     : (selectedSession?.status ?? runStatus)
   const running = isActiveStatus(effectiveStatus)
+  const workbenchProjection = useCopilotEventProjection(activeMessages, effectiveStatus)
   const selectedModel = models.find((model) => model.id === modelId)
   const modelDraftProvider = modelProviders.find((provider) => provider.id === modelDraft.provider)
   const selectedContextMeta = useMemo(() => ({
@@ -498,6 +511,19 @@ export function DataCopilotPanel({
     setSelectedSessionId(session.id)
     setSelectedContextTask(task)
     setMobilePane('conversation')
+  }, [])
+
+  const acceptSnapshotUpgrade = useCallback((session: DataCopilotSession) => {
+    setSessions((current) => mergeSession(current, session))
+    setSelectedSessionId(session.id)
+    const task = taskFromSession(session)
+    selectedContextTaskRef.current = task
+    setSelectedContextTask(task)
+    setSelectedContextSourceIds(session.contextSourceIds?.length
+      ? session.contextSourceIds
+      : defaultTaskContextSourceIds(session.jobId || ''))
+    setRunStatus(session.status || 'idle')
+    setLocalError(null)
   }, [])
 
   const leaveContextTask = useCallback(() => {
@@ -626,7 +652,11 @@ export function DataCopilotPanel({
 
   useEffect(() => {
     if (!open) return
-    messageEndRef.current?.scrollIntoView({ block: 'end' })
+    const area = messageAreaRef.current
+    if (!area || area.scrollHeight - area.scrollTop - area.clientHeight < 96) {
+      messageEndRef.current?.scrollIntoView({ block: 'end' })
+      setShowScrollToLatest(false)
+    }
   }, [activeMessages.length, open, selectedSessionId])
 
   useEffect(() => {
@@ -640,11 +670,13 @@ export function DataCopilotPanel({
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== 'Escape') return
       if (fullscreen) setFullscreen(false)
+      else if (globalThis.innerWidth <= 680 && mobilePane !== 'conversation') setMobilePane('conversation')
+      else if (!contextCollapsed) setContextCollapsed(true)
       else onClose()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [fullscreen, onClose, open])
+  }, [contextCollapsed, fullscreen, mobilePane, onClose, open])
 
   useEffect(() => {
     const onPointerMove = (event: globalThis.PointerEvent) => {
@@ -833,6 +865,7 @@ export function DataCopilotPanel({
         sessionId: session.id,
         content: messageContent,
         modelId,
+        workspaceMode,
         attachmentIds: attachments.map((attachment) => attachment.id),
         contextSourceIds,
       })
@@ -1004,6 +1037,16 @@ export function DataCopilotPanel({
     window.setTimeout(() => composerRef.current?.focus(), 0)
   }
 
+  const openContextPane = () => {
+    if (globalThis.innerWidth <= 680) setMobilePane('context')
+    else setContextCollapsed(false)
+  }
+
+  const scrollToLatest = () => {
+    messageEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' })
+    setShowScrollToLatest(false)
+  }
+
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (
       event.key === 'Enter' &&
@@ -1089,6 +1132,7 @@ export function DataCopilotPanel({
             .data-copilot-panel[data-mobile-pane="context"] .data-copilot-context-pane{display:flex!important}
             .data-copilot-model-dialog-body{grid-template-columns:minmax(0,1fr)!important}
             .data-copilot-model-dialog-body > *{grid-column:1!important}
+            .data-copilot-conversation-header-status{display:none!important}
           }
           @media(max-width:380px){
             .data-copilot-model-select{width:86px!important}
@@ -1121,6 +1165,16 @@ export function DataCopilotPanel({
           </div>
 
           <div style={panelStyles.headerActions}>
+            <button
+              type="button"
+              onClick={() => setQualityOpen(true)}
+              disabled={!selectedSession || !transport.loadQuality}
+              title="运行与质量"
+              aria-label="打开运行与质量"
+              style={panelStyles.headerButton}
+            >
+              <Gauge size={17} aria-hidden="true" />
+            </button>
             <div className="data-copilot-mobile-nav" style={panelStyles.mobileNav}>
               {([
                 ['sessions', '显示会话列表', <MessageSquareText key="sessions" size={15} aria-hidden="true" />],
@@ -1426,6 +1480,15 @@ export function DataCopilotPanel({
           </div>
         ) : null}
 
+        <DataCopilotQualityPanel
+          open={qualityOpen}
+          session={selectedSession}
+          messages={activeMessages}
+          transport={transport}
+          onClose={() => setQualityOpen(false)}
+          onUpgrade={acceptSnapshotUpgrade}
+        />
+
         <div
           className="data-copilot-workspace"
           style={{
@@ -1542,6 +1605,18 @@ export function DataCopilotPanel({
               <div style={panelStyles.conversationHeaderActions}>
                 <button
                   type="button"
+                  onClick={() => void createSession()}
+                  disabled={creatingSession || running || submitting || !modelId || !selectedContextTask}
+                  title="新建会话"
+                  aria-label="新建会话"
+                  style={panelStyles.conversationIconButton}
+                >
+                  {creatingSession
+                    ? <LoaderCircle size={14} style={panelStyles.spinningIcon} aria-hidden="true" />
+                    : <Plus size={15} aria-hidden="true" />}
+                </button>
+                <button
+                  type="button"
                   onClick={() => {
                     if (globalThis.innerWidth <= 680) {
                       setMobilePane('context')
@@ -1555,7 +1630,7 @@ export function DataCopilotPanel({
                   <Database size={14} aria-hidden="true" />
                   数据 {selectedContextSourceIds.length}
                 </button>
-                <div style={panelStyles.statusIndicator}>
+                <div className="data-copilot-conversation-header-status" style={panelStyles.statusIndicator}>
                   <span
                     style={{
                       ...panelStyles.statusDot,
@@ -1568,8 +1643,32 @@ export function DataCopilotPanel({
               </div>
             </div>
 
-            <div style={panelStyles.messageArea} aria-live="polite">
-              {loadingMessages ? (
+            <AgentWorkbench
+              projection={workbenchProjection}
+              sourceCount={selectedContextSourceIds.length}
+              onCancel={running && transport.stopGeneration
+                ? () => { void stopGeneration() }
+                : undefined}
+            />
+
+            {(selectedContextTask?.mode ?? selectedSession?.mode) === 'application' && (selectedContextTask?.id || selectedSession?.jobId) ? (
+              <ApplicationWorkflowSummary
+                jobId={selectedContextTask?.id || selectedSession?.jobId || ''}
+                onPrepare={() => insertShortcut('为当前任务执行批量投递准备：逐岗位核对收件人、邮件主题、正文质量和附件最终文件名；先做 Dry Run 和附件说明，不发送邮件。')}
+              />
+            ) : null}
+
+            <div style={panelStyles.messageStage}>
+              <div
+                ref={messageAreaRef}
+                style={panelStyles.messageArea}
+                aria-live="polite"
+                onScroll={(event) => {
+                  const area = event.currentTarget
+                  setShowScrollToLatest(area.scrollHeight - area.scrollTop - area.clientHeight > 140)
+                }}
+              >
+                {loadingMessages ? (
                 <div style={panelStyles.emptyConversation}>
                   <LoaderCircle size={19} style={panelStyles.spinningIcon} aria-hidden="true" />
                   正在读取消息
@@ -1586,7 +1685,7 @@ export function DataCopilotPanel({
                       {(selectedContextTask.mode === 'application' ? [
                         { label: '筛选可投递岗位', prompt: '结合当前任务全部岗位原帖、招聘要求和已有资料，筛选仍可投递的岗位并按匹配度排序。', icon: <Search size={15} aria-hidden="true" /> },
                         { label: '生成投递邮件', prompt: '基于当前选中岗位的原帖、招聘要求和候选人资料，撰写自然、具体的投递邮件。', icon: <Mail size={15} aria-hidden="true" /> },
-                        { label: '核对标题要求', prompt: '检查当前任务所有岗位原帖中的邮件标题要求，列出要求并生成合规标题。', icon: <FileText size={15} aria-hidden="true" /> },
+                        { label: '核对标题要求', prompt: '逐条检查当前任务所有岗位原帖中的招聘邮箱、邮件标题格式和附件命名要求，完整列出每个岗位，并报告已扫描、已命中和缺失数量。', icon: <FileText size={15} aria-hidden="true" /> },
                         { label: '汇总岗位要求', prompt: '汇总并对比当前任务中全部岗位的职责、要求、地点、邮箱和截止信息。', icon: <BriefcaseBusiness size={15} aria-hidden="true" /> },
                       ] : [
                         { label: '总结核心洞察', prompt: '结合原帖、评论和用户资料，总结当前任务最重要的内容洞察，并给出证据引用。', icon: <Sparkles size={15} aria-hidden="true" /> },
@@ -1607,8 +1706,8 @@ export function DataCopilotPanel({
                     </div>
                   ) : null}
                 </div>
-              ) : (
-                activeMessages.map((message) => (
+                ) : (
+                  activeMessages.map((message) => (
                   <DataCopilotMessage
                     key={message.id}
                     message={message}
@@ -1621,9 +1720,21 @@ export function DataCopilotPanel({
                     busy={running}
                     approvalBusy={running && effectiveStatus !== 'waiting_approval'}
                   />
-                ))
-              )}
-              <div ref={messageEndRef} />
+                  ))
+                )}
+                <div ref={messageEndRef} />
+              </div>
+              {showScrollToLatest ? (
+                <button
+                  type="button"
+                  onClick={scrollToLatest}
+                  title="回到最新消息"
+                  aria-label="回到最新消息"
+                  style={panelStyles.scrollToLatestButton}
+                >
+                  <ArrowDown size={16} aria-hidden="true" />
+                </button>
+              ) : null}
             </div>
 
             <div
@@ -1687,15 +1798,15 @@ export function DataCopilotPanel({
               ) : null}
               <div style={panelStyles.composer}>
                 <div style={panelStyles.shortcutBar} aria-label="快捷指令">
-                  {[
+                  {((selectedContextTask?.mode ?? selectedSession?.mode) === 'application' ? [
                     {
                       label: '写投递邮件',
                       prompt: '为当前选中的岗位撰写投递邮件，结合岗位要求和候选人资料，并使用原帖中的招聘邮箱。',
                       icon: <BriefcaseBusiness size={12} aria-hidden="true" />,
                     },
                     {
-                      label: '按要求拟标题',
-                      prompt: '读取当前岗位原帖的邮件标题或主题格式要求，生成符合要求的投递邮件标题，并说明采用了哪些字段。',
+                      label: '批量核对格式',
+                      prompt: '逐条提取当前任务全部岗位的招聘邮箱、邮件标题或主题格式要求和附件命名要求；一个岗位一行，并报告总数、已扫描数、命中数和缺失数，不要只返回第一条。',
                       icon: <Mail size={12} aria-hidden="true" />,
                     },
                     {
@@ -1703,7 +1814,23 @@ export function DataCopilotPanel({
                       prompt: '预览并发送当前岗位的投递邮件。先核对招聘邮箱、邮件标题、正文和附件，等待我确认后再发送。',
                       icon: <Send size={12} aria-hidden="true" />,
                     },
-                  ].map((shortcut) => (
+                  ] : [
+                    {
+                      label: '总结洞察',
+                      prompt: '结合当前任务的原帖、评论和用户资料，总结核心洞察并标明证据来源。',
+                      icon: <Sparkles size={12} aria-hidden="true" />,
+                    },
+                    {
+                      label: '对比观点',
+                      prompt: '对比当前任务各原帖的观点、证据和分歧，输出结构化结论。',
+                      icon: <FileText size={12} aria-hidden="true" />,
+                    },
+                    {
+                      label: '分析人群',
+                      prompt: '结合评论内容与用户资料，分析主要人群、需求、情绪和高频问题。',
+                      icon: <Users size={12} aria-hidden="true" />,
+                    },
+                  ]).map((shortcut) => (
                     <button
                       key={shortcut.label}
                       type="button"
@@ -1729,6 +1856,28 @@ export function DataCopilotPanel({
                 />
                 <div style={panelStyles.composerToolbar}>
                   <div style={panelStyles.composerTools}>
+                    <div style={panelStyles.modeControl} role="group" aria-label="工作模式">
+                      {([
+                        { id: 'ask', label: '提问' },
+                        { id: 'analyze', label: '分析' },
+                        { id: 'build', label: '构建' },
+                      ] as const).map((mode) => (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          onClick={() => setWorkspaceMode(mode.id)}
+                          aria-pressed={workspaceMode === mode.id}
+                          disabled={running || submitting}
+                          title={`${mode.label}模式`}
+                          style={{
+                            ...panelStyles.modeButton,
+                            ...(workspaceMode === mode.id ? panelStyles.modeButtonActive : undefined),
+                          }}
+                        >
+                          {mode.label}
+                        </button>
+                      ))}
+                    </div>
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1755,12 +1904,19 @@ export function DataCopilotPanel({
                     >
                       <Paperclip size={16} aria-hidden="true" />
                     </button>
-                    <span style={panelStyles.contextCount}>
+                    <button
+                      type="button"
+                      onClick={openContextPane}
+                      disabled={running || submitting}
+                      title="选择数据上下文"
+                      aria-label={`选择数据上下文，已选 ${selectedContextSourceIds.length} 项`}
+                      style={panelStyles.contextCountButton}
+                    >
                       {selectedContextSourceIds.length > 0 ? (
                         <CheckCircle2 size={13} aria-hidden="true" />
                       ) : null}
                       {selectedContextSourceIds.length} 个上下文
-                    </span>
+                    </button>
                   </div>
                   {running ? (
                     <button
@@ -1824,6 +1980,76 @@ export function DataCopilotPanel({
   )
 }
 
+function ApplicationWorkflowSummary({
+  jobId,
+  onPrepare,
+}: {
+  jobId: string
+  onPrepare: () => void
+}) {
+  const [batch, setBatch] = useState<ApplicationBatch | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        const result = await api.applicationBatches(jobId)
+        if (!cancelled) {
+          const latest = [...result.batches].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ?? null
+          setBatch(latest)
+          setLoading(false)
+        }
+      } catch {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    void load()
+    const timer = window.setInterval(() => void load(), 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [jobId])
+
+  const counts = (batch?.counts ?? {}) as Record<string, number>
+  const prepared = Number(counts.ready || 0) + Number(counts.sending || 0) + Number(counts.sent || 0)
+  const total = batch?.items.length || 0
+  const attachmentCount = batch?.items.reduce((sum, item) => sum + (Array.isArray(item.payload.attachments) ? item.payload.attachments.length : 0), 0) || 0
+  const statusLabel = batch ? ({
+    draft: '草稿', ready: '待审批', approved: '已审批', running: '发送中', paused: '已暂停', completed: '已完成', cancelled: '已取消',
+  } as Record<string, string>)[batch.status] || batch.status : '尚未创建批次'
+  const stage = !batch ? 0 : ['draft', 'ready'].includes(batch.status) ? 1 : batch.status === 'approved' ? 2 : 3
+
+  return (
+    <section style={panelStyles.applicationWorkflow} aria-label="批量投递状态">
+      <div style={panelStyles.applicationWorkflowHeader}>
+        <span style={panelStyles.applicationWorkflowTitle}><Layers3 size={14} aria-hidden="true" /><strong>批量投递准备</strong></span>
+        <span style={panelStyles.applicationWorkflowStatus}>{loading ? '读取中' : statusLabel}</span>
+      </div>
+      <div style={panelStyles.applicationWorkflowSteps}>
+        {[
+          { label: '附件准备', detail: attachmentCount ? `${attachmentCount} 个附件` : '待检查' },
+          { label: '批量预览', detail: total ? `${prepared}/${total} 可发送` : '待生成' },
+          { label: '审批发送', detail: batch?.status === 'running' ? '发送中' : batch?.status === 'completed' ? '已完成' : '需确认' },
+        ].map((item, index) => (
+          <div key={item.label} style={{ ...panelStyles.applicationWorkflowStep, ...(index < stage ? panelStyles.applicationWorkflowStepDone : undefined) }}>
+            <span style={panelStyles.applicationWorkflowStepIndex}>{index < stage ? '✓' : String(index + 1)}</span>
+            <span><strong>{item.label}</strong><small>{item.detail}</small></span>
+          </div>
+        ))}
+      </div>
+      <div style={panelStyles.applicationWorkflowFooter}>
+        <span>附件说明会在预览中列出原名、最终投递名、大小和 SHA-256。</span>
+        <span style={panelStyles.applicationWorkflowActions}>
+          <button type="button" onClick={onPrepare} disabled={loading}>准备批量投递</button>
+          <button type="button" onClick={() => document.getElementById('batch-application-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>打开工作台</button>
+        </span>
+      </div>
+    </section>
+  )
+}
+
 const panelStyles: Record<string, CSSProperties> = {
   panel: {
     position: 'fixed',
@@ -1833,10 +2059,11 @@ const panelStyles: Record<string, CSSProperties> = {
     height: '100vh',
     gridTemplateRows: '60px minmax(0, 1fr)',
     overflow: 'hidden',
-    background: '#ffffff',
-    color: '#202522',
-    boxShadow: '0 0 40px rgba(31, 43, 36, 0.18)',
-    fontFamily: '"Segoe UI Variable", Aptos, "Microsoft YaHei UI", sans-serif',
+    background: '#f4f0e7',
+    color: '#1d2823',
+    borderLeft: '1px solid #1c2822',
+    boxShadow: '-24px 0 72px rgba(22, 31, 26, 0.22)',
+    fontFamily: '"Aptos Display", "Segoe UI Variable", "Microsoft YaHei UI", sans-serif',
     fontSize: 13,
     letterSpacing: 0,
   },
@@ -1855,34 +2082,35 @@ const panelStyles: Record<string, CSSProperties> = {
     minWidth: 0,
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: 16,
-    padding: '0 12px 0 16px',
-    borderBottom: '1px solid #d9deda',
-    background: '#f9faf9',
+    gap: 14,
+    padding: '0 14px 0 18px',
+    borderBottom: '1px solid #2e4037',
+    background: '#1b2621',
+    color: '#f4f0e7',
   },
   brand: { display: 'flex', minWidth: 0, alignItems: 'center', gap: 9 },
   brandIcon: {
     display: 'grid',
-    width: 34,
-    height: 34,
+    width: 36,
+    height: 36,
     flex: '0 0 auto',
     placeItems: 'center',
-    border: '1px solid #bcd7ce',
-    borderRadius: 6,
-    background: '#eaf5f1',
-    color: '#0b715b',
+    border: '1px solid #76c8a9',
+    borderRadius: 8,
+    background: '#253a30',
+    color: '#9ee2c5',
   },
   brandText: { display: 'grid', minWidth: 0, gap: 2 },
-  title: { overflow: 'hidden', fontSize: 14, fontWeight: 680, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  subtitle: { overflow: 'hidden', color: '#69736d', fontSize: 11, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  title: { overflow: 'hidden', color: '#f5f1e8', fontSize: 14, fontWeight: 700, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  subtitle: { overflow: 'hidden', color: '#a6b4aa', fontSize: 10, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   headerActions: { display: 'flex', flex: '0 0 auto', alignItems: 'center', gap: 5 },
   mobileNav: {
     gridAutoFlow: 'column',
     gap: 2,
     padding: 2,
-    border: '1px solid #d9dedb',
-    borderRadius: 5,
-    background: '#f5f7f5',
+    border: '1px solid #3b5045',
+    borderRadius: 7,
+    background: '#22312a',
   },
   mobileNavButton: {
     display: 'grid',
@@ -1891,14 +2119,14 @@ const panelStyles: Record<string, CSSProperties> = {
     placeItems: 'center',
     padding: 0,
     border: 0,
-    borderRadius: 4,
+    borderRadius: 5,
     background: 'transparent',
-    color: '#69736d',
+    color: '#a5b4aa',
     cursor: 'pointer',
   },
   mobileNavButtonActive: {
-    background: '#e4f2ed',
-    color: '#0b745d',
+    background: '#b6e4ce',
+    color: '#163b2c',
   },
   modelControl: { display: 'inline-flex', height: 34, alignItems: 'stretch' },
   modelSelectLabel: { display: 'inline-flex' },
@@ -1906,11 +2134,11 @@ const panelStyles: Record<string, CSSProperties> = {
     width: 190,
     height: 34,
     padding: '0 25px 0 8px',
-    border: '1px solid #d2d8d4',
-    borderRadius: '5px 0 0 5px',
+    border: '1px solid #4a5d51',
+    borderRadius: '7px 0 0 7px',
     outline: 0,
-    background: '#fff',
-    color: '#3c4640',
+    background: '#24342c',
+    color: '#f1eee5',
     font: 'inherit',
     fontSize: 12,
     letterSpacing: 0,
@@ -1921,11 +2149,11 @@ const panelStyles: Record<string, CSSProperties> = {
     height: 34,
     placeItems: 'center',
     padding: 0,
-    border: '1px solid #d2d8d4',
+    border: '1px solid #4a5d51',
     borderLeft: 0,
-    borderRadius: '0 5px 5px 0',
-    background: '#f7f9f7',
-    color: '#4f5f57',
+    borderRadius: '0 7px 7px 0',
+    background: '#2b4035',
+    color: '#d9e5da',
     cursor: 'pointer',
   },
   connectModelButton: {
@@ -1934,10 +2162,10 @@ const panelStyles: Record<string, CSSProperties> = {
     alignItems: 'center',
     gap: 7,
     padding: '0 12px',
-    border: '1px solid #14755f',
-    borderRadius: 5,
-    background: '#eaf5f1',
-    color: '#0c6c58',
+    border: '1px solid #6fc39f',
+    borderRadius: 7,
+    background: '#244235',
+    color: '#bfe9d1',
     font: 'inherit',
     fontSize: 12,
     fontWeight: 650,
@@ -1958,9 +2186,9 @@ const panelStyles: Record<string, CSSProperties> = {
     maxHeight: 'calc(100vh - 48px)',
     gridTemplateRows: 'auto minmax(0, 1fr) auto',
     overflow: 'hidden',
-    border: '1px solid #cbd3ce',
-    borderRadius: 8,
-    background: '#fff',
+    border: '1px solid #c8c2b4',
+    borderRadius: 10,
+    background: '#fbf8f0',
     boxShadow: '0 18px 55px rgba(23, 31, 27, 0.24)',
   },
   modelDialogHeader: {
@@ -1971,7 +2199,7 @@ const panelStyles: Record<string, CSSProperties> = {
     gap: 12,
     padding: '15px 16px',
     borderBottom: '1px solid #e0e5e1',
-    background: '#f8faf8',
+    background: '#f0ece3',
   },
   modelDialogHeading: { display: 'flex', minWidth: 0, alignItems: 'center', gap: 10 },
   modelDialogIcon: {
@@ -2079,14 +2307,14 @@ const panelStyles: Record<string, CSSProperties> = {
     color: '#58625c',
     cursor: 'pointer',
   },
-  workspace: { display: 'grid', minWidth: 0, minHeight: 0, overflow: 'hidden', background: '#f2f4f2' },
+  workspace: { display: 'grid', minWidth: 0, minHeight: 0, overflow: 'hidden', background: '#dedbd2' },
   sessionRail: {
     display: 'flex',
     minWidth: 0,
     minHeight: 0,
     flexDirection: 'column',
-    borderRight: '1px solid #dfe3df',
-    background: '#f5f6f4',
+    borderRight: '1px solid #d2cec2',
+    background: '#e9e4d9',
   },
   sessionRailHeader: {
     display: 'flex',
@@ -2094,7 +2322,7 @@ const panelStyles: Record<string, CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'space-between',
     padding: '0 12px 0 16px',
-    borderBottom: '1px solid #e2e5e2',
+    borderBottom: '1px solid #d2cec2',
   },
   sectionHeading: { fontSize: 14, fontWeight: 680 },
   smallIconButton: {
@@ -2103,10 +2331,10 @@ const panelStyles: Record<string, CSSProperties> = {
     height: 32,
     placeItems: 'center',
     padding: 0,
-    border: '1px solid #d1d7d3',
-    borderRadius: 5,
-    background: '#fff',
-    color: '#49544e',
+    border: '1px solid #c8c2b4',
+    borderRadius: 7,
+    background: '#f7f3eb',
+    color: '#36443c',
     cursor: 'pointer',
   },
   sessionSearch: {
@@ -2116,10 +2344,10 @@ const panelStyles: Record<string, CSSProperties> = {
     gap: 6,
     margin: '10px 10px 8px',
     padding: '0 10px',
-    border: '1px solid #d8ddd9',
-    borderRadius: 5,
-    background: '#fff',
-    color: '#758079',
+    border: '1px solid #cbc5b9',
+    borderRadius: 8,
+    background: '#f8f5ee',
+    color: '#707970',
   },
   sessionSearchInput: {
     width: '100%',
@@ -2143,13 +2371,13 @@ const panelStyles: Record<string, CSSProperties> = {
     minHeight: 58,
     padding: '10px 8px',
     border: '1px solid transparent',
-    borderRadius: 5,
+    borderRadius: 8,
     background: 'transparent',
-    color: '#303833',
+    color: '#27332d',
     textAlign: 'left',
     cursor: 'pointer',
   },
-  sessionItemSelected: { border: '1px solid #a9d1c4', background: '#e6f2ee', boxShadow: 'inset 3px 0 #11745f' },
+  sessionItemSelected: { border: '1px solid #85bca4', background: '#d9eee3', boxShadow: 'inset 3px 0 #287b5d' },
   sessionIcon: { display: 'inline-flex', marginTop: 1, color: '#60706a' },
   sessionBody: { display: 'grid', minWidth: 0, gap: 4 },
   sessionTitle: { overflow: 'hidden', fontSize: 12, fontWeight: 650, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
@@ -2165,8 +2393,8 @@ const panelStyles: Record<string, CSSProperties> = {
     minHeight: 0,
     margin: 0,
     padding: 0,
-    gridTemplateRows: '66px minmax(0, 1fr) auto',
-    background: '#fff',
+    gridTemplateRows: '66px auto auto minmax(0, 1fr) auto',
+    background: '#faf8f2',
   },
   conversationHeader: {
     display: 'flex',
@@ -2175,25 +2403,41 @@ const panelStyles: Record<string, CSSProperties> = {
     justifyContent: 'space-between',
     gap: 12,
     padding: '0 18px',
-    borderBottom: '1px solid #e1e5e1',
+    borderBottom: '1px solid #d6d1c7',
   },
   conversationMeta: { display: 'grid', minWidth: 0, gap: 4, color: '#68716c', fontSize: 11 },
-  conversationTitle: { overflow: 'hidden', color: '#29312c', fontSize: 14, fontWeight: 680, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  conversationTitle: { overflow: 'hidden', color: '#1d2c25', fontSize: 15, fontWeight: 720, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   conversationHeaderActions: { display: 'flex', flex: '0 0 auto', alignItems: 'center', gap: 10 },
-  contextToggleButton: { display: 'inline-flex', height: 32, alignItems: 'center', gap: 6, padding: '0 9px', border: '1px solid #ced6d1', borderRadius: 5, background: '#fff', color: '#415049', fontSize: 11, fontWeight: 600, cursor: 'pointer' },
+  conversationIconButton: { display: 'grid', width: 32, height: 32, placeItems: 'center', padding: 0, border: '1px solid #c9c3b7', borderRadius: 7, background: '#f8f4ec', color: '#3d4c43', cursor: 'pointer' },
+  contextToggleButton: { display: 'inline-flex', height: 32, alignItems: 'center', gap: 6, padding: '0 10px', border: '1px solid #c9c3b7', borderRadius: 7, background: '#f8f4ec', color: '#3d4c43', fontSize: 11, fontWeight: 650, cursor: 'pointer' },
   statusIndicator: { display: 'flex', flex: '0 0 auto', alignItems: 'center', gap: 6, color: '#68716c', fontSize: 11 },
   statusDot: { width: 7, height: 7, borderRadius: '50%', background: '#aab1ad' },
   statusDotRunning: { background: '#19846b' },
   statusDotFailed: { background: '#bc493a' },
-  messageArea: { minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', background: '#fdfefd' },
+  applicationWorkflow: { display: 'grid', gap: 8, margin: '0 16px 8px', padding: '10px 12px', border: '1px solid #d8e4dd', borderRadius: 6, background: '#f8fbf8' },
+  applicationWorkflowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  applicationWorkflowTitle: { display: 'inline-flex', alignItems: 'center', gap: 6, color: '#245e4d', fontSize: 11 },
+  applicationWorkflowStatus: { color: '#6f7d75', fontSize: 10, fontWeight: 650 },
+  applicationWorkflowSteps: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 6 },
+  applicationWorkflowStep: { display: 'grid', gridTemplateColumns: '20px minmax(0, 1fr)', gap: 6, alignItems: 'center', minWidth: 0, padding: '6px 7px', borderRadius: 4, background: '#eef2ee', color: '#727e76' },
+  applicationWorkflowStepDone: { background: '#e0f1e7', color: '#286b54' },
+  applicationWorkflowStepIndex: { display: 'grid', width: 18, height: 18, placeItems: 'center', borderRadius: 9, background: '#d5ded8', fontSize: 10, fontWeight: 700 },
+  'applicationWorkflowStep strong': { display: 'block', overflow: 'hidden', fontSize: 10, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  'applicationWorkflowStep small': { display: 'block', overflow: 'hidden', color: '#7b8780', fontSize: 9, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  applicationWorkflowFooter: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, color: '#718078', fontSize: 9, lineHeight: 1.4 },
+  applicationWorkflowActions: { display: 'inline-flex', flexShrink: 0, gap: 5 },
+  'applicationWorkflowActions button': { padding: '4px 7px', border: '1px solid #cbd9d1', borderRadius: 4, background: '#fff', color: '#2c6753', fontSize: 10, cursor: 'pointer' },
+  messageStage: { position: 'relative', minHeight: 0, overflow: 'hidden' },
+  messageArea: { height: '100%', minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', background: '#faf8f2' },
+  scrollToLatestButton: { position: 'absolute', right: 18, bottom: 14, display: 'grid', width: 34, height: 34, placeItems: 'center', padding: 0, border: '1px solid #bdb6a9', borderRadius: '50%', background: '#fffdf8', color: '#287b5d', boxShadow: '0 5px 14px rgba(48, 43, 34, 0.16)', cursor: 'pointer' },
   emptyConversation: { display: 'flex', width: '100%', maxWidth: 620, height: '100%', minHeight: 260, alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 10, margin: '0 auto', padding: '32px 24px', color: '#68736d', fontSize: 12, textAlign: 'center' },
-  emptyIcon: { display: 'grid', width: 44, height: 44, placeItems: 'center', border: '1px solid #abcfc4', borderRadius: 7, background: '#eaf5f1', color: '#0d735d' },
+  emptyIcon: { display: 'grid', width: 48, height: 48, placeItems: 'center', border: '1px solid #9bcdb3', borderRadius: 12, background: '#e2f1e7', color: '#287b5d' },
   emptyTitle: { color: '#26302a', fontSize: 15, fontWeight: 680 },
   starterGrid: { display: 'grid', width: '100%', maxWidth: 520, gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8, marginTop: 10 },
-  starterButton: { display: 'flex', minWidth: 0, minHeight: 42, alignItems: 'center', gap: 9, padding: '8px 11px', border: '1px solid #d5dcd7', borderRadius: 6, background: '#fff', color: '#334039', fontSize: 12, fontWeight: 600, textAlign: 'left', cursor: 'pointer' },
-  composerZone: { position: 'relative', padding: '10px 18px 14px', borderTop: '1px solid #e0e4e0', background: '#f8faf8' },
-  composerZoneDragging: { background: '#edf7f3' },
-  dropOverlay: { position: 'absolute', zIndex: 2, inset: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, border: '1px dashed #29836c', borderRadius: 6, background: 'rgba(239, 248, 244, 0.96)', color: '#176c58', fontSize: 11, fontWeight: 600 },
+  starterButton: { display: 'flex', minWidth: 0, minHeight: 46, alignItems: 'center', gap: 9, padding: '9px 12px', border: '1px solid #d1cbc0', borderRadius: 9, background: '#fffdf8', color: '#2f4036', fontSize: 12, fontWeight: 620, textAlign: 'left', cursor: 'pointer' },
+  composerZone: { position: 'relative', padding: '12px 18px 16px', borderTop: '1px solid #d8d2c7', background: '#eeeae1' },
+  composerZoneDragging: { background: '#dff0e5' },
+  dropOverlay: { position: 'absolute', zIndex: 2, inset: 6, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, border: '1px dashed #287b5d', borderRadius: 9, background: 'rgba(232, 246, 237, 0.97)', color: '#1d6c4f', fontSize: 11, fontWeight: 650 },
   errorBanner: { display: 'grid', gridTemplateColumns: '16px minmax(0, 1fr) 22px', gap: 6, alignItems: 'center', marginBottom: 6, padding: '6px 7px', border: '1px solid #edc2bb', borderRadius: 5, background: '#fff5f3', color: '#9e3c30', fontSize: 10 },
   dismissError: { display: 'grid', width: 21, height: 21, placeItems: 'center', padding: 0, border: 0, background: 'transparent', color: 'inherit', cursor: 'pointer' },
   pendingFiles: { display: 'flex', maxHeight: 72, flexWrap: 'wrap', gap: 5, overflowY: 'auto', marginBottom: 6 },
@@ -2201,16 +2445,19 @@ const panelStyles: Record<string, CSSProperties> = {
   pendingFileName: { overflow: 'hidden', fontSize: 10, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   pendingFileSize: { color: '#87908a', fontSize: 9 },
   removePendingFile: { display: 'grid', width: 19, height: 19, placeItems: 'center', padding: 0, border: 0, borderRadius: 3, background: 'transparent', color: '#727c76', cursor: 'pointer' },
-  composer: { overflow: 'hidden', maxWidth: 860, margin: '0 auto', border: '1px solid #bec9c2', borderRadius: 7, background: '#fff', boxShadow: '0 2px 8px rgba(30, 43, 36, 0.06)' },
+  composer: { overflow: 'hidden', maxWidth: 900, margin: '0 auto', border: '1px solid #bdb6a9', borderRadius: 11, background: '#fffdf8', boxShadow: '0 8px 24px rgba(48, 43, 34, 0.12)' },
   shortcutBar: { display: 'flex', alignItems: 'center', gap: 5, padding: '7px 9px 0', overflowX: 'auto' },
-  shortcutButton: { display: 'inline-flex', flex: '0 0 auto', height: 29, alignItems: 'center', gap: 5, padding: '0 9px', border: '1px solid #d5dcd7', borderRadius: 4, background: '#f7f9f7', color: '#4c5952', fontSize: 11, cursor: 'pointer', whiteSpace: 'nowrap' },
+  shortcutButton: { display: 'inline-flex', flex: '0 0 auto', height: 29, alignItems: 'center', gap: 5, padding: '0 9px', border: '1px solid #d5cec1', borderRadius: 6, background: '#f5f1e8', color: '#526057', fontSize: 11, cursor: 'pointer', whiteSpace: 'nowrap' },
   textarea: { display: 'block', width: '100%', minHeight: 76, maxHeight: 200, resize: 'vertical', padding: '12px 13px 5px', border: 0, outline: 0, background: 'transparent', color: '#252d28', font: 'inherit', fontSize: 13, lineHeight: 1.55, letterSpacing: 0 },
   composerToolbar: { display: 'flex', minHeight: 38, alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '4px 6px 5px 7px' },
   composerTools: { display: 'flex', minWidth: 0, alignItems: 'center', gap: 6 },
+  modeControl: { display: 'inline-flex', flex: '0 0 auto', height: 30, alignItems: 'center', padding: 2, border: '1px solid #d4cec2', borderRadius: 7, background: '#eeeadf' },
+  modeButton: { height: 24, padding: '0 7px', border: 0, borderRadius: 3, background: 'transparent', color: '#67736d', fontSize: 10, fontWeight: 600, letterSpacing: 0, cursor: 'pointer' },
+  modeButtonActive: { background: '#fffdf8', color: '#1f7657', boxShadow: '0 2px 5px rgba(45, 56, 46, 0.16)' },
   hiddenInput: { display: 'none' },
   composerIconButton: { display: 'grid', width: 32, height: 32, placeItems: 'center', padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: '#526159', cursor: 'pointer' },
-  contextCount: { display: 'flex', alignItems: 'center', gap: 5, color: '#69756f', fontSize: 11 },
-  sendButton: { display: 'inline-flex', height: 34, alignItems: 'center', gap: 6, padding: '0 13px', border: '1px solid #08705a', borderRadius: 5, background: '#0b7a62', color: '#fff', fontSize: 12, fontWeight: 650, cursor: 'pointer' },
+  contextCountButton: { display: 'flex', height: 30, alignItems: 'center', gap: 5, padding: '0 7px', border: 0, borderRadius: 4, background: 'transparent', color: '#69756f', fontSize: 11, cursor: 'pointer' },
+  sendButton: { display: 'inline-flex', height: 36, alignItems: 'center', gap: 6, padding: '0 15px', border: '1px solid #1e694f', borderRadius: 8, background: '#287b5d', color: '#fffdf8', fontSize: 12, fontWeight: 680, cursor: 'pointer' },
   stopButton: { display: 'inline-flex', height: 34, alignItems: 'center', gap: 6, padding: '0 13px', border: '1px solid #d0d6d2', borderRadius: 5, background: '#fff', color: '#4c5751', fontSize: 12, fontWeight: 650, cursor: 'pointer' },
   visuallyHidden: { position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)', whiteSpace: 'nowrap' },
   spinningIcon: { animation: 'data-copilot-spin 1s linear infinite' },

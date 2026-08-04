@@ -248,6 +248,53 @@ test('optional tool schemas omit strict mode while strict-compatible schemas ret
   assert.equal(Object.hasOwn(request.tools[1].function, 'strict'), false);
 });
 
+test('batch email format requests receive the complete-coverage tool and system contract', async (t) => {
+  const requests = [];
+  const definitions = [
+    ...TOOL_DEFINITIONS,
+    {
+      name: 'applications.extract_email_requirements',
+      description: 'Batch extract every application email requirement with coverage metadata.',
+      inputSchema: { type: 'object', properties: { offset: { type: 'integer' }, limit: { type: 'integer' } }, additionalProperties: false },
+      risk: 'read',
+    },
+  ];
+  const { runtime, events } = await fixture(t, {
+    definitions,
+    fetchImpl: queuedFetch([
+      chatTool('applications.extract_email_requirements', { offset: 0, limit: 200 }, 'call-batch-email-requirements-001'),
+      chatText('已逐条返回 2 个岗位的邮件格式，覆盖完整。'),
+    ], requests),
+    executeTool: async (name) => {
+      assert.equal(name, 'applications.extract_email_requirements');
+      return {
+        type: 'table.result',
+        total: 2,
+        rows: [
+          { noteId: 'application-001', subjectFormat: '姓名-岗位' },
+          { noteId: 'application-002', subjectFormat: '岗位｜姓名｜学校' },
+        ],
+        coverage: { matchedRecords: 2, scannedRecords: 2, returnedRecords: 2, complete: true, nextOffset: null },
+        source: 'xhs-data://jobs/job-runtime-001/applications',
+      };
+    },
+  });
+
+  await runtime.start(REFERENCE, {
+    content: '提取当前任务全部岗位的邮件格式，不要只返回一个。',
+    aiSessionId: 'ai-session-runtime-001',
+    idempotencyKey: 'message-runtime-batch-email-contract-001',
+  });
+  await waitForEvent(events, (event) => event.type === 'run.completed');
+  const request = requests[0];
+  const system = request.messages.find((message) => message.role === 'system')?.content || '';
+  const toolNames = request.tools.map((item) => item.function.name);
+
+  assert.match(system, /applications\.extract_email_requirements/u);
+  assert.match(system, /never stop after the first record/u);
+  assert.ok(toolNames.includes('copilot_applications__extract_email_requirements'));
+});
+
 test('tool results, selected sources, and model metadata persist across conversation turns', async (t) => {
   const requests = [];
   const fetchImpl = queuedFetch([

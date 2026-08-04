@@ -4,9 +4,11 @@ import csv
 import json
 import hashlib
 import io
+import itertools
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import redirect_stdout
@@ -209,6 +211,31 @@ class CompletionResumeTests(unittest.TestCase):
         )
 
 
+    def test_resume_helpers_match_url_aliases_by_canonical_note_id(self) -> None:
+        previous = {
+            "records": [{
+                "note_url": "https://example.test/search_result/stable-note?token=old",
+                "body": "complete role body",
+                "job_card": {"parse_basis": "full_body", "marker": "preserved"},
+                "outreach": {"runtime_status": "completed"},
+            }],
+        }
+        payload = {
+            "records": [{
+                "note_url": "https://example.test/explore/stable-note?token=new",
+                "body": "complete role body",
+                "job_card": {"parse_basis": "full_body"},
+                "outreach": {"runtime_status": "completed"},
+            }],
+        }
+
+        reused = reuse_completed_records(payload, previous)
+        targets = completion_target_ids(payload, previous)
+
+        self.assertEqual(reused, 1)
+        self.assertEqual(targets, set())
+        self.assertEqual(payload["records"][0]["job_card"]["marker"], "preserved")
+
     def test_candidate_evidence_gap_does_not_mark_job_information_incomplete(self) -> None:
         record = {
             "note_id": "complete-job-card",
@@ -221,6 +248,25 @@ class CompletionResumeTests(unittest.TestCase):
 
 
 class ApplicationAgentTests(unittest.TestCase):
+    def test_pipeline_matches_url_only_card_and_note_aliases(self) -> None:
+        cards = [{
+            "search_result_url": "https://example.test/search_result/stable-note?token=card",
+            "title": "AI product intern",
+        }]
+        notes = [{
+            "note_url": "https://example.test/explore/stable-note?token=detail",
+            "title": "AI product intern",
+            "body": "Own product research, requirements, and delivery.",
+            "access_status": "detail_ok",
+            "scraped_at": "2026-07-28T09:31:42+08:00",
+        }]
+
+        result = ApplicationIntelligencePipeline(PROFILE, now=COLLECTED).run(cards, notes)
+
+        self.assertEqual(len(result.payload["records"]), 1)
+        self.assertEqual(result.payload["records"][0]["note_id"], "stable-note")
+        self.assertEqual(result.payload["records"][0]["body"], notes[0]["body"])
+
     def test_outreach_never_uses_card_author_or_publish_time_as_salutation(self) -> None:
         writer = OutreachWriterAgent({
             "candidate_application": {
@@ -274,7 +320,7 @@ class ApplicationAgentTests(unittest.TestCase):
             [{"id": "skills-1", "category": "skills", "label": "skills", "detail": "R"}],
         )
 
-        self.assertEqual(result["format_version"], "fixed-cn-application-v1")
+        self.assertEqual(result["format_version"], "fixed-cn-application-v2")
         self.assertEqual(result["used_evidence_ids"], [])
         self.assertEqual(result["email_subject"], "应聘商业分析实习生｜示例候选人｜每周可实习5天")
         self.assertTrue(result["greeting"].startswith("您好，我是示例候选人"))
@@ -365,20 +411,23 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertNotIn("我会先对齐目标和交付标准", str(outreach))
 
     def test_evidence_summary_prefers_role_relevant_action_without_repeating_context(self) -> None:
+        evidence = {
+            "label": "市场营销实习生",
+            "detail": (
+                "撰写联动Brief，为活动策划提供决策基础；"
+                "围绕竞品分析、KOL追踪和玩家反馈开展数据抓取；"
+                "围绕竞品分析、KOL追踪和玩家反馈完成50+次爬取"
+            ),
+        }
         summary = OutreachWriterAgent._evidence_sentence(
-            {
-                "label": "市场营销实习生",
-                "detail": (
-                    "撰写联动Brief，为活动策划提供决策基础；"
-                    "围绕竞品分析、KOL追踪和玩家反馈开展数据抓取；"
-                    "围绕竞品分析、KOL追踪和玩家反馈完成50+次爬取"
-                ),
-            },
+            evidence,
             "数据分析实习：开展用户反馈分析并输出可落地报告",
         )
 
         self.assertIn("开展数据抓取；完成50+次爬取", summary)
         self.assertEqual(summary.count("围绕竞品分析、KOL追踪和玩家反馈"), 1)
+        self.assertEqual(OutreachWriterAgent._evidence_lead(evidence), "我")
+        self.assertNotIn("在市场营销实习期间", f"{OutreachWriterAgent._evidence_lead(evidence)}{summary}")
 
     def test_extracts_application_data_with_provenance(self) -> None:
         note = {
@@ -531,6 +580,103 @@ class ApplicationAgentTests(unittest.TestCase):
         unrelated = agent.run({"title": "法务实习", "body": "协助合同归档"}, [])
         self.assertEqual(unrelated, [])
 
+    def test_user_insight_role_prioritizes_interview_and_survey_evidence(self) -> None:
+        agent = FitEvidenceAgent({
+            "evidence_items": [
+                {
+                    "id": "user-research-520",
+                    "category": "project",
+                    "label": "用户需求调研",
+                    "detail": "通过1v1访谈及问卷系统收集520位用户反馈，归纳5类用户需求。",
+                    "source": "resume.pdf",
+                },
+                {
+                    "id": "community-150",
+                    "category": "project",
+                    "label": "社群运营",
+                    "detail": "从0到1搭建并运营150人社群，策划内容与活动。",
+                    "source": "resume.pdf",
+                },
+            ],
+        })
+
+        matched = agent.run(
+            {
+                "title": "AI产品运营实习",
+                "body": "分析用户query、用户痛点与高频场景，沉淀案例库。",
+            },
+            [],
+        )
+
+        self.assertTrue(matched)
+        self.assertEqual(matched[0]["id"], "user-research-520")
+        self.assertTrue({"用户需求", "用户反馈", "访谈", "问卷"} & set(matched[0]["matched_terms"]))
+
+    def test_ai_product_role_selects_product_insight_and_operations_axes(self) -> None:
+        agent = FitEvidenceAgent({
+            "evidence_items": [
+                {
+                    "id": "asteria-product",
+                    "category": "project",
+                    "label": "Asteria 数据分析交付系统",
+                    "detail": "从0到1搭建Asteria数据分析交付系统，把分散分析纳入统一产品链路，覆盖7类输入和6类场景。",
+                    "source": "resume.pdf",
+                },
+                {
+                    "id": "research-applied",
+                    "category": "experience",
+                    "label": "用户洞察转化",
+                    "detail": "开展1v1深访并沉淀4类用户需求与场景，将用户洞察转化为内容策略与栏目结构。",
+                    "source": "resume.pdf",
+                },
+                {
+                    "id": "research-volume",
+                    "category": "experience",
+                    "label": "用户需求调研",
+                    "detail": "通过访谈和问卷收集520位用户反馈，归纳5类用户需求。",
+                    "source": "resume.pdf",
+                },
+                {
+                    "id": "community-ops",
+                    "category": "experience",
+                    "label": "社群运营",
+                    "detail": "从0到1搭建并运营150人社群，通过话题、内容与活动形成固定运营机制。",
+                    "source": "resume.pdf",
+                },
+                {
+                    "id": "agent-backend",
+                    "category": "project",
+                    "label": "Agent 后端模块",
+                    "detail": "使用 Python 开发大模型 Agent 后端模块并完成接口联调。",
+                    "source": "resume.pdf",
+                },
+            ],
+        })
+
+        matched = agent.run(
+            {
+                "title": "AI产品运营实习",
+                "body": "负责数据分析产品 BA Agent，分析用户 query 和高频场景，推进社群活动并监控指标。",
+            },
+            [],
+        )
+
+        self.assertEqual(
+            [(item["id"], item["role_axis"]) for item in matched],
+            [
+                ("asteria-product", "ai_product"),
+                ("research-applied", "user_insight"),
+                ("community-ops", "operations"),
+            ],
+        )
+
+        engineering = agent.run(
+            {"title": "Agent 研发实习", "body": "使用 Python 开发大模型 Agent 后端模块。"},
+            [],
+        )
+        self.assertTrue(engineering)
+        self.assertTrue(all(not item.get("role_axis") for item in engineering))
+
     def test_card_fallback_is_not_counted_as_full_body(self) -> None:
         card = {"note_id": "n1", "title": "AI实习", "note_url": "https://example/n1"}
         note = {
@@ -565,7 +711,7 @@ class ApplicationAgentTests(unittest.TestCase):
                         "email_body": "您好，我希望申请内容运营实习。我在内容营销经历中负责社交媒体内容运营、市场调研和英文沟通，能够对应岗位对内容策划与数据分析的要求。期待进一步沟通岗位当前最需要推进的任务。",
                         "cover_letter": "主题：应聘内容运营实习｜示例用户\n尊敬的招聘负责人：\n您好！我是示例用户，希望申请内容运营实习。我在内容营销经历中负责社交媒体内容运营、市场调研和英文沟通，能够把信息整理、内容判断和协作沟通连接起来，支持岗位所需的内容策划与数据分析。在具体工作中，我会先根据目标受众梳理选题方向，再结合调研反馈判断内容重点，并与相关成员确认发布节奏和交付标准。\n\n针对该岗位，我会先理解团队当前内容目标和数据口径，再从一个具体选题或活动开始验证判断：整理用户反馈和内容表现，识别需要优先优化的环节，把分析结论转化为可执行的内容动作，并在发布后继续复盘结果。这套方法来自我已有的内容营销实践，不依赖未经验证的工具或成果。\n\n我希望进一步了解团队当前最需要推进的内容任务，并具体沟通我可以优先承担的选题研究、内容执行或数据复盘工作。感谢您的阅读，期待进一步沟通。\n\n此致\n敬礼！\n姓名：示例用户",
                         "used_evidence_ids": ["marketing-experience"],
-                        "requirement_matches": ["内容运营对应内容营销经历"],
+                        "requirement_matches": ["内容策划与数据分析 -> marketing-experience -> 社交媒体内容运营与市场调研"],
                         "recommended_resume": "用户运营",
                         "resume_reason": "岗位核心职责为内容运营。",
                     }]}, ensure_ascii=False),
@@ -588,7 +734,8 @@ class ApplicationAgentTests(unittest.TestCase):
             report = agent.enrich([record])
             self.assertEqual(report.generated, 1)
             self.assertEqual(record["outreach"]["generation_mode"], "codex_cli_runtime")
-            self.assertEqual(record["outreach"]["recommended_resume"], "")
+            self.assertEqual(record["outreach"]["recommended_resume"], "用户运营")
+            self.assertEqual(record["outreach"]["resume_reason"], "岗位核心职责为内容运营。")
 
     def test_codex_runtime_rejects_meta_or_unstructured_copy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -891,7 +1038,10 @@ class WorkflowWrapperTests(unittest.TestCase):
                 json.dumps(cards, ensure_ascii=False),
                 encoding="utf-8",
             )
-            monotonic_values = iter((0.0, 10.0, 20.0, 30.0))
+            monotonic_values = itertools.chain(
+                (0.0, 10.0, 20.0, 30.0),
+                itertools.count(40.0, 10.0),
+            )
             original_loader = body_completion.load_upstream
             original_monotonic = body_completion.time.monotonic
             original_sleep = body_completion.time.sleep
@@ -991,6 +1141,7 @@ class WorkflowWrapperTests(unittest.TestCase):
                     sys.modules,
                     {"playwright": playwright_package, "playwright.sync_api": playwright_sync},
                 ):
+                    started_at = time.perf_counter()
                     summary = body_completion.complete_bodies(
                         output,
                         relay_port=18792,
@@ -998,6 +1149,7 @@ class WorkflowWrapperTests(unittest.TestCase):
                         attempts=3,
                         rate_limit_auto_recovery=False,
                     )
+                    elapsed_seconds = time.perf_counter() - started_at
             finally:
                 body_completion.load_upstream = original_loader
 
@@ -1009,6 +1161,7 @@ class WorkflowWrapperTests(unittest.TestCase):
             self.assertTrue(summary["newAccessStopped"])
             self.assertEqual(summary["rateLimit"]["status"], "stopped")
             self.assertEqual(summary["securityVerification"]["status"], "not_detected")
+            self.assertLess(elapsed_seconds, 5.0)
 
     def test_default_candidate_profile_is_project_relative(self) -> None:
         self.assertEqual(DEFAULT_CANDIDATE_PROFILE, PROJECT_ROOT / "profiles/candidate_profile.json")
@@ -1112,6 +1265,26 @@ class WorkflowWrapperTests(unittest.TestCase):
         self.assertEqual(summary["agentStages"][5]["status"], "partial")
         self.assertEqual(summary["agentStages"][6]["status"], "pending")
         self.assertEqual(summary["agentStages"][-1]["status"], "pending")
+
+    def test_job_ai_targets_accept_url_only_records_by_canonical_note_id(self) -> None:
+        payload = {
+            "records": [{
+                "note_url": "https://example.test/discovery/item/url-only?token=signed",
+                "body": "Complete role description",
+            }],
+            "quality_gate": {"discovered_count": 1, "body_count": 1},
+        }
+
+        targets, reason, pending_count, fully_deferred = partition_job_ai_targets(
+            payload,
+            {"url-only"},
+            {"missingBodies": 0},
+        )
+
+        self.assertEqual(targets, {"url-only"})
+        self.assertEqual(reason, "")
+        self.assertEqual(pending_count, 0)
+        self.assertFalse(fully_deferred)
 
     def test_workflow_summary_marks_only_explicit_security_timeout(self) -> None:
         cards = [{"note_id": "n1", "title": "AI one"}]

@@ -173,6 +173,10 @@ class AIProvider:
             self.max_output_tokens = max(256, min(int(configured_output_tokens), 16_384))
         except (TypeError, ValueError):
             self.max_output_tokens = 4_096
+        try:
+            self.http_max_retries = max(0, min(int(os.environ.get("XHS_AI_HTTP_MAX_RETRIES", "5")), 8))
+        except (TypeError, ValueError):
+            self.http_max_retries = 5
         self.last_request_used_images = False
         self.last_request_model = ""
         self._vision_model_cache: str | None = None
@@ -507,7 +511,7 @@ class AIProvider:
             "model": self.model,
             "instructions": system,
             "input": input_value,
-            "temperature": 0.2,
+            "max_output_tokens": self.max_output_tokens,
             "text": {"format": {"type": "json_object"}},
         }
         request = urllib.request.Request(
@@ -516,14 +520,29 @@ class AIProvider:
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")[:500]
-            raise AIProviderError(f"AI provider returned HTTP {error.code}: {detail}") from error
-        except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as error:
-            raise AIProviderError(f"AI provider request failed: {error}") from error
+        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+        for attempt in range(self.http_max_retries + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                if error.code not in retryable_statuses or attempt >= self.http_max_retries:
+                    raise AIProviderError(f"AI provider returned HTTP {error.code}: {detail}") from error
+            except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as error:
+                detail = str(error)
+                if attempt >= self.http_max_retries:
+                    raise AIProviderError(f"AI provider request failed: {detail}") from error
+            delay = min(2 ** attempt, 8)
+            if self.total_timeout:
+                remaining = self._remaining_timeout()
+                if remaining <= delay:
+                    raise AIProviderTimeoutError(
+                        f"AI runtime budget exhausted after {self.total_timeout} seconds; "
+                        "remaining records were preserved for a later resume"
+                    )
+            time.sleep(delay)
         content = result.get("output_text") if isinstance(result, dict) else None
         if not isinstance(content, str):
             parts: list[str] = []

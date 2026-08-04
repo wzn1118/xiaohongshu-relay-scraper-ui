@@ -25,6 +25,7 @@ from ai_provider_runtime import AIProvider
 from audience_collection import collect_audience, normalize_audience_post_status
 from expansion_collection import collect_expansion
 from body_completion_ledger import BodyCompletionLedger, LEDGER_FILENAME, load_ledger
+from note_identity import record_identity_keys, record_key as canonical_record_key
 from parallel_body_completion import complete_bodies
 from workflow_state import (
     WorkflowStateSession,
@@ -133,7 +134,7 @@ def parse_wrapper_args(arguments: list[str]) -> tuple[argparse.Namespace, list[s
     parser.add_argument(
         "--rate-limit-auto-recovery",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument("--rate-limit-initial-delay-seconds", type=float, default=120)
     parser.add_argument("--rate-limit-max-delay-seconds", type=float, default=900)
@@ -452,7 +453,7 @@ def collect_body_checkpoint(
     adaptive_pacing: bool = False,
     adaptive_max_delay_seconds: float = 20,
     block_heavy_resources: bool = False,
-    rate_limit_auto_recovery: bool = True,
+    rate_limit_auto_recovery: bool = False,
     rate_limit_initial_delay_seconds: float = 120,
     rate_limit_max_delay_seconds: float = 900,
     rate_limit_max_retries: int = 6,
@@ -463,6 +464,7 @@ def collect_body_checkpoint(
     body_cache_max_age_days: int = 30,
     max_age_days: int = 0,
     progress_callback: Any = None,
+    attempt_id: str = "",
 ) -> dict[str, Any]:
     if scrape_failed and not checkpoint_fallback:
         return checkpoint_body_summary(output_dir, stop_reason="relay_connection_failed")
@@ -498,6 +500,7 @@ def collect_body_checkpoint(
         max_age_days=max_age_days,
         upstream_scraper=upstream_scraper,
         progress_callback=progress_callback,
+        attempt_id=attempt_id,
     )
 
 
@@ -523,9 +526,9 @@ def reuse_completed_records(
     if not previous:
         return 0
     previous_by_id = {
-        str(record.get("note_id") or ""): record
+        canonical_record_key(record): record
         for record in previous.get("records", [])
-        if isinstance(record, dict) and str(record.get("note_id") or "")
+        if isinstance(record, dict) and canonical_record_key(record)
     }
     reused = 0
     records = payload.get("records", [])
@@ -533,7 +536,7 @@ def reuse_completed_records(
     for index, record in enumerate(records):
         if not isinstance(record, dict):
             continue
-        prior = previous_by_id.get(str(record.get("note_id") or ""))
+        prior = previous_by_id.get(canonical_record_key(record))
         if not prior:
             continue
         prior_analysis = prior.get("media", {}).get("analysis", {})
@@ -589,9 +592,9 @@ def completion_target_ids(
 ) -> set[str]:
     needs_completion = record_needs_content_completion if analysis_mode == "general" else record_needs_completion
     previous_records = {
-        str(record.get("note_id") or ""): record
+        canonical_record_key(record): record
         for record in (previous or {}).get("records", [])
-        if isinstance(record, dict) and str(record.get("note_id") or "")
+        if isinstance(record, dict) and canonical_record_key(record)
     }
     targets = {
         note_id
@@ -601,7 +604,7 @@ def completion_target_ids(
     for record in payload.get("records", []):
         if not isinstance(record, dict):
             continue
-        note_id = str(record.get("note_id") or "")
+        note_id = canonical_record_key(record)
         if not note_id:
             continue
         prior = previous_records.get(note_id)
@@ -678,16 +681,17 @@ def partition_job_ai_targets(
     gate = payload.get("quality_gate") if isinstance(payload.get("quality_gate"), dict) else {}
     body_metrics = canonical_body_metrics(body_summary or {}, gate)
 
-    def record_key(record: dict[str, Any]) -> str:
-        return str(record.get("note_id") or record.get("id") or "").strip()
-
     desired_records = (
         records
         if requested_target_ids is None
-        else [record for record in records if record_key(record) in requested_target_ids]
+        else [record for record in records if canonical_record_key(record) in requested_target_ids]
     )
     ready_records = [record for record in desired_records if str(record.get("body") or "").strip()]
-    ready_target_ids = {record_key(record) for record in ready_records if record_key(record)}
+    ready_target_ids = {
+        canonical_record_key(record)
+        for record in ready_records
+        if canonical_record_key(record)
+    }
     full_body_count = sum(1 for record in records if str(record.get("body") or "").strip())
     contract = payload.get("publication_contract") if isinstance(payload.get("publication_contract"), dict) else {}
     target_count = max(
@@ -1020,9 +1024,9 @@ def materialize_checkpoint(
 def discovery_checkpoint(output_dir: Path) -> dict[str, Any]:
     cards = load_json_array(output_dir / "xiaohongshu_cards_latest.json")
     discovered_ids = list(dict.fromkeys(
-        str(item.get("note_id") or item.get("note_url") or "").strip()
+        canonical_record_key(item)
         for item in cards
-        if str(item.get("note_id") or item.get("note_url") or "").strip()
+        if canonical_record_key(item)
     ))
     return {
         # The upstream collector is scroll-based and exposes no durable cursor.
@@ -1038,16 +1042,7 @@ def discovery_checkpoint(output_dir: Path) -> dict[str, Any]:
 
 
 def card_identity_keys(card: dict[str, Any]) -> list[str]:
-    keys: list[str] = []
-    note_id = str(card.get("note_id") or "").strip()
-    note_url = str(card.get("note_url") or "").strip()
-    if note_id:
-        keys.append(f"id:{note_id}")
-    if note_url:
-        canonical_url = note_url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
-        if canonical_url:
-            keys.append(f"url:{canonical_url}")
-    return keys
+    return record_identity_keys(card)
 
 
 def merge_discovered_cards(
@@ -1350,6 +1345,7 @@ def main_stateful(
                 max_age_days=int(option_value(unlimited_arguments, "--max-age-days") or 0),
                 upstream_scraper=upstream_scraper,
                 progress_callback=body_state_callback(state),
+                attempt_id=str(wrapper.attempt_id or ""),
             )
             body_status = (
                 "completed" if body_summary.get("passed")
@@ -1839,6 +1835,7 @@ def main(arguments: list[str] | None = None) -> int:
         body_cache_max_age_days=wrapper.body_cache_max_age_days,
         max_age_days=int(option_value(unlimited_arguments, "--max-age-days") or 0),
         upstream_scraper=resolve_upstream_scraper(upstream),
+        attempt_id=str(wrapper.attempt_id or ""),
     )
     if not scrape_failed and "--skip-postprocess" not in unlimited_arguments:
         postprocess = upstream.parent / "build_structured_excel.py"

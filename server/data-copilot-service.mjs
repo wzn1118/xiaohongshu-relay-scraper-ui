@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { closeSync, fsyncSync, openSync, writeSync } from 'node:fs';
 import path from 'node:path';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, readdir, rm, stat } from 'node:fs/promises';
 
 import {
   normalizeCopilotIdempotencyKey,
@@ -14,6 +14,17 @@ import {
   createCopilotContextSourceId,
   normalizeCopilotContextSourceIds as normalizeBoundContextSourceIds,
 } from './copilot-context-source.mjs';
+import { createContextManager } from './copilot/context-manager.mjs';
+import { createConversationRepository } from './copilot/conversation-repository.mjs';
+import { runGoldenEvaluation as executeGoldenEvaluation } from './copilot/evaluation-suite.mjs';
+import { createModelGateway } from './copilot/model-gateway.mjs';
+import { createOrchestrator, TaskGraph } from './copilot/orchestrator.mjs';
+import { createReadOnlySandbox } from './copilot/sandbox.mjs';
+import { createRunCoordinator } from './copilot/run-coordinator.mjs';
+import { createSkillRegistry } from './copilot/skills.mjs';
+import { createSpecialistRouter } from './copilot/specialists.mjs';
+import { createUsageTracker } from './copilot/usage-tracker.mjs';
+import { verifyAnswer } from './copilot/verifier.mjs';
 
 const ACTIVE_STATUSES = new Set([
   'planning', 'executing', 'waiting_input', 'stopping',
@@ -48,6 +59,16 @@ export class DataCopilotService {
     mcpAdapter = null,
     manager,
     aiSessions = runtime?.aiSessions,
+    contextManager = null,
+    repository = null,
+    modelGateway = null,
+    orchestrator = null,
+    sandbox = null,
+    skillRegistry = null,
+    specialistRouter = null,
+    usageTracker = null,
+    productionStore = null,
+    runCoordinator = null,
     now = () => new Date(),
   } = {}) {
     if (!store || !approvals || !artifacts || !runtime || !policy) {
@@ -66,6 +87,18 @@ export class DataCopilotService {
     this.mcpAdapter = mcpAdapter;
     this.manager = manager || policy.manager;
     this.aiSessions = aiSessions;
+    this.contextManager = contextManager || createContextManager({ now });
+    this.repository = repository || createConversationRepository({ store });
+    this.modelGateway = modelGateway || createModelGateway({ now });
+    this.orchestrator = orchestrator || createOrchestrator({ now });
+    this.sandbox = sandbox || createReadOnlySandbox();
+    this.skillRegistry = skillRegistry || createSkillRegistry();
+    this.specialistRouter = specialistRouter || createSpecialistRouter();
+    this.usageTracker = usageTracker || createUsageTracker({ now });
+    this.productionStore = productionStore;
+    this.runCoordinator = runCoordinator || (productionStore
+      ? createRunCoordinator({ store: productionStore, orchestrator: this.orchestrator, now })
+      : null);
     this.now = now;
     this.references = new Map();
     this.listeners = new Map();
@@ -169,6 +202,7 @@ export class DataCopilotService {
       'conversation idempotency key',
     );
     const selectedModel = this.#resolveSelectedModel(value.aiSessionId, value.selectedModel);
+    const snapshot = await this.#captureSnapshot(job);
     const conversation = await this.store.createConversation({
       ...(value.conversationId ? { conversationId: requiredCopilotId(value.conversationId, 'conversation ID') } : {}),
       jobId,
@@ -187,7 +221,7 @@ export class DataCopilotService {
       this.modelSessions.set(reference.conversationId, String(value.aiSessionId).trim());
     }
     this.emit(reference, { type: 'conversation.created', conversation: publicConversation(conversation) });
-    return { conversation: publicConversation(conversation) };
+    return { conversation: publicConversation(conversation), ...(snapshot ? { snapshot } : {}) };
   }
 
   async listConversations({ jobId = null, mode = null, limit = 100 } = {}) {
@@ -243,12 +277,365 @@ export class DataCopilotService {
     };
   }
 
+  async listRuns(conversationId, options = {}) {
+    const { reference } = await this.#conversation(conversationId);
+    const runs = await this.store.listRuns(reference, {
+      afterSequence: boundedInteger(options.afterSequence, 0, 0, Number.MAX_SAFE_INTEGER),
+      limit: boundedInteger(options.limit, 100, 1, 1000),
+    });
+    return {
+      runs,
+      nextSequence: runs.length ? runs.at(-1).sequence : Number(options.afterSequence || 0),
+    };
+  }
+
+  async updateConversation(conversationId, value = {}) {
+    const { reference, conversation } = await this.#conversation(conversationId);
+    const patch = {};
+    for (const key of ['title', 'filters', 'selectedModel', 'lastContextSourceIds']) {
+      if (Object.hasOwn(value, key)) patch[key] = value[key];
+    }
+    const updated = await this.store.updateConversation(reference, patch, { expectedRevision: value.expectedRevision });
+    this.emit(reference, { type: 'conversation.updated', conversation: publicConversation(updated) });
+    return { conversation: publicConversation(updated), previousRevision: conversation.revision };
+  }
+
+  async deleteConversation(conversationId) {
+    const { reference, conversation } = await this.#conversation(conversationId);
+    if (ACTIVE_STATUSES.has(conversation.status)) {
+      throw serviceError('COPILOT_CONVERSATION_ACTIVE', 'Active conversations must be cancelled before deletion.', 409);
+    }
+    await rm(path.join(this.rootDir, 'copilot', reference.conversationId), { recursive: true, force: true });
+    this.references.delete(reference.conversationId);
+    this.eventBuffers.delete(reference.conversationId);
+    this.eventSequences.delete(reference.conversationId);
+    this.listeners.delete(reference.conversationId);
+    return { deleted: true, conversationId: reference.conversationId };
+  }
+
+  async listEvents(conversationId, { afterSeq = 0, limit = 500, runId = '' } = {}) {
+    const { reference } = await this.#conversation(conversationId);
+    const after = boundedInteger(afterSeq, 0, 0, Number.MAX_SAFE_INTEGER);
+    const maximum = boundedInteger(limit, 500, 1, 5000);
+    const events = await readEventLog(this.#eventFile(reference.conversationId));
+    const lastSeq = Number(this.eventSequences.get(reference.conversationId) || events.at(-1)?.seq || events.at(-1)?.eventId || 0);
+    const firstSeq = Number(events[0]?.seq || events[0]?.eventId || 0);
+    const gap = after > 0 && firstSeq > after + 1 ? { from: after + 1, to: firstSeq - 1 } : null;
+    const selected = events
+      .filter((event) => Number(event.seq || event.eventId || 0) > after)
+      .filter((event) => !runId || event.runId === runId || event.payload?.runId === runId)
+      .slice(0, maximum);
+    return { schemaVersion: 1, conversationId: reference.conversationId, events: selected, nextSeq: Number(selected.at(-1)?.seq || after), lastSeq, gap };
+  }
+
+  async listRunEvents(runId, options = {}) {
+    const id = requiredCopilotId(runId, 'run ID');
+    for (const reference of this.references.values()) {
+      const runs = await this.repository.listRuns(reference, { afterSequence: 0, limit: 5000 });
+      if (!runs.some((run) => run.runId === id)) continue;
+      const replay = await this.listEvents(reference.conversationId, { ...options, runId: id });
+      return {
+        ...replay,
+        runId: id,
+      };
+    }
+    throw serviceError('COPILOT_RUN_NOT_FOUND', 'Data Copilot run was not found.', 404);
+  }
+
+  async buildWorkingSet(conversationId, value = {}) {
+    const { reference } = await this.#conversation(conversationId);
+    const sourceKinds = value.kind ? [String(value.kind)] : ['posts', 'comments', 'users', 'artifacts'];
+    const [messages, sources] = await Promise.all([
+      this.repository.listMessages(reference, { afterSequence: 0, limit: 5000 }),
+      Promise.all(sourceKinds.map((kind) => this.listContextRecords({ jobId: reference.jobId, mode: reference.mode, kind, query: value.query, offset: 0, limit: 100 }))),
+    ]);
+    const pins = this.productionStore?.listContextPins(reference.conversationId) || [];
+    const result = this.contextManager.buildWorkingSet({
+      query: value.query,
+      constraints: value.constraints || [],
+      goal: value.goal,
+      messages,
+      sources: sources.flatMap((entry) => entry.items || []),
+      tools: value.tools || [],
+      memories: value.memories || [],
+      pins,
+      requiredContextIds: value.requiredContextIds || [],
+      budget: value.budget,
+      reservedOutputTokens: value.reservedOutputTokens,
+      conversationId: reference.conversationId,
+      runId: value.runId,
+      compact: value.compact !== false,
+    });
+    if (result.compaction && this.productionStore) this.productionStore.recordCompaction(result.compaction);
+    return result;
+  }
+
+  async pinContext(conversationId, value = {}) {
+    const { reference } = await this.#conversation(conversationId);
+    this.#requireProductionStore();
+    return {
+      schemaVersion: 2,
+      pin: this.productionStore.upsertContextPin({
+        conversationId: reference.conversationId,
+        itemType: value.itemType || value.type,
+        itemId: value.itemId || value.id,
+        value: value.value || {},
+      }),
+    };
+  }
+
+  async listContextPins(conversationId) {
+    const { reference } = await this.#conversation(conversationId);
+    this.#requireProductionStore();
+    return { schemaVersion: 2, pins: this.productionStore.listContextPins(reference.conversationId) };
+  }
+
+  async removeContextPin(conversationId, pinId) {
+    const { reference } = await this.#conversation(conversationId);
+    this.#requireProductionStore();
+    const id = requiredCopilotId(pinId, 'pin ID');
+    const pin = this.productionStore.listContextPins(reference.conversationId).find((item) => item.pinId === id);
+    if (!pin) throw serviceError('COPILOT_CONTEXT_PIN_NOT_FOUND', 'Context pin was not found.', 404);
+    return { schemaVersion: 2, removed: this.productionStore.removeContextPin(id), pinId: id };
+  }
+
+  verifyAnswer(value = {}) {
+    return verifyAnswer(value);
+  }
+
+  async executeWorkbenchTool(toolName, input = {}) {
+    const startedAt = Date.now();
+    const conversationId = String(input.conversationId || '');
+    try {
+      const output = await this.sandbox.execute(toolName, input);
+      const durationMs = Date.now() - startedAt;
+      this.#recordUsage({ conversationId, toolCalls: 1, latencyMs: durationMs });
+      this.#recordTrace({ conversationId, operation: `workbench.tool:${String(toolName)}`, status: 'completed', durationMs, payload: { outputType: output?.kind || typeof output } });
+      return { schemaVersion: 1, toolName: String(toolName), output };
+    } catch (error) {
+      this.#recordTrace({ conversationId, operation: `workbench.tool:${String(toolName)}`, status: 'failed', durationMs: Date.now() - startedAt, payload: { code: String(error?.code || ''), message: String(error?.message || error).slice(0, 500) } });
+      throw error;
+    }
+  }
+
+  async executeWorkbenchGraph(value = {}) {
+    const tasks = (Array.isArray(value.tasks) ? value.tasks : []).map((task) => ({
+      ...task,
+      kind: String(task.toolName || task.kind || ''),
+    }));
+    if (!tasks.length) throw serviceError('COPILOT_TASK_GRAPH_EMPTY', 'At least one workbench task is required.');
+    const conversationId = String(value.conversationId || '');
+    if (this.runCoordinator && conversationId) {
+      const { reference } = await this.#conversation(conversationId);
+      const events = [];
+      const startedAt = Date.now();
+      try {
+        const result = await this.runCoordinator.execute({
+          ...value,
+          conversationId: reference.conversationId,
+          tasks,
+          executeTask: (task) => this.sandbox.execute(task.kind, task.input || {}),
+          onEvent: (event) => {
+            events.push(event);
+            this.emit(reference, event);
+          },
+        });
+        const durationMs = Date.now() - startedAt;
+        this.#recordUsage({ conversationId: reference.conversationId, runId: result.run?.runId, toolCalls: tasks.length, latencyMs: durationMs });
+        this.#recordTrace({ conversationId: reference.conversationId, runId: result.run?.runId, operation: 'workbench.graph.v2', status: 'completed', durationMs, payload: { tasks: tasks.length, completed: Object.keys(result.outputs || {}).length, governance: result.governance } });
+        return { schemaVersion: 2, ...result, events };
+      } catch (error) {
+        this.#recordTrace({ conversationId: reference.conversationId, runId: String(value.runId || ''), operation: 'workbench.graph.v2', status: 'failed', durationMs: Date.now() - startedAt, payload: { code: String(error?.code || ''), message: String(error?.message || error).slice(0, 500) } });
+        throw error;
+      }
+    }
+    const graph = new TaskGraph(tasks);
+    const events = [];
+    const startedAt = Date.now();
+    const result = await this.orchestrator.run(
+      graph,
+      (task) => this.sandbox.execute(task.kind, task.input || {}),
+      {
+        budget: objectValue(value.budget),
+        onEvent: (event) => events.push(event),
+      },
+    );
+    const durationMs = Date.now() - startedAt;
+    this.#recordUsage({ conversationId, toolCalls: tasks.length, latencyMs: durationMs });
+    this.#recordTrace({
+      conversationId,
+      operation: 'workbench.graph',
+      status: 'completed',
+      durationMs,
+      payload: { tasks: tasks.length, completed: Object.keys(result.outputs || {}).length, governance: result.governance },
+    });
+    return { schemaVersion: 1, ...result, events };
+  }
+
+  getWorkbenchRun(runId, conversationId = '') {
+    this.#requireRunCoordinator();
+    const state = this.runCoordinator.getState(requiredCopilotId(runId, 'run ID'));
+    if (!state.run) throw serviceError('COPILOT_RUN_NOT_FOUND', 'Data Copilot run was not found.', 404);
+    if (conversationId && state.run.conversationId !== requiredCopilotId(conversationId, 'conversation ID')) {
+      throw serviceError('COPILOT_RUN_CONTEXT_MISMATCH', 'The run does not belong to this conversation.', 409);
+    }
+    return state;
+  }
+
+  pauseWorkbenchRun(runId) {
+    this.#requireRunCoordinator();
+    const id = requiredCopilotId(runId, 'run ID');
+    const accepted = this.runCoordinator.pause(id);
+    if (!accepted && !this.runCoordinator.getState(id).run) throw serviceError('COPILOT_RUN_NOT_FOUND', 'Data Copilot run was not found.', 404);
+    return { schemaVersion: 2, accepted, action: 'pause', runId: id };
+  }
+
+  cancelWorkbenchRun(runId) {
+    this.#requireRunCoordinator();
+    const id = requiredCopilotId(runId, 'run ID');
+    const accepted = this.runCoordinator.cancel(id);
+    if (!accepted && !this.runCoordinator.getState(id).run) throw serviceError('COPILOT_RUN_NOT_FOUND', 'Data Copilot run was not found.', 404);
+    return { schemaVersion: 2, accepted, action: 'cancel', runId: id };
+  }
+
+  async resumeWorkbenchRun(runId, value = {}) {
+    this.#requireRunCoordinator();
+    return this.runCoordinator.resume(requiredCopilotId(runId, 'run ID'), {
+      ...value,
+      executeTask: (task) => this.sandbox.execute(task.kind, task.input || {}),
+    });
+  }
+
+  async steerWorkbenchRun(runId, value = {}) {
+    this.#requireRunCoordinator();
+    const tasks = (Array.isArray(value.tasks) ? value.tasks : []).map((task) => ({ ...task, kind: String(task.toolName || task.kind || '') }));
+    if (!tasks.length) throw serviceError('COPILOT_TASK_GRAPH_EMPTY', 'At least one revised workbench task is required.');
+    return this.runCoordinator.steer(requiredCopilotId(runId, 'run ID'), {
+      ...value,
+      tasks,
+      executeTask: (task) => this.sandbox.execute(task.kind, task.input || {}),
+    });
+  }
+
+  getUsage(value = {}) {
+    const summary = this.productionStore
+      ? this.productionStore.summarizeUsage(value)
+      : this.usageTracker.summarize(value);
+    return { schemaVersion: 1, ...summary };
+  }
+
+  listTraces(value = {}) {
+    this.#requireProductionStore();
+    return { schemaVersion: 1, traces: this.productionStore.listTraces(value) };
+  }
+
+  listSnapshots(value = {}) {
+    this.#requireProductionStore();
+    return { schemaVersion: 1, snapshots: this.productionStore.listSnapshots(value) };
+  }
+
+  getSnapshot(jobId, snapshotId) {
+    this.#requireProductionStore();
+    const snapshot = this.productionStore.getSnapshot(requiredCopilotId(jobId, 'job ID'), requiredCopilotId(snapshotId, 'snapshot ID'));
+    if (!snapshot) throw serviceError('COPILOT_SNAPSHOT_NOT_FOUND', 'The requested snapshot was not found.', 404);
+    return snapshot;
+  }
+
+  diffSnapshots(value = {}) {
+    this.#requireProductionStore();
+    return this.productionStore.diffSnapshots({
+      jobId: requiredCopilotId(value.jobId, 'job ID'),
+      fromSnapshotId: requiredCopilotId(value.fromSnapshotId || value.from, 'from snapshot ID'),
+      toSnapshotId: requiredCopilotId(value.toSnapshotId || value.to, 'to snapshot ID'),
+    });
+  }
+
+  async upgradeConversationSnapshot(conversationId, value = {}) {
+    const { reference, conversation } = await this.#conversation(conversationId);
+    const job = this.#getJob(reference.jobId);
+    const currentSnapshotId = `job-r${normalizeJobRevision(job.revision)}`;
+    await this.#captureSnapshot(job);
+    if (currentSnapshotId === reference.snapshotId) {
+      return { upgraded: false, reason: 'already_current', conversation: publicConversation(conversation) };
+    }
+    const diff = this.diffSnapshots({ jobId: reference.jobId, from: reference.snapshotId, to: currentSnapshotId });
+    const created = await this.createConversation({
+      jobId: reference.jobId,
+      mode: reference.mode,
+      scope: { ...reference.scope, jobRevision: normalizeJobRevision(job.revision) },
+      contextSourceIds: conversation.lastContextSourceIds || reference.scope?.contextSourceIds || [],
+      title: conversation.title,
+      filters: conversation.filters,
+      selectedModel: conversation.selectedModel,
+      idempotencyKey: value.idempotencyKey || `snapshot-upgrade:${reference.conversationId}:${currentSnapshotId}`,
+    });
+    const targetReference = this.references.get(created.conversation.conversationId);
+    let inheritedMessages = 0;
+    if (value.copyMessages !== false) {
+      const messages = await this.repository.listMessages(reference, { afterSequence: 0, limit: 5000 });
+      for (const message of messages) {
+        await this.repository.appendMessage(targetReference, {
+          role: message.role,
+          content: message.content,
+          attachments: [],
+          parentMessageId: null,
+          metadata: { ...objectValue(message.metadata), inheritedFromConversationId: reference.conversationId, inheritedSequence: message.sequence },
+          idempotencyKey: `snapshot-upgrade-message:${reference.conversationId}:${message.sequence}`,
+        });
+        inheritedMessages += 1;
+      }
+    }
+    this.#recordTrace({ conversationId: created.conversation.conversationId, operation: 'snapshot.upgrade', status: 'completed', payload: { fromConversationId: reference.conversationId, fromSnapshotId: reference.snapshotId, toSnapshotId: currentSnapshotId, inheritedMessages } });
+    return { upgraded: true, sourceConversationId: reference.conversationId, conversation: created.conversation, inheritedMessages, diff };
+  }
+
+  async createArtifact(conversationId, value = {}) {
+    const { reference } = await this.#conversation(conversationId);
+    const startedAt = Date.now();
+    const result = await this.artifacts.createArtifact(reference, value);
+    const resolved = await this.artifacts.resolveArtifact(reference, result.artifact.artifactId);
+    const verification = {
+      passed: resolved.artifact.status === 'ready' && resolved.artifact.sha256 === result.artifact.sha256,
+      sha256: resolved.artifact.sha256,
+      size: resolved.artifact.size,
+    };
+    const durationMs = Date.now() - startedAt;
+    this.#recordUsage({ conversationId: reference.conversationId, toolCalls: 1, latencyMs: durationMs });
+    this.#recordTrace({ conversationId: reference.conversationId, operation: `artifact.create:${result.artifact.format}`, status: verification.passed ? 'completed' : 'failed', durationMs, payload: { artifactId: result.artifact.artifactId, sha256: result.artifact.sha256, size: result.artifact.size } });
+    this.productionStore?.enqueueOutbox({ topic: 'copilot.artifact.ready', payload: { conversationId: reference.conversationId, artifact: result.artifact } });
+    this.emit(reference, { type: 'artifact.ready', artifact: result.artifact, verification });
+    return { schemaVersion: 1, ...result, verification };
+  }
+
+  async runGoldenEvaluation() {
+    const result = await executeGoldenEvaluation({ sandbox: this.sandbox, now: this.now });
+    const persisted = this.productionStore?.recordEvaluation(result) || result;
+    this.#recordTrace({ operation: 'evaluation.golden-30', status: result.status, durationMs: result.durationMs, payload: result.summary });
+    return persisted;
+  }
+
+  listEvaluations(value = {}) {
+    this.#requireProductionStore();
+    return { schemaVersion: 1, evaluations: this.productionStore.listEvaluations(value) };
+  }
+
   listTools({ query = '', limit = 100 } = {}) {
     const registry = this.runtime.registry || this.mcpAdapter?.registry;
     const maximum = boundedInteger(limit, 100, 1, 500);
-    const tools = String(query || '').trim() && typeof registry?.search === 'function'
+    const catalogTools = String(query || '').trim() && typeof registry?.search === 'function'
       ? registry.search(query, { limit: maximum })
       : registry?.list?.().slice(0, maximum) || [];
+    const analysisTools = this.sandbox.listTools().map((name) => ({
+      name,
+      category: 'analysis',
+      riskLevel: 'read',
+      source: 'workbench',
+    }));
+    const needle = String(query || '').trim().toLocaleLowerCase();
+    const matchingAnalysisTools = analysisTools.filter((tool) => !needle || `${tool.name} ${tool.category}`.toLocaleLowerCase().includes(needle));
+    const tools = [...catalogTools, ...matchingAnalysisTools]
+      .filter((tool, index, items) => items.findIndex((candidate) => candidate.name === tool.name) === index)
+      .slice(0, maximum);
     return {
       schemaVersion: 1,
       query: String(query || '').trim(),
@@ -259,10 +646,51 @@ export class DataCopilotService {
 
   getCapabilities() {
     const registry = this.runtime.registry || this.mcpAdapter?.registry;
-    return this.runtime.describeCapabilities?.() || {
+    const capabilities = this.runtime.describeCapabilities?.() || {
       schemaVersion: 1,
       agentKernel: 'legacy',
       toolCatalog: { total: registry?.list?.().length || 0, categories: [] },
+    };
+    return {
+      ...capabilities,
+      schemaVersion: 2,
+      protocol: {
+        answerAst: { schemaVersion: 1, blockKinds: ['heading', 'paragraph', 'list', 'table', 'code', 'quote', 'callout', 'chart', 'citation', 'artifact', 'checklist', 'diff', 'tool_summary', 'error'] },
+        events: { schemaVersion: 1, typed: true, replay: true, gapDetection: true },
+      },
+      contextManager: { enabled: true, schemaVersion: 2, tokenBudget: true, reservedOutputBudget: true, partitions: true, rankedSources: true, pins: Boolean(this.productionStore), structuredCompaction: true, missingContextContract: true },
+      verifier: { enabled: true, schemaVersion: 2, evidenceGraph: true, claimCoverage: true, numericRecalculation: true, strictMode: true },
+      modelGateway: { enabled: true, wireApis: ['responses', 'chat_completions'], streaming: true, statefulResponses: true, backgroundLifecycle: true, capabilityNegotiation: true },
+      orchestration: {
+        enabled: true,
+        taskGraph: true,
+        parallelReadTasks: true,
+        taskTimeouts: true,
+        runBudgets: true,
+        idempotencyCache: true,
+        outputContracts: true,
+        persistentRuns: Boolean(this.runCoordinator),
+        nodeCheckpoints: Boolean(this.runCoordinator),
+        pauseResumeCancel: Boolean(this.runCoordinator),
+        planRevisions: Boolean(this.runCoordinator),
+        startupRecovery: Boolean(this.runCoordinator),
+        startupRecoveredRuns: this.runCoordinator?.recoveredRunIds?.length || 0,
+      },
+      workbench: {
+        modes: ['ask', 'analyze', 'build'],
+        tools: this.sandbox.listTools(),
+        skills: this.skillRegistry.list(),
+        specialists: this.specialistRouter.list(),
+      },
+      quality: { goldenTasks: 30, persistedEvaluations: Boolean(this.productionStore), traces: Boolean(this.productionStore) },
+      snapshots: { manifest: Boolean(this.productionStore), diff: Boolean(this.productionStore), explicitUpgrade: Boolean(this.productionStore) },
+      artifacts: { verified: true, formats: ['json', 'csv', 'markdown', 'xlsx'], idempotent: true },
+      persistence: {
+        repository: 'jsonl-compat',
+        durableEventLog: true,
+        cursorReplay: true,
+        productionState: this.productionStore?.describe() || { engine: 'memory', journalMode: '', schemaVersion: 0 },
+      },
     };
   }
 
@@ -370,6 +798,7 @@ export class DataCopilotService {
       return resolved.attachment;
     }));
     const aiSessionId = String(value.aiSessionId || this.modelSessions.get(reference.conversationId) || '').trim();
+    const workspaceMode = normalizeWorkspaceMode(value.workspaceMode);
     const selectedModel = this.#resolveSelectedModel(aiSessionId, conversation.selectedModel);
     const idempotencyKey = normalizeCopilotIdempotencyKey(
       value.idempotencyKey || `message:${crypto.randomUUID()}`,
@@ -398,6 +827,7 @@ export class DataCopilotService {
         attachments,
         contextSourceIds,
         aiSessionId,
+        workspaceMode,
         idempotencyKey,
       });
       return { ...result, conversation: publicConversation(result.conversation) };
@@ -520,9 +950,16 @@ export class DataCopilotService {
     const normalized = {
       ...structuredClone(event),
       eventId: nextId,
+      seq: nextId,
       conversationId,
       createdAt: event.createdAt || isoNow(this.now),
     };
+    normalized.occurredAt = normalized.occurredAt || normalized.createdAt;
+    normalized.type = normalized.type || mapLegacyEventType(normalized.event || normalized.name || 'event');
+    normalized.payload = normalized.payload && typeof normalized.payload === 'object'
+      ? structuredClone(normalized.payload)
+      : eventPayload(normalized);
+    normalized.idempotencyKey = normalized.idempotencyKey || `event:${conversationId}:${nextId}`;
     const persisted = jsonEvent(normalized);
     appendEventDurably(this.#eventFile(conversationId), persisted);
     this.eventSequences.set(conversationId, nextId);
@@ -545,11 +982,28 @@ export class DataCopilotService {
     const buffer = this.eventBuffers.get(id) || [];
     const lastEventId = Number(this.eventSequences.get(id) || 0);
     const requestedEventId = Number(afterEventId || 0);
-    const effectiveEventId = Number.isSafeInteger(requestedEventId)
-      && requestedEventId >= 0
-      && requestedEventId <= lastEventId
+    const firstBufferedEventId = Number(buffer[0]?.eventId || lastEventId + 1);
+    let effectiveEventId = Number.isSafeInteger(requestedEventId) && requestedEventId >= 0 && requestedEventId <= lastEventId
       ? requestedEventId
-      : Math.max(0, Number(buffer[0]?.eventId || 1) - 1);
+      : Math.max(0, firstBufferedEventId - 1);
+    if (requestedEventId > lastEventId) {
+      effectiveEventId = Math.max(0, firstBufferedEventId - 1);
+    } else if (requestedEventId > 0 && firstBufferedEventId > requestedEventId + 1) {
+      effectiveEventId = firstBufferedEventId - 1;
+      try {
+        listener({
+          schemaVersion: 1,
+          eventId: effectiveEventId,
+          seq: effectiveEventId,
+          conversationId: id,
+          type: 'stream.gap',
+          occurredAt: isoNow(this.now),
+          createdAt: isoNow(this.now),
+          payload: { from: requestedEventId + 1, to: effectiveEventId, recovery: 'GET ?format=json&afterSeq=<cursor>' },
+          idempotencyKey: `stream-gap:${id}:${requestedEventId}:${effectiveEventId}`,
+        });
+      } catch { /* Gap notification is isolated per subscriber. */ }
+    }
     for (const event of buffer) {
       if (event.eventId > effectiveEventId) {
         try { listener(structuredClone(event)); } catch { /* Replay is isolated per subscriber. */ }
@@ -626,14 +1080,65 @@ export class DataCopilotService {
     const latest = events.slice(-EVENT_BUFFER_LIMIT);
     this.eventBuffers.set(reference.conversationId, latest);
     this.eventSequences.set(reference.conversationId, Number(events.at(-1)?.eventId || 0));
-    if (events.length !== latest.length || invalidCount > 0) {
-      await writeCopilotJsonlAtomically(filePath, latest);
+    if (invalidCount > 0) {
+      await writeCopilotJsonlAtomically(filePath, events);
     }
   }
 
   #eventFile(conversationId) {
     const id = requiredCopilotId(conversationId, 'conversation ID');
     return path.join(this.rootDir, 'copilot', id, 'events.jsonl');
+  }
+
+  async #captureSnapshot(job) {
+    if (!this.productionStore) return null;
+    const summary = contextJobRecord(job);
+    const files = await listTaskArtifactFiles(job.outputDir).catch(() => []);
+    return this.productionStore.upsertSnapshot({
+      jobId: summary.id,
+      snapshotId: summary.snapshotId,
+      revision: summary.revision,
+      manifest: {
+        task: {
+          id: summary.id,
+          title: summary.title,
+          mode: summary.mode,
+          status: summary.status,
+          revision: summary.revision,
+          progress: summary.progress,
+          createdAt: summary.createdAt,
+          updatedAt: summary.updatedAt,
+        },
+        counts: summary.counts,
+        artifacts: files.map((file) => ({
+          relativePath: file.relativePath,
+          size: file.size,
+          updatedAt: file.updatedAt,
+        })),
+      },
+    });
+  }
+
+  #recordUsage(value = {}) {
+    const record = this.usageTracker.record(value);
+    this.productionStore?.recordUsage(record);
+    return record;
+  }
+
+  #recordTrace(value = {}) {
+    return this.productionStore?.recordTrace(value) || null;
+  }
+
+  #requireProductionStore() {
+    if (!this.productionStore) {
+      throw serviceError('COPILOT_PRODUCTION_STORE_UNAVAILABLE', 'The Data Copilot production state store is unavailable.', 503);
+    }
+  }
+
+  #requireRunCoordinator() {
+    if (!this.runCoordinator) {
+      throw serviceError('COPILOT_RUN_COORDINATOR_UNAVAILABLE', 'The durable Data Copilot run coordinator is unavailable.', 503);
+    }
   }
 
   #getJob(jobId) {
@@ -1119,6 +1624,52 @@ function canonicalJson(value) {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
   }
   return JSON.stringify(value);
+}
+
+async function readEventLog(filePath) {
+  let content = '';
+  try { content = await readFile(filePath, 'utf8'); } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  return content.split(/\r?\n/u).filter(Boolean).map((line) => {
+    const event = JSON.parse(line);
+    const seq = Number(event.seq || event.eventId || 0);
+    return {
+      ...event,
+      eventId: Number(event.eventId || seq),
+      seq,
+      occurredAt: event.occurredAt || event.createdAt,
+      type: event.type || mapLegacyEventType(event.event || 'event'),
+      payload: event.payload || eventPayload(event),
+      idempotencyKey: event.idempotencyKey || `event:${event.conversationId || 'conversation'}:${seq}`,
+    };
+  }).filter((event) => event.seq > 0);
+}
+
+function eventPayload(event) {
+  const payload = { ...event };
+  for (const field of ['eventId', 'seq', 'conversationId', 'createdAt', 'occurredAt', 'type', 'payload', 'idempotencyKey']) delete payload[field];
+  return payload;
+}
+
+function mapLegacyEventType(value) {
+  const type = String(value || 'event');
+  if (type === 'conversation.created') return 'run.created';
+  if (type === 'assistant.delta' || type === 'message.delta') return 'message.delta';
+  if (type === 'assistant.completed' || type === 'message.completed') return 'message.completed';
+  if (type.startsWith('tool.')) return type;
+  if (type.startsWith('approval.')) return type === 'approval.confirmed' ? 'approval.resolved' : 'approval.required';
+  if (type.includes('verification')) return type.startsWith('verification.') ? type : 'verification.completed';
+  if (type === 'run.completed' || type === 'run.failed' || type === 'run.cancelled') return type;
+  if (type === 'run.started' || type === 'plan.created' || type === 'plan.updated') return type;
+  return type.replace(/[^A-Za-z0-9_.-]/gu, '_');
+}
+
+function normalizeWorkspaceMode(value) {
+  const mode = String(value || 'ask').trim().toLowerCase();
+  if (!['ask', 'analyze', 'build'].includes(mode)) throw serviceError('COPILOT_WORKSPACE_MODE_INVALID', 'Workspace mode must be ask, analyze, or build.');
+  return mode;
 }
 
 function isoNow(now) {

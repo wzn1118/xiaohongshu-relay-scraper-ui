@@ -354,19 +354,30 @@ def body_excerpt(text: str, limit: int = 220) -> str:
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
+def as_text(value: object) -> str:
+    """Normalize checkpoint fields before text extraction and workbook writes."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(as_text(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
 def build_structured_rows(records: list[dict]) -> list[dict]:
     rows: list[dict] = []
     for record in records:
         combined_text = " ".join(
             [
-                record.get("title", ""),
-                record.get("body", ""),
-                record.get("source_card_text", ""),
-                record.get("tags", ""),
-                record.get("card_title", ""),
-                record.get("card_tags", ""),
-                record.get("card_badges", ""),
-                record.get("card_text_segments", ""),
+                as_text(record.get("title", "")),
+                as_text(record.get("body", "")),
+                as_text(record.get("source_card_text", "")),
+                as_text(record.get("tags", "")),
+                as_text(record.get("card_title", "")),
+                as_text(record.get("card_tags", "")),
+                as_text(record.get("card_badges", "")),
+                as_text(record.get("card_text_segments", "")),
             ]
         )
         rows.append(

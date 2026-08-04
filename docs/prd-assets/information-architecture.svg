@@ -12,7 +12,7 @@
   <text class="subtitle" x="48" y="84">四个导航入口共享当前 Job 上下文，核心动作从控制台进入，历史和产物负责复盘</text>
   <rect class="panel" x="40" y="112" width="1520" height="730" rx="14"/>
 
-  <rect class="root" x="620" y="160" width="280" height="82" rx="12"/><text class="roottext" x="760" y="194" text-anchor="middle">继任采集与投递工作台</text><text x="760" y="220" text-anchor="middle" fill="#d0d5dd" font-size="13" font-family="Microsoft YaHei">当前 Job 上下文</text>
+  <rect class="root" x="620" y="160" width="280" height="82" rx="12"/><text class="roottext" x="760" y="194" text-anchor="middle">今天你投了吗？</text><text x="760" y="220" text-anchor="middle" fill="#d0d5dd" font-size="13" font-family="Microsoft YaHei">当前 Job 上下文</text>
   <rect class="nav" x="90" y="330" width="260" height="90" rx="10"/><text class="head" x="185" y="368">控制台</text><text class="sub" x="130" y="396">配置、连接、启动、实时进度</text>
   <rect class="nav" x="450" y="330" width="260" height="90" rx="10"/><text class="head" x="545" y="368">历史</text><text class="sub" x="500" y="396">任务状态、失败原因、续跑</text>
   <rect class="nav" x="810" y="330" width="260" height="90" rx="10"/><text class="head" x="905" y="368">产物</text><text class="sub" x="858" y="396">导出文件、报告、manifest</text>

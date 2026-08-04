@@ -240,10 +240,12 @@ class BodyCompletionLedger:
         payload: dict[str, Any],
         *,
         clock: Callable[[], str] = utc_now,
+        key_resolver: Callable[[dict[str, Any]], str] = record_key,
     ) -> None:
         self.path = path.resolve()
         self._payload = payload
         self._clock = clock
+        self._key_resolver = key_resolver
         self._lock = threading.RLock()
 
     @classmethod
@@ -256,17 +258,18 @@ class BodyCompletionLedger:
         *,
         clock: Callable[[], str] = utc_now,
         recover_interrupted: bool = True,
+        key_resolver: Callable[[dict[str, Any]], str] = record_key,
     ) -> "BodyCompletionLedger":
         path = output_dir.resolve() / LEDGER_FILENAME
         loaded = load_ledger(path)
         now = clock()
         cards = list(cards)
-        active_ids = {record_key(card) for card in cards if record_key(card)}
+        active_ids = {key_resolver(card) for card in cards if key_resolver(card)}
         completed_by_id = {
-            record_key(item): item for item in complete_records if record_key(item)
+            key_resolver(item): item for item in complete_records if key_resolver(item)
         }
         failures_by_id = {
-            record_key(item): item for item in failures if record_key(item)
+            key_resolver(item): item for item in failures if key_resolver(item)
         }
         if loaded is None:
             legacy_inferred = bool(completed_by_id or failures_by_id)
@@ -280,7 +283,7 @@ class BodyCompletionLedger:
                 "scopeExcludedRecords": {},
             }
             for card in cards:
-                note_id = record_key(card)
+                note_id = key_resolver(card)
                 if not note_id or note_id in payload["records"]:
                     continue
                 record = _new_record(note_id, now)
@@ -308,9 +311,51 @@ class BodyCompletionLedger:
                 payload["records"][note_id] = record
         else:
             payload = loaded
+            rekeyed = False
+            for collection_name in ("records", "scopeExcludedRecords"):
+                original_records = payload.setdefault(collection_name, {})
+                migrated_records: dict[str, dict[str, Any]] = {}
+                for old_key, value in original_records.items():
+                    candidate = {
+                        "note_id": value.get("noteId") or old_key,
+                        "note_url": old_key,
+                    }
+                    new_key = key_resolver(candidate) or str(old_key)
+                    normalized = normalize_record(new_key, value, now)
+                    existing = migrated_records.get(new_key)
+                    if existing is None:
+                        migrated_records[new_key] = normalized
+                    else:
+                        # A signed URL and its stable note id may both exist in an
+                        # older ledger. Keep a completed result when present and
+                        # merge request history without double-counting it.
+                        preferred = (
+                            normalized
+                            if normalized["bodyStatus"] == "succeeded"
+                            and existing["bodyStatus"] != "succeeded"
+                            else existing
+                        )
+                        merged = copy.deepcopy(preferred)
+                        for field in ("requestIds", "completedRequestIds"):
+                            merged[field] = list(dict.fromkeys([
+                                *existing.get(field, []),
+                                *normalized.get(field, []),
+                            ]))
+                        merged["attemptCount"] = max(
+                            int(existing.get("attemptCount") or 0),
+                            int(normalized.get("attemptCount") or 0),
+                            len(merged["requestIds"]),
+                        )
+                        migrated_records[new_key] = normalize_record(
+                            new_key,
+                            merged,
+                            now,
+                        )
+                    rekeyed = rekeyed or new_key != old_key or existing is not None
+                payload[collection_name] = migrated_records
             records = payload["records"]
             excluded_records = payload.setdefault("scopeExcludedRecords", {})
-            recovered = False
+            recovered = rekeyed
             for note_id in list(records):
                 if note_id in active_ids:
                     continue
@@ -360,7 +405,7 @@ class BodyCompletionLedger:
                             "updatedAt": now,
                         })
                         recovered = True
-        ledger = cls(path, payload, clock=clock)
+        ledger = cls(path, payload, clock=clock, key_resolver=key_resolver)
         ledger.discover(cards)
         if loaded is not None and recovered:
             ledger._persist(now)
@@ -381,7 +426,7 @@ class BodyCompletionLedger:
             now = self._clock()
             changed = False
             for card in cards:
-                note_id = record_key(card)
+                note_id = self._key_resolver(card)
                 if note_id and note_id not in self._payload["records"]:
                     self._payload["records"][note_id] = _new_record(note_id, now)
                     changed = True

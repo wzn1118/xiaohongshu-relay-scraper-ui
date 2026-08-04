@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1100" viewBox="0 0 1600 1100" role="img" aria-labelledby="title desc">
-  <title id="title">继任采集与投递工作台产品架构图</title>
+  <title id="title">今天你投了吗？产品架构图</title>
   <desc id="desc">展示用户与外部依赖、React 工作台、本地 Node API、Python 工作流、八阶段 Agent、数据存储和交付产物之间的关系。</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
@@ -31,7 +31,7 @@
   </defs>
 
   <rect class="bg" x="0" y="0" width="1600" height="1100"/>
-  <text class="title" x="48" y="55">产品架构图 · 继任采集与投递工作台</text>
+  <text class="title" x="48" y="55">产品架构图 · 今天你投了吗？</text>
   <text class="subtitle" x="48" y="84">从用户操作到本地服务、任务编排、证据处理和交付产物的完整边界</text>
 
   <rect class="layer" x="40" y="112" width="1520" height="148" rx="12"/>

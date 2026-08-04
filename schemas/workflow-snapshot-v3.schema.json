@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "workflow-snapshot-v3.schema.json",
+  "title": "WorkflowSnapshotV3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "revision",
+    "throughSequence",
+    "jobId",
+    "activeAttemptId",
+    "journey",
+    "state",
+    "activeStage",
+    "headline",
+    "detail",
+    "stages",
+    "counts",
+    "speed",
+    "issues",
+    "connection",
+    "checkpoint"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 3 },
+    "revision": { "type": "integer", "minimum": 0 },
+    "throughSequence": { "type": "integer", "minimum": 0 },
+    "jobId": { "type": "string", "minLength": 1 },
+    "activeAttemptId": { "type": ["string", "null"] },
+    "journey": { "enum": ["job", "general", "body_import"] },
+    "state": { "type": "string", "minLength": 1 },
+    "activeStage": { "type": ["string", "null"] },
+    "headline": { "type": "string" },
+    "detail": { "type": "string" },
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["stage", "state", "progress"],
+        "properties": {
+          "stage": { "type": "string" },
+          "state": { "type": "string" },
+          "headline": { "type": "string" },
+          "detail": { "type": "string" },
+          "progress": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["done", "total"],
+            "properties": {
+              "done": { "type": "integer", "minimum": 0 },
+              "total": { "type": ["integer", "null"], "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["discovered", "fullText", "confirmedJobs", "nonJobs", "matchReady", "draftReady", "applicationReady", "pending", "retryable", "unavailable"],
+      "properties": {
+        "discovered": { "type": "integer", "minimum": 0 },
+        "fullText": { "type": "integer", "minimum": 0 },
+        "confirmedJobs": { "type": "integer", "minimum": 0 },
+        "nonJobs": { "type": "integer", "minimum": 0 },
+        "matchReady": { "type": "integer", "minimum": 0 },
+        "draftReady": { "type": "integer", "minimum": 0 },
+        "applicationReady": { "type": "integer", "minimum": 0 },
+        "pending": { "type": "integer", "minimum": 0 },
+        "retryable": { "type": "integer", "minimum": 0 },
+        "unavailable": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "speed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["activePerMinute", "wallPerMinute", "cacheHits", "networkSuccess", "etaMinSeconds", "etaMaxSeconds", "confidence"],
+      "properties": {
+        "activePerMinute": { "type": ["number", "null"], "minimum": 0 },
+        "wallPerMinute": { "type": ["number", "null"], "minimum": 0 },
+        "cacheHits": { "type": "integer", "minimum": 0 },
+        "networkSuccess": { "type": "integer", "minimum": 0 },
+        "etaMinSeconds": { "type": ["number", "null"], "minimum": 0 },
+        "etaMaxSeconds": { "type": ["number", "null"], "minimum": 0 },
+        "confidence": { "type": "string" }
+      }
+    },
+    "issues": { "type": "array", "items": { "$ref": "user-problem-v1.schema.json" } },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "lastEventAt"],
+      "properties": {
+        "state": { "enum": ["live", "reconnecting", "stale", "offline"] },
+        "lastEventAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "savedAt", "resumeAvailable"],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "savedAt": { "type": "string", "format": "date-time" },
+        "resumeAvailable": { "type": "boolean" }
+      }
+    }
+  }
+}

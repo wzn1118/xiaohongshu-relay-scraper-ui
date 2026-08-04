@@ -6,13 +6,16 @@ const failures = [];
 const nodeFiles = listRepositoryFiles().filter((file) => /\.(?:cjs|js|mjs)$/.test(file));
 for (const file of nodeFiles) {
   const result = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
-  if (result.status !== 0) failures.push(result.stderr.trim() || `${file}: syntax check failed`);
+  if (result.status !== 0) {
+    const detail = result.stderr?.trim() || result.error?.message || 'syntax check failed';
+    failures.push(`${file}: ${detail}`);
+  }
 }
 
 const python = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 const pythonResult = spawnSync(python, ['-m', 'compileall', '-q', 'scripts', 'tests'], { encoding: 'utf8' });
 if (pythonResult.status !== 0) {
-  failures.push(pythonResult.stderr.trim() || 'Python compile check failed.');
+  failures.push(pythonResult.stderr?.trim() || pythonResult.error?.message || 'Python compile check failed.');
 }
 
 if (failures.length) {
