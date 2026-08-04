@@ -4,7 +4,8 @@
   "version": "3.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k -n api,web -c yellow,cyan \"node --watch server/index.mjs\" \"vite\"",
+    "dev": "concurrently -k -n api,web -c yellow,cyan \"node server/index.mjs\" \"vite\"",
+    "dev:watch": "concurrently -k -n api,web -c yellow,cyan \"node --watch server/index.mjs\" \"vite\"",
     "build": "tsc -b && vite build",
     "build:frontend": "vite build",
     "start": "node server/index.mjs",
