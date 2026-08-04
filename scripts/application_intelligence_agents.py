@@ -8,7 +8,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from codex_runtime_outreach import PROMPT_VERSION
+from codex_runtime_outreach import PROMPT_VERSION, _canonical_email_subject, _subject_requirement_focus
 from application_generation import build_generation_payload, build_profile_snapshot, writeback_generated_drafts
 from note_identity import record_key as canonical_record_key, record_note_id
 
@@ -1060,7 +1060,27 @@ class OutreachWriterAgent:
                 if isinstance(item, dict)
             ],
         ])
-        subject = "｜".join(filter(None, (f"应聘{title}", name, f"每周可实习{availability}天" if availability else "")))
+        subject_source = {
+            "title": title,
+            "responsibilities": [
+                _text(item.get("text"))
+                for item in application_info.get("responsibilities", [])
+                if isinstance(item, dict)
+            ],
+            "requirements": [
+                _text(item.get("text"))
+                for item in application_info.get("requirements", [])
+                if isinstance(item, dict)
+            ],
+            "body_excerpt": _text(note.get("body"))[:6000],
+        }
+        subject = _canonical_email_subject(
+            "",
+            title,
+            name,
+            availability,
+            _subject_requirement_focus(subject_source),
+        )
         if writing_evidence:
             evidence_preview = self._evidence_sentence(writing_evidence[0], role_target)
             if len(evidence_preview) > 58:

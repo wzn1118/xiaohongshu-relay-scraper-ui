@@ -330,6 +330,30 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertNotIn("skills相关实践", str(result))
         self.assertNotIn("我R", str(result))
 
+    def test_outreach_subject_uses_requirement_extracted_from_body(self) -> None:
+        writer = OutreachWriterAgent({
+            "candidate_application": {
+                "name": "示例候选人",
+                "availabilityDays": "5",
+            },
+        })
+
+        result = writer.run(
+            {
+                "body": "负责通过可复核的AI产品机制提升chatbot场景与评测效率。",
+                "job_card": {"role_name": "AI产品经理实习"},
+            },
+            {
+                "responsibilities": [],
+                "requirements": [],
+            },
+            [],
+        )
+
+        expected = "应聘AI产品经理实习｜通过可复核的AI产品机制提升chatbot场景与评测效率｜示例候选人｜每周可实习5天"
+        self.assertEqual(result["email_subject"], expected)
+        self.assertTrue(result["cover_letter"].startswith(f"主题：{expected}\n"))
+
     def test_outreach_uses_verified_first_person_claim_verbatim(self) -> None:
         writer = OutreachWriterAgent({
             "candidate_application": {

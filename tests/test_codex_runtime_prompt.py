@@ -14,6 +14,8 @@ class CodexRuntimePromptTests(unittest.TestCase):
     def setUp(self) -> None:
         self.agent = object.__new__(CodexRuntimeOutreachAgent)
         self.agent.builtin_provider = None
+        self.agent.candidate_name = "张三"
+        self.agent.candidate_profile = {"name": "张三"}
         self.source = {
             "note_id": "n1",
             "title": "数据分析实习",
@@ -45,7 +47,8 @@ class CodexRuntimePromptTests(unittest.TestCase):
                 "尊敬的招聘负责人：\n"
                 "您好！我是张三，希望申请数据分析实习。\n\n"
                 "我曾使用 Python 清洗用户数据并输出分析报告，过程中先整理数据口径，再检查异常信息，最后把分析结果整理成可阅读的报告。这段经历让我形成了从问题拆解、数据处理到结论表达的完整工作习惯，也与岗位需要分析用户数据并输出报告的职责直接对应。\n\n"
-                "如果有机会加入，我会先确认团队对指标和报告的判断口径，再从具体任务开始核验数据、记录过程并及时同步结论，确保交付内容能够服务后续讨论。期待进一步了解岗位当前最需要推进的工作。\n\n"
+                "如果有机会加入，我会先确认团队对指标和报告的判断口径，再从具体任务开始核验数据、记录过程并及时同步结论，确保交付内容能够服务后续讨论。"
+                "我也会根据反馈持续复盘数据口径与报告表达，确保结论准确、可追踪。期待进一步了解岗位当前最需要推进的工作。\n\n"
                 "此致\n敬礼！\n"
                 "姓名：张三"
             ),
@@ -138,6 +141,9 @@ class CodexRuntimePromptTests(unittest.TestCase):
         self.assertIn("first_person_claim", prompt)
         self.assertIn("AI 产品工作机制", prompt)
         self.assertIn("query/用户反馈 -> 痛点与场景分类", prompt)
+        self.assertIn("email_subject 必须先从当前 JOB_INPUT", prompt)
+        self.assertIn("正文核心要求", prompt)
+        self.assertIn("第一行必须是“主题：”加上完全相同的 email_subject", prompt)
         self.assertIn("禁止按经历逐段罗列", prompt)
         self.assertIn("在市场营销实习期间", prompt)
         self.assertIn("证据段必须从可核验动作或项目对象起笔", prompt)
@@ -193,6 +199,91 @@ class CodexRuntimePromptTests(unittest.TestCase):
 
         self.assertEqual(result["used_evidence_ids"], ["e1"])
         self.assertTrue(result["requirement_matches"])
+
+    def test_email_subject_is_standardized_and_synced_to_cover_letter(self) -> None:
+        output = self._valid_output()
+        output["email_subject"] = "以可复核的AI产品机制提升chatbot场景与评测效率"
+        output["cover_letter"] = str(output["cover_letter"]).replace(
+            "主题：数据分析实习申请｜张三｜Python 数据分析",
+            "主题：以可复核的AI产品机制提升chatbot场景与评测效率",
+        ) + "\n我会持续复盘交付结果并根据反馈优化方案。"
+
+        result = self.agent._validate_output(output, self.source)
+
+        expected = "应聘数据分析实习｜分析用户数据并输出报告｜张三"
+        self.assertEqual(result["email_subject"], expected)
+        self.assertTrue(result["cover_letter"].startswith(f"主题：{expected}\n"))
+
+    def test_email_subject_normalizes_role_prefix_and_availability_unit(self) -> None:
+        self.agent.candidate_profile = {"name": "张三", "availabilityDays": "5天"}
+        source = {**self.source, "title": "应聘数据分析实习"}
+
+        result = self.agent._validate_output(self._valid_output(), source)
+
+        expected = "应聘数据分析实习｜分析用户数据并输出报告｜张三｜每周可实习5天"
+        self.assertEqual(result["email_subject"], expected)
+        self.assertTrue(result["cover_letter"].startswith(f"主题：{expected}\n"))
+
+    def test_email_subject_normalizes_internal_requirement_separator(self) -> None:
+        source = {**self.source, "responsibilities": ["负责数据分析｜报告输出"]}
+
+        result = self.agent._validate_output(self._valid_output(), source)
+
+        expected = "应聘数据分析实习｜数据分析 报告输出｜张三"
+        self.assertEqual(result["email_subject"], expected)
+        self.assertTrue(result["cover_letter"].startswith(f"主题：{expected}\n"))
+
+    def test_email_subject_omits_capability_suffix_when_candidate_name_is_missing(self) -> None:
+        self.agent.candidate_name = ""
+        self.agent.candidate_profile = {}
+
+        result = self.agent._validate_output(self._valid_output(), self.source)
+
+        expected = "应聘数据分析实习｜分析用户数据并输出报告"
+        self.assertEqual(result["email_subject"], expected)
+        self.assertTrue(result["cover_letter"].startswith(f"主题：{expected}\n"))
+        self.assertNotIn("Python 数据分析", result["email_subject"])
+
+    def test_email_subject_drops_unverified_suffix_without_name_or_job_focus(self) -> None:
+        self.agent.candidate_name = ""
+        self.agent.candidate_profile = {}
+        source = {**self.source, "responsibilities": [], "requirements": [], "body_excerpt": ""}
+
+        result = self.agent._validate_output(self._valid_output(), source)
+
+        self.assertEqual(result["email_subject"], "应聘数据分析实习")
+        self.assertNotIn("张三", result["email_subject"])
+        self.assertNotIn("Python 数据分析", result["email_subject"])
+
+    def test_cover_letter_discards_a_separate_value_proposition_headline(self) -> None:
+        output = self._valid_output()
+        output["cover_letter"] = str(output["cover_letter"]).replace(
+            "主题：数据分析实习申请｜张三｜Python 数据分析",
+            "以可复核的数据分析提高报告交付质量",
+        )
+
+        result = self.agent._validate_output(output, self.source)
+
+        self.assertTrue(
+            result["cover_letter"].startswith(
+                "主题：应聘数据分析实习｜分析用户数据并输出报告｜张三\n尊敬的招聘负责人："
+            )
+        )
+        self.assertNotIn("以可复核的数据分析提高报告交付质量", result["cover_letter"])
+
+    def test_cover_letter_preserves_first_body_paragraph_when_subject_is_missing(self) -> None:
+        output = self._valid_output()
+        original_lines = str(output["cover_letter"]).splitlines()
+        output["cover_letter"] = "核心正文第一段，不是标题。\n" + "\n".join(original_lines[1:])
+
+        result = self.agent._validate_output(output, self.source)
+
+        expected_subject = "应聘数据分析实习｜分析用户数据并输出报告｜张三"
+        self.assertTrue(
+            result["cover_letter"].startswith(
+                f"主题：{expected_subject}\n核心正文第一段，不是标题。\n尊敬的招聘负责人："
+            )
+        )
 
     def test_generic_internship_framing_is_rejected(self) -> None:
         output = self._valid_output()
@@ -376,7 +467,8 @@ class CodexRuntimePromptTests(unittest.TestCase):
         agent.builtin_provider = None
         agent.cli_bin = "fake-codex"
         agent.batch_size = 8
-        agent.candidate_profile = {}
+        agent.candidate_name = "张三"
+        agent.candidate_profile = {"name": "张三"}
         agent.cache = {"entries": {}}
         valid = self._valid_output()
         invalid = {**self._valid_output(), "note_id": "n2", "used_evidence_ids": ["missing"]}

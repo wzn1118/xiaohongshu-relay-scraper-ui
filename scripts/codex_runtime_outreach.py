@@ -19,12 +19,145 @@ except ImportError:
     from ai_provider_runtime import AIProvider
 
 
-PROMPT_VERSION = "xhs-outreach-v14-match-grounding"
+PROMPT_VERSION = "xhs-outreach-v16-body-subject"
 BUILTIN_RUNTIME = "__builtin_relay__"
 
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+_SUBJECT_FOCUS_TERMS = (
+    "ai",
+    "chatbot",
+    "agent",
+    "大模型",
+    "产品",
+    "场景",
+    "评测",
+    "案例",
+    "用户",
+    "query",
+    "反馈",
+    "指标",
+    "数据",
+    "分析",
+    "运营",
+    "增长",
+    "内容",
+    "调研",
+    "转化",
+)
+
+
+def _clean_subject_focus(value: Any) -> str:
+    text = re.sub(r"\s+", " ", _text(value)).strip(" |｜:：-—，,；;。！？")
+    text = re.sub(r"[|｜]+", " ", text)
+    text = re.sub(
+        r"^(?:岗位职责|工作职责|职位描述|岗位要求|任职要求|工作内容|应聘|申请)\s*[:：\-—]?\s*",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"^(?:负责|协助|参与|需要|要求|优先|希望|具备|熟悉|能够|可)\s*", "", text)
+    clauses = [
+        clause.strip(" |｜:：-—，,；;。！？")
+        for clause in re.split(r"[，,；;。！？\n]+", text)
+        if clause.strip(" |｜:：-—，,；;。！？")
+    ]
+    if clauses:
+        text = max(
+            clauses,
+            key=lambda clause: (
+                sum(4 for term in _SUBJECT_FOCUS_TERMS if term.casefold() in clause.casefold()),
+                min(len(clause), 36),
+            ),
+        )
+    return text[:42].rstrip(" |｜:：-—，,；;。！？")
+
+
+def _subject_requirement_focus(source: dict[str, Any] | None) -> str:
+    """Extract one short, source-grounded requirement for the email subject."""
+    if not isinstance(source, dict):
+        return ""
+    candidates: list[str] = []
+    for field in ("requirements", "responsibilities"):
+        value = source.get(field)
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            raw = item.get("text") if isinstance(item, dict) else item
+            cleaned = _clean_subject_focus(raw)
+            if cleaned:
+                candidates.append(cleaned)
+    if not candidates:
+        body = _text(source.get("body_excerpt"))
+        candidates = [
+            cleaned
+            for sentence in re.split(r"[。！？;；\n]+", body)
+            if (cleaned := _clean_subject_focus(sentence))
+        ]
+    if not candidates:
+        return ""
+    return max(
+        candidates,
+        key=lambda candidate: (
+            sum(4 for term in _SUBJECT_FOCUS_TERMS if term.casefold() in candidate.casefold()),
+            min(len(candidate), 42),
+        ),
+    )
+
+
+def _canonical_email_subject(
+    subject: Any,
+    role_title: Any,
+    candidate_name: Any,
+    availability_days: Any = "",
+    requirement_focus: Any = "",
+) -> str:
+    """Return a sendable subject grounded in the extracted job requirement."""
+    role = re.sub(r"\s+", " ", _text(role_title)).strip(" |｜")
+    role = re.sub(r"^(?:应聘|申请)\s*", "", role).strip(" |｜")
+    name = re.sub(r"\s+", " ", _text(candidate_name)).strip(" |｜")
+    availability = re.sub(r"\s+", " ", _text(availability_days)).strip(" |｜")
+    availability = re.sub(r"^每周可实习\s*", "", availability)
+    availability = re.sub(r"天$", "", availability).strip()
+    focus = _clean_subject_focus(requirement_focus)
+    if role:
+        parts = [f"应聘{role}"]
+        if focus and focus.casefold() not in role.casefold():
+            parts.append(focus)
+        if name:
+            parts.append(name)
+        if availability:
+            parts.append(f"每周可实习{availability}天")
+        return "｜".join(parts)
+
+    # Keep a useful subject when a legacy/test record has no role title.
+    fallback = re.sub(r"主题\s*[:：]", "", _text(subject)).replace("\r", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", fallback).strip(" |｜")
+
+
+def _sync_cover_letter_subject(cover_letter: str, subject: str) -> str:
+    """Make the Cover Letter's subject line match the actual email subject."""
+    lines = cover_letter.splitlines()
+    if lines and re.match(r"^\s*主题\s*[:：]", lines[0]):
+        lines[0] = f"主题：{subject}"
+        return "\n".join(lines)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    salutation = r"^\s*(?:尊敬|您好|亲爱的|dear\b)"
+    if lines and re.match(salutation, lines[0], re.I):
+        return f"主题：{subject}\n" + "\n".join(lines)
+    # A model may return a value-proposition headline before the salutation;
+    # only remove a short heading that is immediately followed by the salutation.
+    if (
+        len(lines) > 1
+        and len(lines[0].strip()) <= 80
+        and not re.search(r"[。！？!?；;]\s*$", lines[0])
+        and re.match(salutation, lines[1], re.I)
+    ):
+        lines.pop(0)
+    return f"主题：{subject}\n" + "\n".join(lines)
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -382,12 +515,14 @@ def _legacy_prompt(items: list[dict[str, Any]], candidate_name: str) -> str:
 1. 必须逐条返回，note_id 原样保留；每条文案必须针对该条岗位的职责或要求，不得批量套用同一句话。
 2. 只能使用 candidate_evidence 中的事实；used_evidence_ids 只能引用该条输入中实际存在的 id。
 3. 不得虚构公司、岗位、成果、技能、联系方式或量化数字；信息不足时使用克制表达。
-4. greeting 适合私信；email_body 是完整邮件；cover_letter 是独立求职信，三者不能完全相同。
+4. greeting 适合私信；email_subject 是单行邮件主题；email_body 是完整邮件；cover_letter 是独立求职信，三者不能完全相同。
 5. 全部使用第一人称，直接展示能力对应的行动和结果；禁止出现“简历”“附件”“原帖”“候选人”“材料显示”等元叙述，不得复述招聘正文。
 5.1 greeting 必须以“您好，我是候选人姓名”开场；作者昵称、账号名、发布时间、互动量和页面标签是来源元数据，不得用作称呼或写入文案。
 5.2 greeting 前 80 字必须出现准确岗位名及一项最强匹配证据或明确到岗安排，并以岗位是否仍在招聘等明确问题收尾。
-6. requirement_matches 要简要说明能力与所用经历的对应关系。
-7. 只输出符合给定 JSON Schema 的 JSON，不要添加 Markdown。
+6. email_subject 必须根据当前 JOB_INPUT 的 responsibilities、requirements 或 body_excerpt 提炼一个核心岗位要求，并使用标准邮件格式“应聘岗位名｜正文核心要求｜姓名”；核心要求必须是正文原文或忠实压缩，不能凭空改写成候选人的能力口号，也不要加“主题：”前缀。没有可提取要求时才退回“应聘岗位名｜姓名”。
+7. cover_letter 第一行必须是“主题：”加上完全相同的 email_subject，不得另写文章标题。
+8. requirement_matches 要简要说明能力与所用经历的对应关系。
+9. 只输出符合给定 JSON Schema 的 JSON，不要添加 Markdown。
 
 JOB_INPUT:
 {payload}
@@ -443,9 +578,9 @@ CANDIDATE_PROFILE（只可使用非空字段；空字段不写、不猜）：
 
 阶段 3｜分别写文案
 - greeting：50-140 字。以“您好，我是{profile["name"]}”开头；前 80 字出现准确岗位名和一个匹配点（或明确到岗安排），结尾提出一个具体问题（例如岗位是否仍在招聘）。
-- email_subject：优先使用“岗位名申请｜姓名｜最相关能力”；缺失字段直接省略，不写“申请岗位”等空泛主题。
+- email_subject 必须先从当前 JOB_INPUT 的 responsibilities、requirements 或 body_excerpt 提炼一个最核心的招聘要求，再写成单行、可直接发送的邮件主题，格式为“应聘{{准确岗位名}}｜{{正文核心要求}}｜{{候选人姓名}}”；核心要求必须来自正文原文或忠实压缩，例如正文明确要求 chatbot 场景与评测效率时，主题可以写成“应聘AI产品经理｜Chatbot场景与评测效率｜候选人姓名”。只有正文没有可提取要求时才省略中间段。不要凭空创造价值主张，不要把候选人经历标题当成正文要求，也不要加“主题：”前缀。
 - email_body：120-260 字，最多 4 段。第一段说明申请的岗位，第二段只讲一条证据及其与职责的关系，第三段仅在 profile 有值时写每周可实习/预计时长，结尾邀请沟通。不要把 Cover Letter 整段复制进来。
-- cover_letter：320-460 字，绝对不超过 500 字；写完后主动删除重复的身份、岗位和礼貌句，避免超长。使用“主题 -> 尊敬的招聘负责人 -> 身份/申请岗位 -> 对岗位核心问题的判断 -> 1-2 条证据共同证明这套判断（动作、对象、真实结果） -> 入职后的产品/运营闭环 -> 有值的到岗安排 -> 沟通邀请 -> 此致/敬礼 -> 非空署名字段”的顺序。入职后的计划用“我会”，不能冒充过往业绩。
+- cover_letter：320-460 字，绝对不超过 500 字；写完后主动删除重复的身份、岗位和礼貌句，避免超长。第一行必须是“主题：”加上完全相同的 email_subject，不能写成文章标题或价值主张。之后使用“尊敬的招聘负责人 -> 身份/申请岗位 -> 对岗位核心问题的判断 -> 1-2 条证据共同证明这套判断（动作、对象、真实结果） -> 入职后的产品/运营闭环 -> 有值的到岗安排 -> 沟通邀请 -> 此致/敬礼 -> 非空署名字段”的顺序。入职后的计划用“我会”，不能冒充过往业绩。
 - AI 产品岗位的正文必须明确写出产品对象，并把“query/用户反馈 -> 痛点与场景分类 -> 案例库/运营优先级 -> 运营动作 -> 指标观察 -> 验证/复盘迭代”连成一条完整因果链；说明既有产品建设和用户洞察如何支持这条链路。禁止按经历逐段罗列，禁止连续使用“在某某方面/在某某经历中”作为段落开头。若证据没有历史运营指标，只能把指标观察写成入职后的“我会”，不得伪造成过去成果。
 - 三种文案必须各自承担不同作用：greeting 负责快速建立联系，email_body 负责简洁说明匹配，cover_letter 负责展开一到两条证据；不得共享同一整段。
 
@@ -454,7 +589,7 @@ CANDIDATE_PROFILE（只可使用非空字段；空字段不写、不猜）：
 - used_evidence_ids 均来自当前条目的 candidate_evidence；requirement_matches 非空时每项都同时指向岗位能力点和 evidence id。
 - 全部第一人称；不写“候选人、简历、附件、原帖、材料显示”等元叙述，不写作者昵称、发布时间、互动量或页面标签。
 - 不虚构公司、岗位、工具、数字、成果、联系方式；不把“接触过”改成“精通/熟练”。profile 字段为空时删除对应整行。
-- cover_letter 必须包含真实主题、招聘负责人称呼、“此致/敬礼”和非空署名；不得出现 XX、XXXX、[待填写]、学校/岗位/姓名等模板文字。
+- cover_letter 第一行的“主题：”必须与 email_subject 完全一致，并包含招聘负责人称呼、“此致/敬礼”和非空署名；不得出现 XX、XXXX、[待填写]、学校/岗位/姓名等模板文字。
 - 最终只输出符合给定 JSON Schema 的 JSON，不添加 Markdown、解释或额外字段。
 
 JOB_INPUT（逐条处理）：
@@ -658,9 +793,16 @@ class CodexRuntimeOutreachAgent:
         if any(not _text(item.get(field)) for field in required_text):
             raise ValueError("Codex CLI returned an incomplete outreach draft")
         greeting = _text(item["greeting"])
-        subject = _text(item["email_subject"])
+        subject = _canonical_email_subject(
+            item["email_subject"],
+            source.get("title"),
+            getattr(self, "candidate_name", ""),
+            (getattr(self, "candidate_profile", {}) or {}).get("availabilityDays", ""),
+            _subject_requirement_focus(source),
+        )
         email = _text(item["email_body"])
-        cover = _text(item["cover_letter"])
+        cover = _sync_cover_letter_subject(_text(item["cover_letter"]), subject)
+        cover_body = "\n".join(cover.splitlines()[1:]) if cover.startswith("主题：") else cover
         joined = "\n".join((greeting, subject, email, cover))
         if _GENERIC_INTERNSHIP_FRAMING.search(joined):
             raise ValueError("Codex CLI returned generic internship framing instead of a grounded action")
@@ -676,7 +818,7 @@ class CodexRuntimeOutreachAgent:
         role_text = " ".join(value for value in role_points if value)
         if role_text and _semantic_terms(role_text) and not _has_meaningful_overlap(role_text, joined):
             raise ValueError("Codex CLI returned copy without a job-specific signal")
-        if role_text and _semantic_terms(role_text) and not _has_meaningful_overlap(role_text, cover):
+        if role_text and _semantic_terms(role_text) and not _has_meaningful_overlap(role_text, cover_body):
             raise ValueError("Codex CLI returned Cover Letter without a job-specific signal")
         if role_text and any(value for value in role_points[1:]) and not matches:
             raise ValueError("Codex CLI returned no requirement-to-evidence matches")
@@ -695,10 +837,10 @@ class CodexRuntimeOutreachAgent:
             }
             if ai_product_evidence_ids and not (used_set & ai_product_evidence_ids):
                 raise ValueError("Codex CLI returned AI-product copy without AI-product evidence")
-            if not _has_ai_product_operating_logic(cover):
+            if not _has_ai_product_operating_logic(cover_body):
                 raise ValueError("Codex CLI returned Cover Letter without AI-product operating logic")
-            catalog_openers = len(_EXPERIENCE_CATALOG_OPENER.findall(cover)) + len(
-                _PROJECT_CATALOG_OPENER.findall(cover)
+            catalog_openers = len(_EXPERIENCE_CATALOG_OPENER.findall(cover_body)) + len(
+                _PROJECT_CATALOG_OPENER.findall(cover_body)
             )
             if catalog_openers >= 2:
                 raise ValueError("Codex CLI returned an experience catalog instead of AI-product reasoning")
@@ -719,7 +861,7 @@ class CodexRuntimeOutreachAgent:
         )
         if _semantic_terms(used_evidence_text) and not _has_meaningful_overlap(used_evidence_text, joined):
             raise ValueError("Codex CLI returned copy without used-evidence facts")
-        if _semantic_terms(used_evidence_text) and not _has_meaningful_overlap(used_evidence_text, cover):
+        if _semantic_terms(used_evidence_text) and not _has_meaningful_overlap(used_evidence_text, cover_body):
             raise ValueError("Codex CLI returned Cover Letter without used-evidence facts")
         if _is_ai_product_role(role_text):
             used_ai_product_evidence = used_set & {
@@ -734,7 +876,7 @@ class CodexRuntimeOutreachAgent:
                 )
                 for evidence_id in used_ai_product_evidence
             )
-            if ai_product_evidence_text and not _has_meaningful_overlap(ai_product_evidence_text, cover):
+            if ai_product_evidence_text and not _has_meaningful_overlap(ai_product_evidence_text, cover_body):
                 raise ValueError("Codex CLI returned Cover Letter without its AI-product evidence facts")
             fact_anchors = set().union(
                 *(
@@ -742,7 +884,7 @@ class CodexRuntimeOutreachAgent:
                     for evidence_id in used_ai_product_evidence
                 )
             ) if used_ai_product_evidence else set()
-            if fact_anchors and not any(anchor.casefold() in cover.casefold() for anchor in fact_anchors):
+            if fact_anchors and not any(anchor.casefold() in cover_body.casefold() for anchor in fact_anchors):
                 raise ValueError("Codex CLI returned Cover Letter without a concrete AI-product fact anchor")
         covered_evidence: set[str] = set()
         for match in matches:
