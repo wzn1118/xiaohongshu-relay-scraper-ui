@@ -802,7 +802,9 @@ function formatMoney(value: number) {
 function formatDate(value?: string | null) {
   if (!value) return '时间未记录'
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN', { hour12: false })
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })
 }
 
 function formatConfidence(value: unknown) {
