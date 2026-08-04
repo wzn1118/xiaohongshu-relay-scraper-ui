@@ -610,6 +610,104 @@ test('manual body recovery uses the same bounded warm-start probe as automatic r
   }
 });
 
+test('manual recovery starts a new automatic idempotency cycle after earlier attempts', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-rate-limit-cycle-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260801090700-a11a0003';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  const oldAttemptId = `${jobId}-attempt-0001-old001`;
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1' },
+    { note_id: 'post-2', note_url: 'https://example.test/explore/post-2' },
+  ]), 'utf8');
+  await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([
+    { note_id: 'post-1', note_url: 'https://example.test/explore/post-1', body: 'Saved body', access_status: 'detail_ok' },
+  ]), 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'incomplete',
+    outputDir,
+    params: { analysisMode: 'job', keyword: 'ai product manager' },
+    currentAttemptId: oldAttemptId,
+    resumeCount: 1,
+    attempts: [{
+      attemptId: oldAttemptId,
+      sequence: 1,
+      kind: 'resume',
+      resumeScope: 'body_completion',
+      requestedBy: 'rate_limit_auto_recovery',
+      idempotencyKey: 'rate-limit-auto-body_completion-1',
+      status: 'incomplete',
+      startedAt: '2026-08-01T09:00:00.000Z',
+      finishedAt: '2026-08-01T09:01:00.000Z',
+      stopReason: 'rate_limit',
+    }],
+    rateLimit: {
+      detected: true,
+      detectedAt: '2026-08-01T09:00:00.000Z',
+      status: 'stopped',
+      resumeScope: 'body_completion',
+      autoResumeAttempt: 1,
+      maxAutoResumeAttempts: 1,
+    },
+  }]), 'utf8');
+
+  const children = [createFakeChild(81012), createFakeChild(81013)];
+  let spawnCount = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => children[spawnCount++],
+    rateLimitRecovery: {
+      enabled: true,
+      initialDelayMs: 5,
+      maxDelayMs: 5,
+      maxAttempts: 1,
+      busyDelayMs: 5,
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const manual = await manager.resume(jobId, {
+      scope: 'body_completion',
+      forceCompleted: true,
+      requestedBy: 'manual_recovery_test',
+      rateLimitRecoveryMode: 'manual',
+      idempotencyKey: 'manual-cycle-2',
+    });
+    await waitForJob(manager, manual.id, (job) => job.status === 'running');
+
+    const manualEnded = waitForEnd(manager, jobId);
+    children[0].stdout.write('RATE_LIMIT detected; checkpoint preserved\n');
+    children[0].emit('close', 1, null);
+    await manualEnded;
+
+    await waitForCondition(() => spawnCount === 2);
+    const automaticallyResumed = manager.get(jobId);
+    assert.equal(automaticallyResumed.status, 'running');
+    assert.equal(automaticallyResumed.attempts.length, 3);
+    assert.match(
+      automaticallyResumed.attempts.at(-1).idempotencyKey,
+      /^rate-limit-auto-body_completion-[a-f0-9]{12}-1$/,
+    );
+    assert.notEqual(
+      automaticallyResumed.attempts.at(-1).idempotencyKey,
+      automaticallyResumed.attempts[0].idempotencyKey,
+    );
+
+    const automaticEnded = waitForEnd(manager, jobId);
+    children[1].emit('close', 0, null);
+    await automaticEnded;
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('exhausted audience rate limits automatically resume the same task from its checkpoint', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-rate-limit-auto-'));
   const fakeRunner = path.join(dataDir, 'runner.py');
@@ -1109,9 +1207,10 @@ test('a queued task can be cancelled before it starts', async () => {
     const cancellation = await manager.cancel(queued.id);
     assert.equal(cancellation.changed, true);
     assert.equal(cancellation.job.status, 'cancelled');
+    const ended = waitForEnd(manager, active.id);
     child.emit('close', 0, null);
-    await waitForJob(manager, active.id, (job) => job.status === 'completed');
-    await new Promise((resolve) => setImmediate(resolve));
+    await ended;
+    assert.equal(manager.get(active.id).status, 'completed');
     assert.equal(spawnCount, 1);
   } finally {
     await rm(dataDir, { recursive: true, force: true });

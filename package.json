@@ -13,7 +13,7 @@
     "lint": "node scripts/lint.mjs",
     "format:check": "node scripts/check-format.mjs",
     "typecheck": "tsc -b --pretty false",
-    "test": "node --test server/*.test.mjs tests/*.test.mjs",
+    "test": "node --test server/*.test.mjs server/lib/*.test.mjs tests/*.test.mjs",
     "test:api": "node --test server/app.test.mjs server/contracts.test.mjs server/data-lifecycle-http.test.mjs server/draft-http.test.mjs server/preflight-http.test.mjs",
     "test:artifacts": "node --test tests/mock-runner.test.mjs",
     "test:credentials": "node scripts/check-credentials.mjs",

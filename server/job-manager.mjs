@@ -734,11 +734,12 @@ export class JobManager {
     await this.persist();
     this.#emit(id, 'state', publicJob(job));
     try {
+      const recoveryCycle = rateLimitRecoveryCycleToken(job);
       await this.resume(id, {
         scope: resumeScope,
         forceCompleted: true,
         requestedBy: 'rate_limit_auto_recovery',
-        idempotencyKey: `rate-limit-auto-${resumeScope}-${attempt}`,
+        idempotencyKey: `rate-limit-auto-${resumeScope}-${recoveryCycle}-${attempt}`,
         rateLimitRecoveryMode: 'auto',
       });
     } catch (error) {
@@ -2017,6 +2018,18 @@ function normalizeIdempotencyKey(value) {
     throw jobError('IDEMPOTENCY_KEY_INVALID', 'The idempotency key is invalid.');
   }
   return key;
+}
+
+function rateLimitRecoveryCycleToken(job) {
+  const cycleStartedAt = job.rateLimit?.lastManualResumeAt
+    || job.rateLimit?.detectedAt
+    || job.createdAt
+    || 'initial';
+  return crypto
+    .createHash('sha256')
+    .update(`${job.id}:${cycleStartedAt}`)
+    .digest('hex')
+    .slice(0, 12);
 }
 
 function resumeRunnerParams(original, override, scope) {
