@@ -1389,12 +1389,8 @@ def _local_evidence_locked_result(
         for item in role.get("responsibilities", [])
         if isinstance(item, dict) and _text(item.get("id")) and _text(item.get("text"))
     ]
-    selected_set = set(selected_work_ids)
-    responsibilities_by_evidence: dict[str, list[str]] = {
-        evidence_id: [] for evidence_id in selected_work_ids
-    }
     evidence_ids_by_responsibility: dict[str, list[str]] = {}
-    responsibility_sentences: dict[str, str] = {}
+    keywords_by_responsibility: dict[str, set[str]] = {}
     for index, responsibility in enumerate(responsibilities):
         responsibility_id = _text(responsibility.get("id"))
         responsibility_text = _text(responsibility.get("text"))
@@ -1416,6 +1412,7 @@ def _local_evidence_locked_result(
             expanded_keywords.update(("深访", "竞品", "玩家反馈", "创作者指南"))
         if any(value in responsibility_text for value in ("KOL", "社群", "产品", "团队")):
             expanded_keywords.update(("达人", "社区", "研发", "测试", "设计"))
+        keywords_by_responsibility[responsibility_id] = expanded_keywords
         ranked_ids = sorted(
             selected_work_ids,
             key=lambda evidence_id: (
@@ -1446,7 +1443,6 @@ def _local_evidence_locked_result(
             selected_work_ids[index % len(selected_work_ids)] if selected_work_ids else ""
         )
         if evidence_id:
-            responsibilities_by_evidence[evidence_id].append(responsibility_text)
             evidence_ids_by_responsibility[responsibility_id] = matched_ids or [evidence_id]
 
     application_profile = payload.get("candidate", {}).get("application_profile", {})
@@ -1489,13 +1485,14 @@ def _local_evidence_locked_result(
     intro = (
         f"您好！我是{candidate_name}，申请{role_name}岗位。"
         + education_sentence
-        + "我将与这份岗位职责最相关的简历经历放在正文主体中，分别说明用户洞察、内容执行、数据复盘以及与达人、社群和产品团队协作时的具体动作与结果。"
+        + "我过去的相关工作分别涉及玩家反馈与内容监测、用户深访与达人共创、直播话术与数据复盘，正文随后按三段工作展开。"
     )
     paragraphs = [
         f"主题：{role_name}申请｜{subject_suffix}",
         "尊敬的招聘负责人：",
         intro,
     ]
+    fact_sentences_by_evidence: dict[str, list[str]] = {}
     for evidence_id in selected_work_ids:
         item = evidence_by_id[evidence_id]
         anchor = _text(item.get("required_anchor")) or _text(item.get("label"))
@@ -1504,35 +1501,33 @@ def _local_evidence_locked_result(
             continue
         fact_sentences = [_first_person_locked_fact(fact) + "。" for fact in facts]
         fact_sentences[0] = f"在{anchor}期间，" + fact_sentences[0]
-        mapped_responsibilities = responsibilities_by_evidence.get(evidence_id, [])
-        if mapped_responsibilities:
-            link_sentences = []
-            for value in mapped_responsibilities:
-                sentence = f"这段工作可用于岗位的“{value}”职责。"
-                link_sentences.append(sentence)
-                responsibility_id = next(
-                    (
-                        _text(item.get("id"))
-                        for item in responsibilities
-                        if _text(item.get("text")) == value
-                    ),
-                    "",
-                )
-                if responsibility_id:
-                    responsibility_sentences[responsibility_id] = sentence
-            link = "".join(link_sentences)
-        else:
-            link = "这段经历为当前岗位的内容运营工作提供了可核验的行动和结果依据。"
-        paragraphs.append("".join(fact_sentences) + link)
+        fact_sentences_by_evidence[evidence_id] = fact_sentences
+        paragraphs.append("".join(fact_sentences))
+
+    responsibility_sentences: dict[str, str] = {}
+    for responsibility in responsibilities:
+        responsibility_id = _text(responsibility.get("id"))
+        evidence_ids = evidence_ids_by_responsibility.get(responsibility_id, [])
+        primary_evidence_id = evidence_ids[0] if evidence_ids else ""
+        candidates = fact_sentences_by_evidence.get(primary_evidence_id, [])
+        keywords = keywords_by_responsibility.get(responsibility_id, set())
+        if candidates:
+            responsibility_sentences[responsibility_id] = max(
+                candidates,
+                key=lambda sentence: (
+                    sum(1 for keyword in keywords if keyword in sentence),
+                    len(sentence),
+                ),
+            )
 
     paragraphs.append(
-        "FunPlus的玩家反馈与监测、字节跳动的用户深访与达人共创、网易有道的话术发布与日报周报，"
-        "分别覆盖了这份岗位需要衔接的用户、内容、数据与协作场景。进入岗位后，我会从团队现有的用户反馈和内容数据开始，"
-        "记录选题依据、脚本版本与发布结果，并据此完成逐次复盘。"
+        "进入岗位后，我会复用在FunPlus围绕SoS联动搭建IP资料库和Twitter监测工具的做法，先整理目标用户、竞品、KOL及反馈信息，再形成选题依据；"
+        "内容制作与发布阶段，我会沿用网易有道补充直播话术、优化发布节奏并输出日报周报的记录方式，保留脚本版本、发布数据和用户反馈；"
+        "需要联动达人、社群及产品团队时，我会参考字节跳动的执行过程，明确共创活动的参与对象，并同步产品、研发、测试和设计需要处理的问题。"
     )
     paragraphs.append(
-        "期待有机会基于团队的一项真实内容任务，进一步说明我会如何拆解用户需求、形成选题与脚本、推进发布协作并复盘结果。"
-        "感谢您审阅我的申请。"
+        "我会把选题依据、内容版本、发布结果和协作记录放在同一次复盘中，依据实际数据决定下一轮调整。"
+        "期待有机会结合团队的一项真实内容任务继续沟通，感谢您审阅我的申请。"
     )
     paragraphs.extend(["此致", "敬礼"])
     used_ids = [*selected_work_ids]
