@@ -65,6 +65,7 @@ _FUTURE_OR_METHOD_CUES = (
     "入职后", "到岗后", "我会", "我将", "我计划", "我可以", "我希望", "我愿意", "预计",
 )
 _PROMPT_PATH = Path(__file__).with_name("prompts") / "cover_letter_agent_v4_zh.txt"
+_FULL_PROMPT_PATH = Path(__file__).with_name("prompts") / "cover_letter_agent_v4_full_zh.txt"
 _DEFENSIVE_STYLE_PATTERNS = (
     re.compile(r"不是.{0,36}而是"),
     re.compile(r"并不是.{0,36}而是"),
@@ -84,13 +85,15 @@ _DEFENSIVE_STYLE_PATTERNS = (
 )
 
 
-def _agent_prompt() -> str:
+def _agent_prompt(local_mode: bool = False) -> str:
+    prompt_path = _PROMPT_PATH if local_mode else _FULL_PROMPT_PATH
     try:
-        value = _PROMPT_PATH.read_text(encoding="utf-8").strip()
+        value = prompt_path.read_text(encoding="utf-8").strip()
     except OSError as error:
-        raise RuntimeError(f"Cover Letter Prompt 文件不可用：{_PROMPT_PATH}") from error
-    if len(value) < 1_000:
-        raise RuntimeError(f"Cover Letter Prompt 文件内容不完整：{_PROMPT_PATH}")
+        raise RuntimeError(f"Cover Letter Prompt 文件不可用：{prompt_path}") from error
+    minimum_length = 1_000 if local_mode else 8_000
+    if len(value) < minimum_length:
+        raise RuntimeError(f"Cover Letter Prompt 文件内容不完整：{prompt_path}")
     return value
 
 
@@ -136,12 +139,14 @@ def cover_letter_rewrite_schema() -> dict[str, Any]:
         "type": "object",
         "additionalProperties": False,
         "required": [
+            "email_subject",
             "cover_letter",
             "used_evidence_ids",
             "evidence_coverage",
             "responsibility_coverage",
         ],
         "properties": {
+            "email_subject": {**string, "minLength": 4, "maxLength": 240},
             "cover_letter": string,
             "used_evidence_ids": {"type": "array", "items": string},
             "evidence_coverage": {"type": "array", "items": evidence_coverage},
@@ -224,6 +229,58 @@ def local_cover_letter_review_schema() -> dict[str, Any]:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _default_cover_letter_subject(
+    payload: dict[str, Any],
+    local_plan: dict[str, Any] | None = None,
+) -> str:
+    role_name = _text(payload.get("role", {}).get("role_name")) or "当前岗位"
+    profile = payload.get("candidate", {}).get("application_profile", {})
+    candidate_name = _text(profile.get("name")) if isinstance(profile, dict) else ""
+    positioning = _text((local_plan or {}).get("positioning"))
+    suffix = candidate_name or positioning[:28] or "个人经历与岗位匹配"
+    return f"{role_name}申请｜{suffix}"
+
+
+def _split_cover_letter_subject(
+    cover_letter: str,
+    payload: dict[str, Any],
+    local_plan: dict[str, Any] | None = None,
+    supplied_subject: Any = None,
+) -> tuple[str, str]:
+    """Keep the email subject out of the Cover Letter body, including legacy drafts."""
+    body = _text(cover_letter)
+    subject = re.sub(r"^(?:主题|邮件主题|Subject)\s*[:：]\s*", "", _text(supplied_subject), flags=re.I)
+    heading = re.match(
+        r"^\s*(?:主题|邮件主题|Subject)\s*[:：]\s*([^\r\n]+)\s*(?:\r?\n|$)",
+        body,
+        flags=re.I,
+    )
+    if heading:
+        subject = subject or heading.group(1).strip()
+        body = body[heading.end():].lstrip()
+    else:
+        first_line, separator, remainder = body.partition("\n")
+        role_name = _text(payload.get("role", {}).get("role_name"))
+        next_lines = [line.strip() for line in remainder.splitlines() if line.strip()][:2]
+        next_line = "\n".join(next_lines)
+        looks_like_heading = (
+            bool(separator)
+            and bool(first_line.strip())
+            and not re.match(r"^\s*(?:尊敬|Dear|您好|Hi)\b", first_line, flags=re.I)
+            and (
+                bool(re.search(r"尊敬|Dear|招聘负责人", next_line, flags=re.I))
+                or "｜" in first_line
+                or bool(re.search(r"申请|应聘|求职", first_line))
+            )
+            and (not role_name or role_name in first_line or "｜" in first_line)
+            and len(first_line.strip()) <= 120
+        )
+        if looks_like_heading:
+            subject = subject or first_line.strip()
+            body = remainder.lstrip()
+    return subject or _default_cover_letter_subject(payload, local_plan), body
 
 
 def _compact(value: Any) -> str:
@@ -618,8 +675,13 @@ def _validate_rewrite(result: Any, payload: dict[str, Any]) -> list[str]:
         problems.append(f"Cover Letter 没有准确点名岗位：{role_name}")
     if "我" not in cover_letter:
         problems.append("Cover Letter 必须使用候选人第一人称")
-    if not re.search(r"^主题[：:]", cover_letter):
-        problems.append("Cover Letter 第一行必须是岗位专属主题")
+    email_subject = _text(result.get("email_subject"))
+    if not email_subject:
+        problems.append("email_subject 必须单独返回，不能把主题写入 Cover Letter 正文")
+    if re.search(r"^\s*(?:主题|邮件主题|Subject)\s*[:：]", cover_letter, flags=re.I):
+        problems.append("Cover Letter 正文不得包含邮件主题首行")
+    if role_name and role_name != "当前岗位" and _semantic_compact(role_name) not in _semantic_compact(email_subject):
+        problems.append(f"email_subject 没有准确识别岗位：{role_name}")
     if not re.search(r"尊敬的.{0,20}招聘负责人[：:]", cover_letter):
         problems.append("Cover Letter 必须包含规范的招聘负责人称呼")
     if "此致" not in cover_letter or "敬礼" not in cover_letter:
@@ -657,6 +719,15 @@ def _validate_rewrite(result: Any, payload: dict[str, Any]) -> list[str]:
         for item in payload.get("candidate", {}).get("evidence", [])
         if isinstance(item, dict) and _text(item.get("id"))
     }
+    paragraphs = [value for value in re.split(r"(?:\r?\n){2,}", cover_letter) if value.strip()]
+    for evidence_id in used_evidence_ids:
+        anchor = _text(evidence_by_id.get(evidence_id, {}).get("required_anchor"))
+        compact_anchor = _semantic_compact(anchor)
+        if compact_anchor and any(
+            _semantic_compact(paragraph).count(compact_anchor) > 1
+            for paragraph in paragraphs
+        ):
+            problems.append(f"同一段重复展开了候选人经历：{anchor}")
     problems.extend(_fact_grounding_problems(cover_letter, evidence_by_id, used_evidence_ids))
     evidence_coverage = result.get("evidence_coverage")
     if not isinstance(evidence_coverage, list):
@@ -1191,8 +1262,9 @@ def _normalize_local_result_declarations(
     local_plan: dict[str, Any] | None,
     *,
     allow_grounded_completion: bool = False,
+    sanitize_style: bool = True,
 ) -> Any:
-    """Repair small local-model JSON declaration drift without inventing body claims."""
+    """Repair small model declaration drift without inventing body claims."""
     if not isinstance(result, dict):
         return result
     normalized = dict(result)
@@ -1200,20 +1272,27 @@ def _normalize_local_result_declarations(
     cover_letter = re.sub(r"^```(?:json|text)?\s*", "", cover_letter, flags=re.I)
     cover_letter = re.sub(r"\s*```$", "", cover_letter)
     cover_letter = cover_letter.replace("**", "").strip()
-    if not re.search(r"^主题[：:]", cover_letter):
-        role_name = _text(payload.get("role", {}).get("role_name")) or "当前岗位"
-        profile = payload.get("candidate", {}).get("application_profile", {})
-        candidate_name = _text(profile.get("name")) if isinstance(profile, dict) else ""
-        positioning = _text((local_plan or {}).get("positioning"))
-        suffix = candidate_name or positioning[:24] or "个人经历与岗位匹配"
-        cover_letter = f"主题：{role_name}申请｜{suffix}\n{cover_letter}"
-    cover_letter = _sanitize_local_style(cover_letter)
+    cover_letter = re.sub(
+        r"(?m)^尊敬的招聘负责人[，,:：]?\s*$",
+        "尊敬的招聘负责人：",
+        cover_letter,
+    )
+    cover_letter = re.sub(r"(?m)^此致敬礼[！!]?$", "此致\n敬礼", cover_letter)
+    email_subject, cover_letter = _split_cover_letter_subject(
+        cover_letter,
+        payload,
+        local_plan,
+        normalized.get("email_subject"),
+    )
+    if sanitize_style:
+        cover_letter = _sanitize_local_style(cover_letter)
     if allow_grounded_completion:
         cover_letter = _complete_local_draft_with_grounded_evidence(
             cover_letter,
             payload,
             local_plan,
         )
+    normalized["email_subject"] = email_subject
     normalized["cover_letter"] = cover_letter
 
     sentences = _cover_letter_sentences(cover_letter)
@@ -1389,6 +1468,41 @@ def _local_evidence_locked_result(
         for item in role.get("responsibilities", [])
         if isinstance(item, dict) and _text(item.get("id")) and _text(item.get("text"))
     ]
+    if 0 < len(selected_work_ids) < 4:
+        role_text = " ".join(_text(item.get("text")) for item in responsibilities)
+        role_keywords = {
+            keyword
+            for keyword in (
+                "用户", "需求", "趋势", "选题", "策划", "脚本", "剪辑", "发布", "内容",
+                "数据", "反馈", "复盘", "优化", "KOL", "达人", "社群", "社区", "产品",
+                "研发", "设计", "协作", "项目", "监测", "直播", "活动", "共创",
+            )
+            if keyword in role_text
+        }
+        if any(value in role_text for value in ("脚本", "剪辑", "发布")):
+            role_keywords.update(("话术", "直播", "内容共创"))
+        remaining_work_ids = [
+            evidence_id
+            for evidence_id, item in evidence_by_id.items()
+            if item.get("category") == "完整简历经历" and evidence_id not in selected_work_ids
+        ]
+        ranked_remaining = sorted(
+            remaining_work_ids,
+            key=lambda evidence_id: (
+                sum(
+                    1
+                    for keyword in role_keywords
+                    if keyword in _evidence_fact_text(evidence_by_id[evidence_id])
+                ),
+                -remaining_work_ids.index(evidence_id),
+            ),
+            reverse=True,
+        )
+        if ranked_remaining and any(
+            keyword in _evidence_fact_text(evidence_by_id[ranked_remaining[0]])
+            for keyword in role_keywords
+        ):
+            selected_work_ids.append(ranked_remaining[0])
     evidence_ids_by_responsibility: dict[str, list[str]] = {}
     keywords_by_responsibility: dict[str, set[str]] = {}
     for index, responsibility in enumerate(responsibilities):
@@ -1460,6 +1574,9 @@ def _local_evidence_locked_result(
             if keyword in text and keyword not in subject_axes:
                 subject_axes.append(keyword)
     subject_suffix = "、".join(subject_axes[:3]) or "真实经历与岗位职责匹配"
+    work_count_label = {1: "一", 2: "两", 3: "三", 4: "四"}.get(
+        len(selected_work_ids), "多"
+    )
 
     education_sentence = ""
     education_id = ""
@@ -1485,10 +1602,10 @@ def _local_evidence_locked_result(
     intro = (
         f"您好！我是{candidate_name}，申请{role_name}岗位。"
         + education_sentence
-        + "我过去的相关工作分别涉及玩家反馈与内容监测、用户深访与达人共创、直播话术与数据复盘，正文随后按三段工作展开。"
+        + "我过去的相关工作分别涉及玩家反馈与内容监测、用户深访与达人共创、直播话术与数据复盘，"
+        + f"正文随后按{work_count_label}段工作展开。"
     )
     paragraphs = [
-        f"主题：{role_name}申请｜{subject_suffix}",
         "尊敬的招聘负责人：",
         intro,
     ]
@@ -1526,7 +1643,6 @@ def _local_evidence_locked_result(
         "需要联动达人、社群及产品团队时，我会参考字节跳动的执行过程，明确共创活动的参与对象，并同步产品、研发、测试和设计需要处理的问题。"
     )
     paragraphs.append(
-        "我会把选题依据、内容版本、发布结果和协作记录放在同一次复盘中，依据实际数据决定下一轮调整。"
         "期待有机会结合团队的一项真实内容任务继续沟通，感谢您审阅我的申请。"
     )
     paragraphs.extend(["此致", "敬礼"])
@@ -1534,6 +1650,7 @@ def _local_evidence_locked_result(
     if education_sentence and education_id:
         used_ids.append(education_id)
     return {
+        "email_subject": f"{role_name}申请｜{subject_suffix}",
         "cover_letter": "\n\n".join(paragraphs),
         "used_evidence_ids": used_ids,
         "responsibility_coverage": [
@@ -1564,7 +1681,9 @@ def rewrite_cover_letter(
         candidate_profile,
         application_context,
     )
-    system = f"""{_agent_prompt()}
+    local_mode = getattr(provider, "provider", "") == "local_qwen"
+    role_name = _text(payload.get("role", {}).get("role_name")) or "当前岗位"
+    system = f"""{_agent_prompt(local_mode=local_mode)}
 
 ## 本次运行补充约束
 
@@ -1578,9 +1697,17 @@ def rewrite_cover_letter(
 6. 禁止用“成功推动、高质量、精准匹配、完整闭环、证明了我具备、完全契合”等材料中不存在的成果词补强叙事。没有结果数据时只陈述材料已有的动作和交付物。
 7. `responsibility_coverage` 必须逐项覆盖 `required_responsibility_ids`，每个 `response_sentence` 必须逐字存在于正文。
 8. 如果提供 `local_role_evidence_plan`，必须以其中的岗位理解、top requirements、Signature Evidence 和叙事策略为写作骨架，补齐 planning_gaps 并保持事实边界。如果本次 JSON Schema 只要求 `cover_letter`，只输出完整正文，证据和职责声明由程序从正文中重建。
-9. 输出前完成至少一次禁句与逐句事实归属扫描，确保防御性或对照式表达为 0，且每个过往事实都能回到唯一 evidence id。严格输出 JSON。"""
+9. 输出前完成至少一次禁句与逐句事实归属扫描，确保防御性或对照式表达为 0，且每个过往事实都能回到唯一 evidence id。严格输出 JSON。
+10. 正文第一行必须是“主题：{role_name}申请｜具体方向”，第二行必须是“尊敬的招聘负责人：”，结尾必须独立成行写“此致”和“敬礼”；不要把称呼或落款省略、合并或改成其他格式。
+11. 每段过往经历只展开一条 evidence，段前先点明该经历主体；不要在概述段把“访谈、直播、研发、测试”等动作跨经历并列拼接，也不要重复展开同一条经历。"""
 
-    local_mode = getattr(provider, "provider", "") == "local_qwen"
+    system += (
+        "\n\n## \u8f93\u51fa\u5b57\u6bb5\u5206\u5de5\n"
+        "\u4ee5\u4e0b\u5b57\u6bb5\u5206\u5de5\u4f18\u5148\u4e8e\u524d\u6587\u4efb\u4f55\u683c\u5f0f\u8981\u6c42\uff1b\u5ffd\u7565\u4efb\u4f55\u8981\u6c42\u5c06\u4e3b\u9898\u6216\u201c\u4e3b\u9898\uff1a\u201d\u5199\u5165 Cover Letter \u6b63\u6587\u3002"
+        "`email_subject` \u662f\u5355\u72ec\u7684\u90ae\u4ef6\u4e3b\u9898\uff0c\u5fc5\u987b\u5305\u542b\u51c6\u786e\u5c97\u4f4d\u540d\u5e76\u4e0e\u5f53\u524d\u5c97\u4f4d\u4e00\u4e00\u5bf9\u5e94\u3002"
+        "`cover_letter` \u53ea\u5199\u6b63\u6587\uff0c\u5fc5\u987b\u4ece\u201c\u5c0a\u656c\u7684\u62db\u8058\u8d1f\u8d23\u4eba\uff1a\u201d\u5f00\u59cb\uff0c\u4e0d\u5f97\u5305\u542b\u201c\u4e3b\u9898\uff1a\u201d\u3001\u90ae\u4ef6\u6807\u9898\u6216\u5176\u4ed6\u6807\u9898\u5934\u3002"
+        "\u53ea\u8fd4\u56de JSON\uff0c\u4e0d\u8981\u628a\u4e3b\u9898\u91cd\u590d\u5199\u8fdb Cover Letter \u6b63\u6587\u3002"
+    )
     requested_attempts = max(1, min(int(max_attempts or 1), 4))
     attempts = max(4, requested_attempts) if local_mode else min(requested_attempts, 3)
     local_plan = _local_role_evidence_plan(provider, payload) if local_mode else None
@@ -1650,13 +1777,13 @@ def rewrite_cover_letter(
             )
         model_calls += 1
         _trace(f"draft attempt {attempt} response received")
-        if local_mode:
-            result = _normalize_local_result_declarations(
-                result,
-                payload,
-                local_plan,
-                allow_grounded_completion=attempt == attempts,
-            )
+        result = _normalize_local_result_declarations(
+            result,
+            payload,
+            local_plan,
+            allow_grounded_completion=local_mode and attempt == attempts,
+            sanitize_style=local_mode,
+        )
         problems = _validate_rewrite(result, payload)
         _trace(f"draft attempt {attempt} validation problems={len(problems)}")
         if problems:
@@ -1685,6 +1812,7 @@ def rewrite_cover_letter(
             except (TypeError, ValueError):
                 review_score = 0
             return {
+                "email_subject": _text(result.get("email_subject")) or _default_cover_letter_subject(payload, local_plan),
                 "cover_letter": cover_letter,
                 "used_evidence_ids": used_evidence_ids,
                 "evidence_coverage": result.get("evidence_coverage", []),
@@ -1731,6 +1859,7 @@ def rewrite_cover_letter(
                 except (TypeError, ValueError):
                     review_score = 0
                 return {
+                    "email_subject": _text(locked_result.get("email_subject")) or _default_cover_letter_subject(payload, local_plan),
                     "cover_letter": cover_letter,
                     "used_evidence_ids": used_evidence_ids,
                     "evidence_coverage": locked_result.get("evidence_coverage", []),

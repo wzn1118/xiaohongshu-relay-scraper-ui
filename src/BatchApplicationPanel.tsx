@@ -64,6 +64,17 @@ type BatchWorkbenchPreferences = {
   selectionLimit: number
 }
 
+type CandidateCorpusPage = {
+  jobId: string
+  filterSignature: string
+  total: number
+  sourceTotal: number
+  offset: number
+  nextCursor: string | null
+  items: ApplicationResult[]
+  selectionSnapshot: ApplicationDeliverySelectionSnapshot
+}
+
 const DEFAULT_WORKBENCH_FILTERS: BatchWorkbenchFilters = {
   view: 'all',
   recipient: 'all',
@@ -129,16 +140,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     offset: number
     cursor?: string
   }>({ filterSignature: '', offset: 0, cursor: undefined })
-  const [candidateCorpus, setCandidateCorpus] = useState<{
-    jobId: string
-    filterSignature: string
-    total: number
-    sourceTotal: number
-    offset: number
-    nextCursor: string | null
-    items: ApplicationResult[]
-    selectionSnapshot: ApplicationDeliverySelectionSnapshot
-  } | null>(null)
+  const [candidateCorpus, setCandidateCorpus] = useState<CandidateCorpusPage | null>(null)
   const [candidateLoading, setCandidateLoading] = useState(false)
   const [candidateError, setCandidateError] = useState('')
   const [knownCandidateTotal, setKnownCandidateTotal] = useState(items.length)
@@ -158,12 +160,11 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   const refreshTimer = useRef<number | null>(null)
   const selectionSeedJob = useRef<string | null>(null)
   const candidateRequest = useRef(0)
-  const candidatePageCursors = useRef<{
-    filterSignature: string
-    values: Map<number, string | undefined>
-  }>({ filterSignature: '', values: new Map([[0, undefined]]) })
+  const candidatePageCursors = useRef<Map<string, Map<number, string | undefined>>>(new Map())
+  const candidatePageCache = useRef<Map<string, CandidateCorpusPage>>(new Map())
   const candidateItemCache = useRef<Map<string, ApplicationResult>>(new Map())
-  const candidateSnapshotState = useRef<{ filterSignature: string; hash: string }>({ filterSignature: '', hash: '' })
+  const candidateSelectionRevisions = useRef<Map<string, string>>(new Map())
+  const candidateSnapshotState = useRef<Map<string, string>>(new Map())
   const dryRunRequest = useRef(0)
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const candidateFilterQuery = useMemo(
@@ -173,6 +174,10 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   const candidateFilterSignature = useMemo(() => JSON.stringify(candidateFilterQuery), [candidateFilterQuery])
   const itemsRevision = useMemo(() => JSON.stringify(items), [items])
   const candidateItemsRevisionState = useRef({ revision: itemsRevision, hydrated: items.length > 0 })
+  const batchCandidateRevision = batchJobId === jobId && batch
+    ? `${batch.batchId}:${batch.revision}:${batch.status}:${batch.lastEventSequence}`
+    : ''
+  const candidateBatchRevisionState = useRef(batchCandidateRevision)
 
   const itemById = useMemo(() => new Map(items.map((item) => [item.note_id, item])), [items])
   const preflightById = useMemo(
@@ -206,10 +211,13 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     setCandidateCorpus(null)
     setCandidateError('')
     setKnownCandidateTotal(items.length)
-    candidatePageCursors.current = { filterSignature: '', values: new Map([[0, undefined]]) }
+    candidatePageCursors.current = new Map()
+    candidatePageCache.current = new Map()
     candidateItemCache.current = new Map()
-    candidateSnapshotState.current = { filterSignature: '', hash: '' }
+    candidateSelectionRevisions.current = new Map()
+    candidateSnapshotState.current = new Map()
     candidateItemsRevisionState.current = { revision: itemsRevision, hydrated: items.length > 0 }
+    candidateBatchRevisionState.current = ''
     let cancelled = false
     void api.applicationBatches(jobId).then(({ batches: saved }) => {
       if (cancelled) return
@@ -248,21 +256,35 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   }, [normalizedQuery])
 
   useEffect(() => {
-    candidateRequest.current += 1
     dryRunRequest.current += 1
-    setPreflight(null)
     setPreflightSelectionConfirmed(false)
+    setBusy((current) => current === 'dry-run' ? '' : current)
+  }, [normalizedQuery, workbenchFilters])
+
+  useEffect(() => {
+    candidateRequest.current += 1
     setCandidateOffset(0)
     setCandidatePageRequest({ filterSignature: candidateFilterSignature, offset: 0, cursor: undefined })
-    candidatePageCursors.current = {
-      filterSignature: candidateFilterSignature,
-      values: new Map([[0, undefined]]),
+    if (!candidatePageCursors.current.has(candidateFilterSignature)) {
+      candidatePageCursors.current.set(candidateFilterSignature, new Map([[0, undefined]]))
     }
-    candidateSnapshotState.current = { filterSignature: candidateFilterSignature, hash: '' }
   }, [candidateFilterSignature])
 
   useEffect(() => {
     if (!expanded || candidatePageRequest.filterSignature !== candidateFilterSignature) return
+    const cacheKey = candidatePageCacheKey(
+      candidateFilterSignature,
+      candidatePageRequest.offset,
+      candidatePageRequest.cursor,
+    )
+    const cachedPage = candidatePageCache.current.get(cacheKey)
+    if (cachedPage) {
+      setCandidateLoading(false)
+      setCandidateError('')
+      setCandidateOffset(cachedPage.offset)
+      setCandidateCorpus(cachedPage)
+      return
+    }
     let startedRequestId = 0
     const timer = window.setTimeout(() => {
       const requestId = ++candidateRequest.current
@@ -282,29 +304,29 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
         }
         const sourceTotal = sumFacetCounts(payload.facetCounts.deliveryStatus) || payload.total
         for (const item of payload.items) candidateItemCache.current.set(item.note_id, item)
-        const cursorState = candidatePageCursors.current.filterSignature === candidateFilterSignature
-          ? candidatePageCursors.current
-          : { filterSignature: candidateFilterSignature, values: new Map<number, string | undefined>([[0, undefined]]) }
-        cursorState.values.set(payload.offset, candidatePageRequest.cursor)
-        if (payload.nextCursor) cursorState.values.set(payload.offset + payload.items.length, payload.nextCursor)
-        candidatePageCursors.current = cursorState
-        const previousSnapshot = candidateSnapshotState.current
+        for (const item of payload.selectionSnapshot.revisions) {
+          candidateSelectionRevisions.current.set(item.noteId, item.revision)
+        }
+        const cursorState = candidatePageCursors.current.get(candidateFilterSignature)
+          || new Map<number, string | undefined>([[0, undefined]])
+        cursorState.set(payload.offset, candidatePageRequest.cursor)
+        if (payload.nextCursor) cursorState.set(payload.offset + payload.items.length, payload.nextCursor)
+        candidatePageCursors.current.set(candidateFilterSignature, cursorState)
+        const previousSnapshotHash = candidateSnapshotState.current.get(candidateFilterSignature)
         if (
-          previousSnapshot.filterSignature === candidateFilterSignature
-          && previousSnapshot.hash
-          && previousSnapshot.hash !== payload.selectionSnapshot.selectionSnapshotHash
+          previousSnapshotHash
+          && previousSnapshotHash !== payload.selectionSnapshot.selectionSnapshotHash
         ) {
           dryRunRequest.current += 1
           setPreflight(null)
           setPreflightSelectionConfirmed(false)
           setNotice({ tone: 'info', text: '候选岗位数据已更新，旧的投递预演已失效，请重新运行。' })
         }
-        candidateSnapshotState.current = {
-          filterSignature: candidateFilterSignature,
-          hash: payload.selectionSnapshot.selectionSnapshotHash,
-        }
-        setCandidateOffset(payload.offset)
-        setCandidateCorpus({
+        candidateSnapshotState.current.set(
+          candidateFilterSignature,
+          payload.selectionSnapshot.selectionSnapshotHash,
+        )
+        const page: CandidateCorpusPage = {
           jobId,
           filterSignature: candidateFilterSignature,
           total: payload.total,
@@ -313,10 +335,30 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
           nextCursor: payload.nextCursor,
           items: payload.items,
           selectionSnapshot: payload.selectionSnapshot,
-        })
+        }
+        candidatePageCache.current.set(cacheKey, page)
+        setCandidateOffset(payload.offset)
+        setCandidateCorpus(page)
         if (!candidateQuery) setKnownCandidateTotal((current) => Math.max(current, sourceTotal, payload.total))
       })().catch((error: ApiError) => {
         if (requestId !== candidateRequest.current) return
+        if (error.code === 'APPLICATION_CANDIDATE_CURSOR_STALE' && candidatePageRequest.cursor) {
+          candidatePageCache.current.clear()
+          candidateItemCache.current.clear()
+          candidateSelectionRevisions.current.clear()
+          candidatePageCursors.current = new Map([
+            [candidateFilterSignature, new Map([[0, undefined]])],
+          ])
+          setCandidateError('')
+          setCandidateOffset(0)
+          setNotice({ tone: 'info', text: '候选岗位已更新，正在刷新第一页。' })
+          setCandidatePageRequest({
+            filterSignature: candidateFilterSignature,
+            offset: 0,
+            cursor: undefined,
+          })
+          return
+        }
         setCandidateError(error.message || '投递候选清单读取失败，当前继续显示已加载岗位。')
       }).finally(() => {
         if (requestId === candidateRequest.current) setCandidateLoading(false)
@@ -333,8 +375,34 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     if (previous.revision === itemsRevision) return
     candidateItemsRevisionState.current = { revision: itemsRevision, hydrated: previous.hydrated || items.length > 0 }
     if (!previous.hydrated && items.length > 0) return
-    setCandidatePageRequest((current) => ({ ...current }))
-  }, [items.length, itemsRevision])
+    candidateRequest.current += 1
+    dryRunRequest.current += 1
+    candidatePageCache.current.clear()
+    candidateItemCache.current.clear()
+    candidateSelectionRevisions.current.clear()
+    candidatePageCursors.current = new Map([[candidateFilterSignature, new Map([[0, undefined]])]])
+    setPreflightSelectionConfirmed(false)
+    setBusy((current) => current === 'dry-run' ? '' : current)
+    setCandidateLoading(true)
+    setCandidateOffset(0)
+    setCandidatePageRequest({ filterSignature: candidateFilterSignature, offset: 0, cursor: undefined })
+  }, [candidateFilterSignature, items.length, itemsRevision])
+
+  useEffect(() => {
+    if (candidateBatchRevisionState.current === batchCandidateRevision) return
+    candidateBatchRevisionState.current = batchCandidateRevision
+    candidateRequest.current += 1
+    dryRunRequest.current += 1
+    candidatePageCache.current.clear()
+    candidateItemCache.current.clear()
+    candidateSelectionRevisions.current.clear()
+    candidatePageCursors.current = new Map([[candidateFilterSignature, new Map([[0, undefined]])]])
+    setPreflightSelectionConfirmed(false)
+    setBusy((current) => current === 'dry-run' ? '' : current)
+    setCandidateLoading(true)
+    setCandidateOffset(0)
+    setCandidatePageRequest({ filterSignature: candidateFilterSignature, offset: 0, cursor: undefined })
+  }, [batchCandidateRevision, candidateFilterSignature])
 
   useEffect(() => {
     if (!batch?.batchId || batchJobId !== jobId) {
@@ -451,12 +519,17 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   const selectedOutsideFilterIds = hasCurrentCandidateCorpus
     ? selectedIds.filter((noteId) => !matchingNoteIds.has(noteId))
     : []
+  const selectedOutsideFilterIdSet = new Set(selectedOutsideFilterIds)
   const selectedInvalidIds = selectedIds.filter((noteId) => {
+    if (selectedOutsideFilterIdSet.has(noteId)) return false
     if (selectionSnapshot) return !selectableNoteIds.has(noteId)
     const item = candidateById.get(noteId)
     if (!item) return false
     return !isCandidateSelectable(item, preflightById.get(noteId), batchItemByNoteId.get(noteId))
   })
+  const selectedMissingRevisionIds = selectedIds.filter(
+    (noteId) => !candidateSelectionRevisions.current.has(noteId),
+  )
   const preflightReadyCount = preflight?.readyNoteIds.length || 0
   const preflightPreparableCount = preflight?.items.filter((item) => item.status !== 'ready' && item.canPrepare).length || 0
   const preflightBlockedCount = preflight ? Math.max(0, preflight.items.length - preflightReadyCount - preflightPreparableCount) : 0
@@ -472,34 +545,40 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     && !busy
   const batchTerminal = batch ? ['completed', 'cancelled'].includes(batch.status) : true
 
-  const buildRequest = (noteIds: string[], nextApprovals = approvals, frozenPreflight?: ApplicationBatchPreflight | null): ApplicationBatchRequest => ({
-    noteIds,
-    contactApprovals: noteIds.flatMap((noteId) => nextApprovals[noteId]
-      ? [{ noteId, evidenceHash: nextApprovals[noteId], confirmed: true as const }]
-      : []),
-    defaultAttachmentTemplate: attachmentTemplate.trim() || DEFAULT_ATTACHMENT_TEMPLATE,
-    minIntervalMs: Math.max(0, Math.min(60, minIntervalSeconds)) * 1_000,
-    ...(aiSessionId ? { aiSessionId } : {}),
-    ...(frozenPreflight?.preflightId || frozenPreflight?.planId ? { preflightId: frozenPreflight.preflightId || frozenPreflight.planId } : {}),
-    ...(frozenPreflight?.manifestHash ? { manifestHash: frozenPreflight.manifestHash } : {}),
-    ...(frozenPreflight ? { confirmedNoteIds: [...frozenPreflight.readyNoteIds] } : {}),
-    ...(selectionSnapshot ? {
-      selectionSnapshotId: selectionSnapshot.selectionSnapshotId,
-      selectionSnapshotHash: selectionSnapshot.selectionSnapshotHash,
-      selectionRevisions: selectionSnapshot.revisions,
-    } : {}),
-    idempotencyKey: createRequestIdempotencyKey(
+  const buildRequest = (noteIds: string[], nextApprovals = approvals, frozenPreflight?: ApplicationBatchPreflight | null): ApplicationBatchRequest => {
+    const selectionRevisions = noteIds.flatMap((noteId) => {
+      const revision = candidateSelectionRevisions.current.get(noteId)
+      return revision === undefined ? [] : [{ noteId, revision }]
+    })
+    return {
       noteIds,
-      nextApprovals,
-      attachmentTemplate,
-      minIntervalSeconds,
-      aiSessionId,
-      frozenPreflight?.preflightId || frozenPreflight?.planId,
-      frozenPreflight?.manifestHash,
-      selectionSnapshot?.selectionSnapshotId,
-      selectionSnapshot?.selectionSnapshotHash,
-    ),
-  })
+      contactApprovals: noteIds.flatMap((noteId) => nextApprovals[noteId]
+        ? [{ noteId, evidenceHash: nextApprovals[noteId], confirmed: true as const }]
+        : []),
+      defaultAttachmentTemplate: attachmentTemplate.trim() || DEFAULT_ATTACHMENT_TEMPLATE,
+      minIntervalMs: Math.max(0, Math.min(60, minIntervalSeconds)) * 1_000,
+      ...(aiSessionId ? { aiSessionId } : {}),
+      ...(frozenPreflight?.preflightId || frozenPreflight?.planId ? { preflightId: frozenPreflight.preflightId || frozenPreflight.planId } : {}),
+      ...(frozenPreflight?.manifestHash ? { manifestHash: frozenPreflight.manifestHash } : {}),
+      ...(frozenPreflight ? { confirmedNoteIds: [...frozenPreflight.readyNoteIds] } : {}),
+      ...(selectionSnapshot ? {
+        selectionSnapshotId: selectionSnapshot.selectionSnapshotId,
+        selectionSnapshotHash: selectionSnapshot.selectionSnapshotHash,
+        selectionRevisions,
+      } : {}),
+      idempotencyKey: createRequestIdempotencyKey(
+        noteIds,
+        nextApprovals,
+        attachmentTemplate,
+        minIntervalSeconds,
+        aiSessionId,
+        frozenPreflight?.preflightId || frozenPreflight?.planId,
+        frozenPreflight?.manifestHash,
+        selectionSnapshot?.selectionSnapshotId,
+        selectionSnapshot?.selectionSnapshotHash,
+      ),
+    }
+  }
 
   async function runDryRun(noteIds = selectedIds, nextApprovals = approvals) {
     if (!noteIds.length) {
@@ -512,6 +591,11 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     }
     if (!selectionSnapshot || candidateLoading) {
       setNotice({ tone: 'info', text: '候选清单正在更新，请等待选择快照就绪后再运行投递预演。' })
+      return
+    }
+    const missingRevisionIds = noteIds.filter((noteId) => !candidateSelectionRevisions.current.has(noteId))
+    if (missingRevisionIds.length) {
+      setNotice({ tone: 'info', text: `有 ${missingRevisionIds.length} 个已选岗位缺少最新修订，请重新加载候选清单后再运行投递预演。` })
       return
     }
     const requestId = ++dryRunRequest.current
@@ -646,7 +730,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
 
   function showPreviousCandidatePage() {
     const offset = Math.max(0, candidateOffset - CANDIDATE_PAGE_SIZE)
-    requestCandidatePage(offset, candidatePageCursors.current.values.get(offset))
+    requestCandidatePage(offset, candidatePageCursors.current.get(candidateFilterSignature)?.get(offset))
   }
 
   function showNextCandidatePage() {
@@ -792,7 +876,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
         <div className="batch-toolbar">
           <label className="batch-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索岗位、邮箱、主题或附件名" title="同时搜索邮件正文和 Cover Letter" /><span className="batch-search-summary" aria-live="polite"><b>待投岗位 {candidateSourceTotal} 项</b><b>筛选结果 {candidateTotal} 项</b>{batch && <b>当前批次 {visibleBatchItems.length} 封</b>}</span></label>
           <div className="batch-selection-actions">
-            <span className="batch-selection-summary">已选 <strong>{selected.size}</strong> / {MAX_BATCH_SIZE}<small>{candidateLoading ? '选择校验中' : `筛选外 ${selectedOutsideFilterIds.length} · 无效 ${selectedInvalidIds.length}`}</small></span>
+            <span className="batch-selection-summary">已选 <strong>{selected.size}</strong> / {MAX_BATCH_SIZE}<small>{candidateLoading ? '选择校验中' : `筛选外 ${selectedOutsideFilterIds.length} · 无效 ${selectedInvalidIds.length}${selectedMissingRevisionIds.length ? ` · 修订缺失 ${selectedMissingRevisionIds.length}，请重新加载` : ''}`}</small></span>
             <button type="button" onClick={selectCurrentPage} disabled={candidateLoading || rows.length === 0}><CheckCircle2 size={15} />选择当前页</button>
             <label className="batch-selection-limit"><span>首批数量</span><input aria-label="首批选择数量" type="number" min={1} max={MAX_BATCH_SIZE} step={1} value={selectionLimit} onChange={(event) => setSelectionLimit(clampSelectionLimit(event.target.value))} /></label>
             <button type="button" onClick={selectFirstReady} disabled={candidateLoading || candidateTotal === 0}><CheckCircle2 size={15} />选择前 {selectionLimit} 条可投递</button>
@@ -839,7 +923,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
               const checked = preflightById.get(item.note_id)
               const savedBatchItem = batchItemByNoteId.get(item.note_id)
               const savedRecipient = typeof savedBatchItem?.payload.recipient === 'string' ? savedBatchItem.payload.recipient : ''
-              const savedSubject = typeof savedBatchItem?.payload.subject === 'string' ? savedBatchItem.payload.subject : ''
+              const savedSubject = applicationEmailSubject(item, checked, savedBatchItem)
               const savedFilenames = Array.isArray(savedBatchItem?.payload.finalFilenames) ? savedBatchItem.payload.finalFilenames.map(String) : []
               const emailBody = applicationEmailBody(item, checked, savedBatchItem)
               const coverLetter = applicationCoverLetter(item, checked, savedBatchItem)
@@ -861,6 +945,8 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
               const copyQualityBlocked = copyQuality?.batch_ready === false
               const subjectGuard = item.emailSubjectGuard
               const subjectNeedsReview = subjectGuard?.requiresReview === true
+                || ['rejected_noisy_title', 'rejected_bare_title', 'rejected_unverified_subject']
+                  .includes(String(subjectGuard?.sourceStatus || ''))
               const qualityPassed = item.draftVersion?.qualityStatus === 'passed' && !copyQualityBlocked
               const aiMechanismPending = copyQuality?.ai_product_role === true && copyQuality.ai_product_mechanism_pass === false
               const candidates = liveResolution?.candidates || []
@@ -893,7 +979,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
                 </td>
                 <td data-label="邮件标题与附件命名">
                   <small className="batch-field-label">实际发送标题</small>
-                  <strong className={`batch-subject ${subjectNeedsReview ? 'needs-review' : ''}`}>{checked?.preview?.subject || item.emailSubjectPreview || (subjectNeedsReview ? subjectGuard?.suggestedSubject || '主题待重生成' : savedSubject || item.outreach?.email_subject) || '主题待生成'}</strong>
+                  <strong className={`batch-subject ${subjectNeedsReview ? 'needs-review' : ''}`}>{subjectNeedsReview ? subjectGuard?.suggestedSubject || '主题待重生成' : savedSubject || '主题待生成'}</strong>
                   {subjectNeedsReview && <small className="batch-blocker">原帖标题不是岗位名，主题待按准确岗位名重生成</small>}
                   {item.emailSubjectRequirement?.detected && <span className="batch-email-subject-rule" title={item.emailSubjectRequirement.evidence}><Mail size={12} /><span><small>正文邮件标题要求</small><b>{item.emailSubjectRequirement.template}</b><em>发送时自动按此规则校验</em></span></span>}
                   {checked?.attachments?.length ? checked.attachments.map((attachment) => {
@@ -929,7 +1015,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
         </div>
 
         <div className="batch-primary-actions">
-          <button type="button" aria-label="Dry Run" title="只生成投递预演，不发送邮件" disabled={!selected.size || Boolean(busy)} onClick={() => void runDryRun()}>{busy === 'dry-run' ? <LoaderCircle className="spin" size={16} /> : <Gauge size={16} />}投递预演 <small>不发送</small></button>
+          <button type="button" aria-label="Dry Run" title={selectedMissingRevisionIds.length ? '已选岗位修订缺失，请重新加载候选清单' : '只生成投递预演，不发送邮件'} disabled={!selected.size || selectedMissingRevisionIds.length > 0 || Boolean(busy) || candidateLoading} onClick={() => void runDryRun()}>{busy === 'dry-run' ? <LoaderCircle className="spin" size={16} /> : <Gauge size={16} />}投递预演 <small>不发送</small></button>
           <button type="button" className="primary" title={selectedMatchesPreflight && preflightSelectionConfirmed ? '冻结当前投递预演' : '请先运行投递预演，并保持就绪清单与命名规则不变'} disabled={!canCreate} onClick={() => void createBatch()}>{busy === 'create' ? <LoaderCircle className="spin" size={16} /> : <Eye size={16} />}冻结批次预览</button>
           {preflight && <span><strong>{preflightReadyCount}</strong> 项就绪{preflightPreparableCount > 0 && <> · <strong>{preflightPreparableCount}</strong> 项可自动准备</>} · <strong>{preflightBlockedCount}</strong> 项阻塞</span>}
         </div>
@@ -1009,11 +1095,29 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   )
 }
 
+function splitBatchCoverLetter(value: unknown): { subject: string; body: string } {
+  const body = String(value || '').trim()
+  if (!body) return { subject: '', body: '' }
+  const heading = body.match(/^\s*(?:主题|邮件主题|Subject)\s*[:：]\s*([^\r\n]+)\s*(?:\r?\n|$)/iu)
+  if (heading) return { subject: heading[1].trim(), body: body.slice(heading[0].length).trim() }
+  const firstLineBreak = body.indexOf('\n')
+  if (firstLineBreak > 0) {
+    const firstLine = body.slice(0, firstLineBreak).trim()
+    const remainder = body.slice(firstLineBreak + 1).trim()
+    if (
+      firstLine.length <= 120
+      && !/^(?:尊敬|Dear|您好|Hi)\b/iu.test(firstLine)
+      && (/尊敬|招聘负责人|Dear/iu.test(remainder.slice(0, 160)) || /申请|应聘|求职/u.test(firstLine) || firstLine.includes('｜'))
+    ) return { subject: firstLine, body: remainder }
+  }
+  return { subject: '', body }
+}
+
 function payloadCoverLetter(payload: ApplicationBatch['items'][number]['payload']) {
   const record = payload as Record<string, unknown>
   for (const key of ['coverLetter', 'cover_letter']) {
     const value = record[key]
-    if (typeof value === 'string' && value.trim()) return value.trim()
+    if (typeof value === 'string' && value.trim()) return splitBatchCoverLetter(value).body
   }
   return ''
 }
@@ -1024,7 +1128,22 @@ function applicationCoverLetter(
   savedBatchItem: ApplicationBatch['items'][number] | undefined,
 ) {
   const checkedValue = checked?.coverLetter?.trim() || (checked?.payload ? payloadCoverLetter(checked.payload) : '')
-  return checkedValue || (savedBatchItem ? payloadCoverLetter(savedBatchItem.payload) : '') || item.outreach?.cover_letter?.trim() || ''
+  return splitBatchCoverLetter(checkedValue).body
+    || (savedBatchItem ? payloadCoverLetter(savedBatchItem.payload) : '')
+    || splitBatchCoverLetter(item.outreach?.cover_letter).body
+}
+
+function applicationEmailSubject(
+  item: ApplicationResult,
+  checked: ApplicationBatchPreflight['items'][number] | undefined,
+  savedBatchItem: ApplicationBatch['items'][number] | undefined,
+) {
+  return checked?.preview?.subject?.trim()
+    || item.emailSubjectPreview?.trim()
+    || (typeof savedBatchItem?.payload.subject === 'string' ? savedBatchItem.payload.subject.trim() : '')
+    || item.outreach?.email_subject?.trim()
+    || splitBatchCoverLetter(item.outreach?.cover_letter).subject
+    || ''
 }
 
 function applicationEmailBody(
@@ -1387,6 +1506,10 @@ function applicationContactEvidence(item: ApplicationResult, contact: Applicatio
     sourceFields: contact.sourceFields?.length ? contact.sourceFields : sourceFields,
     sourceImageIndex: matchingRoute.source_image_index,
   }
+}
+
+function candidatePageCacheKey(filterSignature: string, offset: number, cursor?: string) {
+  return JSON.stringify([filterSignature, offset, cursor || null])
 }
 
 function formatBytes(value: number) {

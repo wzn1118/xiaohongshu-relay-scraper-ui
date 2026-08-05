@@ -812,13 +812,39 @@ function routeVerificationLabel(route: DeliveryRouteView) {
   return '来自岗位正文'
 }
 
+function splitDisplayedCoverLetter(value: unknown): { subject: string; body: string } {
+  const body = String(value || '').trim()
+  if (!body) return { subject: '', body: '' }
+  const heading = body.match(/^\s*(?:主题|邮件主题|Subject)\s*[:：]\s*([^\r\n]+)\s*(?:\r?\n|$)/iu)
+  if (heading) {
+    return {
+      subject: heading[1].trim(),
+      body: body.slice(heading[0].length).trim(),
+    }
+  }
+  const firstLineBreak = body.indexOf('\n')
+  if (firstLineBreak > 0) {
+    const firstLine = body.slice(0, firstLineBreak).trim()
+    const remainder = body.slice(firstLineBreak + 1).trim()
+    if (
+      firstLine.length <= 120
+      && !/^(?:尊敬|Dear|您好|Hi)\b/iu.test(firstLine)
+      && (/尊敬|招聘负责人|Dear/iu.test(remainder.slice(0, 160)) || /申请|应聘|求职/u.test(firstLine) || firstLine.includes('｜'))
+    ) {
+      return { subject: firstLine, body: remainder }
+    }
+  }
+  return { subject: '', body }
+}
+
 function outreachDraft(result: ApplicationResult): OutreachDraft {
   const outreach = result.outreach ?? {}
+  const legacyCoverLetter = splitDisplayedCoverLetter(outreach.cover_letter)
   return {
     greeting: outreach.greeting || '',
-    email_subject: result.emailSubjectPreview || outreach.email_subject || '',
+    email_subject: result.emailSubjectPreview || outreach.email_subject || legacyCoverLetter.subject || '',
     email_body: outreach.email_body || '',
-    cover_letter: outreach.cover_letter || '',
+    cover_letter: legacyCoverLetter.body,
   }
 }
 
@@ -1788,6 +1814,7 @@ function App() {
   const relayConnectionRef = useRef<Promise<RelayStatus> | null>(null)
   const rateLimitAlertRef = useRef<string | null>(null)
   const resultsRequestRef = useRef(0)
+  const coverageJobIdRef = useRef<string | null>(null)
   const draftViewRevisionRef = useRef(0)
   const draftSaveResponseRef = useRef(0)
   const audienceRequestRef = useRef(0)
@@ -1957,7 +1984,8 @@ function App() {
     setActiveJob(nextJob)
     setAudienceTask(nextAudienceTask)
     setArtifacts([])
-    setCoverage(null)
+    coverageJobIdRef.current = nextResults?.coverage ? nextJob?.id || null : null
+    setCoverage(nextResults?.coverage || null)
     setResults(nextResults)
     setAudienceResults(null)
     setAudienceDataJobId('')
@@ -2840,6 +2868,7 @@ function App() {
       if (requestId !== resultsRequestRef.current) return
       if (payload.analysisMode !== requestMode) throw new Error('结果所属工作台与当前页面不一致')
       setResults(payload)
+      coverageJobIdRef.current = jobId
       setCoverage(payload.coverage || parseCoverage(payload) || null)
       setResultOffset(offset)
       if (!options.preserveDraft || !draftDirtyRef.current) {
@@ -3120,13 +3149,18 @@ function App() {
   }, [activeJob?.id, resultOffset, resultSort, resultTimeRange, selectedResult?.note_id, workspaceMode])
 
   useEffect(() => {
-    setCoverage(activeJob?.coverage || parseCoverage(activeJob?.workflowSummary) || null)
     if (!activeJob) {
+      coverageJobIdRef.current = null
+      setCoverage(null)
       setArtifacts([])
       setResults(null)
       setSelectedResult(null)
       setAudienceResults(null)
       return
+    }
+    if (coverageJobIdRef.current !== activeJob.id) {
+      coverageJobIdRef.current = activeJob.id
+      setCoverage(activeJob.coverage || parseCoverage(activeJob.workflowSummary) || null)
     }
     api.artifacts(activeJob.id).then(setArtifacts).catch(() => setArtifacts(activeJob.artifacts || []))
     void loadResults(activeJob.id, 0, { preserveDraft: true })
@@ -3217,8 +3251,9 @@ function App() {
       sort: resultSort,
       timeRange: resultTimeRange,
     }).then((payload) => {
-      if (workspaceMode === mode) {
+      if (workspaceMode === mode && coverageJobIdRef.current === activeJob.id) {
         setResults(payload)
+        coverageJobIdRef.current = activeJob.id
         setCoverage(payload.coverage || parseCoverage(payload) || null)
         setResultOffset(0)
         if (!draftDirtyRef.current) {
@@ -3311,9 +3346,16 @@ function App() {
     const controller = new AbortController()
     fetch(api.artifactUrl(activeJob.id, summary), { signal: controller.signal })
       .then((response) => response.ok ? response.json() : null)
-      .then((value) => setCoverage(parseCoverage(value)))
+      .then((value) => {
+        if (coverageJobIdRef.current !== activeJob.id) return
+        coverageJobIdRef.current = activeJob.id
+        setCoverage(parseCoverage(value))
+      })
       .catch((error: Error) => {
-        if (error.name !== 'AbortError') setCoverage(null)
+        if (error.name !== 'AbortError') {
+          coverageJobIdRef.current = null
+          setCoverage(null)
+        }
       })
     return () => controller.abort()
   }, [activeJob, artifacts, coverage])
@@ -3443,6 +3485,7 @@ function App() {
     }
     setSubmitting(true)
     setNotice(null)
+    coverageJobIdRef.current = null
     setCoverage(null)
     setLogs([`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${payload.checkOnly ? '正在执行启动前检查...' : '正在创建任务...'}`])
     try {
@@ -3503,6 +3546,7 @@ function App() {
   const performBodyImport = async (records: BodyImportRecord[], sourceName: string) => {
     setSubmitting(true)
     setNotice(null)
+    coverageJobIdRef.current = null
     setCoverage(null)
     setArtifacts([])
     setLogs([`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] 正在创建 ${records.length} 条正文采集任务...`])
@@ -4121,10 +4165,13 @@ function App() {
   const featuredExperience = featuredJob
     ? jobExperienceView(featuredJob, jobAnalysisMode(featuredJob), 'live', null)
     : null
-  const featuredDiscovered = Number(featuredExperience?.counts.discovered ?? featuredSummary.cardsDiscovered ?? featuredJob?.discoveredCount ?? 0)
-  const featuredBodies = Number(featuredExperience?.counts.fullText ?? featuredSummary.bodiesCaptured ?? featuredJob?.bodyProcessedCount ?? 0)
-  const featuredDrafts = Number(featuredJob?.applicationCount ?? featuredSummary.applicationCopyGenerated ?? 0)
-  const featuredPending = Number(featuredExperience?.counts.pending ?? Math.max(0, featuredDiscovered - featuredBodies))
+  const featuredCoverage = featuredJob?.id === activeJob?.id ? coverage : null
+  const featuredDiscovered = Number(featuredCoverage?.discovered ?? featuredExperience?.counts.discovered ?? featuredSummary.cardsDiscovered ?? featuredJob?.discoveredCount ?? 0)
+  const featuredBodies = Number(featuredCoverage?.bodySucceeded ?? featuredExperience?.counts.fullText ?? featuredSummary.bodiesCaptured ?? featuredJob?.bodyProcessedCount ?? 0)
+  const featuredDrafts = Number(featuredCoverage?.draftsGenerated ?? featuredJob?.applicationCount ?? featuredSummary.applicationCopyGenerated ?? 0)
+  const featuredPending = Number(featuredCoverage
+    ? Math.max(0, Number(featuredCoverage.discovered ?? 0) - Math.max(Number(featuredCoverage.bodySucceeded ?? 0), Number(featuredCoverage.draftsGenerated ?? 0)))
+    : featuredExperience?.counts.pending ?? Math.max(0, featuredDiscovered - featuredBodies))
   const featuredCollectionComplete = featuredDiscovered > 0 && featuredBodies >= featuredDiscovered && featuredPending === 0
   const featuredQualityNeedsReview = String(featuredSummary.status || '') === 'failed'
   const featuredAccessIssue = featuredExperience?.issues.find((issue) => ['RATE_LIMITED', 'SECURITY_VERIFICATION', 'LOGIN_REQUIRED'].includes(issue.code))

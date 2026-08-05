@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+import {
+  applicationDeliveryCandidateContentRevision,
+  applicationDeliveryCandidateRevision,
+} from './application-delivery-candidates.mjs';
 import { buildApplicationAttachmentRule } from './lib/application-attachment-rule.mjs';
 import { applicationRoleTitle, applicationSubjectGuard, applicationSubjectRule } from './lib/application-email-draft.mjs';
 import { applicationContactSourceRevision, resolveApplicationContacts } from './lib/application-contact-resolver.mjs';
@@ -13,6 +17,8 @@ const MAX_MIN_INTERVAL_MS = 60_000;
 const PREFLIGHT_PLAN_TTL_MS = 30 * 60_000;
 const PREFLIGHT_ID = /^[a-f0-9-]{36}$/u;
 const MANIFEST_HASH = /^[a-f0-9]{64}$/u;
+const OCCUPIED_BATCH_STATUSES = new Set(['ready', 'approved', 'running', 'paused', 'completed']);
+const OCCUPIED_ITEM_STATUSES = new Set(['sending', 'sent', 'skipped', 'unknown_manual_review']);
 const RETRYABLE_CODES = new Set([
   'EMAIL_PREVIEW_STALE',
   'SMTP_NOT_CONFIGURED',
@@ -79,16 +85,24 @@ export class ApplicationBatchService {
     this.sleep = sleep;
     this.runners = new Map();
     this.preflightPlans = new Map();
+    this.batchCreationTail = Promise.resolve();
   }
 
   async dryRun(value = {}) {
     const preflightId = randomUUID();
-    const prepared = await this.#prepare(value, { batchId: preflightId, applyChanges: false });
+    const noteIds = normalizedNoteIds(value.noteIds, this.maxBatchSize);
+    const selection = await this.#validateSelectionSnapshot(value, noteIds);
+    const prepared = await this.#prepare(value, {
+      batchId: preflightId,
+      applyChanges: false,
+      noteIds,
+      recordsByNoteId: selection.recordsByNoteId,
+    });
     const deliveryManifest = buildDeliveryManifest(this.jobId, prepared.items);
     const manifestHash = hashJson(deliveryManifest);
     const generatedAt = isoNow(this.now);
     const expiresAt = new Date(epochNow(this.now) + PREFLIGHT_PLAN_TTL_MS).toISOString();
-    this.#rememberPreflightPlan(preflightId, manifestHash, prepared.readyNoteIds, value);
+    this.#rememberPreflightPlan(preflightId, manifestHash, prepared.readyNoteIds, value, selection.snapshot, noteIds);
     return {
       schemaVersion: 2,
       dryRun: true,
@@ -104,6 +118,12 @@ export class ApplicationBatchService {
   }
 
   async createBatch(value = {}) {
+    const operation = this.batchCreationTail.catch(() => {}).then(() => this.#createBatch(value));
+    this.batchCreationTail = operation.catch(() => {});
+    return operation;
+  }
+
+  async #createBatch(value = {}) {
     const preflightId = optionalPreflightId(value.preflightId ?? value.planId);
     const requestedManifestHash = optionalManifestHash(value.manifestHash);
     if (!preflightId && !requestedManifestHash) {
@@ -130,7 +150,16 @@ export class ApplicationBatchService {
       if (replay) return replay;
     }
     const preflightPlan = this.#requirePreflightPlan(preflightId, value, confirmedNoteIds);
-    const prepared = await this.#prepare(value, { batchId, applyChanges: true });
+    const noteIds = normalizedNoteIds(value.noteIds, this.maxBatchSize);
+    const selection = await this.#validateSelectionSnapshot(value, noteIds, preflightPlan.selectionSnapshot);
+    const prepared = await this.#prepare(value, {
+      batchId,
+      applyChanges: true,
+      noteIds,
+      recordsByNoteId: selection.recordsByNoteId,
+    });
+    await this.#recheckPreparedSelection(noteIds, selection.recordsByNoteId);
+    await this.#recheckBatchAvailability(noteIds);
     const deliveryManifest = buildDeliveryManifest(this.jobId, prepared.items);
     const manifestHash = hashJson(deliveryManifest);
     if (
@@ -343,13 +372,8 @@ export class ApplicationBatchService {
   }
 
   async #idempotentReplay(batchId, createIdempotencyKey, createRequestHash) {
-    let existing;
-    try {
-      existing = await this.manager.getBatch(batchId);
-    } catch (error) {
-      if (error?.code === 'APPLICATION_BATCH_NOT_FOUND') return null;
-      throw error;
-    }
+    const existing = (await this.manager.listBatches()).find((batch) => batch.batchId === batchId);
+    if (!existing) return null;
     if (
       existing.jobId !== this.jobId
       || existing.metadata?.createIdempotencyKey !== createIdempotencyKey
@@ -369,7 +393,7 @@ export class ApplicationBatchService {
     };
   }
 
-  #rememberPreflightPlan(preflightId, manifestHash, readyNoteIds, value) {
+  #rememberPreflightPlan(preflightId, manifestHash, readyNoteIds, value, selectionSnapshot, selectedNoteIds) {
     const now = epochNow(this.now);
     for (const [candidateId, plan] of this.preflightPlans.entries()) {
       if (plan.expiresAt <= now) this.preflightPlans.delete(candidateId);
@@ -378,6 +402,9 @@ export class ApplicationBatchService {
       manifestHash,
       readyNoteIds: [...readyNoteIds],
       defaultAttachmentTemplate: normalizedText(value?.defaultAttachmentTemplate, 240),
+      selectionSnapshot: selectionSnapshot
+        ? selectionSnapshotForNoteIds(selectionSnapshot, selectedNoteIds)
+        : null,
       expiresAt: now + PREFLIGHT_PLAN_TTL_MS,
     });
   }
@@ -414,8 +441,98 @@ export class ApplicationBatchService {
     return plan;
   }
 
-  async #prepare(value, { batchId, applyChanges }) {
-    const noteIds = normalizedNoteIds(value.noteIds, this.maxBatchSize);
+  async #validateSelectionSnapshot(value, noteIds, expectedSnapshot = undefined) {
+    const snapshot = normalizedSelectionSnapshot(value);
+    const staleNoteIds = selectionSnapshotStaleNoteIds(noteIds, snapshot, expectedSnapshot);
+    const recordsByNoteId = snapshot ? new Map() : null;
+    if (snapshot) {
+      for (const noteId of noteIds) {
+        if (staleNoteIds.has(noteId)) continue;
+        try {
+          const record = await this.loadRecord(noteId);
+          recordsByNoteId.set(noteId, record);
+          const currentRevision = applicationDeliveryCandidateRevision(record);
+          if (
+            currentRevision !== snapshot.revisionByNoteId.get(noteId)
+            || applicationRecordDeliveryUnavailable(record)
+          ) staleNoteIds.add(noteId);
+        } catch {
+          staleNoteIds.add(noteId);
+        }
+      }
+      const batches = await this.manager.listBatches({ jobId: this.jobId });
+      for (const batch of batches) {
+        for (const item of Array.isArray(batch?.items) ? batch.items : []) {
+          const noteId = String(item?.noteId || '').trim();
+          if (noteIds.includes(noteId) && applicationBatchItemUnavailable(batch, item)) staleNoteIds.add(noteId);
+        }
+      }
+    }
+    if (staleNoteIds.size) {
+      throw batchServiceError(
+        'APPLICATION_BATCH_SELECTION_STALE',
+        'The selected application records changed. Refresh the candidate list and run Dry Run again.',
+        409,
+        { staleNoteIds: noteIds.filter((noteId) => staleNoteIds.has(noteId)) },
+      );
+    }
+    return { snapshot, recordsByNoteId };
+  }
+
+  async #recheckPreparedSelection(noteIds, baselineRecordsByNoteId) {
+    if (!(baselineRecordsByNoteId instanceof Map)) return;
+    const staleNoteIds = new Set();
+    for (const noteId of noteIds) {
+      const baseline = baselineRecordsByNoteId.get(noteId);
+      try {
+        const current = await this.loadRecord(noteId);
+        if (
+          !baseline
+          || applicationDeliveryCandidateContentRevision(current)
+            !== applicationDeliveryCandidateContentRevision(baseline)
+        ) staleNoteIds.add(noteId);
+      } catch {
+        staleNoteIds.add(noteId);
+      }
+    }
+    const batches = await this.manager.listBatches({ jobId: this.jobId });
+    for (const batch of batches) {
+      for (const item of Array.isArray(batch?.items) ? batch.items : []) {
+        const noteId = String(item?.noteId || '').trim();
+        if (noteIds.includes(noteId) && applicationBatchItemUnavailable(batch, item)) staleNoteIds.add(noteId);
+      }
+    }
+    if (staleNoteIds.size) {
+      throw batchServiceError(
+        'APPLICATION_BATCH_SELECTION_STALE',
+        'The selected application records changed. Refresh the candidate list and run Dry Run again.',
+        409,
+        { staleNoteIds: noteIds.filter((noteId) => staleNoteIds.has(noteId)) },
+      );
+    }
+  }
+
+  async #recheckBatchAvailability(noteIds) {
+    const staleNoteIds = new Set();
+    const batches = await this.manager.listBatches({ jobId: this.jobId });
+    for (const batch of batches) {
+      for (const item of Array.isArray(batch?.items) ? batch.items : []) {
+        const noteId = String(item?.noteId || '').trim();
+        if (noteIds.includes(noteId) && applicationBatchItemUnavailable(batch, item)) staleNoteIds.add(noteId);
+      }
+    }
+    if (staleNoteIds.size) {
+      throw batchServiceError(
+        'APPLICATION_BATCH_SELECTION_STALE',
+        'The selected application records changed. Refresh the candidate list and run Dry Run again.',
+        409,
+        { staleNoteIds: noteIds.filter((noteId) => staleNoteIds.has(noteId)) },
+      );
+    }
+  }
+
+  async #prepare(value, { batchId, applyChanges, noteIds: selectedNoteIds, recordsByNoteId = null }) {
+    const noteIds = selectedNoteIds || normalizedNoteIds(value.noteIds, this.maxBatchSize);
     const approvals = normalizedContactApprovals(value.contactApprovals);
     const items = [];
     for (const noteId of noteIds) {
@@ -426,6 +543,7 @@ export class ApplicationBatchService {
         defaultAttachmentTemplate: value.defaultAttachmentTemplate,
         aiSessionId: value.aiSessionId,
         applyChanges,
+        recordsByNoteId,
       }));
     }
     return {
@@ -437,10 +555,10 @@ export class ApplicationBatchService {
     };
   }
 
-  async #prepareItem({ noteId, batchId, approvals, defaultAttachmentTemplate, aiSessionId, applyChanges }) {
+  async #prepareItem({ noteId, batchId, approvals, defaultAttachmentTemplate, aiSessionId, applyChanges, recordsByNoteId }) {
     let record;
     try {
-      record = await this.loadRecord(noteId);
+      record = recordsByNoteId?.has(noteId) ? recordsByNoteId.get(noteId) : await this.loadRecord(noteId);
     } catch (error) {
       return blockedItem(noteId, 'draft_pending', 'APPLICATION_RECORD_UNAVAILABLE', publicErrorMessage(error));
     }
@@ -859,8 +977,77 @@ function normalizedContactApprovals(value) {
   return approvals;
 }
 
+function normalizedSelectionSnapshot(value) {
+  const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const fields = ['selectionSnapshotId', 'selectionSnapshotHash', 'selectionRevisions'];
+  if (!fields.some((field) => Object.hasOwn(input, field))) return null;
+  const revisions = (Array.isArray(input.selectionRevisions) ? input.selectionRevisions : []).map((item) => ({
+    noteId: String(item?.noteId || '').trim(),
+    revision: String(item?.revision || '').trim().toLowerCase(),
+  }));
+  const revisionByNoteId = new Map();
+  const duplicateNoteIds = new Set();
+  for (const item of revisions) {
+    if (revisionByNoteId.has(item.noteId)) duplicateNoteIds.add(item.noteId);
+    else revisionByNoteId.set(item.noteId, item.revision);
+  }
+  return {
+    selectionSnapshotId: normalizedText(input.selectionSnapshotId, 240),
+    selectionSnapshotHash: String(input.selectionSnapshotHash || '').trim().toLowerCase(),
+    revisions,
+    revisionByNoteId,
+    duplicateNoteIds,
+  };
+}
+
+function selectionSnapshotStaleNoteIds(noteIds, snapshot, expectedSnapshot) {
+  const staleNoteIds = new Set();
+  if (expectedSnapshot !== undefined) {
+    if (Boolean(snapshot) !== Boolean(expectedSnapshot)) return new Set(noteIds);
+    if (!snapshot && !expectedSnapshot) return staleNoteIds;
+    if (
+      snapshot.selectionSnapshotId !== expectedSnapshot.selectionSnapshotId
+      || snapshot.selectionSnapshotHash !== expectedSnapshot.selectionSnapshotHash
+    ) return new Set(noteIds);
+  }
+  if (!snapshot) return staleNoteIds;
+  const invalidReference = !snapshot.selectionSnapshotId || !MANIFEST_HASH.test(snapshot.selectionSnapshotHash);
+  for (const noteId of noteIds) {
+    const revision = snapshot.revisionByNoteId.get(noteId);
+    if (
+      invalidReference
+      || snapshot.duplicateNoteIds.has(noteId)
+      || !MANIFEST_HASH.test(String(revision || ''))
+      || (expectedSnapshot && revision !== expectedSnapshot.revisionByNoteId.get(noteId))
+    ) staleNoteIds.add(noteId);
+  }
+  return staleNoteIds;
+}
+
+function selectionSnapshotForNoteIds(snapshot, noteIds) {
+  const revisions = noteIds.map((noteId) => ({ noteId, revision: snapshot.revisionByNoteId.get(noteId) }));
+  return {
+    selectionSnapshotId: snapshot.selectionSnapshotId,
+    selectionSnapshotHash: snapshot.selectionSnapshotHash,
+    revisions,
+    revisionByNoteId: new Map(revisions.map((item) => [item.noteId, item.revision])),
+    duplicateNoteIds: new Set(),
+  };
+}
+
+function applicationRecordDeliveryUnavailable(record) {
+  return record?.delivery?.action === 'email_sent' || record?.delivery?.email?.status === 'sent';
+}
+
+function applicationBatchItemUnavailable(batch, item) {
+  const itemStatus = String(item?.status || '');
+  if (OCCUPIED_ITEM_STATUSES.has(itemStatus)) return true;
+  return OCCUPIED_BATCH_STATUSES.has(String(batch?.status || ''));
+}
+
 function normalizedCreateIdentity(value, maxBatchSize) {
   const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const selectionSnapshot = normalizedSelectionSnapshot(input);
   return {
     noteIds: normalizedNoteIds(input.noteIds, maxBatchSize),
     confirmedNoteIds: normalizedConfirmedNoteIds(input.confirmedNoteIds, maxBatchSize).sort(),
@@ -873,6 +1060,13 @@ function normalizedCreateIdentity(value, maxBatchSize) {
     minIntervalMs: boundedInteger(input.minIntervalMs, 0, MAX_MIN_INTERVAL_MS, DEFAULT_MIN_INTERVAL_MS),
     preflightId: optionalPreflightId(input.preflightId ?? input.planId) || '',
     manifestHash: optionalManifestHash(input.manifestHash) || '',
+    ...(selectionSnapshot ? {
+      selectionSnapshotId: selectionSnapshot.selectionSnapshotId,
+      selectionSnapshotHash: selectionSnapshot.selectionSnapshotHash,
+      selectionRevisions: [...selectionSnapshot.revisions].sort((left, right) => (
+        left.noteId.localeCompare(right.noteId) || left.revision.localeCompare(right.revision)
+      )),
+    } : {}),
   };
 }
 

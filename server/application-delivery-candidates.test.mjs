@@ -14,9 +14,10 @@ function candidate(noteId, overrides = {}) {
     body: `正文 ${noteId}`,
     collected_at: `2026-08-0${noteId.slice(-1)}T00:00:00.000Z`,
     publish_time: { value: `2026-08-0${noteId.slice(-1)}T00:00:00.000Z` },
+    job_card: { role_name: 'AI产品经理实习生' },
     application_info: { contacts: [], application_routes: [] },
     outreach: {
-      email_subject: `申请 ${noteId}`,
+      email_subject: '应聘AI产品经理实习生',
       email_body: `邮件正文 ${noteId}`,
       cover_letter: `Cover Letter ${noteId}`,
       content_quality: { batch_ready: true },
@@ -76,7 +77,27 @@ test('rejects a cursor when filters change', () => {
   const first = buildApplicationDeliveryCandidates({ jobId: 'job-1', records, limit: 1 });
   assert.throws(
     () => buildApplicationDeliveryCandidates({ jobId: 'job-1', records, query: { cursor: first.nextCursor, copyStatus: 'passed' }, limit: 1 }),
-    (error) => error instanceof ApplicationDeliveryCandidateError && error.code === 'APPLICATION_CANDIDATE_CURSOR_INVALID',
+    (error) => error instanceof ApplicationDeliveryCandidateError
+      && error.code === 'APPLICATION_CANDIDATE_CURSOR_INVALID'
+      && error.status === 400,
+  );
+});
+
+test('rejects a cursor with 409 when the filtered candidate dataset changes', () => {
+  const records = [candidate('1'), candidate('2')];
+  const first = buildApplicationDeliveryCandidates({ jobId: 'job-1', records, limit: 1 });
+  assert.ok(first.nextCursor);
+
+  assert.throws(
+    () => buildApplicationDeliveryCandidates({
+      jobId: 'job-1',
+      records: [...records, candidate('3')],
+      query: { cursor: first.nextCursor },
+      limit: 1,
+    }),
+    (error) => error instanceof ApplicationDeliveryCandidateError
+      && error.code === 'APPLICATION_CANDIDATE_CURSOR_STALE'
+      && error.status === 409,
   );
 });
 
@@ -108,6 +129,64 @@ test('selection snapshot changes when a source revision changes', () => {
   const second = buildApplicationDeliveryCandidates({ jobId: 'job-1', records: [after] });
   assert.notEqual(applicationDeliveryCandidateRevision(before), applicationDeliveryCandidateRevision(after));
   assert.notEqual(first.selectionSnapshot.selectionSnapshotHash, second.selectionSnapshot.selectionSnapshotHash);
+});
+
+test('selection snapshot hash includes latest batch identity, statuses, and revisions', () => {
+  const record = candidate('1');
+  const batch = {
+    batchId: 'batch-1',
+    status: 'ready',
+    revision: 1,
+    updatedAt: '2026-08-05T00:00:00.000Z',
+    items: [{
+      itemId: 'item-1',
+      noteId: '1',
+      status: 'ready',
+      revision: 1,
+      updatedAt: '2026-08-05T00:00:00.000Z',
+    }],
+  };
+  const first = buildApplicationDeliveryCandidates({ jobId: 'job-1', records: [record], batches: [batch] });
+  const firstRevision = first.selectionSnapshot.revisions[0].revision;
+
+  const variants = [
+    { ...batch, batchId: 'batch-2' },
+    { ...batch, status: 'approved' },
+    { ...batch, revision: 2 },
+    { ...batch, items: [{ ...batch.items[0], status: 'sending' }] },
+    { ...batch, items: [{ ...batch.items[0], revision: 2 }] },
+  ];
+  for (const changedBatch of variants) {
+    const changed = buildApplicationDeliveryCandidates({ jobId: 'job-1', records: [record], batches: [changedBatch] });
+    assert.equal(changed.selectionSnapshot.revisions[0].revision, firstRevision);
+    assert.notEqual(changed.selectionSnapshot.selectionSnapshotHash, first.selectionSnapshot.selectionSnapshotHash);
+  }
+});
+
+test('rejects an existing cursor after latest batch state changes', () => {
+  const records = [candidate('1'), candidate('2')];
+  const batch = {
+    batchId: 'batch-1',
+    status: 'ready',
+    revision: 1,
+    updatedAt: '2026-08-05T00:00:00.000Z',
+    items: [{ itemId: 'item-1', noteId: '1', status: 'ready', revision: 1 }],
+  };
+  const first = buildApplicationDeliveryCandidates({ jobId: 'job-1', records, batches: [batch], limit: 1 });
+  assert.ok(first.nextCursor);
+
+  assert.throws(
+    () => buildApplicationDeliveryCandidates({
+      jobId: 'job-1',
+      records,
+      batches: [{ ...batch, revision: 2, items: [{ ...batch.items[0], status: 'sent', revision: 2 }] }],
+      query: { cursor: first.nextCursor },
+      limit: 1,
+    }),
+    (error) => error instanceof ApplicationDeliveryCandidateError
+      && error.code === 'APPLICATION_CANDIDATE_CURSOR_STALE'
+      && error.status === 409,
+  );
 });
 
 test('latest batch state is included and sent candidates can be filtered', () => {
@@ -147,4 +226,23 @@ test('delivery candidates expose the globally resolved subject instead of a nois
   assert.equal(item.outreach.email_subject, '应聘岗位');
   assert.equal(item.emailSubjectGuard.requiresReview, true);
   assert.equal(item.deliveryManifestSummary.subjectRuleStatus, 'needs_input');
+});
+
+test('delivery candidates keep an unverified source subject blocked after generating a safe preview', () => {
+  const result = buildApplicationDeliveryCandidates({
+    jobId: 'job-1',
+    records: [candidate('1', {
+      outreach: {
+        email_subject: 'Weekly update',
+        email_body: 'Email body',
+        cover_letter: 'Cover Letter',
+        content_quality: { batch_ready: true },
+      },
+    })],
+  });
+  const item = result.items[0];
+  assert.equal(item.emailSubjectGuard.sourceStatus, 'rejected_unverified_subject');
+  assert.equal(item.deliveryManifestSummary.subjectRuleStatus, 'needs_input');
+  assert.equal(item.deliveryManifestSummary.readiness, 'needs_input');
+  assert.ok(item.deliveryManifestSummary.blockers.some((blocker) => blocker.code === 'SUBJECT_REVIEW_REQUIRED'));
 });

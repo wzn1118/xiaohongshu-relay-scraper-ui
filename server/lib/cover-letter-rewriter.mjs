@@ -163,8 +163,10 @@ function isRewriteOutput(value) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
   const coverLetter = String(result.cover_letter || '').trim();
   const charCount = Array.from(coverLetter.replace(/\s+/gu, '')).length;
+  const emailSubject = String(result.email_subject || '').trim();
   return Boolean(
     coverLetter
+      && emailSubject
       && charCount >= 800
       && charCount <= 1_600
       && Number(result.char_count) === charCount

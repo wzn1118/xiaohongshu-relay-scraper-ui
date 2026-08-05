@@ -28,6 +28,7 @@ function validOutput() {
   const coverLetter = '我'.repeat(800);
   return {
     result: {
+      email_subject: '内容运营实习申请｜示例用户',
       cover_letter: coverLetter,
       used_evidence_ids: ['evidence-1'],
       evidence_coverage: [{ evidence_id: 'evidence-1', evidence_sentence: coverLetter }],

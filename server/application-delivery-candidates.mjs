@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import { resolveApplicationEmailSubject } from './lib/application-email-draft.mjs';
+import {
+  applicationSubjectGuard,
+  resolveApplicationEmailSubject,
+} from './lib/application-email-draft.mjs';
 
 const EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
 const FILTER_FIELDS = Object.freeze([
@@ -13,11 +16,11 @@ const FILTER_FIELDS = Object.freeze([
 ]);
 
 export class ApplicationDeliveryCandidateError extends Error {
-  constructor(code, message) {
+  constructor(code, message, status = 400) {
     super(message);
     this.name = 'ApplicationDeliveryCandidateError';
     this.code = code;
-    this.status = 400;
+    this.status = status;
   }
 }
 
@@ -48,12 +51,16 @@ export function buildApplicationDeliveryCandidates({
   ));
   const sorted = sortCandidates(filtered, normalizedQuery.sort);
   const queryHash = hashJson({ ...normalizedQuery, cursor: undefined });
-  const offset = decodeCursor(normalizedQuery.cursor, queryHash);
+  const revisions = sorted.map((entry) => ({
+    noteId: entry.summary.noteId,
+    revision: entry.summary.sourceRevision,
+  }));
+  const snapshotState = sorted.map(selectionSnapshotState);
+  const selectionSnapshotHash = hashJson({ jobId: String(jobId || ''), queryHash, snapshotState });
+  const offset = decodeCursor(normalizedQuery.cursor, queryHash, selectionSnapshotHash);
   const safeLimit = Math.min(100, Math.max(1, Number(limit) || 20));
   const page = sorted.slice(offset, offset + safeLimit);
   const nextOffset = offset + page.length;
-  const revisions = sorted.map((entry) => ({ noteId: entry.summary.noteId, revision: entry.summary.sourceRevision }));
-  const selectionSnapshotHash = hashJson({ jobId: String(jobId || ''), queryHash, revisions });
   const selectableNoteIds = sorted
     .filter((entry) => isSelectableCandidateSummary(entry.summary))
     .map((entry) => entry.summary.noteId);
@@ -69,7 +76,7 @@ export function buildApplicationDeliveryCandidates({
     offset,
     limit: safeLimit,
     cursor: normalizedQuery.cursor || null,
-    nextCursor: nextOffset < sorted.length ? encodeCursor(nextOffset, queryHash) : null,
+    nextCursor: nextOffset < sorted.length ? encodeCursor(nextOffset, queryHash, selectionSnapshotHash) : null,
     items: page.map((entry) => ({ ...entry.record, deliveryManifestSummary: entry.summary })),
     filters: publicQuery(normalizedQuery),
     facetCounts,
@@ -88,7 +95,7 @@ export function buildApplicationDeliveryCandidates({
   };
 }
 
-function withResolvedApplicationSubject(record) {
+export function withResolvedApplicationSubject(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return record;
   const resolution = resolveApplicationEmailSubject(record, record?.outreach?.email_subject);
   return {
@@ -115,9 +122,16 @@ function isSelectableCandidateSummary(summary) {
 }
 
 export function applicationDeliveryCandidateRevision(record) {
+  return hashJson(applicationDeliveryCandidateRevisionInput(record, true));
+}
+
+export function applicationDeliveryCandidateContentRevision(record) {
+  return hashJson(applicationDeliveryCandidateRevisionInput(record, false));
+}
+
+function applicationDeliveryCandidateRevisionInput(record, includeDeliveryUpdatedAt) {
   const discovery = record?.contactDiscovery || {};
-  const subjectResolution = resolveApplicationEmailSubject(record, record?.outreach?.email_subject);
-  return hashJson({
+  return {
     noteId: noteIdOf(record),
     collectedAt: record?.collected_at || '',
     publishTime: record?.publish_time?.value || record?.publish_time?.raw || '',
@@ -125,17 +139,20 @@ export function applicationDeliveryCandidateRevision(record) {
     body: record?.body || '',
     draft: record?.draftVersion || null,
     outreach: {
-      subject: subjectResolution.subject,
+      // Keep the persisted value in the revision so an edited stale subject
+      // invalidates an earlier Dry Run. Public delivery views are normalized
+      // separately by withResolvedApplicationSubject().
+      subject: record?.outreach?.email_subject || '',
       body: record?.outreach?.email_body || '',
       coverLetter: record?.outreach?.cover_letter || '',
       quality: record?.outreach?.content_quality || null,
     },
-    deliveryUpdatedAt: record?.delivery?.updatedAt || '',
+    ...(includeDeliveryUpdatedAt ? { deliveryUpdatedAt: record?.delivery?.updatedAt || '' } : {}),
     contactEvidence: (Array.isArray(discovery.candidates) ? discovery.candidates : [])
       .map((candidate) => [candidate.address, candidate.evidenceHash, candidate.verificationStatus]),
     subjectRequirement: record?.emailSubjectRequirement || null,
     attachmentRequirement: record?.attachmentRequirement || null,
-  });
+  };
 }
 
 function classifyCandidate(record, latestBatch) {
@@ -162,6 +179,14 @@ function classifyCandidate(record, latestBatch) {
       : 'needs_input';
   return {
     record,
+    selectionBatchRevision: latestBatch ? {
+      batchId: latestBatch.batchId,
+      batchStatus: latestBatch.batchStatus,
+      batchRevision: latestBatch.batchRevision,
+      itemId: latestBatch.item?.itemId,
+      itemStatus: latestBatch.item?.status,
+      itemRevision: normalizedRevision(latestBatch.item?.revision),
+    } : null,
     summary: {
       schemaVersion: 2,
       noteId,
@@ -250,7 +275,13 @@ function classifyCopy(record) {
 }
 
 function classifySubject(record) {
-  if (record?.emailSubjectGuard?.requiresReview === true || !String(record?.outreach?.email_subject || '').trim()) return 'needs_input';
+  const subject = String(record?.outreach?.email_subject || '').trim();
+  const subjectGuard = record?.emailSubjectGuard || applicationSubjectGuard(record, subject);
+  if (!subject
+    || subjectGuard.requiresReview
+    || ['rejected_noisy_title', 'rejected_bare_title', 'rejected_unverified_subject'].includes(subjectGuard.sourceStatus)) {
+    return 'needs_input';
+  }
   if (record?.emailSubjectRequirement?.detected === true) return 'job_requirement_satisfied';
   return 'batch_default';
 }
@@ -286,6 +317,7 @@ function latestBatchItemsByNoteId(batches, batchId) {
       map.set(noteId, {
         batchId: String(batch.batchId || ''),
         batchStatus: String(batch.status || ''),
+        batchRevision: normalizedRevision(batch.revision),
         updatedAt: String(item.updatedAt || batch.updatedAt || ''),
         item,
       });
@@ -396,19 +428,44 @@ function noteIdOf(record) {
   return String(record?.note_id || record?.noteId || record?.post_id || record?.id || '');
 }
 
-function encodeCursor(offset, queryHash) {
-  return Buffer.from(JSON.stringify({ v: 1, offset, queryHash }), 'utf8').toString('base64url');
+function selectionSnapshotState(entry) {
+  return {
+    noteId: entry.summary.noteId,
+    revision: hashJson({
+      sourceRevision: entry.summary.sourceRevision,
+      latestBatch: entry.selectionBatchRevision,
+    }),
+  };
 }
 
-function decodeCursor(cursor, queryHash) {
+function normalizedRevision(value) {
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+}
+
+function encodeCursor(offset, queryHash, selectionSnapshotHash) {
+  return Buffer.from(JSON.stringify({ v: 2, offset, queryHash, selectionSnapshotHash }), 'utf8').toString('base64url');
+}
+
+function decodeCursor(cursor, queryHash, selectionSnapshotHash) {
   if (!cursor) return 0;
+  let parsed;
   try {
-    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
-    if (parsed?.v !== 1 || parsed?.queryHash !== queryHash || !Number.isSafeInteger(parsed?.offset) || parsed.offset < 0) throw new Error('invalid');
-    return parsed.offset;
+    parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
   } catch {
     throw new ApplicationDeliveryCandidateError('APPLICATION_CANDIDATE_CURSOR_INVALID', '候选列表游标已失效，请从第一页重新加载。');
   }
+  if (parsed?.v !== 2 || parsed?.queryHash !== queryHash || !Number.isSafeInteger(parsed?.offset) || parsed.offset < 0) {
+    throw new ApplicationDeliveryCandidateError('APPLICATION_CANDIDATE_CURSOR_INVALID', '候选列表游标已失效，请从第一页重新加载。');
+  }
+  if (parsed.selectionSnapshotHash !== selectionSnapshotHash) {
+    throw new ApplicationDeliveryCandidateError(
+      'APPLICATION_CANDIDATE_CURSOR_STALE',
+      '候选列表在翻页期间已更新，请从第一页重新加载。',
+      409,
+    );
+  }
+  return parsed.offset;
 }
 
 function hashJson(value) {

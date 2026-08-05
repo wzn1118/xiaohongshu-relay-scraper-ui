@@ -2304,7 +2304,7 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
 .batch-application-table th:nth-child(5) { width: 19%; }
 .batch-application-table th:nth-child(6) { width: 25%; }
 .batch-application-table th:nth-child(7) { width: auto; }
-.batch-application-table td { min-width: 0; padding: 9px 8px; vertical-align: top; border-bottom: 1px solid #e4e5e2; color: #303432; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.batch-application-table td { height: auto; min-width: 0; padding: 9px 8px; vertical-align: top; border-bottom: 1px solid #e4e5e2; color: #303432; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
 .batch-application-table tr:last-child td { border-bottom: 0; }
 .batch-application-table tr.selected td:first-child { box-shadow: inset 3px 0 0 #18755e; }
 .batch-application-table tr.status-ready { background: #fbfdfc; }

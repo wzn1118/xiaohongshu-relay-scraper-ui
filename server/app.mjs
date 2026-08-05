@@ -56,6 +56,7 @@ import { ApplicationBatchService, ApplicationBatchServiceError } from './applica
 import {
   ApplicationDeliveryCandidateError,
   buildApplicationDeliveryCandidates,
+  withResolvedApplicationSubject,
 } from './application-delivery-candidates.mjs';
 import { ApplicationContactOcrService } from './application-contact-ocr-service.mjs';
 import { ApplicationContactResolutionService } from './application-contact-resolution-service.mjs';
@@ -431,16 +432,34 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         )
           .map((historyJobId) => manager.getInternal(historyJobId)?.outputDir)
           .filter((outputDir) => outputDir && path.resolve(outputDir) !== cacheKey);
-        const loadRecord = async (noteId) => {
-          const record = await readApplicationRecord(internal.outputDir, noteId);
-          const state = await readDeliveryState(internal.outputDir);
-          return mergeApplicationState(
-            record,
-            state[noteId],
-            record[APPLICATION_RECORD_INDEX],
-            record[APPLICATION_ARTIFACT_FILENAME],
-          );
-        };
+          const loadRecord = async (noteId) => {
+            const records = (await readApplicationContactRecords(internal.outputDir, internal))
+              .map(withApplicationAttachmentRequirement)
+              .map(withResolvedApplicationSubject);
+            const record = records.find((item) => String(item?.note_id || '') === String(noteId));
+            if (!record) {
+              const error = new Error(`Application record not found: ${noteId}`);
+              error.code = 'APPLICATION_RECORD_NOT_FOUND';
+              throw error;
+            }
+            try {
+              const cachedResolution = await applicationContactResolution.refresh({
+                outputDir: internal.outputDir,
+                fallbackOutputDirs,
+                task: internal,
+              });
+              const reportItem = (Array.isArray(cachedResolution?.report?.items)
+                ? cachedResolution.report.items
+                : [])
+                .find((item) => String(item?.noteId || '') === String(noteId));
+              return {
+                ...record,
+                contactDiscovery: reportItem || null,
+              };
+            } catch {
+              return { ...record, contactDiscovery: null };
+            }
+          };
         const replyTo = String(internal.params?.candidateProfile?.email || '').trim();
         return new ApplicationBatchService({
           jobId,
@@ -2333,7 +2352,11 @@ function applicationCoverageFromRecords(records, payload, task) {
     const quality = isRecord(record?.quality) ? record.quality : null;
     return Boolean(quality) && Object.values(quality).every(Boolean);
   });
-  const firstFinite = (...values) => values.find((value) => Number.isFinite(Number(value)));
+  const firstFinite = (...values) => values.find((value) => (
+    value !== null
+    && value !== undefined
+    && Number.isFinite(Number(value))
+  ));
   const discovered = firstFinite(
     sourceCoverage.targetCount,
     qualityGate.discovered_count,
@@ -3339,7 +3362,13 @@ async function rewriteApplicationCoverLetter(
     throw wrapped;
   }
 
-  const coverLetter = String(rewritten?.cover_letter ?? rewritten?.coverLetter ?? '').trim();
+  const normalizedRewrite = normalizeCoverLetterRewriteOutput(
+    rewritten,
+    currentDraft,
+    record,
+  );
+  const coverLetter = normalizedRewrite.coverLetter;
+  const emailSubject = normalizedRewrite.emailSubject;
   const charCount = unicodeNonWhitespaceCount(coverLetter);
   const responsibilityCoverage = Array.isArray(rewritten?.responsibility_coverage)
     ? rewritten.responsibility_coverage
@@ -3450,7 +3479,11 @@ async function rewriteApplicationCoverLetter(
     noteId,
     draftId: requestedDraftId,
     baseVersion: expectedVersion,
-    outreach: { ...currentDraft, cover_letter: coverLetter },
+    outreach: {
+      ...currentDraft,
+      email_subject: emailSubject,
+      cover_letter: coverLetter,
+    },
     preserveEmailSubject: true,
     applicationContext,
     generation: {
@@ -3497,6 +3530,37 @@ async function rewriteApplicationCoverLetter(
 
 function unicodeNonWhitespaceCount(value) {
   return Array.from(String(value || '').replace(/\s+/gu, '')).length;
+}
+
+function normalizeCoverLetterRewriteOutput(rewritten, currentDraft, record) {
+  let coverLetter = String(rewritten?.cover_letter ?? rewritten?.coverLetter ?? '').trim();
+  let emailSubject = String(rewritten?.email_subject ?? rewritten?.emailSubject ?? '').trim();
+  const draftSubject = String(currentDraft?.email_subject || '').trim();
+  emailSubject = emailSubject.replace(/^(?:\u4e3b\u9898|\u90ae\u4ef6\u4e3b\u9898|Subject)\s*[:：]\s*/iu, '').trim();
+  const heading = coverLetter.match(/^\s*(?:\u4e3b\u9898|\u90ae\u4ef6\u4e3b\u9898|Subject)\s*[:：]\s*([^\r\n]+)\s*(?:\r?\n|$)/iu);
+  if (heading) {
+    emailSubject = emailSubject || draftSubject || String(heading[1] || '').trim();
+    coverLetter = coverLetter.slice(heading[0].length).trim();
+  } else {
+    const firstBreak = coverLetter.indexOf('\n');
+    if (firstBreak > 0) {
+      const firstLine = coverLetter.slice(0, firstBreak).trim();
+      const remainder = coverLetter.slice(firstBreak + 1).trim();
+      const looksLikeHeading = firstLine.length <= 120
+        && !/^(?:尊敬|Dear|您好|Hi)\b/iu.test(firstLine)
+        && (/尊敬|招聘负责人|Dear/iu.test(remainder.slice(0, 160)) || /申请|应聘|求职/u.test(firstLine) || firstLine.includes('｜'));
+      if (looksLikeHeading) {
+        emailSubject = emailSubject || draftSubject || firstLine;
+        coverLetter = remainder;
+      }
+    }
+  }
+  if (!emailSubject) emailSubject = draftSubject;
+  if (!emailSubject) {
+    const roleName = String(record?.application_info?.role_name || record?.job_card?.role_name || record?.title || '').trim();
+    emailSubject = roleName ? `${roleName}申请` : '求职申请';
+  }
+  return { emailSubject, coverLetter };
 }
 
 function assertCoverLetterRewriteResult(

@@ -2515,7 +2515,7 @@ function validRewrittenCoverLetter() {
     + '并记录内容调整前后的变化，让每次优化都能回到用户需求和业务目标，而不是依赖空泛表达。'
   ));
   return {
-    coverLetter: `主题：内容运营实习申请｜内容策划与数据复盘\n尊敬的招聘负责人：\n\n${researchSentence}\n\n${communitySentence}\n\n${responseSentence}\n\n${paragraphs.join('\n\n')}\n\n此致\n敬礼`,
+    coverLetter: `尊敬的招聘负责人：\n\n${researchSentence}\n\n${communitySentence}\n\n${responseSentence}\n\n${paragraphs.join('\n\n')}\n\n此致\n敬礼`,
     responseSentence,
     researchSentence,
     communitySentence,
@@ -2592,6 +2592,8 @@ test('a non-persistent preview returns the full preview without writing delivery
 test('Cover Letter rewrite sends the exact role context and instructions to the configured model and saves a new version', async (t) => {
   const calls = [];
   const generated = validRewrittenCoverLetter();
+  generated.coverLetter = `Subject: Content Operations Intern | Evidence\n${generated.coverLetter}`;
+  const expectedCoverLetter = generated.coverLetter.replace(/^Subject:[^\r\n]+\r?\n/u, '').trim();
   const rootRoleRecord = applicationRecord();
   rootRoleRecord.responsibilities = ['内容策划'];
   rootRoleRecord.requirements = ['数据分析'];
@@ -2664,7 +2666,8 @@ test('Cover Letter rewrite sends the exact role context and instructions to the 
   assert.equal(calls[0].payload.candidateProfile.resumeArtifacts[0].id, 'resume-ops');
   assert.equal(calls[0].ai.model, 'fixture-quality-model');
   assert.equal(fixture.resolvedAiSessions.at(-1), 'advanced-cover-session');
-  assert.equal(response.body.outreach.cover_letter, generated.coverLetter);
+  assert.equal(response.body.outreach.cover_letter, expectedCoverLetter);
+  assert.doesNotMatch(response.body.outreach.cover_letter, /^Subject:/u);
   assert.equal(response.body.outreach.email_subject, customSubject);
   assert.equal(response.body.draftVersion.version, 2);
   assert.equal(response.body.generation.model, 'fixture-quality-model');
@@ -2673,7 +2676,7 @@ test('Cover Letter rewrite sends the exact role context and instructions to the 
   const state = await readDeliveryState(fixture.outputDir);
   assert.equal(state[NOTE_ID].draftStore.currentVersion, 2);
   assert.equal(state[NOTE_ID].draftStore.versions[0].content.cover_letter, initial.outreach.cover_letter);
-  assert.equal(state[NOTE_ID].draftStore.versions[1].content.cover_letter, generated.coverLetter);
+  assert.equal(state[NOTE_ID].draftStore.versions[1].content.cover_letter, expectedCoverLetter);
   const expectedInputHash = createHash('sha256')
     .update(JSON.stringify([
       'cover-letter-rewrite-input:v3-signature-evidence',

@@ -180,9 +180,20 @@ test('API delivery sends a quality-checked UTF-8 message with immutable PDF/DOCX
   assert.equal(checked.body.cover_letter_evaluation.passed, true);
   assert.equal(Object.keys(checked.body.cover_letter_evaluation.rubric).length, 10);
 
+  const recipientCandidate = initial.contactDiscovery?.candidates?.find((candidate) => (
+    String(candidate?.address || '').toLowerCase() === RECIPIENT
+  ));
+  assert.ok(recipientCandidate?.evidenceHash);
+  assert.ok(recipientCandidate?.sourceRevision);
+  const recipientEvidence = {
+    evidenceHash: recipientCandidate.evidenceHash,
+    sourceRevision: recipientCandidate.sourceRevision,
+  };
+
   const preview = await postJson(api.origin, 'send-email/preview', {
     noteId: NOTE_ID,
     to: RECIPIENT,
+    ...recipientEvidence,
     draftId: checked.body.draftVersion.draftId,
     version: checked.body.draftVersion.version,
     attachmentIds,
@@ -207,6 +218,7 @@ test('API delivery sends a quality-checked UTF-8 message with immutable PDF/DOCX
   const sent = await postJson(api.origin, 'send-email', {
     noteId: NOTE_ID,
     to: RECIPIENT,
+    ...recipientEvidence,
     draftId: checked.body.draftVersion.draftId,
     version: checked.body.draftVersion.version,
     attachmentIds,
@@ -289,8 +301,8 @@ test('batch API sends one independently frozen message per selected role through
     {
       noteId: 'batch-role-growth',
       recipient: 'growth@example.test',
-      roleName: 'Growth Strategist',
-      subject: 'Application for Growth Strategist',
+      roleName: 'Growth Marketing Manager',
+      subject: 'Application for Growth Marketing Manager',
       body: '您好，我是 Test Candidate，申请 Growth Strategist 岗位。我有增长实验、渠道分析和数据复盘经验，能够根据转化结果持续调整策略并推动落地。希望有机会进一步沟通团队目标，感谢您的时间。',
     },
     {
@@ -321,6 +333,7 @@ test('batch API sends one independently frozen message per selected role through
   const results = new Map(resultsResponse.body.items.map((item) => [item.note_id, item]));
   const resumeBytes = Buffer.from('%PDF-1.7\nBatch resume fixture\n%%EOF\n', 'utf8');
   const resumeSha256 = sha256(resumeBytes);
+  const qualityInputs = [];
   for (const item of cases) {
     const record = results.get(item.noteId);
     assert.ok(record?.draftVersion, `Missing draft version for ${item.noteId}`);
@@ -337,6 +350,39 @@ test('batch API sends one independently frozen message per selected role through
     });
     assert.equal(uploaded.status, 201, JSON.stringify(uploaded.body));
     assert.equal(uploaded.body.attachment.sha256, resumeSha256);
+
+    qualityInputs.push({
+      noteId: item.noteId,
+      draftId: record.draftVersion.draftId,
+      version: record.draftVersion.version,
+      contentHash: record.draftVersion.contentHash,
+      attachmentId: uploaded.body.attachment.attachmentId,
+    });
+    const checked = await postJson(api.origin, 'draft/quality', {
+      noteId: item.noteId,
+      draftId: record.draftVersion.draftId,
+      version: record.draftVersion.version,
+      contentHash: record.draftVersion.contentHash,
+      attachmentIds: [uploaded.body.attachment.attachmentId],
+      aiSessionId: 'mailpit-quality-session',
+    });
+    assert.equal(checked.status, 200, JSON.stringify(checked.body));
+    assert.equal(checked.body.draftVersion.qualityStatus, 'passed');
+  }
+
+  // The quality report includes the peer-draft corpus. Recheck after every
+  // selected draft exists so the final report is bound to the complete set.
+  for (const input of qualityInputs) {
+    const checked = await postJson(api.origin, 'draft/quality', {
+      noteId: input.noteId,
+      draftId: input.draftId,
+      version: input.version,
+      contentHash: input.contentHash,
+      attachmentIds: [input.attachmentId],
+      aiSessionId: 'mailpit-quality-session',
+    });
+    assert.equal(checked.status, 200, JSON.stringify(checked.body));
+    assert.equal(checked.body.draftVersion.qualityStatus, 'passed');
   }
 
   const createRequest = {
@@ -346,10 +392,35 @@ test('batch API sends one independently frozen message per selected role through
     aiSessionId: 'mailpit-quality-session',
     idempotencyKey: 'mailpit-batch-three-roles-v1',
   };
+  const candidates = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-delivery-candidates?limit=20`);
+  assert.equal(candidates.status, 200, JSON.stringify(candidates.body));
+  const selectionSnapshot = candidates.body.selectionSnapshot;
+  assert.deepEqual(
+    [...selectionSnapshot.noteIds].sort(),
+    cases.map((item) => item.noteId).sort(),
+  );
+  const preflightRequest = {
+    ...createRequest,
+    selectionSnapshotId: selectionSnapshot.selectionSnapshotId,
+    selectionSnapshotHash: selectionSnapshot.selectionSnapshotHash,
+    selectionRevisions: selectionSnapshot.revisions,
+  };
+  const dryRun = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-batches/dry-run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(preflightRequest),
+  });
+  assert.equal(dryRun.status, 200, JSON.stringify(dryRun.body));
+  assert.deepEqual(dryRun.body.readyNoteIds, cases.map((item) => item.noteId));
   const created = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-batches`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(createRequest),
+    body: JSON.stringify({
+      ...preflightRequest,
+      preflightId: dryRun.body.preflightId,
+      manifestHash: dryRun.body.manifestHash,
+      confirmedNoteIds: dryRun.body.readyNoteIds,
+    }),
   });
   assert.equal(created.status, 201, JSON.stringify(created.body));
   assert.deepEqual(created.body.preflight.readyNoteIds, cases.map((item) => item.noteId));
@@ -401,7 +472,12 @@ test('batch API sends one independently frozen message per selected role through
   const replay = await requestJson(api.origin, `/api/jobs/${JOB_ID}/application-batches`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(createRequest),
+    body: JSON.stringify({
+      ...preflightRequest,
+      preflightId: dryRun.body.preflightId,
+      manifestHash: dryRun.body.manifestHash,
+      confirmedNoteIds: dryRun.body.readyNoteIds,
+    }),
   });
   assert.equal(replay.status, 200, JSON.stringify(replay.body));
   assert.equal(replay.body.idempotentReplay, true);
@@ -562,7 +638,7 @@ async function acquireMailpit() {
     if (!externalUrl || !externalSmtpPort) {
       throw new Error('MAILPIT_HTTP_URL and MAILPIT_SMTP_PORT must be supplied together.');
     }
-    await mailpitInfo(externalUrl);
+    await waitForExternalMailpit(externalUrl);
     return {
       apiBase: externalUrl,
       smtpHost: String(process.env.MAILPIT_SMTP_HOST || '127.0.0.1'),
@@ -620,6 +696,19 @@ async function acquireMailpit() {
       await removeDirectoryWithRetry(runDir);
     },
   };
+}
+
+async function waitForExternalMailpit(apiBase) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      return await mailpitInfo(apiBase);
+    } catch (error) {
+      lastError = error;
+      await delay(250);
+    }
+  }
+  throw lastError || new Error(`Mailpit did not become ready at ${apiBase}.`);
 }
 
 async function ensureWindowsMailpit() {

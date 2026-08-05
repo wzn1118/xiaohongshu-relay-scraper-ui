@@ -639,6 +639,10 @@ type ApiCapture = {
   candidateRequests: string[]
 }
 
+type WorkbenchFixtureOptions = {
+  staleCandidateCursorOnce?: boolean
+}
+
 function deliveryManifestSummary(record: ReturnType<typeof application>, activeBatch: ReturnType<typeof frozenBatch> | ReturnType<typeof controlledBatch> | ReturnType<typeof sentThreeEmailBatch> | null) {
   const batchItem = activeBatch?.items.find((item) => item.noteId === record.note_id)
   const contacts = [...(record.application_info.contacts || []), ...(record.application_info.application_routes || [])]
@@ -654,7 +658,9 @@ function deliveryManifestSummary(record: ReturnType<typeof application>, activeB
     : batchItem?.status === 'skipped' ? 'skipped'
       : batchItem?.status === 'unknown_manual_review' ? 'unknown'
         : batchItem?.status === 'failed_retryable' ? 'failed'
-          : recipientStatus === 'resolved' && copyStatus === 'passed' && subjectRuleStatus !== 'needs_input' ? 'ready_to_preview' : 'unprepared'
+          : batchItem && activeBatch?.status === 'running' ? 'sending'
+            : batchItem && ['ready', 'approved', 'paused'].includes(activeBatch?.status || '') ? 'frozen'
+              : recipientStatus === 'resolved' && copyStatus === 'passed' && subjectRuleStatus !== 'needs_input' ? 'ready_to_preview' : 'unprepared'
   const blockers = [
     ...(recipientStatus === 'missing' ? [{ code: 'NO_RECIPIENT', field: 'recipient', message: '未找到可用收件邮箱' }] : []),
     ...(copyStatus === 'missing_email_body' ? [{ code: 'EMAIL_BODY_REQUIRED', field: 'content.emailBody', message: '缺少邮件正文' }] : []),
@@ -710,8 +716,13 @@ function deliveryCandidatesResponse(
   const offset = Number(params.get('cursor') || 0)
   const limit = Math.min(100, Math.max(1, Number(params.get('limit') || 20)))
   const pageItems = filtered.slice(offset, offset + limit)
-  const revisions = filtered.map((record) => ({ noteId: record.note_id, revision: record.deliveryManifestSummary.sourceRevision }))
-  const snapshotHash = `snapshot-${filtered.map((record) => record.note_id).join('-') || 'empty'}`
+  const revisions = filtered.map((record) => ({
+    noteId: record.note_id,
+    revision: record.deliveryManifestSummary.sourceRevision,
+  }))
+  const snapshotHash = activeBatch
+    ? `snapshot-${filtered.map((record) => record.note_id).join('-') || 'empty'}-batch-${activeBatch.revision}-${activeBatch.status}`
+    : `snapshot-${filtered.map((record) => record.note_id).join('-') || 'empty'}`
   return {
     schemaVersion: 2,
     available: true,
@@ -760,11 +771,14 @@ function controlledBatch(status: 'running' | 'paused' | 'cancelled', revision: n
 
 async function openWorkbench(
   page: Page,
-  initialBatch: ReturnType<typeof sentThreeEmailBatch> | null = null,
+  initialBatch: ReturnType<typeof frozenBatch> | ReturnType<typeof controlledBatch> | ReturnType<typeof sentThreeEmailBatch> | null = null,
   sourceRecords = applications,
+  options: WorkbenchFixtureOptions = {},
 ): Promise<ApiCapture> {
   const capture: ApiCapture = { dryRuns: [], creates: [], approvals: [], controls: [], resultQueries: [], candidateRequests: [] }
   let currentBatch: ReturnType<typeof frozenBatch> | ReturnType<typeof controlledBatch> | ReturnType<typeof sentThreeEmailBatch> = initialBatch || frozenBatch('ready')
+  let hasCurrentBatch = Boolean(initialBatch)
+  let staleCandidateCursorRemaining = options.staleCandidateCursorOnce === true
 
   await installQuietEventSource(page)
   await page.route('**/api/**', async (route) => {
@@ -783,10 +797,18 @@ async function openWorkbench(
     if (path === '/api/profiles') return fulfillJson(route, [])
     if (path === `/api/jobs/${jobId}/application-delivery-candidates`) {
       capture.candidateRequests.push(request.url())
-      const q = new URL(request.url()).searchParams.get('q')?.toLocaleLowerCase() || ''
+      const requestUrl = new URL(request.url())
+      const q = requestUrl.searchParams.get('q')?.toLocaleLowerCase() || ''
       capture.resultQueries.push(q)
+      if (staleCandidateCursorRemaining && requestUrl.searchParams.has('cursor')) {
+        staleCandidateCursorRemaining = false
+        return fulfillJson(route, {
+          code: 'APPLICATION_CANDIDATE_CURSOR_STALE',
+          message: '候选分页游标已失效。',
+        }, 409)
+      }
       try {
-        return fulfillJson(route, deliveryCandidatesResponse(request.url(), sourceRecords, initialBatch ? currentBatch : null))
+        return fulfillJson(route, deliveryCandidatesResponse(request.url(), sourceRecords, hasCurrentBatch ? currentBatch : null))
       } catch (error) {
         const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
         console.error('application delivery candidates fixture failed', error)
@@ -832,11 +854,12 @@ async function openWorkbench(
       ))
       return fulfillJson(route, preflight(requestBody.noteIds as string[], approvedComment))
     }
-    if (path === batchCollection && method === 'GET') return fulfillJson(route, { batches: initialBatch ? [currentBatch] : [] })
+    if (path === batchCollection && method === 'GET') return fulfillJson(route, { batches: hasCurrentBatch ? [currentBatch] : [] })
     if (path === batchCollection && method === 'POST') {
       const requestBody = request.postDataJSON() as Record<string, unknown>
       capture.creates.push(requestBody)
       currentBatch = frozenBatch('ready')
+      hasCurrentBatch = true
       return fulfillJson(route, {
         schemaVersion: 1,
         batch: currentBatch,
@@ -882,6 +905,8 @@ async function exerciseWorkbench(page: Page) {
   await commentRow.getByRole('checkbox').check({ force: true })
   await partialRow.getByRole('checkbox').check({ force: true })
   await panel.getByRole('button', { name: 'Dry Run' }).click()
+  const freezeButton = panel.getByRole('button', { name: '冻结批次预览' })
+  await expect(freezeButton).toBeEnabled()
 
   await expect(panel.locator('thead th').filter({ hasText: '投递正文' })).toHaveCount(1)
   await expect(bodyRow.getByTestId(`batch-email-body-${bodyNoteId}`)).toContainText('这是针对产品经理岗位准备的求职邮件')
@@ -894,7 +919,11 @@ async function exerciseWorkbench(page: Page) {
   const search = panel.getByPlaceholder('搜索岗位、邮箱、主题或附件名')
   await search.fill('产品经理')
   await expect(bodyRow).toBeVisible()
+  await expect(bodyRow.getByTestId(`batch-cover-letter-${bodyNoteId}`)).toContainText('预演定稿关键词')
+  await expect(freezeButton).toBeDisabled()
   await search.fill('')
+  await expect(commentRow.getByRole('button', { name: /author@example\.test/ })).toBeVisible()
+  await expect(freezeButton).toBeDisabled()
   const coverLetterToggle = bodyRow.getByRole('button', { name: '展开全文' })
   await expect(coverLetterToggle).toHaveAttribute('aria-expanded', 'false')
   await coverLetterToggle.click()
@@ -925,21 +954,29 @@ async function exerciseWorkbench(page: Page) {
   await commentRow.getByRole('button', { name: /author@example\.test/ }).click()
   await expect(commentRow.getByText('帖主评论', { exact: true })).toBeVisible()
   await expect(commentRow.getByText('增长策略实习生-张三-北京大学-简历.pdf', { exact: true })).toBeVisible()
+  await expect(freezeButton).toBeEnabled()
 
   expect(capture.dryRuns).toHaveLength(2)
-  expect(capture.dryRuns[0]).toMatchObject({ noteIds: [bodyNoteId, commentNoteId, partialNoteId] })
+  expect(capture.dryRuns[0]).toMatchObject({
+    noteIds: [bodyNoteId, commentNoteId, partialNoteId],
+    selectionRevisions: [
+      { noteId: bodyNoteId, revision: `revision-${bodyNoteId}` },
+      { noteId: commentNoteId, revision: `revision-${commentNoteId}` },
+      { noteId: partialNoteId, revision: `revision-${partialNoteId}` },
+    ],
+  })
   expect(capture.dryRuns[1]).toMatchObject({
     noteIds: [bodyNoteId, commentNoteId, partialNoteId],
     contactApprovals: [{ noteId: commentNoteId, evidenceHash: commentEvidenceHash, confirmed: true }],
   })
 
-  const freezeButton = panel.getByRole('button', { name: '冻结批次预览' })
   await bodyRow.getByRole('checkbox').uncheck({ force: true })
   await expect(freezeButton).toBeDisabled()
   await bodyRow.getByRole('checkbox').check({ force: true })
   await expect(freezeButton).toBeDisabled()
   await panel.getByRole('button', { name: '仅保留可投递' }).click()
   await expect(freezeButton).toBeEnabled()
+  const candidateRequestsBeforeFreeze = capture.candidateRequests.length
   await freezeButton.click()
   const frozen = panel.getByRole('region', { name: '冻结批次预览' })
   const frozenItems = frozen.locator('.frozen-item-list')
@@ -957,10 +994,16 @@ async function exerciseWorkbench(page: Page) {
   await expect(emailCards.nth(0).locator('.batch-email-preview-body')).toHaveText(/.+/u)
   await expect(emailCards.nth(0).getByText('Cover Letter 正文', { exact: false })).toBeVisible()
   await expect(emailCards.nth(1)).toContainText('author@example.test')
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeFreeze + 1)
+  await expect(panel.locator('.batch-candidate-pagination')).toHaveAttribute('aria-busy', 'false')
 
+  const candidateRequestsBeforeApproval = capture.candidateRequests.length
   await frozen.getByRole('button', { name: '审批' }).click()
   await expect(panel.getByText('已审批', { exact: true })).toHaveText('已审批')
   await expect(frozen.getByRole('button', { name: '开始' })).toBeEnabled()
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeApproval + 1)
+  await expect(panel.locator('.batch-candidate-pagination')).toHaveAttribute('aria-busy', 'false')
+  await expect(panel.locator('.batch-selection-summary')).toContainText('筛选外 0 · 无效 2')
   expect(capture.creates).toHaveLength(1)
   expect(capture.creates[0]).toMatchObject({
     noteIds: [bodyNoteId, commentNoteId],
@@ -972,7 +1015,6 @@ async function exerciseWorkbench(page: Page) {
     selectionRevisions: [
       { noteId: bodyNoteId, revision: `revision-${bodyNoteId}` },
       { noteId: commentNoteId, revision: `revision-${commentNoteId}` },
-      { noteId: partialNoteId, revision: `revision-${partialNoteId}` },
     ],
   })
   expect(String(capture.creates[0].idempotencyKey)).toContain('8'.repeat(64))
@@ -994,6 +1036,21 @@ for (const viewport of [
     const { panel } = await exerciseWorkbench(page)
     await expect(panel).toBeVisible()
     await expect(panel.locator('.batch-status-badge')).toBeVisible()
+    if (viewport.name === 'mobile') {
+      const mobileRowLayout = await panel.locator('tbody tr').first().evaluate((row) => {
+        const cells = [...row.querySelectorAll(':scope > td')]
+        const boxes = cells.map((cell) => {
+          const box = cell.getBoundingClientRect()
+          const childBottom = Math.max(box.top, ...[...cell.children].map((child) => child.getBoundingClientRect().bottom))
+          return { top: box.top, bottom: box.bottom, childBottom }
+        })
+        return {
+          childrenContained: boxes.every((box) => box.childBottom <= box.bottom + 1),
+          cellsSeparated: boxes.every((box, index) => index === boxes.length - 1 || box.bottom <= boxes[index + 1].top + 1),
+        }
+      })
+      expect(mobileRowLayout).toEqual({ childrenContained: true, cellsSeparated: true })
+    }
     await page.evaluate(() => {
       document.documentElement.style.scrollBehavior = 'auto'
       document.body.style.scrollBehavior = 'auto'
@@ -1006,21 +1063,27 @@ for (const viewport of [
 
 test('structured filters include matching roles beyond the first candidate page', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1_000 })
-  await openWorkbench(page, null, paginatedApplications)
+  const capture = await openWorkbench(page, null, paginatedApplications)
   const panel = page.getByRole('region', { name: '批量投递工作台' })
 
   await expect(panel.locator('tbody tr')).toHaveCount(20)
+  await expect.poll(() => capture.candidateRequests.length).toBe(1)
   const namingFilter = panel.getByRole('combobox', { name: '附件筛选' })
   await namingFilter.selectOption('will_rename')
+  await expect.poll(() => capture.candidateRequests.length).toBe(2)
   await expect(panel.locator('.batch-search-summary')).toContainText('待投岗位 25 项')
   await expect(panel.locator('.batch-search-summary')).toContainText('筛选结果 1 项')
   await expect(panel.getByText('岗位 25', { exact: true })).toBeVisible()
   await expect(panel.getByText('跨页命名-姓名-岗位.pdf', { exact: true })).toBeVisible()
   const search = panel.getByPlaceholder('搜索岗位、邮箱、主题或附件名')
-  await search.fill('跨页命名')
+  await search.fill('不存在的岗位')
   await expect(namingFilter).toHaveValue('will_rename')
+  await expect(panel.locator('.batch-search-empty-row')).toBeVisible()
+  await expect.poll(() => capture.candidateRequests.length).toBe(3)
   await search.fill('')
   await expect(namingFilter).toHaveValue('will_rename')
+  await expect(panel.getByText('岗位 25', { exact: true })).toBeVisible()
+  await expect.poll(() => capture.candidateRequests.length).toBe(3)
 })
 
 test('candidate pagination loads one server page and keeps cross-page selection stable', async ({ page }) => {
@@ -1044,17 +1107,62 @@ test('candidate pagination loads one server page and keeps cross-page selection 
 
   await panel.getByTitle('上一页待投岗位').click()
   await expect(panel.getByText('岗位 1', { exact: true })).toBeVisible()
-  await expect.poll(() => capture.candidateRequests.length).toBe(3)
+  await expect.poll(() => capture.candidateRequests.length).toBe(2)
   const page1Row = panel.locator('tbody tr').filter({ has: page.getByText('分页岗位 1', { exact: true }) })
   await page1Row.locator('label.batch-checkbox').click()
   await expect(panel.locator('.batch-selection-actions')).toContainText('已选 2 / 10')
 
   await panel.getByTitle('下一页待投岗位').click()
   await expect(page21Row.getByRole('checkbox')).toBeChecked()
-  await expect.poll(() => capture.candidateRequests.length).toBe(4)
+  await expect.poll(() => capture.candidateRequests.length).toBe(2)
+  await panel.getByRole('combobox', { name: '附件筛选' }).selectOption('will_rename')
+  await expect(panel.getByText('岗位 25', { exact: true })).toBeVisible()
+  await expect.poll(() => capture.candidateRequests.length).toBe(3)
+  await expect(panel.locator('.batch-selection-summary')).toContainText('筛选外 2 · 无效 0')
+  await panel.getByRole('combobox', { name: '附件筛选' }).selectOption('all')
+  await expect(panel.getByText('岗位 1', { exact: true })).toBeVisible()
+  await expect.poll(() => capture.candidateRequests.length).toBe(3)
   await panel.getByRole('button', { name: 'Dry Run' }).click()
   await expect.poll(() => capture.dryRuns.length).toBe(1)
-  expect(capture.dryRuns[0]).toMatchObject({ noteIds: ['note-page-01', 'note-page-21'] })
+  expect(capture.dryRuns[0]).toMatchObject({
+    noteIds: ['note-page-01', 'note-page-21'],
+    selectionRevisions: [
+      { noteId: 'note-page-01', revision: 'revision-note-page-01' },
+      { noteId: 'note-page-21', revision: 'revision-note-page-21' },
+    ],
+  })
+})
+
+test('stale candidate cursor refreshes page one and allows the next page to load again', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1_000 })
+  const capture = await openWorkbench(page, null, paginatedApplications, { staleCandidateCursorOnce: true })
+  const panel = page.getByRole('region', { name: '批量投递工作台' })
+  const search = panel.getByPlaceholder('搜索岗位、邮箱、主题或附件名')
+
+  await expect(panel.locator('tbody tr')).toHaveCount(20)
+  await search.fill('分页岗位')
+  await expect(panel.locator('.batch-search-summary')).toContainText('筛选结果 25 项')
+  await expect.poll(() => capture.candidateRequests.length).toBe(2)
+  await panel.getByRole('button', { name: '清空' }).click()
+  const page1Row = panel.locator('tbody tr').filter({ has: page.getByText('分页岗位 1', { exact: true }) })
+  await page1Row.locator('label.batch-checkbox').click()
+  await expect(panel.locator('.batch-selection-actions')).toContainText('已选 1 / 10')
+
+  const requestsBeforeStaleCursor = capture.candidateRequests.length
+  await panel.getByTitle('下一页待投岗位').click()
+  await expect.poll(() => capture.candidateRequests.length).toBe(requestsBeforeStaleCursor + 2)
+  await expect(panel.getByText('候选岗位已更新，正在刷新第一页。', { exact: true })).toBeVisible()
+  await expect(search).toHaveValue('分页岗位')
+  await expect(panel.getByText('岗位 1', { exact: true })).toBeVisible()
+  await expect(page1Row.getByRole('checkbox')).toBeChecked()
+  expect(new URL(capture.candidateRequests.at(-2)!).searchParams.get('cursor')).toBe('20')
+  expect(new URL(capture.candidateRequests.at(-1)!).searchParams.has('cursor')).toBe(false)
+
+  await panel.getByTitle('下一页待投岗位').click()
+  await expect(panel.getByText('岗位 21', { exact: true })).toBeVisible()
+  await expect.poll(() => capture.candidateRequests.length).toBe(requestsBeforeStaleCursor + 3)
+  expect(new URL(capture.candidateRequests.at(-1)!).searchParams.get('cursor')).toBe('20')
+  await expect(panel.locator('.batch-selection-actions')).toContainText('已选 1 / 10')
 })
 
 test('changing the attachment naming rule invalidates the current preflight', async ({ page }) => {
@@ -1203,17 +1311,34 @@ test('product workbench shows three sent emails with their exact content and fil
 test('batch workbench controls start, pause, resume, and cancel with current revisions', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1_000 })
   const { panel, capture } = await exerciseWorkbench(page)
-  const controls = panel.locator('.batch-control-actions').locator('button')
+  const controls = panel.locator('.batch-control-actions')
   const status = panel.locator('.batch-status-badge')
+  const sentFilter = panel.getByRole('button', { name: '已发送', exact: true })
 
-  await controls.nth(1).click()
+  const candidateRequestsBeforeSentFilter = capture.candidateRequests.length
+  await sentFilter.click()
+  await expect(panel.locator('.batch-search-empty-row')).toBeVisible()
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeSentFilter + 1)
+
+  let candidateRequestCount = capture.candidateRequests.length
+  await controls.getByRole('button', { name: '开始' }).click()
   await expect(status).toHaveClass(/running/u)
-  await controls.nth(2).click()
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestCount + 1)
+  candidateRequestCount += 1
+  await expect(panel.locator('.batch-selection-summary')).toContainText('筛选外 2 · 无效 0 · 修订缺失 2，请重新加载')
+  await expect(panel.getByRole('button', { name: 'Dry Run' })).toBeDisabled()
+
+  await controls.getByRole('button', { name: '暂停' }).click()
   await expect(status).toHaveClass(/paused/u)
-  await controls.nth(3).click()
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestCount + 1)
+  candidateRequestCount += 1
+  await controls.getByRole('button', { name: '恢复' }).click()
   await expect(status).toHaveClass(/running/u)
-  await controls.nth(4).click()
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestCount + 1)
+  candidateRequestCount += 1
+  await controls.getByRole('button', { name: '取消' }).click()
   await expect(status).toHaveClass(/cancelled/u)
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestCount + 1)
 
   expect(capture.controls).toEqual([
     { action: 'start', body: { expectedRevision: 2 } },
@@ -1221,4 +1346,25 @@ test('batch workbench controls start, pause, resume, and cancel with current rev
     { action: 'resume', body: { expectedRevision: 4 } },
     { action: 'cancel', body: { expectedRevision: 5 } },
   ])
+})
+
+test('batch revision drops a page cursor and reloads candidate eligibility from page one', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1_000 })
+  const capture = await openWorkbench(page, frozenBatch('approved'), paginatedApplications)
+  const panel = page.getByRole('region', { name: '批量投递工作台' })
+
+  await expect(panel.locator('tbody tr')).toHaveCount(20)
+  await expect(panel.locator('.batch-candidate-pagination')).toHaveAttribute('aria-busy', 'false')
+  const candidateRequestsBeforeNextPage = capture.candidateRequests.length
+  await panel.getByTitle('下一页待投岗位').click()
+  await expect(panel.getByText('岗位 21', { exact: true })).toBeVisible()
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeNextPage + 1)
+  expect(new URL(capture.candidateRequests.at(-1)!).searchParams.get('cursor')).toBe('20')
+
+  const candidateRequestsBeforeStart = capture.candidateRequests.length
+  await panel.locator('.batch-control-actions').getByRole('button', { name: '开始' }).click()
+  await expect(panel.locator('.batch-status-badge')).toHaveClass(/running/u)
+  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeStart + 1)
+  await expect(panel.getByText('岗位 1', { exact: true })).toBeVisible()
+  expect(new URL(capture.candidateRequests.at(-1)!).searchParams.has('cursor')).toBe(false)
 })

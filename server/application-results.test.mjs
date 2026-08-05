@@ -140,6 +140,12 @@ test('application results expose general presentation and use general completene
     assert.equal(response.presentation.title, '城市展览内容观察');
     assert.equal(response.insights.groundedRecords, 1);
     assert.equal(response.filters.stats.incomplete, 0);
+    assert.equal(response.coverage.discovered, 1);
+    assert.equal(response.coverage.bodyAttempted, 1);
+    assert.equal(response.coverage.bodySucceeded, 1);
+    assert.equal(response.coverage.timesNormalized, 1);
+    assert.equal(response.coverage.applicationInfo, 1);
+    assert.equal(response.coverage.draftsGenerated, 0);
     assert.equal(response.items[0].content_analysis.modules[0].title, '展览亮点');
 
     const completionResponse = await fetch(`${origin}/api/jobs/${id}/complete-missing`, {

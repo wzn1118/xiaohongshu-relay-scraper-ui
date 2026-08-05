@@ -9,6 +9,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { createApp, createPersistentSmtpSendGate, streamApplicationBatchEvents } from './app.mjs';
 import { ApplicationBatchManager } from './application-batch-manager.mjs';
 import { ApplicationBatchService } from './application-batch-service.mjs';
+import { applicationDeliveryCandidateRevision } from './application-delivery-candidates.mjs';
 
 const JOB_ID = '20260804120000-abcdef12';
 const FIXED_TIME = '2026-08-04T04:00:00.000Z';
@@ -77,6 +78,7 @@ function readyAttachment(noteId) {
 async function readyServiceFixture(t, {
   noteIds,
   sendEmail = async () => {},
+  previewHook = async () => {},
 } = {}) {
   const outputDir = await temporaryOutputDir(t);
   const records = new Map(noteIds.map((noteId) => [noteId, readyRecord(noteId)]));
@@ -100,6 +102,7 @@ async function readyServiceFixture(t, {
     previewEmail: async (value, allowedRecipients) => {
       previewCalls.push(structuredClone(value));
       assert.deepEqual(allowedRecipients, [value.to]);
+      await previewHook(value, { manager, records });
       return {
         readiness: 'ready',
         warnings: [],
@@ -153,6 +156,27 @@ async function freezeAndApprove(service, noteIds) {
     actor: 'test-user',
   });
   return { created, approved };
+}
+
+function selectionSnapshot(records, noteIds, overrides = {}) {
+  return {
+    selectionSnapshotId: 'selection-snapshot-1',
+    selectionSnapshotHash: 'c'.repeat(64),
+    selectionRevisions: noteIds.map((noteId) => ({
+      noteId,
+      revision: applicationDeliveryCandidateRevision(records.get(noteId)),
+    })),
+    ...overrides,
+  };
+}
+
+async function createReadyCompetingBatch(manager, noteId, batchId) {
+  return manager.createBatch({
+    batchId,
+    jobId: JOB_ID,
+    title: `Competing batch for ${noteId}`,
+    items: [{ itemId: noteId, noteId, status: 'ready', payload: {} }],
+  });
 }
 
 test('dry run keeps partial comment collection pending instead of reporting no email', async (t) => {
@@ -260,6 +284,282 @@ test('freezing a confirmed Dry Run regenerates a persistent preview', async (t) 
   });
 
   assert.deepEqual(previewCalls.map((call) => call.persist), [false, true]);
+});
+
+test('selection snapshot revisions allow a matching Dry Run and freeze', async (t) => {
+  const noteIds = ['snapshot-match'];
+  const { service, records, previewCalls } = await readyServiceFixture(t, { noteIds });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, noteIds),
+  };
+
+  const dryRun = await service.dryRun(request);
+  const created = await service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  });
+
+  assert.deepEqual(dryRun.readyNoteIds, noteIds);
+  assert.deepEqual(created.batch.items.map((item) => item.noteId), noteIds);
+  assert.deepEqual(previewCalls.map((call) => call.persist), [false, true]);
+});
+
+test('selection snapshot rejects a missing selected revision before preview', async (t) => {
+  const noteIds = ['snapshot-present', 'snapshot-missing'];
+  const { service, records, previewCalls } = await readyServiceFixture(t, { noteIds });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, ['snapshot-present']),
+  };
+
+  await assert.rejects(service.dryRun(request), (error) => {
+    assert.equal(error.code, 'APPLICATION_BATCH_SELECTION_STALE');
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.details, { staleNoteIds: ['snapshot-missing'] });
+    return true;
+  });
+  assert.deepEqual(previewCalls, []);
+});
+
+test('selection snapshot rejects a duplicate selected revision before preview', async (t) => {
+  const noteIds = ['snapshot-duplicate'];
+  const { service, records, previewCalls } = await readyServiceFixture(t, { noteIds });
+  const snapshot = selectionSnapshot(records, noteIds);
+  snapshot.selectionRevisions.push({ ...snapshot.selectionRevisions[0] });
+
+  await assert.rejects(service.dryRun({
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...snapshot,
+  }), (error) => {
+    assert.equal(error.code, 'APPLICATION_BATCH_SELECTION_STALE');
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.details, { staleNoteIds: noteIds });
+    return true;
+  });
+  assert.deepEqual(previewCalls, []);
+});
+
+test('freezing rejects a selected record that changed after Dry Run', async (t) => {
+  const noteIds = ['snapshot-record-changed'];
+  const { service, records, previewCalls } = await readyServiceFixture(t, { noteIds });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, noteIds),
+  };
+  const dryRun = await service.dryRun(request);
+  records.get(noteIds[0]).outreach.cover_letter = 'Changed after Dry Run';
+
+  await assert.rejects(service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  }), (error) => {
+    assert.equal(error.code, 'APPLICATION_BATCH_SELECTION_STALE');
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.details, { staleNoteIds: noteIds });
+    return true;
+  });
+  assert.deepEqual(previewCalls.map((call) => call.persist), [false]);
+});
+
+test('freezing rejects a changed selection snapshot reference', async (t) => {
+  const noteIds = ['snapshot-reference-changed'];
+  const { service, records, previewCalls } = await readyServiceFixture(t, { noteIds });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, noteIds),
+  };
+  const dryRun = await service.dryRun(request);
+
+  await assert.rejects(service.createBatch({
+    ...request,
+    selectionSnapshotHash: 'd'.repeat(64),
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  }), (error) => {
+    assert.equal(error.code, 'APPLICATION_BATCH_SELECTION_STALE');
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.details, { staleNoteIds: noteIds });
+    return true;
+  });
+  assert.deepEqual(previewCalls.map((call) => call.persist), [false]);
+});
+
+test('selection snapshot rejects a note frozen by another batch', async (t) => {
+  const noteIds = ['snapshot-already-frozen'];
+  const { service, records, manager, previewCalls } = await readyServiceFixture(t, { noteIds });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, noteIds),
+  };
+  await createReadyCompetingBatch(manager, noteIds[0], 'competing-frozen-batch');
+
+  await assert.rejects(service.dryRun(request), (error) => {
+    assert.equal(error.code, 'APPLICATION_BATCH_SELECTION_STALE');
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.details, { staleNoteIds: noteIds });
+    return true;
+  });
+  assert.deepEqual(previewCalls, []);
+});
+
+test('selection snapshot rejects a note sent by another batch', async (t) => {
+  const noteIds = ['snapshot-already-sent'];
+  const { service, records, manager, previewCalls } = await readyServiceFixture(t, { noteIds });
+  let competing = await createReadyCompetingBatch(manager, noteIds[0], 'competing-sent-batch');
+  competing = await manager.approveBatch(competing.batchId, { expectedRevision: competing.revision });
+  competing = await manager.resumeBatch(competing.batchId, { expectedRevision: competing.revision });
+  competing = await manager.updateItem(competing.batchId, noteIds[0], { status: 'sending' }, {
+    expectedBatchRevision: competing.revision,
+    expectedItemRevision: competing.items[0].revision,
+  });
+  await manager.updateItem(competing.batchId, noteIds[0], { status: 'sent' }, {
+    expectedBatchRevision: competing.revision,
+    expectedItemRevision: competing.items[0].revision,
+  });
+
+  await assert.rejects(service.dryRun({
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, noteIds),
+  }), (error) => {
+    assert.equal(error.code, 'APPLICATION_BATCH_SELECTION_STALE');
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.details, { staleNoteIds: noteIds });
+    return true;
+  });
+  assert.deepEqual(previewCalls, []);
+});
+
+test('freezing rechecks record revisions after asynchronous preparation', async (t) => {
+  const noteIds = ['snapshot-changed-during-prepare'];
+  const { service, records, manager, previewCalls } = await readyServiceFixture(t, {
+    noteIds,
+    previewHook: async (preview, fixture) => {
+      if (preview.persist) fixture.records.get(noteIds[0]).outreach.cover_letter = 'Changed during persistent preview';
+    },
+  });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, noteIds),
+  };
+  const dryRun = await service.dryRun(request);
+
+  await assert.rejects(service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  }), (error) => {
+    assert.equal(error.code, 'APPLICATION_BATCH_SELECTION_STALE');
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.details, { staleNoteIds: noteIds });
+    return true;
+  });
+  assert.deepEqual(previewCalls.map((call) => call.persist), [false, true]);
+  assert.deepEqual(await manager.listBatches({ jobId: JOB_ID }), []);
+});
+
+test('freezing rechecks batch occupancy after asynchronous preparation', async (t) => {
+  const noteIds = ['snapshot-frozen-during-prepare'];
+  let competingCreated = false;
+  const { service, records, manager, previewCalls } = await readyServiceFixture(t, {
+    noteIds,
+    previewHook: async (preview, fixture) => {
+      if (!preview.persist || competingCreated) return;
+      competingCreated = true;
+      await createReadyCompetingBatch(fixture.manager, noteIds[0], 'competing-during-prepare');
+    },
+  });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, noteIds),
+  };
+  const dryRun = await service.dryRun(request);
+
+  await assert.rejects(service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  }), (error) => {
+    assert.equal(error.code, 'APPLICATION_BATCH_SELECTION_STALE');
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.details, { staleNoteIds: noteIds });
+    return true;
+  });
+  assert.deepEqual(previewCalls.map((call) => call.persist), [false, true]);
+  const batches = await manager.listBatches({ jobId: JOB_ID });
+  assert.deepEqual(batches.map((batch) => batch.batchId), ['competing-during-prepare']);
+});
+
+test('concurrent freezes cannot claim the same selection twice', async (t) => {
+  const noteIds = ['snapshot-concurrent-freeze'];
+  const { service, records, manager, previewCalls } = await readyServiceFixture(t, { noteIds });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    ...selectionSnapshot(records, noteIds),
+  };
+  const [firstDryRun, secondDryRun] = await Promise.all([
+    service.dryRun(request),
+    service.dryRun(request),
+  ]);
+  const createRequest = (dryRun) => ({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  });
+
+  const results = await Promise.allSettled([
+    service.createBatch(createRequest(firstDryRun)),
+    service.createBatch(createRequest(secondDryRun)),
+  ]);
+
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  const rejected = results.find((result) => result.status === 'rejected');
+  assert.equal(rejected?.reason?.code, 'APPLICATION_BATCH_SELECTION_STALE');
+  assert.deepEqual(rejected?.reason?.details, { staleNoteIds: noteIds });
+  assert.equal((await manager.listBatches({ jobId: JOB_ID })).length, 1);
+  assert.deepEqual(previewCalls.map((call) => call.persist), [false, false, true]);
+});
+
+test('batch idempotency does not replay across selection snapshots', async (t) => {
+  const noteIds = ['snapshot-idempotency'];
+  const { service, records } = await readyServiceFixture(t, { noteIds });
+  const request = {
+    noteIds,
+    defaultAttachmentTemplate: 'resume',
+    idempotencyKey: 'selection-snapshot-idempotency',
+    ...selectionSnapshot(records, noteIds),
+  };
+  const dryRun = await service.dryRun(request);
+  const createRequest = {
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  };
+  await service.createBatch(createRequest);
+
+  await assert.rejects(
+    service.createBatch({ ...createRequest, selectionSnapshotId: 'selection-snapshot-2' }),
+    { code: 'APPLICATION_BATCH_IDEMPOTENCY_CONFLICT', status: 409 },
+  );
 });
 
 test('new batches require an exact confirmed Dry Run selection', async (t) => {

@@ -63,6 +63,7 @@ def valid_result() -> dict:
     cover += "\n\n此致\n敬礼"
     evidence_sentence = sections[1]
     return {
+        "email_subject": "内容运营实习申请｜用户洞察与数据复盘",
         "cover_letter": cover,
         "used_evidence_ids": ["content-project"],
         "evidence_coverage": [{
@@ -246,7 +247,8 @@ class CoverLetterRewriterTests(unittest.TestCase):
         self.assertEqual(provider.calls[0]["payload"]["rewrite_request"]["user_instructions"], "请突出数据复盘")
         self.assertTrue(provider.calls[1]["payload"]["correction"]["validation_errors"])
         self.assertIn("Signature Evidence", provider.calls[0]["system"])
-        self.assertIn("内部质量审核", provider.calls[0]["system"])
+        self.assertIn("完成初稿后不要立即输出。", provider.calls[0]["system"])
+        self.assertIn("高级求职投递 Agent", provider.calls[0]["system"])
 
     def test_quality_gate_rejects_defensive_contrast_style(self) -> None:
         defensive = valid_result()
@@ -309,6 +311,28 @@ class CoverLetterRewriterTests(unittest.TestCase):
         errors = provider.calls[1]["payload"]["correction"]["validation_errors"]
         self.assertTrue(any("未支持的成果或能力判断" in item for item in errors))
 
+    def test_quality_gate_rejects_repeated_resume_experience_in_one_paragraph(self) -> None:
+        invalid = rich_valid_result()
+        repeated = invalid["evidence_coverage"][1]["evidence_sentence"]
+        invalid["cover_letter"] = invalid["cover_letter"].replace(
+            repeated,
+            f"{repeated}{repeated}",
+            1,
+        )
+        provider = CapturingProvider([invalid, rich_valid_result()])
+
+        result = rewrite_cover_letter(
+            provider,
+            fixture_record(),
+            {},
+            "结合真实简历且不要重复经历",
+            rich_candidate_profile(),
+        )
+
+        self.assertEqual(result["attempts"], 2)
+        errors = provider.calls[1]["payload"]["correction"]["validation_errors"]
+        self.assertTrue(any("同一段重复展开了候选人经历" in item for item in errors))
+
     def test_failed_quality_gate_returns_error_instead_of_generic_fallback(self) -> None:
         short = {
             "cover_letter": "主题：内容运营实习申请\n尊敬的招聘负责人：\n我想申请。\n此致\n敬礼",
@@ -334,6 +358,47 @@ class CoverLetterRewriterTests(unittest.TestCase):
 
         self.assertEqual(result["attempts"], 1)
         self.assertGreaterEqual(result["char_count"], 800)
+
+    def test_advanced_model_structure_is_normalized_from_grounded_body(self) -> None:
+        generated = rich_valid_result()
+        generated["cover_letter"] = generated["cover_letter"].replace("主题：", "", 1)
+        generated["used_evidence_ids"].remove("resume-community")
+        generated["evidence_coverage"] = [
+            item
+            for item in generated["evidence_coverage"]
+            if item["evidence_id"] != "resume-community"
+        ]
+        provider = CapturingProvider([generated])
+
+        result = rewrite_cover_letter(
+            provider,
+            fixture_record(),
+            {},
+            "结合真实简历",
+            rich_candidate_profile(),
+        )
+
+        self.assertEqual(result["attempts"], 1)
+        self.assertTrue(result["cover_letter"].startswith("尊敬的招聘负责人："))
+        self.assertEqual(result["email_subject"], "内容运营实习申请｜用户洞察与数据复盘")
+        self.assertIn("resume-community", result["used_evidence_ids"])
+        self.assertTrue(any(
+            item["evidence_id"] == "resume-community"
+            for item in result["evidence_coverage"]
+        ))
+
+    def test_structure_normalizer_repairs_punctuation_only_salutation_and_closing(self) -> None:
+        generated = valid_result()
+        generated["cover_letter"] = generated["cover_letter"].replace(
+            "尊敬的招聘负责人：", "尊敬的招聘负责人，", 1
+        ).replace("\n\n此致\n敬礼", "\n\n此致敬礼", 1)
+        provider = CapturingProvider([generated])
+
+        result = rewrite_cover_letter(provider, fixture_record(), {}, "重写")
+
+        self.assertIn("尊敬的招聘负责人：", result["cover_letter"])
+        self.assertNotRegex(result["cover_letter"], r"^\s*主题[：:]")
+        self.assertTrue(result["cover_letter"].endswith("此致\n敬礼"))
 
     def test_local_model_runs_role_plan_write_and_quality_review(self) -> None:
         plan = {
@@ -398,7 +463,9 @@ class CoverLetterRewriterTests(unittest.TestCase):
             provider.calls[1]["payload"]["local_role_evidence_plan"]["signature_evidence_ids"],
             ["content-project"],
         )
-        self.assertIn("Signature Evidence", provider.calls[0]["system"])
+        self.assertIn("Signature Evidence", provider.calls[1]["system"])
+        self.assertIn("内部质量审核", provider.calls[1]["system"])
+        self.assertNotIn("完成初稿后不要立即输出。", provider.calls[1]["system"])
         self.assertEqual(result["style_violation_count"], 0)
 
     def test_local_model_gets_targeted_length_repair_instead_of_equal_length_rewrite(self) -> None:

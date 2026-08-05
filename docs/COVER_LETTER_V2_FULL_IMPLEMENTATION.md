@@ -11,7 +11,7 @@ Cover Letter V2 不再把笔记标题直接当作岗位名称，也不再用短�
 - 每个岗位支持“一键 AI 重写”，允许用户输入本次重写要求。
 - 重写请求必须绑定当前高级模型会话或用户指定的本地模型会话，并在结果中记录真实 provider、model、wire API、请求版本、执行策略和证据来源。
 - 任何模型失败、长度不达标或版本冲突都不得覆盖当前有效稿件。
-- 重写后的稿件必须重新通过 90 分质量门槛，才能进入发送阶段。
+- 重写后的稿件必须重新通过 92 分质量门槛，才能进入发送阶段。
 
 ## 2. 原问题与根因
 
@@ -50,14 +50,16 @@ flowchart LR
   P --> J["800-1600 字与岗位覆盖校验"]
   I --> J
   J --> K["不可变草稿版本与生成溯源"]
-  K --> L["90 分质量复检"]
+  K --> L["92 分质量复检"]
   L --> M["发送预览与投递"]
 ```
 
 核心模块：
 
 - `scripts/job_role_title.py`：岗位名称归一化。
-- `scripts/cover_letter_rewriter.py`：重写提示、结果解析、长度和职责覆盖校验。
+- `scripts/prompts/cover_letter_agent_v4_full_zh.txt`：高级模型使用的附件完整 Prompt，仅压缩空白行，不删减规则。
+- `scripts/prompts/cover_letter_agent_v4_zh.txt`：本地 4B 模型使用的语义等价压缩 Prompt，降低上下文负担。
+- `scripts/cover_letter_rewriter.py`：按 provider 路由 Prompt，并执行结果解析、长度、事实归属和职责覆盖校验。
 - `scripts/rewrite_cover_letter.py`：通过标准输入接收完整请求，并调用指定模型会话。
 - `server/lib/cover-letter-rewriter.mjs`：Node 与 Python 模型运行器的边界层。
 - `POST /api/jobs/:jobId/draft/rewrite`：岗位级重写、版本检查和持久化接口。
@@ -121,13 +123,15 @@ flowchart LR
 }
 ```
 
+`email_subject` 与 `cover_letter` 是两个独立字段：前者只保存邮件主题，后者只保存求职信正文，正文必须从称呼开始，不能再包含“主题：”或其他标题行。服务端会在写入和读取时兼容旧草稿，自动把历史正文首行标题迁移到 `email_subject`。
+
 ### 服务端执行顺序
 
 1. 校验任务、岗位、草稿、版本和 AI 会话。
 2. 以请求中实际提交的当前稿件计算输入哈希。
 3. 组装岗位标题、正文、职责、要求、候选人证据和用户要求。
 4. 将 provider、model、base URL 和 wire API 精确传给模型运行器；本地模式先生成岗位职责与证据规划。
-5. 最多重试 2 次，逐次反馈具体校验失败原因。
+5. 高级模型最多生成 3 次，本地模型至少生成 4 次，逐次反馈具体校验失败原因。
 6. 校验长度、岗位名称、第一人称、职责覆盖、证据引用和完整结构。
 7. 以新版本持久化，仅更新 Cover Letter，不覆盖邮件和私信内容。
 8. 返回真实模型元数据、执行策略、模型调用次数、本地终审分、输入输出哈希、覆盖职责和使用证据。
@@ -173,11 +177,11 @@ UI 优先显示持久化的 provider/model，因此刷新页面后仍能看到�
 
 1. **岗位规划**：本地模型逐项读取岗位职责，只能从候选人事实库选择证据 ID；没有直接证据时，规划为入职后的具体执行方法。
 2. **完整成稿**：同一个本地模型接收岗位、候选人证据、当前稿件、用户原始要求和规划结果，生成 800-1600 个非空白字符的岗位专属求职信。
-3. **本地终审**：本地模型按岗位专属性、职责覆盖、证据可核验、用户要求和自然表达独立评分；至少 90 分且三个硬条件全部通过才可保存。
+3. **本地终审**：本地模型按岗位专属性、职责覆盖、证据可核验、用户要求和自然表达独立评分；至少 92 分且全部硬条件通过才可保存。
 4. **程序硬校验**：服务端独立检查长度、岗位名、第一人称、职责响应句、证据 ID、结构和版本。模型终审不能绕过这些规则。
 5. **失败纠正**：任一终审或硬校验失败时，将具体问题和上次完整结果交回同一模型重写；最终仍不达标则保留旧稿。
 
-正常成功路径会产生三次真实本地模型调用，持久化 `strategy=local_plan_write_review`、`modelCalls=3` 和 `reviewScore`；触发质量修订后调用次数会继续累加。批量申请工作流的本地模式也会真实调用本地模型做终审，并在下一轮把上一版全文和修改意见继续交给模型，不再使用“本地模型只跑确定性评分”的旁路。
+正常成功路径会产生三次真实本地模型调用，持久化 `strategy=local_plan_write_review`、`modelCalls=3` 和 `reviewScore`；触发质量修订后调用次数会继续累加。自由生成连续失败时，程序会基于本地模型已经选择的证据生成 evidence-locked 正文，再交回同一本地模型终审；该路径记录为 `local_plan_evidence_locked_write_review`，仍不是通用回退文案。
 
 本地请求使用 `http://127.0.0.1:11434/v1`，不需要 API Key；岗位正文、候选人材料和用户要求留在本机模型运行时内。
 
@@ -209,7 +213,7 @@ UI 优先显示持久化的 provider/model，因此刷新页面后仍能看到�
 | 模型输出少于 800 字 | 请求失败，旧稿不变 |
 | 用户填写自定义要求 | 要求原样进入高级模型请求 |
 | 选择已安装本地模型 | 创建真实 `local_qwen` 会话，按规划、成稿、终审三阶段执行 |
-| 本地终审低于 90 分 | 带具体问题再次重写；最终失败时旧稿不变 |
+| 本地终审低于 92 分 | 带具体问题再次重写；最终失败时旧稿不变 |
 | 本地模式刷新页面 | provider/model、执行策略、调用次数和终审分仍可追踪 |
 | 模型会话不可用 | 显示明确错误，不生成回退文案 |
 | 两个窗口同时重写 | 后提交的旧版本请求被冲突保护拦截 |
@@ -250,28 +254,32 @@ UI 优先显示持久化的 provider/model，因此刷新页面后仍能看到�
 
 - provider / model：`local_qwen / qwen3.5:4b`
 - wire API：`chat_completions`
-- 执行策略：`local_plan_write_review`
-- 真实模型调用：4 次，包含岗位证据规划、首稿、定向修订和独立终审
-- 最终正文：906 个非空白字符
+- 执行策略：`local_plan_evidence_locked_write_review`
+- 真实模型调用：6 次，包含岗位证据规划、4 次受约束成稿和独立终审
+- 最终正文：1020 个非空白字符
 - 职责覆盖：4 / 4
-- 使用简历证据：3 条
-- 提示词版本：`cover-letter-rewrite-v3-resume-grounded`
-- 结果边界：确定性简历证据门禁通过；本地模型终审分仅作为提示，不替代事实校验
+- 使用简历证据：5 条，其中 4 条工作经历、1 条教育经历
+- 本地终审：94 分，禁句 0，质量状态通过
+- 提示词版本：`cover-letter-rewrite-v4-signature-evidence`
+- profileSnapshotId：`663705390b338bdcb1da341ab0ad1d5dcc1b7c6a3081e219f9524446ac3fc136`
+- 结果边界：程序事实门禁和本地模型终审同时通过；终审不能替代事实校验
 
-本地真实模型运行证据：`.runtime/cover-letter-v2-live/local-model-verification.json`。该记录验证生产重写核心的真实模型执行；浏览器选择本地会话、API 请求和持久化字段另由 Cover Letter Playwright 与 API 自动化测试覆盖，二者不混作同一类证据。
+本地真实模型运行证据：`.runtime/cover-letter-v2-live/prompt-v4-local-verification.json`。该记录验证生产重写核心的真实模型执行；浏览器选择本地会话、API 请求和持久化字段另由 Cover Letter Playwright 与 API 自动化测试覆盖，二者不混作同一类证据。
 
-### 12.3 简历关联高级模型现场验收
+### 12.3 附件完整 Prompt 高级模型现场验收
 
 使用同一份真实候选人档案快照和岗位职责，走高级模型直连重写路径，结果已保存为可复核的 JSON 与纯文本：
 
 - provider / model：`relay / gpt-5.6-sol`
 - 执行策略：`direct_model_rewrite`
-- 正文长度：`1042` 个非空白字符，超过 800 字门槛
-- 简历证据：`5` 条，覆盖用户研究、FunPlus 数据监测与 Discord 社区、网易有道直播运营、非遗 KOL 社群、字节跳动社区冷启动
+- 正文长度：`978` 个非空白字符，位于 900-1200 目标区间
+- 生成次数：`3`，前两轮错误进入真实校验反馈，第三轮通过
+- 简历证据：`4` 条，覆盖基金会用户研究与直播、非遗 KOL 社群、字节跳动社区、网易有道直播运营
 - 岗位职责映射：`4 / 4`，每项都有正文原句和对应证据 ID
-- prompt 版本：`cover-letter-rewrite-v3-resume-grounded`
-- profileSnapshotId：`501f6d4950c101b0bd4294fdf933002197ce630112d85acc07b9d274eeaa0793`
-- JSON：`.runtime/cover-letter-v2-live/resume-grounded-advanced-verification.json`
-- 文案：`.runtime/cover-letter-v2-live/resume-grounded-cover-letter.txt`
+- 防御性或对照式禁句：`0`
+- prompt 版本：`cover-letter-rewrite-v4-signature-evidence`
+- 实际 Prompt：`scripts/prompts/cover_letter_agent_v4_full_zh.txt`
+- profileSnapshotId：`663705390b338bdcb1da341ab0ad1d5dcc1b7c6a3081e219f9524446ac3fc136`
+- JSON：`.runtime/cover-letter-v2-live/prompt-v4-advanced-verification.json`
 
-该验收证明岗位上下文、用户要求、完整候选人简历快照和上传简历元数据都进入了高级模型请求，并在返回结果中被逐条回指；它不把标题当作岗位，也不再使用无上下文回退文案。
+该验收证明附件 Prompt、岗位上下文、用户要求、完整候选人简历快照和上传简历元数据都进入了高级模型请求，并在返回结果中被逐条回指；首轮失败稿没有被保存，第二轮合格稿也没有使用无上下文回退文案。
