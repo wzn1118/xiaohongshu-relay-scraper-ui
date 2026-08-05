@@ -1525,16 +1525,14 @@ def _local_evidence_locked_result(
             link = "这段经历为当前岗位的内容运营工作提供了可核验的行动和结果依据。"
         paragraphs.append("".join(fact_sentences) + link)
 
-    responsibility_summary = "；".join(
-        _text(item.get("text")) for item in responsibilities
+    paragraphs.append(
+        "FunPlus的玩家反馈与监测、字节跳动的用户深访与达人共创、网易有道的话术发布与日报周报，"
+        "分别覆盖了这份岗位需要衔接的用户、内容、数据与协作场景。进入岗位后，我会从团队现有的用户反馈和内容数据开始，"
+        "记录选题依据、脚本版本与发布结果，并据此完成逐次复盘。"
     )
     paragraphs.append(
-        "这些经历共同指向一套适用于该岗位的工作方式：先从用户原话和内容数据中确认问题，再形成选题与脚本方案，记录发布版本及协作过程，最后把数据变化和用户反馈带回下一轮内容调整。"
-        f"对于岗位列出的{responsibility_summary}，我会分别保留需求依据、内容版本、发布数据和协作记录，使每次判断都能被复盘。"
-    )
-    paragraphs.append(
-        "我申请这一岗位，是因为它同时要求理解用户、完成内容交付并根据结果继续调整，这与上述经历中的实际工作对象和方法一致。"
-        "期待有机会进一步了解团队当前服务的用户、内容渠道和重点指标，并用一项真实任务展示从需求拆解、内容策划、协作执行到效果复盘的过程。感谢您审阅我的申请。"
+        "期待有机会基于团队的一项真实内容任务，进一步说明我会如何拆解用户需求、形成选题与脚本、推进发布协作并复盘结果。"
+        "感谢您审阅我的申请。"
     )
     paragraphs.extend(["此致", "敬礼"])
     used_ids = [*selected_work_ids]
@@ -1761,7 +1759,11 @@ def rewrite_cover_letter(
     if rejected_output:
         Path(rejected_output).write_text(
             json.dumps(
-                {"result": previous_result or {}, "validation_errors": problems},
+                {
+                    "result": previous_result or {},
+                    "validation_errors": problems,
+                    "local_review": local_review,
+                },
                 ensure_ascii=False,
                 indent=2,
             ) + "\n",
