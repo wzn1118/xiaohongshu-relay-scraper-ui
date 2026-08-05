@@ -280,6 +280,7 @@ test('继续任务遇到 AI 会话过期会自动重连并再次恢复', async (
     scope: 'full',
     aiSessionId: `session-journey-${state.aiSessionRequests}`,
   })
+  await expect(page.getByText('任务已恢复，正在从已保存进度继续处理。')).toBeVisible()
   await expect(page.getByText('The selected AI session has expired.')).toHaveCount(0)
 })
 

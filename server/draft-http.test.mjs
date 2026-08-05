@@ -2789,6 +2789,36 @@ test('Cover Letter rewrite rejects an under-800 response without overwriting the
   assert.equal(after.outreach.cover_letter, initial.outreach.cover_letter);
 });
 
+test('Cover Letter rewrite rejects an internal evidence identifier without overwriting the saved draft', async (t) => {
+  const generated = validRewrittenCoverLetter();
+  const leakedCoverLetter = `exp_2022_xinhua ${generated.coverLetter}`;
+  const fixture = await startFixture(t, {
+    coverLetterRewriter: async () => ({
+      cover_letter: leakedCoverLetter,
+      used_evidence_ids: [],
+      responsibility_coverage: [],
+      char_count: Array.from(leakedCoverLetter.replace(/\s+/gu, '')).length,
+      prompt_version: 'cover-letter-rewrite-v1',
+    }),
+  });
+  const initial = (await fixture.getResults()).body.items[0];
+
+  const response = await fixture.post('draft/rewrite', {
+    noteId: NOTE_ID,
+    aiSessionId: 'advanced-cover-session',
+    instructions: 'rewrite',
+    outreach: initial.outreach,
+    draftId: initial.draftVersion.draftId,
+    baseVersion: initial.draftVersion.version,
+  });
+
+  assert.equal(response.status, 502);
+  assert.equal(response.body.error.code, 'AI_COVER_LETTER_REWRITE_FAILED');
+  const after = (await fixture.getResults()).body.items[0];
+  assert.equal(after.draftVersion.version, initial.draftVersion.version);
+  assert.equal(after.outreach.cover_letter, initial.outreach.cover_letter);
+});
+
 test('Cover Letter rewrite rejects a stale baseVersion before calling the model', async (t) => {
   let calls = 0;
   const fixture = await startFixture(t, {

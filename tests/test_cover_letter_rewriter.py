@@ -225,6 +225,24 @@ class CoverLetterRewriterTests(unittest.TestCase):
         self.assertEqual(payload["role"]["responsibilities"][0]["text"], "负责短视频脚本、剪辑协作及多平台内容发布")
         self.assertEqual(payload["role"]["requirements"][0]["text"], "具备内容运营经验")
 
+    def test_input_infers_role_from_structured_recruitment_body_when_social_title_is_noise(self) -> None:
+        payload = build_cover_letter_rewrite_input(
+            {
+                "title": "实习找继任",
+                "body": (
+                    "中信保诚资管有限公司 债权业务事业部实习生 8月底之前到岗 "
+                    "【工作内容】1. 协助团队进行金融市场数据的收集、整理与分析；"
+                    "【任职要求】金融、金融工程、数学、经济类相关专业。"
+                ),
+            },
+            {},
+            "结合岗位职责与候选人简历",
+            {},
+            {},
+        )
+
+        self.assertEqual(payload["role"]["role_name"], "债权业务事业部实习生")
+
     def test_quality_gate_rejects_generic_copy_when_resume_experience_is_available(self) -> None:
         provider = CapturingProvider([valid_result(), rich_valid_result()])
 
@@ -271,8 +289,9 @@ class CoverLetterRewriterTests(unittest.TestCase):
     def test_quality_gate_rejects_internal_evidence_token(self) -> None:
         leaked = valid_result()
         leaked["cover_letter"] = leaked["cover_letter"].replace(
-            "内容研究项目",
-            "exp_2022_xinhua 内容研究项目",
+            "\n\n",
+            "\n\nexp_2022_xinhua ",
+            1,
         )
         provider = CapturingProvider([leaked, valid_result()])
 

@@ -4169,10 +4169,7 @@ async function terminatePersistedJobProcesses(job) {
     throw new Error('Cannot identify the persisted job process without its unique output directory.');
   }
 
-  const matchesJob = (item) => {
-    const commandLine = String(item.CommandLine || '').toLowerCase();
-    return Boolean(commandLine) && commandLine.includes(outputDir);
-  };
+  const matchesJob = (item) => persistedProcessBelongsToJob(item, outputDir);
   const before = await listWindowsProcesses();
   const matches = before.filter(matchesJob).filter((item) => Number(item.ProcessId) !== process.pid);
   if (matches.length === 0) {
@@ -4194,6 +4191,22 @@ async function terminatePersistedJobProcesses(job) {
     throw new Error(`Persisted job process cleanup left ${remaining.length} matching process(es) running.`);
   }
   return { matched: matches.length, terminated: matches.length, method: 'command-line-identity' };
+}
+
+export function persistedProcessBelongsToJob(item, normalizedOutputDir) {
+  const commandLine = String(item?.CommandLine || '').toLowerCase();
+  const outputDir = String(normalizedOutputDir || '').trim().toLowerCase();
+  if (!commandLine || !outputDir || !commandLine.includes(outputDir)) return false;
+
+  // This sidecar is supervised by the API server and intentionally keeps using
+  // the finished collection's artifacts. Treating it as a runner orphan makes
+  // cleanup race its supervisor and incorrectly fails an otherwise valid run.
+  if (
+    commandLine.includes('resolve_application_contacts.py')
+    && commandLine.includes('--job-id contact-ocr-')
+  ) return false;
+
+  return true;
 }
 
 async function removeStaleAtomicTemps(outputDir) {

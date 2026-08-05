@@ -29,7 +29,8 @@
     "test:copilot-eval": "node scripts/run-copilot-evals.mjs",
     "test:copilot-contract": "node --test server/copilot-protocol.test.mjs server/data-copilot-http.test.mjs",
     "test:copilot-recovery": "node --test server/copilot-runtime-v2.test.mjs",
-    "test:copilot-migration": "node --test --test-name-pattern=\"schema v2 migrates\" server/copilot-runtime-v2.test.mjs"
+    "test:copilot-migration": "node --test --test-name-pattern=\"schema v2 migrates\" server/copilot-runtime-v2.test.mjs",
+    "cover-letter:external-batch": "node scripts/run_external_cover_letter_batch.mjs"
   },
   "dependencies": {
     "busboy": "^1.6.0",

@@ -637,6 +637,34 @@ def _local_json_with_output_limit(
         provider.max_output_tokens = previous_limit
 
 
+def _infer_role_name_from_body(record: dict[str, Any]) -> str:
+    body = _text(record.get("body") or record.get("body_excerpt"))[:1200]
+    if not body:
+        return ""
+    patterns = (
+        re.compile(r"(?:招聘岗位|岗位名称|招聘职位|职位名称)\s*[:：]\s*([^\n【】。；;]{2,60})", re.I),
+        re.compile(
+            r"(?:有限责任公司|股份有限公司|有限公司|集团(?:有限公司)?|公司)\s*[-—:：]?\s*"
+            r"([^\n【】。；;]{2,60}?(?:实习生|实习岗位|实习|管培生|助理|专员|经理|分析师|研究员|顾问|工程师|运营|产品|设计|编辑|剪辑))"
+            r"(?=\s*(?:\d{1,2}月|ASAP|尽快|立即|【|工作内容|岗位职责|职位描述|任职要求|$))",
+            re.I,
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.search(body)
+        if not match:
+            continue
+        candidate = re.split(
+            r"\s+(?:工作内容|岗位职责|职位描述|任职要求|岗位要求|工作地点|薪资待遇|投递方式)\b",
+            match.group(1).strip(),
+            maxsplit=1,
+        )[0].strip(" -—|：:")
+        role_name = normalize_role_title(candidate)
+        if role_name:
+            return role_name
+    return ""
+
+
 def build_cover_letter_rewrite_input(
     record: dict[str, Any],
     current_draft: dict[str, Any],
@@ -653,7 +681,7 @@ def build_cover_letter_rewrite_input(
         or record.get("role_name")
         or record.get("title")
     )
-    role_name = normalize_role_title(raw_role_name) or "当前岗位"
+    role_name = normalize_role_title(raw_role_name) or _infer_role_name_from_body(record) or "当前岗位"
     responsibilities = _role_points(record, "responsibilities", 6)
     requirements = _role_points(record, "requirements", 8)
     evidence = _candidate_evidence(record, profile)
@@ -680,6 +708,9 @@ def build_cover_letter_rewrite_input(
                 for key, value in profile.items()
                 if key not in {
                     "education",
+                    "experiences",
+                    "projects",
+                    "candidate_application",
                     "evidence_items",
                     "evidence",
                     "profile_snapshot",

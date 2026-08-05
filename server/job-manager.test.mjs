@@ -5,7 +5,13 @@ import { PassThrough } from 'node:stream';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { JobManager, bodyMetricsForJob, publicJob, updateProgressFromLog } from './job-manager.mjs';
+import {
+  JobManager,
+  bodyMetricsForJob,
+  persistedProcessBelongsToJob,
+  publicJob,
+  updateProgressFromLog,
+} from './job-manager.mjs';
 import { validateExpansionStartRequest, validateRunRequest } from './lib/contracts.mjs';
 import {
   WORKFLOW_EVENT_LINE_PREFIX,
@@ -22,6 +28,16 @@ function createFakeChild(pid) {
   child.kill = () => queueMicrotask(() => child.emit('close', null, 'SIGTERM'));
   return child;
 }
+
+test('process isolation ignores the supervised contact OCR sidecar', () => {
+  const outputDir = 'c:\\workspace\\data\\jobs\\job-1\\artifacts';
+  assert.equal(persistedProcessBelongsToJob({
+    CommandLine: `python scripts\\runner.py --output-dir ${outputDir}`,
+  }, outputDir), true);
+  assert.equal(persistedProcessBelongsToJob({
+    CommandLine: `python scripts\\resolve_application_contacts.py --output-dir ${outputDir} --job-id contact-ocr-123 --watch`,
+  }, outputDir), false);
+});
 
 function waitForJob(manager, id, predicate, timeoutMs = 3000) {
   const current = manager.get(id);

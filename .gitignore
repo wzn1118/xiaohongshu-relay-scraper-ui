@@ -8,6 +8,7 @@ output/
 test-results/
 tmp/
 deliverables/
+artifacts/
 profiles/*.json
 !profiles/candidate_profile.example.json
 docs/RESUME_EVIDENCE.md

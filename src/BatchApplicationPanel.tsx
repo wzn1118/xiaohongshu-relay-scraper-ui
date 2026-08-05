@@ -1183,6 +1183,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
               const status = checked?.status || savedBatchItem?.status
               const copyQuality = item.outreach?.content_quality
               const copyQualityBlocked = copyQuality?.batch_ready === false
+                || item.deliveryManifestSummary?.copyStatus === 'quality_failed'
               const subjectGuard = item.emailSubjectGuard
               const subjectNeedsReview = subjectGuard?.requiresReview === true
                 || ['rejected_noisy_title', 'rejected_bare_title', 'rejected_unverified_subject']

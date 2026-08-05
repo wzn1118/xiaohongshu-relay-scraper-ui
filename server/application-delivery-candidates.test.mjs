@@ -72,6 +72,33 @@ test('filters the full corpus, returns facet counts, and pages with a stable cur
   assert.equal(second.selectionSnapshot.selectionSnapshotHash, first.selectionSnapshot.selectionSnapshotHash);
 });
 
+test('searches extracted responsibilities and requirements', () => {
+  const records = [candidate('1', {
+    application_info: {
+      contacts: [],
+      application_routes: [],
+      responsibilities: [{ text: 'RESPONSIBILITY_MATCH_42' }],
+      requirements: [{ text: 'REQUIREMENT_MATCH_73' }],
+    },
+  }), candidate('2')];
+
+  const responsibilityMatch = buildApplicationDeliveryCandidates({
+    jobId: 'job-1',
+    records,
+    query: { q: 'responsibility_match_42' },
+  });
+  assert.equal(responsibilityMatch.total, 1);
+  assert.equal(responsibilityMatch.items[0].note_id, '1');
+
+  const requirementMatch = buildApplicationDeliveryCandidates({
+    jobId: 'job-1',
+    records,
+    query: { q: 'requirement_match_73' },
+  });
+  assert.equal(requirementMatch.total, 1);
+  assert.equal(requirementMatch.items[0].note_id, '1');
+});
+
 test('defaults to 50 rows and safely caps larger page-size requests at 100', () => {
   const records = Array.from({ length: 130 }, (_, index) => candidate(String(index + 1).padStart(3, '0')));
   const defaultPage = buildApplicationDeliveryCandidates({ jobId: 'job-1', records });

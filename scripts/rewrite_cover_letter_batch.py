@@ -54,14 +54,14 @@ def _build_job(entry: dict[str, Any], candidate_profile: dict[str, Any], instruc
     return {
         "note_id": _text(entry.get("note_id") or record.get("note_id")),
         "TARGET_ROLE": payload["role"].get("role_name", "当前岗位"),
-        "role": payload["role"],
-        "JOB_DESCRIPTION": payload["role"].get("source_body_excerpt", ""),
+        "candidate_name": _text(payload["candidate"].get("application_profile", {}).get("name")),
+        "role": {
+            "role_name": payload["role"].get("role_name", "当前岗位"),
+            "source_post_title": payload["role"].get("source_post_title", ""),
+        },
+        "JOB_DESCRIPTION": payload["role"].get("source_body_excerpt", "")[:1200],
         "JOB_RESPONSIBILITIES": payload["role"].get("responsibilities", []),
         "JOB_REQUIREMENTS": payload["role"].get("requirements", []),
-        "responsibilities": payload["role"].get("responsibilities", []),
-        "requirements": payload["role"].get("requirements", []),
-        "source_body_excerpt": payload["role"].get("source_body_excerpt", ""),
-        "current_subject": _text(outreach.get("email_subject")),
         "allowed_evidence_ids": payload["quality_contract"].get("allowed_evidence_ids", []),
         "required_responsibility_ids": payload["quality_contract"].get("required_responsibility_ids", []),
     }
@@ -95,7 +95,9 @@ def _normalize_result(item: dict[str, Any], jobs_by_id: dict[str, dict[str, Any]
     embedded_subject, body = _split_cover_letter_subject(body, payload_for_job)
     if not subject:
         subject = embedded_subject
-    subject = _bounded_cover_letter_subject(subject, payload_for_job, {"positioning": "个人经历与岗位匹配"})
+    role_name = _text(job.get("role", {}).get("role_name")) or "当前岗位"
+    candidate_name = _text(job.get("candidate_name")) or "候选人"
+    subject = _bounded_cover_letter_subject(f"应聘{role_name}｜{candidate_name}", payload_for_job, {"positioning": "个人经历与岗位匹配"})
     used = item.get("used_evidence_ids") if isinstance(item.get("used_evidence_ids"), list) else []
     allowed = set(job.get("allowed_evidence_ids", []))
     used = [_text(value) for value in used if _text(value) in allowed]

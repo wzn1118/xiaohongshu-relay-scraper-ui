@@ -3815,6 +3815,9 @@ function App() {
       setJobs((current) => replaceJobInPlace(current, resumedJob))
       if (scope === 'audience') setAudienceTask(resumedJob)
       if (['queued', 'resuming', 'running'].includes(resumedJob.status)) connectJob(resumedJob)
+      setNotice(['queued', 'resuming', 'running'].includes(resumedJob.status)
+        ? '任务已恢复，正在从已保存进度继续处理。'
+        : '恢复请求已处理，已同步最新任务状态。')
       return resumedJob
     } catch (error) {
       setNotice((error as Error).message)
