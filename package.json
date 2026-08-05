@@ -9,6 +9,7 @@
     "build": "tsc -b && vite build",
     "build:frontend": "vite build",
     "start": "node server/index.mjs",
+    "provision:auth": "node scripts/provision-auth.mjs",
     "configure:outlook": "node scripts/configure-outlook-smtp.mjs",
     "lint": "node scripts/lint.mjs",
     "format:check": "node scripts/check-format.mjs",

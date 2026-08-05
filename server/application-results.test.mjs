@@ -116,7 +116,7 @@ test('application results expose general presentation and use general completene
   await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), '[]', 'utf8');
   const internal = { id, outputDir, config: { analysisMode: 'general' } };
   const manager = {
-    active: null,
+    active: internal,
     list: () => [],
     get: (jobId) => jobId === id ? internal : null,
     getInternal: (jobId) => jobId === id ? internal : null,
@@ -190,7 +190,8 @@ test('legacy results can be viewed as content and remain pending until AI struct
     config: {},
   };
   const manager = {
-    active: null,
+    active: internal,
+    // active collection fixture
     list: () => [],
     get: (jobId) => jobId === id ? internal : null,
     getInternal: (jobId) => jobId === id ? internal : null,
@@ -374,7 +375,7 @@ test('application results hydrate images and filter the full result set by publi
         media: { analysis: { status: 'analyzed', source: 'vision_model' } },
         outreach: { ...base.outreach, runtime_status: 'image_enriched_missing_job_body' },
       },
-      { ...base, note_id: 'old', title: '较早岗位', body: '完整正文。简历标题备注上：岗位-姓名-最早到岗时间-可实习时长，帖子不删就是还在招', publish_time: { raw: old, value: old, precision: 'minute', is_estimated: false }, job_card: { parse_basis: 'full_body' } },
+      { ...base, note_id: 'old', title: '较早岗位', body: '完整正文。简历标题备注上：岗位-姓名-最早到岗时间-可实习时长；邮件标题要求：姓名-学校-应聘岗位。帖子不删就是还在招', publish_time: { raw: old, value: old, precision: 'minute', is_estimated: false }, job_card: { parse_basis: 'full_body' } },
       { ...base, note_id: 'unknown', title: '日期待确认', body: '', publish_time: { raw: '', value: '', precision: 'unknown', is_estimated: false }, job_card: { parse_basis: 'search_card' }, outreach: { ...base.outreach, runtime_status: 'fallback_missing_job_body' } },
     ],
   }), 'utf8');
@@ -388,7 +389,7 @@ test('application results hydrate images and filter the full result set by publi
   const id = '20260729080000-abcdef12';
   const internal = { id, outputDir, config: {} };
   const manager = {
-    active: null,
+    active: internal,
     list: () => [],
     get: (jobId) => jobId === id ? internal : null,
     getInternal: (jobId) => jobId === id ? internal : null,
@@ -415,6 +416,12 @@ test('application results hydrate images and filter the full result set by publi
       template: '岗位-姓名-最早到岗时间-可实习时长',
       evidence: '简历标题备注上:岗位-姓名-最早到岗时间-可实习时长',
       fields: ['jobTitle', 'candidateName', 'arrivalDate', 'internshipDuration'],
+    });
+    assert.deepEqual(all.items.find((item) => item.note_id === 'old').emailSubjectRequirement, {
+      detected: true,
+      template: '姓名-学校-应聘岗位',
+      evidence: '邮件标题要求：姓名-学校-应聘岗位',
+      fields: ['candidateName', 'school', 'jobTitle'],
     });
 
     const roleMatch = await fetch(`${origin}/api/jobs/${id}/results?query=${encodeURIComponent('结构化增长产品经理')}`).then((response) => response.json());
@@ -471,9 +478,9 @@ test('application results expose normalized legacy body emails to search and det
       outreach: { email_subject: '内容运营实习申请', email_body: '正文', cover_letter: '求职信' },
     }],
   }), 'utf8');
-  const internal = { id, outputDir, config: {} };
+  const internal = { id, outputDir, config: {}, params: { analysisMode: 'job' } };
   const manager = {
-    active: null,
+    active: internal,
     list: () => [],
     get: (jobId) => jobId === id ? internal : null,
     getInternal: (jobId) => jobId === id ? internal : null,
@@ -525,9 +532,9 @@ test('application results proxy Xiaohongshu images through a persistent per-task
   }), 'utf8');
   await writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), '[]', 'utf8');
   await writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), '[]', 'utf8');
-  const internal = { id, outputDir, config: {} };
+  const internal = { id, outputDir, config: {}, params: { analysisMode: 'job' } };
   const manager = {
-    active: null,
+    active: internal,
     list: () => [],
     get: (jobId) => jobId === id ? internal : null,
     getInternal: (jobId) => jobId === id ? internal : null,
@@ -649,9 +656,9 @@ test('media proxy returns 502 without crashing when the source image rejects acc
   const outputDir = path.join(fixture, 'artifacts');
   await mkdir(outputDir, { recursive: true });
   const id = '20260801090000-abcdef12';
-  const internal = { id, outputDir, config: {} };
+  const internal = { id, outputDir, config: {}, params: { analysisMode: 'job' } };
   const manager = {
-    active: null,
+    active: internal,
     list: () => [],
     get: (jobId) => jobId === id ? internal : null,
     getInternal: (jobId) => jobId === id ? internal : null,
@@ -672,6 +679,124 @@ test('media proxy returns 502 without crashing when the source image rejects acc
 
     const health = await fetch(`${origin}/api/health`);
     assert.equal(health.status, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(fixture, { recursive: true, force: true });
+  }
+});
+
+test('application results start contact OCR through the shared service instance', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-contact-ocr-results-'));
+  const outputDir = path.join(fixture, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  const id = '20260805010000-abcdef12';
+  await Promise.all([
+    writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
+      records: [{
+        note_id: 'image-contact-1',
+        title: 'Image contact role',
+        note_url: 'https://www.xiaohongshu.com/explore/image-contact-1',
+        body: 'Role description without an email address.',
+        publish_time: { value: new Date().toISOString() },
+        media: {
+          images: [{ url: 'https://img.example/contact.webp' }],
+          analysis: { status: 'pending_ai', source: 'image_urls' },
+        },
+        application_info: { contacts: [], application_routes: [], responsibilities: [], requirements: [] },
+        outreach: { runtime_status: 'completed' },
+      }, {
+        note_id: 'body-contact-1',
+        title: 'Body contact role',
+        note_url: 'https://www.xiaohongshu.com/explore/body-contact-1',
+        body: 'Please send your resume to body@example.com',
+        publish_time: { value: new Date().toISOString() },
+        media: {
+          images: [{ url: 'https://img.example/body-contact.webp' }],
+          analysis: { status: 'pending_ai', source: 'image_urls' },
+        },
+        application_info: { contacts: [], application_routes: [], responsibilities: [], requirements: [] },
+        outreach: { runtime_status: 'completed' },
+      }],
+    }), 'utf8'),
+    writeFile(path.join(outputDir, 'xiaohongshu_cards_latest.json'), '[]', 'utf8'),
+    writeFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), '[]', 'utf8'),
+    writeFile(path.join(outputDir, 'application-contact-ocr.json'), JSON.stringify({
+      schemaVersion: 1,
+      records: {
+        'image-contact-1': {
+          status: 'complete',
+          visibleText: 'Apply at image@example.com',
+          routes: [{
+            type: 'email',
+            channel: 'email',
+            value: 'image@example.com',
+            source: 'image',
+            source_field: 'image',
+            confidence: 100,
+            actionable: true,
+          }],
+          contactOcr: { status: 'complete', attempts: 1, emailsFound: 1 },
+        },
+      },
+    }), 'utf8'),
+  ]);
+  const internal = { id, outputDir, config: {}, params: { analysisMode: 'job' } };
+  const manager = {
+    active: null,
+    list: () => [],
+    get: (jobId) => jobId === id ? internal : null,
+    getInternal: (jobId) => jobId === id ? internal : null,
+  };
+  let starts = 0;
+  const applicationContactOcrService = {
+    ensureStarted: async (requestedOutputDir) => {
+      starts += 1;
+      assert.equal(requestedOutputDir, outputDir);
+      return {
+        action: 'started',
+        state: { status: 'running', active: true, totalQueued: 1, processed: 0 },
+      };
+    },
+    getState: async () => ({ status: 'running', active: true, totalQueued: 1, processed: 0 }),
+  };
+  const server = http.createServer(createApp({
+    manager,
+    config: {
+      host: '127.0.0.1',
+      port: 0,
+      maxBodyBytes: 4096,
+      runnerAvailable: true,
+      applicationContactOcrEnabled: true,
+      applicationContactOcrAutoEnabled: true,
+    },
+    applicationContactOcrService,
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const resultsResponse = await fetch(`${origin}/api/jobs/${id}/results`);
+    assert.equal(resultsResponse.status, 200);
+    const results = await resultsResponse.json();
+    assert.equal(starts, 1);
+    assert.equal(results.contactResolution.action, 'started');
+    assert.equal(results.contactResolution.status, 'running');
+    assert.equal(results.items[0].application_info.application_routes[0].value, 'image@example.com');
+    assert.equal(results.items[0].media.analysis.contact_ocr.status, 'complete');
+    assert.equal(results.items[0].contactDiscovery.status, 'ready');
+    assert.equal(results.items[0].contactDiscovery.candidates[0].address, 'image@example.com');
+    assert.equal(results.items[0].contactDiscovery.candidates[0].noteId, 'image-contact-1');
+    assert.equal(results.contactDiscovery.summary.imageEmailRecords, 1);
+
+    const resolutionResponse = await fetch(`${origin}/api/jobs/${id}/contact-resolution?limit=5`);
+    assert.equal(resolutionResponse.status, 200);
+    const resolution = await resolutionResponse.json();
+    assert.equal(resolution.summary.imageOcrComplete, 1);
+    assert.equal(resolution.summary.imageOcrSkippedBodyEmail, 1);
+    assert.equal(resolution.summary.imageOcrPending, 0);
+    assert.equal(resolution.items.find((item) => item.noteId === 'body-contact-1').imageOcrStatus, 'skipped_body_email');
+    assert.equal(resolution.summary.commentsPending, 0);
+    assert.equal(resolution.summary.noEmailConfirmed, 0);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await rm(fixture, { recursive: true, force: true });

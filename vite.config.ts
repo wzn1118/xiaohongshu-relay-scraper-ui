@@ -7,7 +7,13 @@ const apiProxy = process.env.VITE_API_PROXY
 export default defineConfig({
   plugins: [react()],
   server: {
+    host: '::',
     port: 5173,
+    watch: {
+      // Playwright creates and removes this transient directory while tests run.
+      // Chokidar must not crash the dev server when that directory disappears.
+      ignored: ['**/.playwright-cli/**'],
+    },
     proxy: {
       '/api': apiProxy,
     },

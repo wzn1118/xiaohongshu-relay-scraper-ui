@@ -77,6 +77,22 @@ test('creates atomic batch and item JSON under artifacts/application-batches and
   assert.deepEqual((await reopened.listBatches({ jobId: 'job-001' })).map((batch) => batch.batchId), ['batch-001']);
 });
 
+test('historical batches remain readable without newly added zero-count status keys', async (t) => {
+  const { rootDir, manager } = await fixture(t);
+  await createReady(manager, { batchId: 'batch-historical-statuses' });
+  const batchPath = path.join(rootDir, 'artifacts', 'application-batches', 'batch-historical-statuses', 'batch.json');
+  const historical = JSON.parse(await readFile(batchPath, 'utf8'));
+  delete historical.counts.subject_pending;
+  delete historical.counts.copy_quality_failed;
+  await writeFile(batchPath, JSON.stringify(historical, null, 2), 'utf8');
+
+  const reopened = new ApplicationBatchManager({ rootDir, now: () => new Date(T2) });
+  const loaded = await reopened.getBatch('batch-historical-statuses');
+
+  assert.equal(loaded.batchId, 'batch-historical-statuses');
+  assert.equal(loaded.items[0].status, 'ready');
+});
+
 test('item lifecycle is revision guarded and derives batch readiness', async (t) => {
   const { manager } = await fixture(t);
   let batch = await manager.createBatch({
@@ -85,7 +101,7 @@ test('item lifecycle is revision guarded and derives batch readiness', async (t)
     items: [{ itemId: 'note-001', noteId: 'note-001' }],
   });
 
-  const steps = ['draft_pending', 'quality_pending', 'filename_pending', 'ready'];
+  const steps = ['subject_pending', 'copy_quality_failed', 'draft_pending', 'quality_pending', 'filename_pending', 'ready'];
   for (const status of steps) {
     batch = await manager.updateItem('batch-lifecycle', 'note-001', { status }, {
       expectedBatchRevision: batch.revision,
@@ -94,7 +110,7 @@ test('item lifecycle is revision guarded and derives batch readiness', async (t)
   }
   assert.equal(batch.status, 'ready');
   assert.equal(batch.items[0].status, 'ready');
-  assert.equal(batch.revision, 5);
+  assert.equal(batch.revision, 7);
 
   await assert.rejects(
     manager.updateItem('batch-lifecycle', 'note-001', { payload: { changed: true } }, { expectedBatchRevision: 1 }),
@@ -104,6 +120,22 @@ test('item lifecycle is revision guarded and derives batch readiness', async (t)
     manager.updateItem('batch-lifecycle', 'note-001', { status: 'sent' }),
     { code: 'APPLICATION_BATCH_ITEM_TRANSITION_INVALID', status: 409 },
   );
+});
+
+test('subject and copy quality blockers are valid persisted initial states', async (t) => {
+  const { manager } = await fixture(t);
+  const batch = await manager.createBatch({
+    batchId: 'batch-copy-blockers',
+    jobId: 'job-001',
+    items: [
+      { itemId: 'subject-note', noteId: 'subject-note', status: 'subject_pending' },
+      { itemId: 'copy-note', noteId: 'copy-note', status: 'copy_quality_failed' },
+    ],
+  });
+
+  assert.equal(batch.counts.subject_pending, 1);
+  assert.equal(batch.counts.copy_quality_failed, 1);
+  assert.equal(batch.status, 'draft');
 });
 
 test('approval binds an explicit revision and immutable payload, then pause and resume retain it', async (t) => {

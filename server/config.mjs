@@ -10,7 +10,9 @@ const audienceAiRunnerPath =
   process.env.XHS_AUDIENCE_AI_RUNNER_PATH ||
   path.resolve(serverDir, '..', 'scripts', 'run_audience_ai.py');
 const audienceProfileSupplementPath = path.resolve(serverDir, '..', 'scripts', 'audience_profile_supplement.py');
+const applicationContactOcrPath = path.resolve(serverDir, '..', 'scripts', 'resolve_application_contacts.py');
 const dataDir = path.resolve(process.env.XHS_SERVER_DATA_DIR || path.join(serverDir, '..', 'data', 'jobs'));
+const authRoot = path.resolve(process.env.XHS_AUTH_DATA_DIR || path.join(dataDir, '..', 'auth'));
 const smtpPort = readPort(process.env.SMTP_PORT, 587);
 const smtpUser = String(process.env.SMTP_USER || '').trim();
 const smtpPass = String(process.env.SMTP_PASS || '');
@@ -29,10 +31,34 @@ export const config = Object.freeze({
   audienceAiRunnerAvailable: existsSync(audienceAiRunnerPath),
   audienceAiMaxConcurrent: readInt(process.env.XHS_AUDIENCE_AI_MAX_CONCURRENT, 2, 1, 8),
   audienceProfileSupplementPath,
+  applicationContactOcrEnabled: readBoolean(process.env.XHS_APPLICATION_CONTACT_OCR_ENABLED, true),
+  applicationContactOcrAutoEnabled: readBoolean(process.env.XHS_APPLICATION_CONTACT_OCR_AUTO_ENABLED, true),
+  applicationContactOcrPath,
+  applicationContactOcrTimeoutSeconds: readInt(process.env.XHS_APPLICATION_CONTACT_OCR_TIMEOUT_SECONDS, 180, 30, 600),
+  applicationContactOcrCheckpointEvery: readInt(process.env.XHS_APPLICATION_CONTACT_OCR_CHECKPOINT_EVERY, 5, 1, 50),
+  applicationContactOcrMaxAttempts: readInt(process.env.XHS_APPLICATION_CONTACT_OCR_MAX_ATTEMPTS, 2, 1, 3),
+  applicationContactOcrConcurrency: readInt(process.env.XHS_APPLICATION_CONTACT_OCR_CONCURRENCY, 2, 1, 8),
+  applicationContactOcrPrefetchConcurrency: readInt(process.env.XHS_APPLICATION_CONTACT_OCR_PREFETCH_CONCURRENCY, 12, 1, 32),
+  applicationContactOcrImageBatchSize: readInt(process.env.XHS_APPLICATION_CONTACT_OCR_IMAGE_BATCH_SIZE, 4, 1, 4),
+  applicationContactOcrBaseUrls: readLocalModelBaseUrls(process.env.XHS_APPLICATION_CONTACT_OCR_BASE_URLS),
+  applicationContactOcrModel: String(process.env.XHS_APPLICATION_CONTACT_OCR_MODEL || '').trim(),
+  applicationContactOcrContextTokens: readInt(process.env.XHS_APPLICATION_CONTACT_OCR_CONTEXT_TOKENS, 4096, 2048, 8192),
+  applicationContactOcrMaxOutputTokens: readInt(process.env.XHS_APPLICATION_CONTACT_OCR_MAX_OUTPUT_TOKENS, 256, 128, 2048),
+  applicationContactOcrKeepAlive: String(process.env.XHS_APPLICATION_CONTACT_OCR_KEEP_ALIVE || '60m').trim(),
   staticDir: path.resolve(process.env.XHS_STATIC_DIR || path.join(serverDir, '..', 'dist')),
   projectRoot: path.resolve(serverDir, '..'),
   windowsPrerequisiteScriptPath: path.resolve(serverDir, '..', 'scripts', 'ensure-windows-prerequisites.ps1'),
   dataDir,
+  localModelEndpoint: normalizeLocalModelEndpoint(process.env.XHS_LOCAL_MODEL_ENDPOINT || 'http://127.0.0.1:11434'),
+  authRequired: readBoolean(process.env.XHS_AUTH_REQUIRED, process.env.NODE_ENV === 'production'),
+  authUsersPath: path.resolve(process.env.XHS_AUTH_USERS_PATH || path.join(authRoot, 'users.json')),
+  authSessionSecretPath: path.resolve(process.env.XHS_AUTH_SESSION_SECRET_PATH || path.join(authRoot, 'session-secret')),
+  authBootstrapEmail: String(process.env.XHS_AUTH_EMAIL || '').trim(),
+  authBootstrapPassword: String(process.env.XHS_AUTH_PASSWORD || ''),
+  authCookieName: String(process.env.XHS_AUTH_COOKIE_NAME || 'xhs_session').trim() || 'xhs_session',
+  authSecureCookie: readBoolean(process.env.XHS_AUTH_SECURE_COOKIE, process.env.NODE_ENV === 'production'),
+  authSessionTtlSeconds: readInt(process.env.XHS_AUTH_SESSION_TTL_SECONDS, 8 * 60 * 60, 300, 7 * 24 * 60 * 60),
+  authOrigin: String(process.env.XHS_AUTH_ORIGIN || '').trim(),
   managedBrowserDataDir: path.resolve(process.env.XHS_BROWSER_DATA_DIR || path.join(dataDir, '..', 'browser')),
   relayConfigPath: path.resolve(process.env.XHS_RELAY_CONFIG_PATH || path.join(dataDir, '..', 'relay-config.json')),
   aiConfigPath: path.resolve(process.env.XHS_AI_CONFIG_PATH || path.join(dataDir, '..', 'ai-config.json')),
@@ -89,6 +115,31 @@ function readInt(value, fallback, min, max) {
 function readBoolean(value, fallback = false) {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function normalizeLocalModelEndpoint(value) {
+  const text = String(value || '').trim();
+  let parsed;
+  try { parsed = new URL(text); } catch { throw new Error('XHS_LOCAL_MODEL_ENDPOINT 必须是完整 URL。'); }
+  const local = ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname);
+  if (parsed.protocol !== 'https:' && !(local && parsed.protocol === 'http:')) {
+    throw new Error('XHS_LOCAL_MODEL_ENDPOINT 仅支持 HTTPS，或本机 HTTP。');
+  }
+  if (parsed.username || parsed.password) throw new Error('XHS_LOCAL_MODEL_ENDPOINT 不得包含账号或密码。');
+  parsed.search = '';
+  parsed.hash = '';
+  parsed.pathname = parsed.pathname.replace(/\/v1\/?$/iu, '').replace(/\/+$/u, '');
+  return parsed.toString().replace(/\/+$/u, '');
+}
+
+function readLocalModelBaseUrls(value) {
+  if (!value) return Object.freeze([]);
+  const urls = String(value)
+    .split(/[;,\s]+/u)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => `${normalizeLocalModelEndpoint(entry)}/v1`);
+  return Object.freeze([...new Set(urls)].slice(0, 4));
 }
 
 function normalizeMicrosoftTenant(value) {

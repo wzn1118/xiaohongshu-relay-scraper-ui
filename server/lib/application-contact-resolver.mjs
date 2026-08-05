@@ -32,6 +32,7 @@ const REDACTED_EMAIL_MATCHES = Object.freeze([
 export async function resolveApplicationContacts(record, {
   outputDir = '',
   fallbackOutputDirs = [],
+  audienceSnapshot = null,
 } = {}) {
   const { noteId, postId } = applicationRecordIds(record);
   const primaryCandidates = applicationRecordCandidates(record, { noteId, postId });
@@ -63,7 +64,7 @@ export async function resolveApplicationContacts(record, {
     });
   }
 
-  const audience = await readAudienceArtifacts(outputDir, fallbackOutputDirs);
+  const audience = audienceSnapshot || await readAudienceArtifacts(outputDir, fallbackOutputDirs);
   const matchedComments = audience.comments.filter((comment) => commentPostId(comment) === postId);
   const matchedPosts = audience.posts.filter((post) => audiencePostId(post) === postId);
   const collectionStatus = audienceCollectionStatus(matchedPosts, matchedComments);
@@ -137,6 +138,38 @@ export async function resolveApplicationContacts(record, {
   });
 }
 
+export async function resolveApplicationContactsBatch(records, {
+  outputDir = '',
+  fallbackOutputDirs = [],
+} = {}) {
+  const items = Array.isArray(records) ? records : [];
+  const needsCommentFallback = items.some((record) => {
+    const { noteId, postId } = applicationRecordIds(record);
+    return Boolean(postId) && applicationRecordCandidates(record, { noteId, postId }).length === 0;
+  });
+  const audienceSnapshot = needsCommentFallback
+    ? await readAudienceArtifacts(outputDir, fallbackOutputDirs)
+    : null;
+  return Promise.all(items.map((record) => (
+    resolveApplicationContacts(record, audienceSnapshot ? { audienceSnapshot } : {})
+  )));
+}
+
+export function applicationContactSourceRevision(candidate) {
+  return sha256(JSON.stringify([
+    'application-contact-source:v1',
+    String(candidate?.noteId || ''),
+    String(candidate?.postId || ''),
+    String(candidate?.commentId || ''),
+    String(candidate?.authorId || ''),
+    String(candidate?.source || ''),
+    String(candidate?.evidenceHash || ''),
+    sha256(candidate?.evidenceText || ''),
+    String(candidate?.collectionStatus || ''),
+    String(candidate?.verificationStatus || ''),
+  ]));
+}
+
 /**
  * Add deterministic, actionable email routes to a hydrated result record.
  * Persisted artifacts remain unchanged; this view-layer enrichment lets old
@@ -167,6 +200,8 @@ export function enrichApplicationRecordContacts(record) {
       source_fields: candidate.sourceFields,
       verification_status: candidate.verificationStatus,
       normalization_applied: candidate.normalizationApplied,
+      evidence_hash: candidate.evidenceHash,
+      source_revision: applicationContactSourceRevision(candidate),
       actionable: true,
     }));
   if (!generated.length) return record;

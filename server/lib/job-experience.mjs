@@ -31,7 +31,9 @@ const PROBLEM_DEFINITIONS = Object.freeze({
   RATE_LIMITED: {
     category: 'access', severity: 'warning', affectedStage: 'body', retryable: true,
     automaticAction: '停止普通请求并等待恢复检查',
-    message: ({ saved, total, retryAt }) => `已保存 ${saved}/${total} 篇，将在 ${retryAt || '稍后'} 做一次恢复检查`,
+    message: ({ saved, total, retryAt }) => retryAt
+      ? `已保存 ${saved}/${total} 篇，系统会在下方时间自动检查是否恢复`
+      : `已保存 ${saved}/${total} 篇，系统会稍后自动检查是否恢复`,
     action: { id: 'check_recovery', label: '立即检查是否恢复' },
   },
   SECURITY_VERIFICATION: {
@@ -192,14 +194,15 @@ export function mapUserProblem(rawCode, context = {}) {
 
 export function deriveUserProblems(job = {}) {
   const body = normalizedBodyMetrics(job);
+  const bodyComplete = bodyCoverageComplete(body);
   const context = {
     saved: body.succeeded,
     total: body.discovered,
     retryAt: job.rateLimit?.nextRetryAt || null,
   };
   const codes = [];
-  if (ACTIVE_RATE_LIMIT_STATES.has(job.rateLimit?.status)) codes.push('RATE_LIMITED');
-  if (ACTIVE_SECURITY_STATES.has(job.securityRestriction?.status)) codes.push('SECURITY_VERIFICATION');
+  if (!bodyComplete && ACTIVE_RATE_LIMIT_STATES.has(job.rateLimit?.status)) codes.push('RATE_LIMITED');
+  if (!bodyComplete && ACTIVE_SECURITY_STATES.has(job.securityRestriction?.status)) codes.push('SECURITY_VERIFICATION');
   if (job.status === 'interrupted') codes.push('PROCESS_INTERRUPTED');
 
   const currentAttemptRecord = currentAttempt(job);
@@ -472,6 +475,16 @@ function normalizedBodyMetrics(job) {
   };
 }
 
+function bodyCoverageComplete(body) {
+  return body.discovered > 0
+    && body.succeeded >= body.discovered
+    && body.failed === 0
+    && body.notAttempted === 0
+    && body.blocked === 0
+    && body.cancelled === 0
+    && body.pending === 0;
+}
+
 function normalizeAttemptProgress(job, body) {
   const current = currentAttempt(job);
   const explicit = job.attemptProgress && typeof job.attemptProgress === 'object' ? job.attemptProgress : {};
@@ -549,8 +562,9 @@ function activeStageForJob(job) {
 }
 
 function normalizeTaskState(status, job) {
-  if (ACTIVE_SECURITY_STATES.has(job.securityRestriction?.status)) return 'waiting_user';
-  if (ACTIVE_RATE_LIMIT_STATES.has(job.rateLimit?.status)) return 'waiting_system';
+  const bodyComplete = bodyCoverageComplete(normalizedBodyMetrics(job));
+  if (!bodyComplete && ACTIVE_SECURITY_STATES.has(job.securityRestriction?.status)) return 'waiting_user';
+  if (!bodyComplete && ACTIVE_RATE_LIMIT_STATES.has(job.rateLimit?.status)) return 'waiting_system';
   const value = String(status || 'queued').toLowerCase();
   if (value === 'succeeded') return 'completed';
   if (value === 'incomplete' || value === 'interrupted' || value === 'blocked') return 'partial';

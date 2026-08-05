@@ -92,6 +92,21 @@ class FakeProvider:
                 "针对岗位中的增长分析与协作推进任务，我会先明确业务目标和衡量口径，再梳理用户反馈与"
                 "转化数据，找到优先级最高的问题；随后与相关成员确认可执行的调整动作，并持续追踪结果，"
                 "让每次复盘都能沉淀为下一轮行动依据。这样的工作方式与我在校园活动增长项目中的实践一致。\n\n"
+                "我理解增长运营首先要把业务目标转换为可检查的问题。面对一项活动，我会先确认希望改善的"
+                "用户阶段、需要观察的行为和复盘周期，再判断现有数据是否足以解释变化。这样既能避免只看"
+                "表面波动，也能让后续调研和执行围绕同一个判断展开。\n\n"
+                "已有的校园活动经历为这一方法提供了直接证据：我开展用户调研，并结合转化数据定位关键流失"
+                "环节。进入岗位后，我会继续区分用户反馈中的事实、推测和待验证问题，把访谈发现与行为数据"
+                "相互核对，再决定应调整内容、触达节奏还是活动流程。\n\n"
+                "对于数据复盘，我会保留指标口径、数据范围、异常情况和结论依据。若某项变化暂时缺少足够"
+                "证据，我会明确标记需要补充的观察，而不是直接归因。形成结论后，我会把问题、建议动作、"
+                "负责人和检查节点写清楚，方便相关成员理解为什么调整以及何时复核。\n\n"
+                "对于协作推进，我会在开始前确认交付目标和各方依赖，在执行中同步影响进度的变化，并在复盘"
+                "时把不同成员的反馈还原到具体环节。校园活动中与团队共同迭代方案的经验，使我能够把讨论"
+                "落到任务顺序和可执行动作上，同时保留调整依据。\n\n"
+                "如果团队同时推进多项增长任务，我会根据用户影响、问题频率、执行成本和验证条件排序，先做"
+                "能够快速获得有效反馈的事项。每轮执行后，我会比较预期与实际结果，记录哪些判断成立、哪些"
+                "需要修正，并把新发现带入下一轮调研和数据观察。\n\n"
                 "目前我每周可实习5天，预计可连续实习6个月。希望有机会进一步了解团队当前的增长目标，"
                 "并具体沟通我可以优先承担的数据复盘或协作推进任务。简历随信附上，感谢您的阅读，期待进一步沟通。\n\n"
                 "此致\n敬礼！\n姓名：测试用户"
@@ -508,6 +523,22 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertTrue(draft["greeting"].startswith("您好，我是Candidate Name"))
         self.assertIn("每周可实习5天", draft["greeting"])
         self.assertEqual(draft["email_subject"], "数据分析实习申请｜Candidate Name")
+
+    def test_local_draft_obeys_subject_requirement_in_job_body(self) -> None:
+        draft = _finalize_local_draft(
+            {
+                "greeting": "Candidate Name您好。",
+                "email_subject": "Application",
+            },
+            {"role_name": "AI产品经理实习"},
+            {"name": "Candidate Name", "school": "Example University"},
+            {
+                "title": "AI产品经理实习",
+                "body": "投递时邮件标题要求：姓名-学校-应聘岗位。",
+            },
+        )
+
+        self.assertEqual(draft["email_subject"], "Candidate Name-Example University-AI产品经理实习")
 
     def test_human_quality_reports_all_dimensions_and_ai_cliches(self) -> None:
         dimensions = _human_quality_dimensions(
@@ -976,18 +1007,37 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertTrue(any("作者昵称" in problem for problem in problems))
         self.assertTrue(any("页面噪声" in problem for problem in problems))
 
-    def test_local_model_uses_deterministic_quality_gate(self) -> None:
+    def test_local_model_performs_model_quality_evaluation(self) -> None:
         class LocalProvider:
             provider = "local_qwen"
 
+            def __init__(self) -> None:
+                self.calls = 0
+
             def generate_json(self, *_args, **_kwargs):
-                raise AssertionError("Local quality evaluation must not depend on another model response")
+                self.calls += 1
+                return {
+                    "score": 93,
+                    "rubric": {
+                        "role_relevance": 24,
+                        "evidence": 23,
+                        "first_person": 14,
+                        "concision": 14,
+                        "credibility": 9,
+                        "action_readiness": 9,
+                    },
+                    "strengths": ["岗位职责与候选人证据有明确对应。"],
+                    "problems": [],
+                    "rewrite_instructions": [],
+                }
 
-        evaluation = _evaluate(LocalProvider(), {}, [], {})
+        provider = LocalProvider()
+        evaluation = _evaluate(provider, {}, [], {})
 
-        self.assertLess(evaluation["score"], 90)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(evaluation["score"], 93)
         self.assertEqual(sum(evaluation["rubric"].values()), evaluation["score"])
-        self.assertTrue(evaluation["problems"])
+        self.assertIn("human_quality", evaluation)
 
     def test_quality_gate_rejects_unsupported_tools_and_metrics(self) -> None:
         evidence = [{

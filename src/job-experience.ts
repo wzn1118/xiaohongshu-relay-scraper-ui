@@ -277,7 +277,8 @@ function userProblem(params: Partial<UserProblem> & Pick<UserProblem, 'code' | '
 
 function legacyIssues(job: Job, saved: number, total: number): UserProblem[] {
   const savedText = total > 0 ? `${saved}/${total}` : String(saved)
-  if (job.securityRestriction?.detected && job.securityRestriction.status !== 'cleared') {
+  const bodyComplete = total > 0 && saved >= total
+  if (!bodyComplete && job.securityRestriction?.detected && job.securityRestriction.status !== 'cleared') {
     return [userProblem({
       code: 'SECURITY_VERIFICATION',
       category: 'access',
@@ -292,7 +293,7 @@ function legacyIssues(job: Job, saved: number, total: number): UserProblem[] {
       technicalRef: `security:${job.securityRestriction.status}`,
     })]
   }
-  if (job.rateLimit?.detected && job.rateLimit.status !== 'cleared') {
+  if (!bodyComplete && job.rateLimit?.detected && job.rateLimit.status !== 'cleared') {
     const retryAt = job.rateLimit.nextRetryAt || null
     return [userProblem({
       code: 'RATE_LIMITED',
@@ -361,20 +362,21 @@ export function jobExperienceView(
     : legacyStages(job, mode, maxAgeDays)
   const body = job.bodyMetrics
   const snapshotCounts = snapshot?.counts
-  const discovered = nonNegative(snapshotCounts?.discovered ?? body?.discovered ?? job.discoveredCount)
-  const fullText = nonNegative(snapshotCounts?.fullText ?? body?.succeeded ?? job.scrapedCount)
+  // A persisted body ledger is newer than any resumable experience snapshot.
+  const discovered = nonNegative(body?.discovered ?? snapshotCounts?.discovered ?? job.discoveredCount)
+  const fullText = nonNegative(body?.succeeded ?? snapshotCounts?.fullText ?? job.scrapedCount)
   const resultReady = nonNegative(
     mode === 'job'
       ? snapshotCounts?.applicationReady ?? snapshotCounts?.confirmedJobs ?? job.applicationCount
       : snapshotCounts?.applicationReady ?? job.applicationCount,
   )
   const pending = nonNegative(
-    snapshotCounts?.pending
-      ?? (body
-        ? body.failed + body.notAttempted + body.blocked + body.cancelled + body.pending
-        : Math.max(0, discovered - fullText)),
+    body
+      ? body.failed + body.notAttempted + body.blocked + body.cancelled + body.pending
+      : snapshotCounts?.pending ?? Math.max(0, discovered - fullText),
   )
-  const retryable = nonNegative(snapshotCounts?.retryable)
+  const bodyComplete = discovered > 0 && fullText >= discovered && pending === 0
+  const retryable = bodyComplete ? 0 : nonNegative(snapshotCounts?.retryable)
   const unavailable = nonNegative(snapshotCounts?.unavailable ?? body?.failed)
   const discovery = stages.find((stage) => stage.id === 'discovery')
   const stableTotal = snapshot?.journey === 'body_import'
@@ -382,27 +384,63 @@ export function jobExperienceView(
     || ['completed', 'partial', 'failed', 'cancelled'].includes(discovery?.state || '')
     || !ACTIVE_JOB_STATUSES.has(job.status)
   const coveragePercent = discovered > 0 ? Math.min(100, Math.round((fullText / discovered) * 1000) / 10) : null
-  const waitingForAccess = Boolean(job.rateLimit?.detected && job.rateLimit.status !== 'cleared')
+  const rawSnapshotIssues = Array.isArray(snapshot?.issues) ? snapshot.issues : []
+  const snapshotIssues = bodyComplete
+    ? rawSnapshotIssues.filter((issue) => !(
+        issue.affectedStage === 'body'
+        && ['RATE_LIMITED', 'SECURITY_VERIFICATION'].includes(issue.code)
+      ))
+    : rawSnapshotIssues
+  const waitingForAccess = !bodyComplete && (
+    Boolean(job.rateLimit?.detected && job.rateLimit.status !== 'cleared')
     || Boolean(job.securityRestriction?.detected && job.securityRestriction.status !== 'cleared')
-    || snapshot?.issues.some((issue) => ['RATE_LIMITED', 'SECURITY_VERIFICATION', 'LOGIN_REQUIRED'].includes(issue.code))
+    || snapshotIssues.some((issue) => ['RATE_LIMITED', 'SECURITY_VERIFICATION', 'LOGIN_REQUIRED'].includes(issue.code))
+  )
+  const normalizedStages = stages.map((stage) => {
+    if (stage.id !== 'body' || discovered <= 0) return stage
+    const done = Math.min(fullText, discovered)
+    const total = discovered
+    const state = waitingForAccess && done < total
+      ? 'waiting_system' as WorkflowStageState
+      : done >= total
+        ? 'completed' as WorkflowStageState
+        : stage.state
+    return {
+      ...stage,
+      state,
+      done,
+      total,
+      detail: stageDetail(state, done, total),
+    }
+  })
   const snapshotSpeed = snapshot?.speed
-  const activeStage = stages.find((stage) => ['running', 'waiting_system', 'waiting_user', 'retrying'].includes(stage.state))
-    || stages.find((stage) => stage.state === 'partial')
-  const headline = snapshot?.headline?.trim()
+  const activeStage = normalizedStages.find((stage) => ['running', 'waiting_system', 'waiting_user', 'retrying'].includes(stage.state))
+    || normalizedStages.find((stage) => stage.state === 'partial')
+  const staleBodyAccessHeadline = bodyComplete && rawSnapshotIssues.some((issue) => (
+    issue.affectedStage === 'body'
+    && ['RATE_LIMITED', 'SECURITY_VERIFICATION'].includes(issue.code)
+    && issue.userTitle === snapshot?.headline?.trim()
+  ))
+  const qualityNeedsReview = String(job.workflowSummary?.status || '') === 'failed'
+    || normalizedStages.some((stage) => stage.id === 'quality' && ['partial', 'failed'].includes(stage.state))
+  const headline = staleBodyAccessHeadline
+    ? qualityNeedsReview ? '正文采集已完成，求职材料仍需检查' : '正文采集已完成'
+    : snapshot?.headline?.trim()
     || (activeStage ? `正在${activeStage.label}`
       : job.status === 'completed' ? '任务结果已准备好'
         : job.status === 'failed' ? '当前步骤没有完成'
           : ['incomplete', 'interrupted', 'cancelled', 'blocked'].includes(job.status) ? '本轮结果已保存'
             : '任务正在准备中')
-  const detail = snapshot?.detail?.trim()
-    || activeStage?.detail
-    || (discovered > 0 ? `已获得 ${fullText}/${discovered} 篇完整正文。` : '有新结果时会在这里更新。')
-  const snapshotIssues = Array.isArray(snapshot?.issues) ? snapshot.issues : []
+  const detail = discovered > 0
+    ? `已找到 ${discovered} 条，完整正文 ${fullText} 条，待处理 ${pending} 条`
+    : snapshot?.detail?.trim()
+      || activeStage?.detail
+      || '有新结果时会在这里更新。'
   const checkpoint = snapshot?.checkpoint
   return {
     headline,
     detail,
-    stages,
+    stages: normalizedStages,
     counts: { discovered, fullText, resultReady, pending, retryable, unavailable },
     speed: {
       activePerMinute: nullableNumber(snapshotSpeed?.activePerMinute),

@@ -334,27 +334,41 @@ export async function deleteApplicationAttachment(outputDir, attachmentId) {
   });
 }
 
-export async function resolveApplicationAttachments(outputDir, noteId, attachmentIds, limits = DEFAULT_ATTACHMENT_LIMITS) {
+export async function resolveApplicationAttachments(
+  outputDir,
+  noteId,
+  attachmentIds,
+  limits = DEFAULT_ATTACHMENT_LIMITS,
+  filenameOverrides = null,
+) {
   assertNoteId(noteId);
   return withApplicationDeliveryLock(outputDir, () => resolveApplicationAttachmentsUnlocked(
     outputDir,
     noteId,
     attachmentIds,
     limits,
+    null,
+    filenameOverrides,
   ));
 }
 
-export async function resolveSelectedApplicationAttachments(outputDir, noteId, attachmentIds, limits = DEFAULT_ATTACHMENT_LIMITS) {
+export async function resolveSelectedApplicationAttachments(
+  outputDir,
+  noteId,
+  attachmentIds,
+  limits = DEFAULT_ATTACHMENT_LIMITS,
+  filenameOverrides = null,
+) {
   assertNoteId(noteId);
   return withApplicationDeliveryLock(outputDir, async () => {
     if (attachmentIds !== undefined) {
-      return resolveApplicationAttachmentsUnlocked(outputDir, noteId, attachmentIds, limits);
+      return resolveApplicationAttachmentsUnlocked(outputDir, noteId, attachmentIds, limits, null, filenameOverrides);
     }
     const manifest = await readManifest(outputDir);
     const selectedIds = manifest.attachments
       .filter((item) => item.noteId === noteId && item.status === 'ready' && item.selected)
       .map((item) => item.attachmentId);
-    return resolveApplicationAttachmentsUnlocked(outputDir, noteId, selectedIds, limits, manifest);
+    return resolveApplicationAttachmentsUnlocked(outputDir, noteId, selectedIds, limits, manifest, filenameOverrides);
   });
 }
 
@@ -364,6 +378,7 @@ async function resolveApplicationAttachmentsUnlocked(
   attachmentIds,
   limits = DEFAULT_ATTACHMENT_LIMITS,
   suppliedManifest = null,
+  filenameOverrides = null,
 ) {
   const ids = attachmentIds === undefined
     ? []
@@ -373,6 +388,7 @@ async function resolveApplicationAttachmentsUnlocked(
   }
   if (ids.length > limits.maxFiles) throw new AttachmentError('ATTACHMENT_LIMIT_EXCEEDED', 'Too many attachments selected.');
   ids.forEach(assertAttachmentId);
+  const overrides = normalizeFilenameOverrides(filenameOverrides, ids);
   const manifest = suppliedManifest || await readManifest(outputDir);
   const resolved = [];
   for (const id of ids) {
@@ -381,7 +397,19 @@ async function resolveApplicationAttachmentsUnlocked(
       throw new AttachmentError('ATTACHMENT_NOT_FOUND', 'A selected attachment is unavailable.', 404);
     }
     const verified = await readVerifiedAttachmentFile(outputDir, attachment);
-    resolved.push({ ...attachment, absolutePath: verified.absolutePath });
+    const displayName = overrides.has(id)
+      ? normalizeDisplayName(overrides.get(id), `.${attachment.extension}`)
+      : attachment.displayName;
+    resolved.push({
+      ...attachment,
+      sourceDisplayName: attachment.displayName,
+      displayName,
+      absolutePath: verified.absolutePath,
+    });
+  }
+  const duplicateName = findDuplicateDisplayName(resolved.map((item) => item.displayName));
+  if (duplicateName) {
+    throw new AttachmentError('ATTACHMENT_NAME_CONFLICT', `Multiple attachments would use the filename ${duplicateName}.`);
   }
   const totalBytes = resolved.reduce((sum, item) => sum + item.size, 0);
   if (totalBytes > limits.maxTotalBytes) throw new AttachmentError('ATTACHMENT_TOTAL_TOO_LARGE', 'Selected attachments exceed the total size limit.', 413);
@@ -393,6 +421,33 @@ async function resolveApplicationAttachmentsUnlocked(
     attachmentBundleHash,
     summary: { count: snapshots.length, totalBytes, attachments: snapshots },
   };
+}
+
+function normalizeFilenameOverrides(value, selectedIds) {
+  if (value === null || value === undefined) return new Map();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new AttachmentError('ATTACHMENT_INVALID_SELECTION', 'attachmentFilenameOverrides must be an object.');
+  }
+  const selected = new Set(selectedIds);
+  const result = new Map();
+  for (const [attachmentId, displayName] of Object.entries(value)) {
+    assertAttachmentId(attachmentId);
+    if (!selected.has(attachmentId)) {
+      throw new AttachmentError('ATTACHMENT_INVALID_SELECTION', 'A filename override refers to an unselected attachment.');
+    }
+    result.set(attachmentId, String(displayName || ''));
+  }
+  return result;
+}
+
+function findDuplicateDisplayName(names) {
+  const seen = new Set();
+  for (const name of names) {
+    const normalized = String(name || '').normalize('NFC').toLocaleLowerCase('en-US');
+    if (seen.has(normalized)) return name;
+    seen.add(normalized);
+  }
+  return '';
 }
 
 export async function resolveApplicationAttachmentDownload(outputDir, attachmentId) {

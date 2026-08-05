@@ -24,6 +24,7 @@ import {
   saveDraftVersion,
 } from './lib/draft-store.mjs';
 import { createDraftQualityChecker } from './lib/draft-quality-checker.mjs';
+import { createCoverLetterRewriter } from './lib/cover-letter-rewriter.mjs';
 import { normalizeDiagnosticRoute } from './lib/diagnostics.mjs';
 import {
   AttachmentError,
@@ -52,8 +53,25 @@ import { handleDataCopilotRequest } from './data-copilot-http.mjs';
 import { writeCopilotJsonAtomically } from './data-copilot-store.mjs';
 import { ApplicationBatchManager } from './application-batch-manager.mjs';
 import { ApplicationBatchService, ApplicationBatchServiceError } from './application-batch-service.mjs';
+import {
+  ApplicationDeliveryCandidateError,
+  buildApplicationDeliveryCandidates,
+} from './application-delivery-candidates.mjs';
+import { ApplicationContactOcrService } from './application-contact-ocr-service.mjs';
+import { ApplicationContactResolutionService } from './application-contact-resolution-service.mjs';
 import { detectApplicationAttachmentRule } from './lib/application-attachment-rule.mjs';
-import { enrichApplicationRecordContacts } from './lib/application-contact-resolver.mjs';
+import {
+  applicationContactSourceRevision,
+  enrichApplicationRecordContacts,
+  resolveApplicationContactsBatch,
+} from './lib/application-contact-resolver.mjs';
+import {
+  applicationSubjectRule,
+  applicationSubjectGuard,
+  normalizeApplicationRoleTitle,
+  resolveApplicationEmailSubject,
+  validateApplicationEmailSubject,
+} from './lib/application-email-draft.mjs';
 import {
   AudienceAiValidationError,
   validateAudienceAiEmptyRequest,
@@ -161,6 +179,7 @@ function smtpSendGateError(code, message, cause = undefined) {
   return error;
 }
 const APPLICATION_ARTIFACT_FILENAME = Symbol('applicationArtifactFilename');
+const APPLICATION_CONTACT_OCR_OVERLAY = 'application-contact-ocr.json';
 const CONTENT_RESEARCH_LABELS = Object.freeze({
   auto: 'AI 自动识别',
   experience: '经验攻略',
@@ -171,7 +190,26 @@ const CONTENT_RESEARCH_LABELS = Object.freeze({
   custom: '自定义研究',
 });
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService, dataCopilotService }) {
+export function contactOcrDrainState(state) {
+  if (!state || typeof state !== 'object') return { ready: false, signature: '' };
+  const report = state.report && typeof state.report === 'object' ? state.report : {};
+  const queue = report.queue && typeof report.queue === 'object' ? report.queue : {};
+  const processed = Number(queue.processed || 0);
+  const total = Number(queue.total || 0);
+  const status = String(state.status || '');
+  const queueDrained = total === 0 || processed >= total;
+  const terminal = !state.active && ['completed', 'partial', 'failed', 'interrupted'].includes(status);
+  const watcherCaughtUp = status === 'watching' && Boolean(report.finishedAt) && queueDrained;
+  const ready = state.sourceArtifactChanged !== true && (terminal || watcherCaughtUp);
+  return {
+    ready,
+    signature: ready
+      ? `${String(state.sourceArtifactModifiedAt || '')}:${String(report.finishedAt || '')}:${processed}:${total}`
+      : '',
+  };
+}
+
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, coverLetterRewriter, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService, applicationContactOcrService, applicationContactResolutionService, dataCopilotService, authStore }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const relayRuntime = relaySupervisor || createRelaySupervisor({
     getConfig: getRelayConfig,
@@ -204,12 +242,155 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     pythonBin: config.pythonBin || (process.platform === 'win32' ? 'python' : 'python3'),
     scriptPath: path.join(config.projectRoot || process.cwd(), 'scripts', 'recheck_application_draft.py'),
   });
+  const runCoverLetterRewrite = coverLetterRewriter || createCoverLetterRewriter({
+    pythonBin: config.pythonBin || (process.platform === 'win32' ? 'python' : 'python3'),
+    scriptPath: path.join(config.projectRoot || process.cwd(), 'scripts', 'rewrite_cover_letter.py'),
+  });
   const audienceAi = audienceAiService || new AudienceAiService({
     manager,
     aiSessions,
     config,
     profileEnricher: createAudienceAiProfileRunner({ manager, config, getRelayConfig }),
   });
+  const applicationContactOcr = applicationContactOcrService || new ApplicationContactOcrService({ config });
+  const applicationContactResolution = applicationContactResolutionService || new ApplicationContactResolutionService({
+    loadRecords: readApplicationContactRecords,
+    resolveBatch: resolveApplicationContactsBatch,
+    buildReport: applicationContactResolutionReport,
+  });
+  const contactResolutionFallbackDirs = (jobId, outputDir) => audienceHistoryJobIds(
+    manager,
+    audienceContentSourceJobId(manager, jobId),
+    jobId,
+  )
+    .map((historyJobId) => manager.getInternal?.(historyJobId)?.outputDir)
+    .filter((historyOutputDir) => historyOutputDir && path.resolve(historyOutputDir) !== path.resolve(outputDir));
+
+  const assertDirectRecipientEvidence = async (jobId, internal, body) => {
+    const requestedAddress = String(body?.to || '').trim().toLowerCase();
+    if (!requestedAddress) return null;
+    const suppliedEvidenceHash = String(body?.evidenceHash || '').trim();
+    const suppliedSourceRevision = String(body?.sourceRevision || '').trim();
+    if (!suppliedEvidenceHash || !suppliedSourceRevision) {
+      const error = applicationDraftError(
+        'EMAIL_RECIPIENT_EVIDENCE_REQUIRED',
+        'Recipient evidenceHash and sourceRevision are required.',
+      );
+      error.status = 400;
+      throw error;
+    }
+    const noteId = String(body?.noteId || '').trim();
+    const cachedResolution = await applicationContactResolution.refresh({
+      outputDir: internal.outputDir,
+      fallbackOutputDirs: contactResolutionFallbackDirs(jobId, internal.outputDir),
+      task: internal,
+    });
+    const reportItem = (Array.isArray(cachedResolution?.report?.items) ? cachedResolution.report.items : [])
+      .find((item) => String(item?.noteId || '') === noteId);
+    const candidate = (Array.isArray(reportItem?.candidates) ? reportItem.candidates : []).find((item) => (
+      item?.actionable !== false && String(item?.address || '').trim().toLowerCase() === requestedAddress
+    ));
+    const currentSourceRevision = candidate
+      ? String(candidate.sourceRevision || applicationContactSourceRevision(candidate))
+      : '';
+    if (
+      !candidate
+      || candidate.evidenceHash !== suppliedEvidenceHash
+      || currentSourceRevision !== suppliedSourceRevision
+    ) {
+      const error = applicationDraftError(
+        'EMAIL_RECIPIENT_EVIDENCE_STALE',
+        'Recipient evidence changed after it was displayed. Refresh the recipient before sending.',
+      );
+      error.status = 409;
+      throw error;
+    }
+    return candidate;
+  };
+
+  const refreshSupervisedContactResolution = () => {
+    const active = manager.active;
+    const activeInternal = active?.id ? (manager.getInternal?.(active.id) || active) : null;
+    const targetIds = new Set();
+    if (activeInternal?.id && activeInternal.params?.analysisMode !== 'general') {
+      if (activeInternal.params?.audienceOnly === true) {
+        targetIds.add(audienceContentSourceJobId(manager, activeInternal.id));
+      } else {
+        targetIds.add(activeInternal.id);
+      }
+    }
+    for (const targetId of targetIds) {
+      const internal = manager.getInternal?.(targetId);
+      if (!internal?.outputDir || internal.params?.analysisMode === 'general' || internal.params?.audienceOnly === true) continue;
+      void applicationContactResolution.refresh({
+        outputDir: internal.outputDir,
+        fallbackOutputDirs: contactResolutionFallbackDirs(targetId, internal.outputDir),
+        task: internal,
+      }).catch(() => {});
+    }
+  };
+  // Keep image contact OCR attached to the active collection. The results
+  // endpoint remains a read path; opening the UI is no longer required to
+  // start recognition. The worker watches collection snapshots and is stopped
+  // as soon as the owning collection leaves the active slot.
+  const supervisedContactOcrDirs = new Set();
+  const contactOcrDrainCandidates = new Map();
+  const contactOcrDrainGraceMs = 3000;
+  const contactOcrSupervisor = setInterval(() => {
+    if (config.applicationContactOcrEnabled !== true) return;
+    const active = manager.active;
+    const activeOutputDir = active?.outputDir && active?.params?.analysisMode !== 'general'
+      ? path.resolve(active.outputDir)
+      : null;
+    if (activeOutputDir) {
+      supervisedContactOcrDirs.add(activeOutputDir);
+      contactOcrDrainCandidates.delete(activeOutputDir);
+      void applicationContactOcr.ensureStarted(activeOutputDir, {
+        watch: true,
+        pollSeconds: 1,
+        retryPartial: true,
+      }).catch(() => {});
+    }
+    refreshSupervisedContactResolution();
+    for (const outputDir of [...supervisedContactOcrDirs]) {
+      if (outputDir === activeOutputDir) continue;
+      // Collection can finish while the last OCR snapshot is still being
+      // processed. Keep the watcher alive until its report has drained the
+      // queue (or exhausted bounded retries); only then reclaim the child.
+      void (async () => {
+        const state = await applicationContactOcr.getState?.(outputDir);
+        if (!state) return;
+        const drain = contactOcrDrainState(state);
+        if (!drain.ready) {
+          contactOcrDrainCandidates.delete(outputDir);
+          if (!state.active && state.sourceAvailable) {
+            await applicationContactOcr.ensureStarted(outputDir, {
+              watch: true,
+              pollSeconds: 1,
+              retryPartial: true,
+            }).catch(() => {});
+          }
+          return;
+        }
+        const candidate = contactOcrDrainCandidates.get(outputDir);
+        if (!candidate || candidate.signature !== drain.signature) {
+          contactOcrDrainCandidates.set(outputDir, { signature: drain.signature, since: Date.now() });
+          return;
+        }
+        if (Date.now() - candidate.since < contactOcrDrainGraceMs) return;
+        const confirmed = contactOcrDrainState(await applicationContactOcr.getState?.(outputDir));
+        if (!confirmed.ready || confirmed.signature !== candidate.signature) {
+          contactOcrDrainCandidates.delete(outputDir);
+          return;
+        }
+        supervisedContactOcrDirs.delete(outputDir);
+        contactOcrDrainCandidates.delete(outputDir);
+        const stopping = applicationContactOcr.stop?.(outputDir, 'collection_finished');
+        if (stopping && typeof stopping.catch === 'function') await stopping.catch(() => {});
+      })().catch(() => {});
+    }
+  }, 1500);
+  contactOcrSupervisor.unref?.();
   const deliveryMailer = mailSender || {
     status: () => ({ configured: false, from: '' }),
     configure: () => ({ configured: false, from: '' }),
@@ -309,7 +490,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             smtpConfig,
             deliveryAttachmentLimits,
             deliveryStateWriter,
-            { allowedRecipients },
+            { allowedRecipients, persist: value?.persist !== false },
           ),
           sendEmail: (value, allowedRecipients) => withSmtpOperationLock(() => sendApplicationEmail(
             internal.outputDir,
@@ -339,10 +520,11 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     const requestStartedAt = performance.now();
     const requestId = diagnostics?.requestId?.(req.headers['x-request-id']);
     if (requestId) res.setHeader('X-Request-Id', requestId);
-    setSecurityHeaders(res);
+    setSecurityHeaders(res, config);
     if (req.method === 'OPTIONS') return noContent(res);
     const url = new URL(req.url, 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean);
+    const authUser = authStore?.authenticate(req) || null;
     res.once('finish', () => diagnostics?.record?.('http_request_completed', {
       requestId,
       method: req.method,
@@ -351,11 +533,36 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       durationMs: performance.now() - requestStartedAt,
     }));
     try {
+      if (req.method === 'GET' && url.pathname === '/api/auth/me') {
+        return json(res, 200, { authenticated: Boolean(authUser), required: Boolean(authStore?.required), user: authUser });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/auth/login') {
+        if (!authStore) return json(res, 503, errorBody('AUTH_UNAVAILABLE', '认证服务未配置。'));
+        const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 64 * 1024));
+        const user = await authStore.login(body.email, body.password);
+        authStore.setSession(res, user);
+        return json(res, 200, { authenticated: true, required: true, user });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
+        authStore?.clearSession(res);
+        return json(res, 200, { authenticated: false });
+      }
+      const publicApiRoutes = new Set(['/api/auth/me', '/api/auth/login', '/api/auth/logout', '/api/health']);
+      if (authStore?.required && url.pathname.startsWith('/api/') && !publicApiRoutes.has(url.pathname)) {
+        if (!authUser) return json(res, 401, errorBody('AUTH_REQUIRED', '请先登录后再访问此功能。'));
+        if (config.authOrigin && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+          const origin = String(req.headers.origin || '').trim();
+          if (origin && origin !== config.authOrigin) return json(res, 403, errorBody('CSRF_ORIGIN_REJECTED', '请求来源未通过校验。'));
+        }
+      }
       if (req.method === 'GET' && url.pathname === '/api/diagnostics/bundle') {
         if (!diagnostics?.bundle) return json(res, 503, errorBody('DIAGNOSTICS_UNAVAILABLE', 'Diagnostics are unavailable.'));
         return json(res, 200, diagnostics.bundle());
       }
       if (req.method === 'GET' && url.pathname === '/api/health') {
+        if (authStore?.required && !authUser) {
+          return json(res, 200, { ok: true, service: 'xiaohongshu-relay-scraper', authRequired: true, timestamp: new Date().toISOString() });
+        }
         return json(res, 200, {
           ok: true,
           service: 'xiaohongshu-relay-scraper',
@@ -889,7 +1096,150 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           }
         }
         if (req.method === 'GET' && parts[3] === 'results' && parts.length === 4) {
-          return json(res, 200, await readApplicationResults(internal.outputDir, url.searchParams, internal));
+          let results = await readApplicationResults(internal.outputDir, url.searchParams, internal);
+          let contactResolution = null;
+          if (config.applicationContactOcrEnabled === true && results.available && results.filters.stats.withImages > 0) {
+            try {
+              const activeCollection = manager.active?.id === id
+                && internal.params?.analysisMode !== 'general';
+              const operation = config.applicationContactOcrAutoEnabled === true
+                ? await applicationContactOcr.ensureStarted(internal.outputDir, activeCollection
+                  ? { watch: true, pollSeconds: 1, retryPartial: true }
+                  : {})
+                : { action: 'status', state: await applicationContactOcr.getState(internal.outputDir) };
+              contactResolution = { action: operation.action, ...operation.state };
+            } catch (error) {
+              contactResolution = {
+                action: 'error',
+                status: 'failed',
+                active: false,
+                error: String(error?.message || error),
+              };
+            }
+          }
+          let contactDiscovery = null;
+          if (results.available && results.analysisMode === 'job') {
+            try {
+              const cachedResolution = await applicationContactResolution.refresh({
+                outputDir: internal.outputDir,
+                fallbackOutputDirs: contactResolutionFallbackDirs(id, internal.outputDir),
+                task: internal,
+              });
+              const report = cachedResolution.report || { summary: {}, items: [] };
+              const discoveryByNoteId = new Map(report.items.map((item) => [String(item.noteId || ''), item]));
+              results = {
+                ...results,
+                items: results.items.map((item) => ({
+                  ...item,
+                  contactDiscovery: discoveryByNoteId.get(String(item.note_id || '')) || null,
+                })),
+              };
+              contactDiscovery = {
+                generatedAt: cachedResolution.generatedAt,
+                sourceSignature: cachedResolution.sourceSignature,
+                summary: report.summary,
+              };
+            } catch (error) {
+              contactDiscovery = { error: String(error?.message || error) };
+            }
+          }
+          return json(res, 200, { ...results, contactResolution, contactDiscovery });
+        }
+        if (req.method === 'GET' && parts[3] === 'application-delivery-candidates' && parts.length === 4) {
+          let records = [];
+          try {
+            records = (await readApplicationContactRecords(internal.outputDir, internal))
+              .map(withApplicationAttachmentRequirement);
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+          }
+          let contactDiscovery = null;
+          if (records.length) {
+            try {
+              const cachedResolution = await applicationContactResolution.refresh({
+                outputDir: internal.outputDir,
+                fallbackOutputDirs: contactResolutionFallbackDirs(id, internal.outputDir),
+                task: internal,
+              });
+              const report = cachedResolution.report || { summary: {}, items: [] };
+              const discoveryByNoteId = new Map(report.items.map((item) => [String(item.noteId || ''), item]));
+              records = records.map((record) => ({
+                ...record,
+                contactDiscovery: discoveryByNoteId.get(String(record.note_id || '')) || null,
+              }));
+              contactDiscovery = {
+                generatedAt: cachedResolution.generatedAt,
+                sourceSignature: cachedResolution.sourceSignature,
+                summary: report.summary,
+              };
+            } catch (error) {
+              contactDiscovery = { error: String(error?.message || error) };
+            }
+          }
+          const service = await getApplicationBatchService(id, internal);
+          const response = buildApplicationDeliveryCandidates({
+            jobId: id,
+            records,
+            batches: await service.listBatches(),
+            limit: boundedInteger(url.searchParams.get('limit'), 20, 1, 100),
+            query: {
+              q: url.searchParams.get('q') || url.searchParams.get('query'),
+              deliveryStatus: url.searchParams.get('deliveryStatus'),
+              recipientStatus: url.searchParams.get('recipientStatus'),
+              recipientSource: url.searchParams.get('recipientSource'),
+              copyStatus: url.searchParams.get('copyStatus'),
+              subjectRuleStatus: url.searchParams.get('subjectRuleStatus'),
+              attachmentStatus: url.searchParams.get('attachmentStatus'),
+              readiness: url.searchParams.get('readiness'),
+              hasCoverLetter: url.searchParams.get('hasCoverLetter'),
+              batchId: url.searchParams.get('batchId'),
+              sort: url.searchParams.get('sort'),
+              cursor: url.searchParams.get('cursor'),
+            },
+          });
+          return json(res, 200, { ...response, contactDiscovery });
+        }
+        if (parts[3] === 'contact-resolution' && parts.length === 4) {
+          if (req.method === 'GET') {
+            const offset = boundedInteger(url.searchParams.get('offset'), 0, 0, 1000000);
+            const limit = boundedInteger(url.searchParams.get('limit'), 50, 1, 100);
+            const cachedResolution = await applicationContactResolution.refresh({
+              outputDir: internal.outputDir,
+              fallbackOutputDirs: contactResolutionFallbackDirs(id, internal.outputDir),
+              task: internal,
+            });
+            const report = cachedResolution.report || { summary: {}, items: [] };
+            return json(res, 200, {
+              available: true,
+              jobId: id,
+              generatedAt: cachedResolution.generatedAt,
+              sourceSignature: cachedResolution.sourceSignature,
+              ...report,
+              offset,
+              limit,
+              items: report.items.slice(offset, offset + limit),
+              state: await applicationContactOcr.getState(internal.outputDir),
+            });
+          }
+          if (req.method === 'POST') {
+            if (config.applicationContactOcrEnabled !== true) {
+              return json(res, 409, errorBody('CONTACT_OCR_DISABLED', 'Local image contact OCR is disabled.'));
+            }
+            const body = await readJsonBody(req, config.maxBodyBytes);
+            if (!body || typeof body !== 'object' || Array.isArray(body)) {
+              throw new ValidationError('Request body must be a JSON object.');
+            }
+            const unsupported = Object.keys(body).filter((key) => !['force', 'maxRecords', 'noteIds'].includes(key));
+            if (unsupported.length) {
+              throw new ValidationError('Unsupported contact OCR parameters.', unsupported.map((field) => ({ field, reason: 'not_allowed' })));
+            }
+            const operation = await applicationContactOcr.start(internal.outputDir, {
+              force: body.force === true,
+              maxRecords: boundedInteger(body.maxRecords, 0, 0, 1000000),
+              noteIds: Array.isArray(body.noteIds) ? body.noteIds : [],
+            });
+            return json(res, operation.action === 'started' ? 202 : 200, operation);
+          }
         }
         if (req.method === 'GET' && parts[3] === 'media' && parts.length === 4) {
           return await serveCachedMedia(res, {
@@ -1328,6 +1678,18 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           const body = await readJsonBody(req, config.maxBodyBytes);
           return json(res, 200, await writeApplicationGeneration(internal.outputDir, body, deliveryStateWriter));
         }
+        if (req.method === 'POST' && parts[3] === 'draft' && parts[4] === 'rewrite' && parts.length === 5) {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const ai = resolveDraftAiRuntime(aiSessions, internal, body);
+          return json(res, 200, await rewriteApplicationCoverLetter(
+            internal.outputDir,
+            body,
+            runCoverLetterRewrite,
+            ai,
+            internal.params?.candidateProfile,
+            deliveryStateWriter,
+          ));
+        }
         if (req.method === 'POST' && parts[3] === 'draft' && parts[4] === 'quality' && parts.length === 5) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           const ai = resolveDraftAiRuntime(aiSessions, internal, body);
@@ -1387,6 +1749,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (req.method === 'POST' && parts[3] === 'send-email' && parts[4] === 'preview' && parts.length === 5) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           const replyTo = String(internal.params?.candidateProfile?.email || '').trim();
+          const recipientEvidence = await assertDirectRecipientEvidence(id, internal, body);
           return json(res, 200, await previewApplicationEmail(
             internal.outputDir,
             body,
@@ -1395,11 +1758,13 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
              smtpConfig,
              deliveryAttachmentLimits,
              deliveryStateWriter,
+             { allowedRecipients: recipientEvidence ? [recipientEvidence.address] : [] },
            ));
         }
         if (req.method === 'POST' && parts[3] === 'send-email' && parts.length === 4) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           const replyTo = String(internal.params?.candidateProfile?.email || '').trim();
+          const recipientEvidence = await assertDirectRecipientEvidence(id, internal, body);
           return json(res, 200, await withSmtpOperationLock(() => sendApplicationEmail(
             internal.outputDir,
             body,
@@ -1411,6 +1776,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
                appendAudit: sendAuditAppender,
                readAudit: sendAuditReader,
                attachmentLimits: deliveryAttachmentLimits,
+               allowedRecipients: recipientEvidence ? [recipientEvidence.address] : [],
              },
           )));
         }
@@ -1455,8 +1821,14 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           ...(error.details !== undefined ? { details: error.details } : {}),
         });
       }
+      if (error instanceof ApplicationDeliveryCandidateError || String(error.code || '').startsWith('APPLICATION_CANDIDATE_')) {
+        return json(res, Number(error.status || 400), errorBody(error.code || 'APPLICATION_CANDIDATE_QUERY_INVALID', error.message));
+      }
       if (error instanceof AttachmentError || String(error.code || '').startsWith('ATTACHMENT_')) {
         return json(res, Number(error.status || 400), errorBody(error.code || 'ATTACHMENT_INVALID', error.message));
+      }
+      if (String(error.code || '').startsWith('EMAIL_RECIPIENT_EVIDENCE_')) {
+        return json(res, Number(error.status || 400), errorBody(error.code, error.message));
       }
       if (error instanceof ValidationError) return json(res, 400, errorBody('VALIDATION_ERROR', error.message, error.details));
       if (error.code === 'DRAFT_VERSION_CONFLICT') {
@@ -1508,6 +1880,13 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'MEDIA_SOURCE_INVALID') return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'MEDIA_SOURCE_UNAVAILABLE') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'BODY_TOO_LARGE') return json(res, 413, errorBody('BODY_TOO_LARGE', 'Request body is too large.'));
+      if (['AUTH_INVALID_CREDENTIALS', 'AUTH_RATE_LIMITED'].includes(error.code)) {
+        return json(res, Number(error.status || (error.code === 'AUTH_RATE_LIMITED' ? 429 : 401)), {
+          ...errorBody(error.code, error.message),
+          ...(error.retryAfter ? { retryAfter: error.retryAfter } : {}),
+        });
+      }
+      if (String(error.code || '').startsWith('AUTH_')) return json(res, Number(error.status || 500), errorBody(error.code, error.message));
       if (['AI_VALIDATION', 'AI_SESSION_EXPIRED', 'PROFILE_VALIDATION', 'PROFILE_AI_SESSION_REQUIRED', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'AI_MODEL_DISCOVERY_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'LOCAL_MODEL_VALIDATION') return json(res, 400, errorBody(error.code, error.message));
@@ -1550,6 +1929,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       if (error.code === 'MAIL_CONNECTION_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'MAIL_SEND_FAILED') return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'AI_QUALITY_CHECK_FAILED') return json(res, 502, errorBody(error.code, error.message));
+      if (error.code === 'AI_COVER_LETTER_REWRITE_FAILED' || String(error.code || '').startsWith('COVER_LETTER_REWRITE_')) {
+        return json(res, 502, errorBody(error.code, error.message));
+      }
       if (error.code === 'EMAIL_SEND_STATUS_UNKNOWN') return json(res, 409, errorBody(error.code, error.message));
       if (error.code === 'DELIVERY_STATE_REVISION_CONFLICT') {
         return json(res, 409, errorBody(error.code, error.message));
@@ -1928,6 +2310,73 @@ function applicationCompletionCount(results) {
   return sourcePending + Math.max(0, incomplete - publishedWithoutBody);
 }
 
+function applicationCoverageFromRecords(records, payload, task) {
+  const workflowSummary = isRecord(task?.workflowSummary) ? task.workflowSummary : {};
+  const bodyMetrics = isRecord(workflowSummary.bodyMetrics) ? workflowSummary.bodyMetrics : {};
+  const sourceCoverage = isRecord(payload?.source_coverage)
+    ? payload.source_coverage
+    : (isRecord(workflowSummary.sourceCoverage) ? workflowSummary.sourceCoverage : {});
+  const qualityGate = isRecord(payload?.quality_gate) ? payload.quality_gate : {};
+  const recordList = Array.isArray(records) ? records : [];
+  const count = (predicate) => recordList.filter(predicate).length;
+  const generatedDrafts = count((record) => {
+    const outreach = isRecord(record?.outreach) ? record.outreach : {};
+    return ['greeting', 'email_subject', 'email_body', 'cover_letter']
+      .every((field) => String(outreach[field] || '').trim());
+  });
+  const generatedJobCards = count((record) => isRecord(record?.job_card) || isRecord(record?.application_info));
+  const normalizedTimes = count((record) => {
+    const publishTime = isRecord(record?.publish_time) ? record.publish_time : {};
+    return Boolean(publishTime.value ?? publishTime.normalized);
+  });
+  const qualityPassed = count((record) => {
+    const quality = isRecord(record?.quality) ? record.quality : null;
+    return Boolean(quality) && Object.values(quality).every(Boolean);
+  });
+  const firstFinite = (...values) => values.find((value) => Number.isFinite(Number(value)));
+  const discovered = firstFinite(
+    sourceCoverage.targetCount,
+    qualityGate.discovered_count,
+    workflowSummary.cardsDiscovered,
+    workflowSummary.discovered,
+    recordList.length,
+  ) ?? 0;
+  const bodyAttempted = firstFinite(
+    bodyMetrics.attempted,
+    sourceCoverage.totalRecordCount,
+    workflowSummary.bodyAttempted,
+    recordList.length,
+  ) ?? 0;
+  const bodySucceeded = firstFinite(
+    bodyMetrics.succeeded,
+    sourceCoverage.fullBodyCount,
+    workflowSummary.bodySucceeded,
+    count((record) => String(record?.body || '').trim().length > 0),
+  ) ?? 0;
+  const generatedRecordCount = recordList.length || Number(qualityGate.record_count) || 0;
+  return {
+    discovered: nonNegativeCount(discovered),
+    bodyAttempted: nonNegativeCount(bodyAttempted),
+    bodySucceeded: nonNegativeCount(bodySucceeded),
+    bodyFailed: nonNegativeCount(firstFinite(bodyMetrics.failed, workflowSummary.bodyFailed)),
+    bodyNotAttempted: nonNegativeCount(firstFinite(bodyMetrics.notAttempted, workflowSummary.bodyNotAttempted)),
+    bodyBlocked: nonNegativeCount(firstFinite(bodyMetrics.blocked, workflowSummary.bodyBlocked)),
+    bodyCancelled: nonNegativeCount(firstFinite(bodyMetrics.cancelled, workflowSummary.bodyCancelled)),
+    bodyCompletionRatePercent: bodyAttempted > 0 ? Math.round((bodySucceeded / bodyAttempted) * 10000) / 100 : 0,
+    timesNormalized: recordList.length ? normalizedTimes : nonNegativeCount(workflowSummary.timesNormalized),
+    applicationInfo: recordList.length ? generatedJobCards : nonNegativeCount(workflowSummary.applicationInfo),
+    draftsGenerated: recordList.length ? generatedDrafts : nonNegativeCount(workflowSummary.draftsGenerated),
+    generationCoveragePercent: generatedRecordCount > 0
+      ? Math.round((generatedDrafts / generatedRecordCount) * 10000) / 100
+      : nonNegativeCount(workflowSummary.generationCoveragePercent),
+    qualityPassed: Number.isFinite(Number(workflowSummary.qualityPassed))
+      ? nonNegativeCount(workflowSummary.qualityPassed)
+      : (recordList.length ? qualityPassed : 0),
+    gatePassed: typeof qualityGate.passed === 'boolean' ? qualityGate.passed : undefined,
+    issueCount: Array.isArray(qualityGate.issues) ? qualityGate.issues.length : undefined,
+  };
+}
+
 function audienceContentSourceJobId(manager, jobId) {
   return audienceJobLineage(manager, jobId).at(-1) || jobId;
 }
@@ -1970,6 +2419,8 @@ function applicationResultSearchText(record) {
 
 function withApplicationAttachmentRequirement(record) {
   const rule = detectApplicationAttachmentRule(record);
+  const subjectRule = applicationSubjectRule(record);
+  const subjectResolution = resolveApplicationEmailSubject(record, record?.outreach?.email_subject);
   return {
     ...record,
     attachmentRequirement: {
@@ -1978,6 +2429,15 @@ function withApplicationAttachmentRequirement(record) {
       evidence: rule.evidence,
       fields: rule.fields,
     },
+    emailSubjectRequirement: {
+      detected: subjectRule.detected,
+      template: subjectRule.template,
+      evidence: subjectRule.evidence,
+      fields: subjectRule.fields,
+      ...(subjectRule.literal ? { literal: true } : {}),
+    },
+    emailSubjectPreview: subjectResolution.subject,
+    emailSubjectGuard: subjectResolution.subjectGuard,
   };
 }
 
@@ -2054,6 +2514,7 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
       codexRuntime: payload.ai_workflow || payload.codex_runtime || null,
       qualityGate: payload.quality_gate || null,
       sourceCoverage: payload.source_coverage || task.workflowSummary?.sourceCoverage || null,
+      coverage: applicationCoverageFromRecords(hydratedSource, payload, task),
     };
   } catch (error) {
     if (error.code === 'ENOENT') return {
@@ -2071,14 +2532,112 @@ async function readApplicationResults(outputDir, searchParams, task = {}) {
       codexRuntime: null,
       qualityGate: null,
       sourceCoverage: task.workflowSummary?.sourceCoverage || null,
+      coverage: null,
     };
     throw error;
   }
 }
 
+async function readApplicationContactRecords(outputDir, task = {}) {
+  const payload = await readLatestApplicationPayload(outputDir);
+  const delivery = await readDeliveryState(outputDir);
+  const legacyMedia = await readLegacyMediaSources(outputDir);
+  return Array.isArray(payload.records)
+    ? payload.records.map((record, recordIndex) => enrichApplicationRecordContacts(
+      localizeApplicationMedia(
+        mergeApplicationState(
+          hydrateApplicationMedia(record, legacyMedia.get(record.note_id)),
+          delivery[record.note_id],
+          recordIndex,
+          payload[APPLICATION_ARTIFACT_FILENAME],
+        ),
+        task.id,
+      ),
+    ))
+    : [];
+}
+
+function applicationContactResolutionReport(records, resolutions) {
+  const items = records.map((record, index) => {
+    const resolution = resolutions[index] || {};
+    const images = Array.isArray(record.media?.images) ? record.media.images : [];
+    const analysis = record.media?.analysis && typeof record.media.analysis === 'object'
+      ? record.media.analysis
+      : {};
+    const contactOcr = analysis.contact_ocr && typeof analysis.contact_ocr === 'object'
+      ? analysis.contact_ocr
+      : {};
+    const candidates = Array.isArray(resolution.candidates) ? resolution.candidates : [];
+    const hasBodyEmail = candidates.some((candidate) => candidate.source === 'body' && candidate.actionable !== false);
+    const persistedImageOcrStatus = contactOcr.status || (
+      analysis.status === 'analyzed' && ['vision_model', 'image_ocr_model', 'image_ocr', 'ocr'].includes(analysis.source)
+        ? 'complete'
+        : ''
+    );
+    return {
+      noteId: String(record.note_id || record.post_id || record.id || ''),
+      postId: String(resolution.postId || record.post_id || record.note_id || ''),
+      title: String(record.title || record.job_card?.role_name || ''),
+      imageCount: images.length,
+      imageOcrStatus: persistedImageOcrStatus
+        || (images.length ? (hasBodyEmail ? 'skipped_body_email' : 'pending') : 'not_applicable'),
+      imageOcrAttempts: Number(contactOcr.attempts || 0),
+      status: String(resolution.status || 'pending'),
+      reason: String(resolution.reason || ''),
+      collectionStatus: String(resolution.collectionStatus || 'pending'),
+      requiresReview: resolution.requiresReview === true,
+      candidates: candidates.map((candidate) => ({
+        address: candidate.address,
+        source: candidate.source,
+        noteId: candidate.noteId,
+        postId: candidate.postId,
+        confidence: candidate.confidence,
+        collectionStatus: candidate.collectionStatus,
+        verificationStatus: candidate.verificationStatus,
+        normalizationApplied: candidate.normalizationApplied,
+        sourceFields: candidate.sourceFields,
+        evidenceText: candidate.evidenceText,
+        evidenceHash: candidate.evidenceHash,
+        sourceRevision: applicationContactSourceRevision(candidate),
+        commentId: candidate.commentId,
+        authorId: candidate.authorId,
+        ownershipStatus: candidate.ownershipStatus,
+        actionable: candidate.actionable,
+        requiresReview: candidate.requiresReview,
+      })),
+    };
+  });
+  const hasCandidateSource = (item, sources) => item.candidates.some((candidate) => sources.has(candidate.source));
+  const withImages = items.filter((item) => item.imageCount > 0);
+  return {
+    summary: {
+      totalRecords: items.length,
+      withImages: withImages.length,
+      imageOcrComplete: withImages.filter((item) => item.imageOcrStatus === 'complete').length,
+      imageOcrPending: withImages.filter((item) => item.imageOcrStatus === 'pending').length,
+      imageOcrFailed: withImages.filter((item) => item.imageOcrStatus === 'failed').length,
+      imageOcrSkippedBodyEmail: withImages.filter((item) => item.imageOcrStatus === 'skipped_body_email').length,
+      bodyEmailRecords: items.filter((item) => hasCandidateSource(item, new Set(['body']))).length,
+      imageEmailRecords: items.filter((item) => hasCandidateSource(item, new Set(['image']))).length,
+      commentEmailRecords: items.filter((item) => hasCandidateSource(item, new Set(['author_comment', 'other_comment']))).length,
+      ready: items.filter((item) => item.status === 'ready').length,
+      manualReview: items.filter((item) => item.status === 'manual_review').length,
+      commentsPending: items.filter((item) => item.collectionStatus === 'pending' && !item.candidates.length).length,
+      commentsPartial: items.filter((item) => item.collectionStatus === 'partial' && !item.candidates.length).length,
+      noEmailConfirmed: items.filter((item) => item.status === 'no_email').length,
+    },
+    items,
+  };
+}
+
 async function readLatestApplicationPayload(outputDir) {
   const candidates = await Promise.all(
-    ['application_intelligence.checkpoint.json', 'application_intelligence.json'].map(async (filename) => {
+    [
+      'application_intelligence.checkpoint.json',
+      'application_intelligence.json',
+      'xiaohongshu_notes_latest.json',
+      'xiaohongshu_cards_latest.json',
+    ].map(async (filename) => {
       const filePath = path.join(outputDir, filename);
       try {
         const metadata = await stat(filePath);
@@ -2090,11 +2649,26 @@ async function readLatestApplicationPayload(outputDir) {
     }),
   );
   const available = candidates.filter(Boolean).sort((left, right) => right.modifiedAt - left.modifiedAt);
+  // Keep the existing analyzed snapshot authoritative whenever it exists. Raw
+  // collection files are a live fallback while analysis has not produced a
+  // snapshot yet; letting a newer raw file win would drop hydrated fields and
+  // break legacy result semantics during an in-progress collection.
+  const intelligence = available.filter((candidate) => candidate.filename.startsWith('application_intelligence'));
+  const ordered = intelligence.length
+    ? [...intelligence, ...available.filter((candidate) => !candidate.filename.startsWith('application_intelligence'))]
+    : available;
   let lastError = null;
-  for (const candidate of available) {
+  for (const candidate of ordered) {
     try {
-      const payload = JSON.parse(await readFile(candidate.filePath, 'utf8'));
+      const decoded = JSON.parse(await readFile(candidate.filePath, 'utf8'));
+      const payload = Array.isArray(decoded)
+        ? { schema_version: 1, analysis_mode: 'job', source_kind: 'collection', records: decoded }
+        : decoded;
       if (payload && Array.isArray(payload.records)) {
+        if (payload.source_kind === 'collection') {
+          payload.records = payload.records.map(normalizeCollectionApplicationRecord);
+        }
+        await mergeApplicationContactOcrOverlay(outputDir, payload.records);
         Object.defineProperty(payload, APPLICATION_ARTIFACT_FILENAME, {
           value: candidate.filename,
           enumerable: false,
@@ -2109,6 +2683,114 @@ async function readLatestApplicationPayload(outputDir) {
   const error = new Error('Application results are not available.');
   error.code = 'ENOENT';
   throw error;
+}
+
+function normalizeCollectionApplicationRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return {};
+  const roleName = String(record.title || record.card_title || '').trim();
+  const publishTime = record.publish_time && typeof record.publish_time === 'object'
+    ? record.publish_time
+    : {
+        value: String(record.publish_time || '').trim(),
+        is_estimated: true,
+        precision: 'unknown',
+        source: 'collection_snapshot',
+      };
+  const applicationInfo = record.application_info && typeof record.application_info === 'object'
+    ? record.application_info
+    : {};
+  const outreach = record.outreach && typeof record.outreach === 'object' ? record.outreach : {};
+  return {
+    ...record,
+    note_id: String(record.note_id || record.post_id || record.id || '').trim(),
+    title: roleName,
+    body: String(record.body || '').trim(),
+    publish_time: publishTime,
+    media: record.media && typeof record.media === 'object' ? record.media : undefined,
+    job_card: record.job_card && typeof record.job_card === 'object'
+      ? record.job_card
+      : { role_name: roleName, title: roleName, parse_basis: 'search_card' },
+    application_info: {
+      ...applicationInfo,
+      contacts: Array.isArray(applicationInfo.contacts) ? applicationInfo.contacts : [],
+      application_routes: Array.isArray(applicationInfo.application_routes) ? applicationInfo.application_routes : [],
+      responsibilities: Array.isArray(applicationInfo.responsibilities) && applicationInfo.responsibilities.length > 0
+        ? applicationInfo.responsibilities
+        : Array.isArray(record.responsibilities) ? record.responsibilities : [],
+      requirements: Array.isArray(applicationInfo.requirements) && applicationInfo.requirements.length > 0
+        ? applicationInfo.requirements
+        : Array.isArray(record.requirements) ? record.requirements : [],
+    },
+    outreach: {
+      greeting: String(outreach.greeting || ''),
+      email_subject: String(outreach.email_subject || ''),
+      email_body: String(outreach.email_body || ''),
+      cover_letter: String(outreach.cover_letter || ''),
+      ...outreach,
+    },
+    quality: record.quality && typeof record.quality === 'object' ? record.quality : {},
+  };
+}
+
+async function mergeApplicationContactOcrOverlay(outputDir, records) {
+  let overlay;
+  try {
+    overlay = JSON.parse(await readFile(path.join(outputDir, APPLICATION_CONTACT_OCR_OVERLAY), 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) return;
+    throw error;
+  }
+  const entries = overlay?.records && typeof overlay.records === 'object' && !Array.isArray(overlay.records)
+    ? overlay.records
+    : {};
+  for (const [index, record] of records.entries()) {
+    if (!record || typeof record !== 'object') continue;
+    const noteId = String(record.note_id || record.post_id || record.id || `record-${index + 1}`).trim();
+    const entry = entries[noteId];
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const contactOcr = entry.contactOcr && typeof entry.contactOcr === 'object'
+      ? entry.contactOcr
+      : {};
+    const media = record.media && typeof record.media === 'object' ? record.media : {};
+    const analysis = media.analysis && typeof media.analysis === 'object' ? media.analysis : {};
+    const routes = Array.isArray(entry.routes) ? entry.routes.filter((route) => route && typeof route === 'object') : [];
+    const complete = contactOcr.status === 'complete';
+    record.media = {
+      ...media,
+      analysis: {
+        ...analysis,
+        ...(complete ? {
+          status: 'analyzed',
+          source: 'image_ocr_model',
+          visible_text: String(entry.visibleText || ''),
+          ocr_text: String(entry.visibleText || ''),
+          application_routes: routes,
+          application_route_count: routes.length,
+        } : {}),
+        contact_ocr: contactOcr,
+      },
+    };
+    if (!complete || routes.length === 0) continue;
+    const applicationInfo = record.application_info && typeof record.application_info === 'object'
+      ? record.application_info
+      : {};
+    const existingRoutes = Array.isArray(applicationInfo.application_routes)
+      ? applicationInfo.application_routes.filter((route) => route && typeof route === 'object')
+      : [];
+    const merged = [];
+    const positions = new Map();
+    for (const route of [...existingRoutes, ...routes]) {
+      const key = `${String(route.channel || route.type || 'other').toLowerCase()}:${String(route.value || '').trim().toLowerCase()}`;
+      if (key.endsWith(':')) continue;
+      if (positions.has(key)) {
+        merged[positions.get(key)] = { ...merged[positions.get(key)], ...route };
+      } else {
+        positions.set(key, merged.length);
+        merged.push({ ...route });
+      }
+    }
+    record.application_info = { ...applicationInfo, application_routes: merged };
+  }
 }
 
 async function readLegacyMediaSources(outputDir) {
@@ -2402,6 +3084,53 @@ async function readApplicationRecord(outputDir, noteId) {
     : -1;
   const record = recordIndex >= 0 ? payload.records[recordIndex] : null;
   if (!record) throw new ValidationError('Application record not found.');
+  const applicationInfo = record.application_info && typeof record.application_info === 'object'
+    && !Array.isArray(record.application_info)
+    ? record.application_info
+    : {};
+  record.application_info = {
+    ...applicationInfo,
+    responsibilities: Array.isArray(applicationInfo.responsibilities) && applicationInfo.responsibilities.length > 0
+      ? applicationInfo.responsibilities
+      : Array.isArray(record.responsibilities) ? record.responsibilities : [],
+    requirements: Array.isArray(applicationInfo.requirements) && applicationInfo.requirements.length > 0
+      ? applicationInfo.requirements
+      : Array.isArray(record.requirements) ? record.requirements : [],
+  };
+  const snapshot = payload?.profile_snapshot && typeof payload.profile_snapshot === 'object' && !Array.isArray(payload.profile_snapshot)
+    ? payload.profile_snapshot
+    : null;
+  const snapshotCandidate = snapshot?.candidate && typeof snapshot.candidate === 'object' && !Array.isArray(snapshot.candidate)
+    ? snapshot.candidate
+    : {};
+  const existingCandidate = record.candidate_profile && typeof record.candidate_profile === 'object' && !Array.isArray(record.candidate_profile)
+    ? record.candidate_profile
+    : {};
+  if (snapshot) {
+    const evidence = Array.isArray(snapshot.evidence) ? snapshot.evidence : [];
+    const resumeArtifacts = Array.isArray(snapshot.resumeArtifacts) ? snapshot.resumeArtifacts : [];
+    const candidateProfile = {
+      ...snapshotCandidate,
+      ...existingCandidate,
+      evidence_items: evidence,
+      evidence,
+      resumeArtifacts,
+      profile_snapshot: {
+        profileSnapshotId: String(snapshot.profileSnapshotId || '').trim(),
+        evidence,
+        resumeArtifacts,
+        provenancePolicy: snapshot.provenancePolicy && typeof snapshot.provenancePolicy === 'object'
+          ? snapshot.provenancePolicy
+          : {},
+      },
+    };
+    Object.defineProperty(record, 'candidate_profile', {
+      value: candidateProfile,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
   Object.defineProperty(record, APPLICATION_RECORD_INDEX, { value: recordIndex, enumerable: false });
   Object.defineProperty(record, APPLICATION_ARTIFACT_FILENAME, {
     value: payload[APPLICATION_ARTIFACT_FILENAME],
@@ -2541,6 +3270,336 @@ async function updateDeliveryState(outputDir, value) {
   });
 }
 
+async function rewriteApplicationCoverLetter(
+  outputDir,
+  value,
+  rewriter,
+  ai,
+  candidateProfile = {},
+  writeState = writeDeliveryState,
+) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ValidationError('Cover Letter rewrite body must be an object.');
+  }
+  const noteId = String(value.noteId || '').trim();
+  if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
+  if (typeof value.instructions !== 'string') {
+    throw new ValidationError('Cover Letter rewrite instructions must be a string.');
+  }
+  const instructions = value.instructions.trim();
+  if (Array.from(instructions).length > 4_000) {
+    throw new ValidationError('Cover Letter rewrite instructions must not exceed 4000 characters.');
+  }
+  if (typeof rewriter !== 'function') {
+    throw applicationDraftError('AI_COVER_LETTER_REWRITE_FAILED', 'Cover Letter rewrite service is unavailable.');
+  }
+
+  const record = await readApplicationRecord(outputDir, noteId);
+  const state = await readDeliveryState(outputDir);
+  const existing = state[noteId] || {};
+  const store = draftStoreFor(record, existing);
+  const current = currentDraftVersion(store);
+  const suppliedVersion = value.baseVersion ?? value.expectedVersion ?? value.version;
+  const expectedVersion = suppliedVersion == null ? store.currentVersion : Number(suppliedVersion);
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+    throw applicationDraftError('DRAFT_VERSION_REQUIRED', 'A valid baseVersion is required for Cover Letter rewrite.');
+  }
+  if (expectedVersion !== store.currentVersion) {
+    throw draftVersionConflict(expectedVersion, store.currentVersion);
+  }
+  const requestedDraftId = String(value.draftId || store.draftId).trim();
+  if (requestedDraftId !== store.draftId) {
+    throw applicationDraftError('DRAFT_ID_MISMATCH', 'The requested draftId does not match the stored draft.');
+  }
+
+  const currentDraft = normalizeDraft(value.outreach, current.content);
+  const applicationContext = resolveApplicationContext(record, existing, value);
+  const mergedCandidateProfile = {
+    ...(record.candidate_profile && typeof record.candidate_profile === 'object' ? record.candidate_profile : {}),
+    ...(candidateProfile && typeof candidateProfile === 'object' ? candidateProfile : {}),
+  };
+  const requestId = randomUUID();
+  let rewritten;
+  try {
+    rewritten = await rewriter({
+      record,
+      outreach: currentDraft,
+      instructions,
+      candidateProfile: mergedCandidateProfile,
+      applicationContext,
+      maxAttempts: 2,
+    }, ai);
+  } catch (error) {
+    if (String(error?.code || '').startsWith('COVER_LETTER_REWRITE_')) throw error;
+    const wrapped = applicationDraftError(
+      'AI_COVER_LETTER_REWRITE_FAILED',
+      `Cover Letter rewrite failed: ${String(error?.message || error)}`,
+    );
+    wrapped.cause = error;
+    throw wrapped;
+  }
+
+  const coverLetter = String(rewritten?.cover_letter ?? rewritten?.coverLetter ?? '').trim();
+  const charCount = unicodeNonWhitespaceCount(coverLetter);
+  const responsibilityCoverage = Array.isArray(rewritten?.responsibility_coverage)
+    ? rewritten.responsibility_coverage
+    : Array.isArray(rewritten?.responsibilityCoverage)
+      ? rewritten.responsibilityCoverage
+      : [];
+  const evidenceCoverage = Array.isArray(rewritten?.evidence_coverage)
+    ? rewritten.evidence_coverage
+    : Array.isArray(rewritten?.evidenceCoverage)
+      ? rewritten.evidenceCoverage
+      : [];
+  const usedEvidenceIds = Array.isArray(rewritten?.used_evidence_ids)
+    ? rewritten.used_evidence_ids
+    : Array.isArray(rewritten?.usedEvidenceIds)
+      ? rewritten.usedEvidenceIds
+      : [];
+  assertCoverLetterRewriteResult(
+    record,
+    mergedCandidateProfile,
+    coverLetter,
+    charCount,
+    responsibilityCoverage,
+    usedEvidenceIds,
+    evidenceCoverage,
+  );
+
+  const generatedAt = new Date().toISOString();
+  const promptVersion = String(rewritten?.prompt_version || rewritten?.promptVersion || 'cover-letter-rewrite-v2').trim();
+  const runtime = rewritten?.runtime && typeof rewritten.runtime === 'object' ? rewritten.runtime : {};
+  const provider = String(runtime.provider || ai?.provider || '').trim();
+  const model = String(runtime.model || ai?.model || '').trim();
+  const wireApi = String(runtime.wireApi || runtime.wire_api || ai?.wireApi || '').trim();
+  const strategy = String(rewritten?.generation_strategy || rewritten?.generationStrategy || 'direct_model_rewrite').trim();
+  const modelCalls = Math.max(1, Math.min(10, Number(rewritten?.model_calls || rewritten?.modelCalls) || 1));
+  const reviewScoreValue = rewritten?.review_score ?? rewritten?.reviewScore;
+  const reviewScore = reviewScoreValue == null
+    ? null
+    : Math.max(0, Math.min(100, Number(reviewScoreValue) || 0));
+  const styleViolationCount = Math.max(0, Number(
+    rewritten?.style_violation_count ?? rewritten?.styleViolationCount ?? 0,
+  ) || 0);
+  const requestedSignatureEvidenceIds = [...new Set((Array.isArray(rewritten?.signature_evidence_ids)
+    ? rewritten.signature_evidence_ids
+    : Array.isArray(rewritten?.signatureEvidenceIds)
+      ? rewritten.signatureEvidenceIds
+      : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean))].slice(0, 4);
+  if (styleViolationCount !== 0) {
+    throw applicationDraftError(
+      'AI_COVER_LETTER_STYLE_GATE_FAILED',
+      `Cover Letter rewrite reported ${styleViolationCount} prohibited defensive or contrast expressions.`,
+    );
+  }
+  const profileSnapshot = mergedCandidateProfile.profile_snapshot
+    && typeof mergedCandidateProfile.profile_snapshot === 'object'
+    && !Array.isArray(mergedCandidateProfile.profile_snapshot)
+    ? mergedCandidateProfile.profile_snapshot
+    : {};
+  const profileSnapshotId = String(profileSnapshot.profileSnapshotId || '').trim() || createHash('sha256')
+    .update(JSON.stringify(['cover-letter-profile:v2', mergedCandidateProfile]), 'utf8')
+    .digest('hex');
+  const resumeArtifacts = Array.isArray(profileSnapshot.resumeArtifacts)
+    ? profileSnapshot.resumeArtifacts
+    : Array.isArray(mergedCandidateProfile.resumeArtifacts)
+      ? mergedCandidateProfile.resumeArtifacts
+      : [];
+  const resumeArtifactIds = [...new Set(resumeArtifacts
+    .map((item) => String(item?.id || '').trim())
+    .filter(Boolean))].slice(0, 6);
+  const evidenceIds = [...new Set((Array.isArray(mergedCandidateProfile.evidence_items)
+    ? mergedCandidateProfile.evidence_items
+    : Array.isArray(mergedCandidateProfile.evidence)
+      ? mergedCandidateProfile.evidence
+      : [])
+    .map((item) => String(item?.id || '').trim())
+    .filter(Boolean))];
+  const normalizedUsedEvidenceIds = [...new Set(usedEvidenceIds
+    .map((item) => String(item || '').trim())
+    .filter(Boolean))];
+  const signatureEvidenceIds = requestedSignatureEvidenceIds
+    .filter((evidenceId) => normalizedUsedEvidenceIds.includes(evidenceId));
+  const roleResponsibilities = Array.isArray(record.application_info?.responsibilities)
+    && record.application_info.responsibilities.length > 0
+    ? record.application_info.responsibilities
+    : Array.isArray(record.responsibilities) ? record.responsibilities : [];
+  const roleRequirements = Array.isArray(record.application_info?.requirements)
+    && record.application_info.requirements.length > 0
+    ? record.application_info.requirements
+    : Array.isArray(record.requirements) ? record.requirements : [];
+  const inputHashPayload = [
+      'cover-letter-rewrite-input:v3-signature-evidence',
+      noteId,
+      hashDraftContent(currentDraft),
+      instructions,
+      applicationContext,
+      record.job_card?.role_name || record.application_info?.role_name || record.title || '',
+      roleResponsibilities,
+      roleRequirements,
+      profileSnapshotId,
+      evidenceIds,
+      resumeArtifactIds,
+    ];
+  const inputHash = createHash('sha256')
+    .update(JSON.stringify(inputHashPayload), 'utf8')
+    .digest('hex');
+  const saved = await updateApplicationDraft(outputDir, {
+    noteId,
+    draftId: requestedDraftId,
+    baseVersion: expectedVersion,
+    outreach: { ...currentDraft, cover_letter: coverLetter },
+    preserveEmailSubject: true,
+    applicationContext,
+    generation: {
+      runId: requestId,
+      promptVersion,
+      model,
+      provider,
+      strategy,
+      modelCalls,
+      reviewScore,
+      styleViolationCount,
+      signatureEvidenceIds,
+      profileSnapshotId,
+      inputHash,
+      usedEvidenceIds,
+      resumeArtifactIds,
+      status: 'saved',
+      generatedAt,
+    },
+  }, writeState);
+  return {
+    ...saved,
+    generation: {
+      provider,
+      model,
+      wireApi,
+      requestId,
+      generatedAt,
+      promptVersion,
+      strategy,
+      modelCalls,
+      reviewScore,
+      styleViolationCount,
+      signatureEvidenceIds,
+      usedEvidenceIds: normalizedUsedEvidenceIds,
+      evidenceCoverage,
+      resumeArtifactIds,
+      responsibilityCoverage,
+      charCount,
+      attempts: Math.max(1, Number(rewritten?.attempts) || 1),
+    },
+  };
+}
+
+function unicodeNonWhitespaceCount(value) {
+  return Array.from(String(value || '').replace(/\s+/gu, '')).length;
+}
+
+function assertCoverLetterRewriteResult(
+  record,
+  candidateProfile,
+  coverLetter,
+  charCount,
+  responsibilityCoverage,
+  usedEvidenceIds,
+  evidenceCoverage,
+) {
+  if (charCount < 800 || charCount > 1_600) {
+    throw applicationDraftError(
+      'AI_COVER_LETTER_REWRITE_FAILED',
+      `AI Cover Letter has ${charCount} non-whitespace characters; required range is 800-1600.`,
+    );
+  }
+  const application = record?.application_info && typeof record.application_info === 'object'
+    ? record.application_info
+    : {};
+  const responsibilities = Array.isArray(application.responsibilities)
+    ? application.responsibilities
+        .map((item) => String(item?.text ?? item ?? '').trim())
+        .filter(Boolean)
+        .slice(0, 6)
+    : [];
+  const expectedIds = new Set(responsibilities.map((_, index) => `responsibility-${index + 1}`));
+  const seenIds = new Set();
+  for (const item of responsibilityCoverage) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const id = String(item.responsibility_id || item.responsibilityId || '').trim();
+    const responseSentence = String(item.response_sentence || item.responseSentence || '').trim();
+    if (id) seenIds.add(id);
+    if (!responseSentence || !coverLetter.replace(/\s+/gu, '').includes(responseSentence.replace(/\s+/gu, ''))) {
+      throw applicationDraftError(
+        'AI_COVER_LETTER_REWRITE_FAILED',
+        `AI Cover Letter did not include the declared response for ${id || 'a responsibility'}.`,
+      );
+    }
+  }
+  if ([...expectedIds].some((id) => !seenIds.has(id))) {
+    throw applicationDraftError(
+      'AI_COVER_LETTER_REWRITE_FAILED',
+      'AI Cover Letter did not cover every extracted job responsibility.',
+    );
+  }
+
+  const candidateEvidence = Array.isArray(candidateProfile?.evidence_items)
+    ? candidateProfile.evidence_items
+    : Array.isArray(candidateProfile?.evidence)
+      ? candidateProfile.evidence
+      : [];
+  const evidenceById = new Map(candidateEvidence
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => [String(item.id || '').trim(), item])
+    .filter(([id]) => id));
+  const normalizedUsedEvidenceIds = new Set((Array.isArray(usedEvidenceIds) ? usedEvidenceIds : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean));
+  if ([...normalizedUsedEvidenceIds].some((id) => !evidenceById.has(id))) {
+    throw applicationDraftError(
+      'AI_COVER_LETTER_REWRITE_FAILED',
+      'AI Cover Letter referenced evidence outside the candidate profile snapshot.',
+    );
+  }
+  const seenEvidenceIds = new Set();
+  for (const item of Array.isArray(evidenceCoverage) ? evidenceCoverage : []) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const id = String(item.evidence_id || item.evidenceId || '').trim();
+    const sentence = String(item.evidence_sentence || item.evidenceSentence || '').trim();
+    if (id) seenEvidenceIds.add(id);
+    if (!normalizedUsedEvidenceIds.has(id) || !sentence || !coverLetter.replace(/\s+/gu, '').includes(sentence.replace(/\s+/gu, ''))) {
+      throw applicationDraftError(
+        'AI_COVER_LETTER_REWRITE_FAILED',
+        `AI Cover Letter did not include the declared personal-experience sentence for ${id || 'an evidence item'}.`,
+      );
+    }
+    const anchor = candidateEvidenceAnchor(evidenceById.get(id));
+    if (anchor && !sentence.replace(/\s+/gu, '').includes(anchor.replace(/\s+/gu, ''))) {
+      throw applicationDraftError(
+        'AI_COVER_LETTER_REWRITE_FAILED',
+        `AI Cover Letter did not name the candidate experience ${anchor}.`,
+      );
+    }
+  }
+  if ([...normalizedUsedEvidenceIds].some((id) => !seenEvidenceIds.has(id))) {
+    throw applicationDraftError(
+      'AI_COVER_LETTER_REWRITE_FAILED',
+      'AI Cover Letter did not ground every used candidate experience in the body.',
+    );
+  }
+}
+
+function candidateEvidenceAnchor(item) {
+  const organization = String(item?.organization || '').trim();
+  if (organization) return organization;
+  const label = String(item?.label || item?.title || '').trim();
+  const latin = label.match(/^([A-Za-z][A-Za-z0-9.+#-]{1,30})/u);
+  if (latin) return latin[1];
+  const entity = label.match(/^(.{2,10}?)(?:海外|用户研究|达人|舆情|直播|社区|需求|市场|数据|内容运营|AI产品)/u);
+  return String(entity?.[1] || label).replace(/^[ 、，/|]+|[ 、，/|]+$/gu, '');
+}
+
 async function updateApplicationDraft(outputDir, value, writeState = writeDeliveryState) {
   const noteId = String(value?.noteId || '').trim();
   if (!NOTE_ID.test(noteId)) throw new ValidationError('Invalid noteId.');
@@ -2551,6 +3610,18 @@ async function updateApplicationDraft(outputDir, value, writeState = writeDelive
     const store = draftStoreFor(record, existing);
     const current = currentDraftVersion(store);
     const draft = normalizeDraft(value?.outreach, current.content);
+    const subjectResolution = resolveApplicationEmailSubject(record, draft.email_subject, value?.outreach || {});
+    if (
+      value?.preserveEmailSubject !== true
+      && subjectResolution.subject
+      && subjectResolution.missingFields.length === 0
+      && (
+        subjectResolution.rule.detected
+        || subjectResolution.subjectGuard.rejectedSubject
+      )
+    ) {
+      draft.email_subject = subjectResolution.subject;
+    }
     const suppliedVersion = value?.baseVersion ?? value?.expectedVersion ?? value?.version;
     const requestedHash = hashDraftContent(draft);
     const isIdempotentRetry = requestedHash === current.contentHash;
@@ -2613,16 +3684,26 @@ function normalizeGenerationMetadata(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const bounded = (input, limit) => String(input || '').trim().slice(0, limit);
   const usedEvidenceIds = Array.isArray(value.usedEvidenceIds)
-    ? [...new Set(value.usedEvidenceIds.map((item) => bounded(item, 120)).filter(Boolean))].slice(0, 2)
+    ? [...new Set(value.usedEvidenceIds.map((item) => bounded(item, 120)).filter(Boolean))].slice(0, 5)
     : [];
   const resumeArtifactIds = Array.isArray(value.resumeArtifactIds)
     ? [...new Set(value.resumeArtifactIds.map((item) => bounded(item, 100)).filter(Boolean))].slice(0, 6)
+    : [];
+  const signatureEvidenceIds = Array.isArray(value.signatureEvidenceIds)
+    ? [...new Set(value.signatureEvidenceIds.map((item) => bounded(item, 120)).filter(Boolean))].slice(0, 4)
     : [];
   const metadata = {
     runId: bounded(value.runId, 160),
     promptVersion: bounded(value.promptVersion, 120),
     model: bounded(value.model, 160),
     provider: bounded(value.provider, 120),
+    strategy: bounded(value.strategy, 120),
+    modelCalls: Math.max(0, Math.min(10, Number(value.modelCalls) || 0)),
+    reviewScore: value.reviewScore == null
+      ? null
+      : Math.max(0, Math.min(100, Number(value.reviewScore) || 0)),
+    styleViolationCount: Math.max(0, Number(value.styleViolationCount) || 0),
+    signatureEvidenceIds,
     profileSnapshotId: bounded(value.profileSnapshotId, 128),
     inputHash: bounded(value.inputHash, 128),
     usedEvidenceIds,
@@ -2894,15 +3975,26 @@ export async function previewApplicationEmail(
   const record = await readApplicationRecord(outputDir, noteId);
   const extracted = extractedEmails(record, options.allowedRecipients);
   const requested = String(value?.to || '').trim().toLowerCase();
-  const recipient = extracted.find((item) => item.toLowerCase() === requested) || (!requested ? extracted[0] : '');
+  if (!requested) throw new ValidationError('Recipient is required.');
+  const recipient = extracted.find((item) => item.toLowerCase() === requested) || '';
   if (!recipient) throw new ValidationError('Recipient must be an email extracted from this application record.');
   return withDeliveryStateLock(outputDir, async () => {
     const state = await readDeliveryState(outputDir);
     const existing = state[noteId] || {};
-    const bundle = await resolveApplicationAttachments(outputDir, noteId, value?.attachmentIds, limits);
+    const qualityBundle = await resolveApplicationAttachments(outputDir, noteId, value?.attachmentIds, limits);
+    const bundle = value?.attachmentFilenameOverrides
+      ? await resolveApplicationAttachments(
+          outputDir,
+          noteId,
+          value?.attachmentIds,
+          limits,
+          value.attachmentFilenameOverrides,
+        )
+      : qualityBundle;
     const resolved = resolveStoredDraftForAction(record, existing, value);
     const draft = { ...resolved.content };
     if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
+    assertApplicationSubjectRule(record, draft.email_subject);
     validateDeliveryDraft(draft, record);
     const peerCorpusHash = applicationPeerCorpusHash(savedPeerDrafts(state, noteId));
     const applicationContextHash = persistedApplicationContextHash(existing);
@@ -2910,7 +4002,7 @@ export async function previewApplicationEmail(
       outputDir,
       record,
       resolved,
-      bundle.attachmentBundleHash,
+      qualityBundle.attachmentBundleHash,
       peerCorpusHash,
       applicationContextHash,
     );
@@ -2918,7 +4010,7 @@ export async function previewApplicationEmail(
       existing,
       resolved,
       record,
-      bundle.attachmentBundleHash,
+      qualityBundle.attachmentBundleHash,
       peerCorpusHash,
       applicationContextHash,
     );
@@ -2949,22 +4041,24 @@ export async function previewApplicationEmail(
       },
       warnings,
     });
-    const previewedAt = new Date().toISOString();
-    state[noteId] = {
-      ...existing,
-      ...deliveryStatusPatch(existing, preview.readiness === 'ready' ? 'preview_ready' : 'blocked', previewedAt),
-      action: 'email_previewed',
-      updatedAt: previewedAt,
-      preview: {
-        previewRevision: preview.previewRevision,
-        attachmentBundleHash: preview.attachmentBundleHash,
-        draftId: preview.draftId,
-        draftVersion: preview.draftVersion,
-        readiness: preview.readiness,
-        preparedAt: previewedAt,
-      },
-    };
-    await writeState(outputDir, state);
+    if (options.persist !== false) {
+      const previewedAt = new Date().toISOString();
+      state[noteId] = {
+        ...existing,
+        ...deliveryStatusPatch(existing, preview.readiness === 'ready' ? 'preview_ready' : 'blocked', previewedAt),
+        action: 'email_previewed',
+        updatedAt: previewedAt,
+        preview: {
+          previewRevision: preview.previewRevision,
+          attachmentBundleHash: preview.attachmentBundleHash,
+          draftId: preview.draftId,
+          draftVersion: preview.draftVersion,
+          readiness: preview.readiness,
+          preparedAt: previewedAt,
+        },
+      };
+      await writeState(outputDir, state);
+    }
     return preview;
   });
 }
@@ -3142,7 +4236,8 @@ export async function sendApplicationEmail(outputDir, value, mailer, replyTo, sm
   const record = await readApplicationRecord(outputDir, noteId);
   const extracted = extractedEmails(record, options.allowedRecipients);
   const requested = String(value?.to || '').trim().toLowerCase();
-  const to = extracted.find((item) => item.toLowerCase() === requested) || (!requested ? extracted[0] : '');
+  if (!requested) throw new ValidationError('Recipient is required.');
+  const to = extracted.find((item) => item.toLowerCase() === requested) || '';
   if (!to) throw new ValidationError('Recipient must be an email extracted from this application record.');
 
   return withDeliveryStateLock(outputDir, async () => {
@@ -3167,14 +4262,24 @@ export async function sendApplicationEmail(outputDir, value, mailer, replyTo, sm
     const resolved = resolveStoredDraftForAction(record, existing, value);
     const draft = { ...resolved.content };
     if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
+    assertApplicationSubjectRule(record, draft.email_subject);
     validateDeliveryDraft(draft, record);
-    const attachmentBundle = await resolveApplicationAttachments(outputDir, noteId, value?.attachmentIds, limits);
+    const qualityAttachmentBundle = await resolveApplicationAttachments(outputDir, noteId, value?.attachmentIds, limits);
+    const attachmentBundle = value?.attachmentFilenameOverrides
+      ? await resolveApplicationAttachments(
+          outputDir,
+          noteId,
+          value?.attachmentIds,
+          limits,
+          value.attachmentFilenameOverrides,
+        )
+      : qualityAttachmentBundle;
     const peerCorpusHash = applicationPeerCorpusHash(savedPeerDrafts(state, noteId));
     await assertQualityReportReference(
       outputDir,
       record,
       resolved,
-      attachmentBundle.attachmentBundleHash,
+      qualityAttachmentBundle.attachmentBundleHash,
       peerCorpusHash,
       persistedApplicationContextHash(existing),
     );
@@ -3196,7 +4301,7 @@ export async function sendApplicationEmail(outputDir, value, mailer, replyTo, sm
         existing,
         resolved,
         record,
-        attachmentBundle.attachmentBundleHash,
+        qualityAttachmentBundle.attachmentBundleHash,
         peerCorpusHash,
         persistedApplicationContextHash(existing),
       ),
@@ -3768,12 +4873,44 @@ function applicationDraftError(code, message) {
   return error;
 }
 
+function assertApplicationSubjectRule(record, subject) {
+  const subjectGuard = applicationSubjectGuard(record, subject);
+  if (!subjectGuard.explicitRule && (
+    subjectGuard.requestedNoisyTitle
+    || subjectGuard.requestedBareTitle
+    || subjectGuard.requestedUnverifiedSubject
+    || subjectGuard.requiresReview
+  )) {
+    const error = applicationDraftError(
+      'APPLICATION_SUBJECT_TITLE_REVIEW_REQUIRED',
+      '邮件主题需使用准确岗位名；原帖标题中的招聘口号已排除，请补全岗位名后重新生成。',
+    );
+    error.subjectGuard = subjectGuard;
+    throw error;
+  }
+  const rule = applicationSubjectRule(record);
+  if (!rule.detected) return;
+  const validation = validateApplicationEmailSubject(record, subject);
+  if (validation.status === 'compliant') return;
+  const error = applicationDraftError(
+    'APPLICATION_SUBJECT_RULE_MISMATCH',
+    '正文要求的邮件标题与当前草稿不一致，请重新保存或生成草稿后再发送。',
+  );
+  error.subjectRule = {
+    ...rule,
+    status: validation.status,
+    missingFields: validation.missingFields,
+    missingValues: validation.missingValues,
+  };
+  throw error;
+}
+
 function resolveDraftAiRuntime(aiSessions, internal, value) {
   const aiSessionId = String(value?.aiSessionId || internal?.params?.aiSessionId || '').trim();
   if (!aiSessionId || !aiSessions?.resolve) {
     throw applicationDraftError(
       'AI_SESSION_UNAVAILABLE',
-      'A configured AI session is required to check the edited draft.',
+      'A configured AI session is required to use AI draft features.',
     );
   }
   return aiSessions.resolve(aiSessionId);
@@ -4307,7 +5444,7 @@ function validateDeliveryDraft(draft, record) {
   if (/(?:原帖|岗位提到|候选人|材料显示)/.test(metaScan)) {
     throw new ValidationError('Email contains unsupported meta wording.');
   }
-  const roleName = String(record?.job_card?.role_name || record?.title || '').trim();
+  const roleName = normalizeApplicationRoleTitle(record?.job_card?.role_name || record?.job_card?.title || record?.title);
   if (roleName && !subject.includes(roleName) && !body.includes(roleName)) {
     throw new ValidationError('Email subject or body must identify the current role.');
   }
@@ -4316,7 +5453,7 @@ function validateDeliveryDraft(draft, record) {
   }
 }
 
-function extractedEmails(record, allowedRecipients = []) {
+function extractedEmails(record, allowedRecipients) {
   const routes = [...(record.application_info?.contacts || []), ...(record.application_info?.application_routes || [])];
   const values = routes.flatMap((route) => {
     const routeType = `${route?.type || ''} ${route?.channel || ''}`;
@@ -4330,12 +5467,14 @@ function extractedEmails(record, allowedRecipients = []) {
   const serverAllowed = (Array.isArray(allowedRecipients) ? allowedRecipients : [])
     .map((value) => String(value || '').trim().toLowerCase())
     .filter((value) => EMAIL.test(value));
-  return [...new Set([...values.map((value) => value.toLowerCase()), ...serverAllowed])];
+  if (Array.isArray(allowedRecipients)) return [...new Set(serverAllowed)];
+  return [...new Set(values.map((value) => value.toLowerCase()))];
 }
 
 function mergeApplicationState(record, state, recordIndex, artifactFilename) {
   const store = draftStoreFor(record, state || {}, recordIndex, artifactFilename);
   const current = currentDraftVersion(store);
+  const modelRewrite = state?.generation?.promptVersion === 'cover-letter-rewrite-v1';
   const qualityChecks = Array.isArray(state?.qualityChecks) ? state.qualityChecks : [];
   const recordApplicationContext = record?.outreach?.applicationContext
     ?? record?.outreach?.application_context
@@ -4357,6 +5496,7 @@ function mergeApplicationState(record, state, recordIndex, artifactFilename) {
     outreach: {
       ...record.outreach,
       ...current.content,
+      ...(modelRewrite ? { generation_mode: 'model_rewrite' } : {}),
       ...(applicationContext ? { applicationContext } : {}),
     },
     cover_letter_evaluation: currentQuality?.evaluation
@@ -4875,12 +6015,13 @@ async function readJsonBody(req, maxBytes) {
   return text ? JSON.parse(text) : {};
 }
 
-function setSecurityHeaders(res) {
+function setSecurityHeaders(res, config = {}) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Access-Control-Allow-Origin', 'http://127.0.0.1:5173');
+  res.setHeader('Access-Control-Allow-Origin', config.authOrigin || 'http://127.0.0.1:5173');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
 }

@@ -139,6 +139,23 @@ test('local free model creates a session and discovers installed models without 
   assert.equal(session.configured, true);
 });
 
+test('local free model uses the configured internal HTTPS runtime endpoint', () => {
+  const store = new AiSessionStore({ localModelEndpoint: 'https://ollama.internal.example/' });
+  const provider = store.providers().find((item) => item.id === 'local_qwen');
+  assert.equal(provider.baseUrl, 'https://ollama.internal.example/v1');
+});
+
+test('local free model ignores a browser-supplied endpoint and keeps the deployment endpoint', async () => {
+  const store = new AiSessionStore({ localModelEndpoint: 'https://ollama.internal.example' });
+  const session = await store.create({
+    provider: 'local_qwen',
+    model: 'qwen3.5:4b',
+    baseUrl: 'https://untrusted.example/v1',
+    wireApi: 'chat_completions',
+  });
+  assert.equal(session.baseUrl, 'https://ollama.internal.example/v1');
+});
+
 test('relay provider normalizes a pasted endpoint and exposes relay capabilities', async () => {
   const calls = [];
   const store = new AiSessionStore({

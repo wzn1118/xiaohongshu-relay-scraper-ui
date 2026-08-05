@@ -56,6 +56,114 @@ function Test-PortOpen {
     }
 }
 
+function Test-OllamaEndpoint {
+    param([string]$Endpoint)
+    try {
+        $version = Invoke-RestMethod -Uri "$($Endpoint.TrimEnd('/'))/api/version" -TimeoutSec 2
+        return [bool]$version.version
+    } catch {
+        return $false
+    }
+}
+
+function Test-EnabledValue {
+    param([string]$Value)
+    return @('1', 'true', 'yes', 'on') -contains ([string]$Value).Trim().ToLowerInvariant()
+}
+
+function Warm-DedicatedOcrModel {
+    param([string]$Endpoint)
+    $model = if ($env:XHS_APPLICATION_CONTACT_OCR_MODEL) {
+        $env:XHS_APPLICATION_CONTACT_OCR_MODEL.Trim()
+    } else {
+        'qwen2.5vl:3b'
+    }
+    if (-not $model) { throw 'A dedicated OCR model name is required.' }
+    $keepAlive = if ($env:XHS_APPLICATION_CONTACT_OCR_KEEP_ALIVE) {
+        $env:XHS_APPLICATION_CONTACT_OCR_KEEP_ALIVE.Trim()
+    } else {
+        '60m'
+    }
+    $contextTokens = 4096
+    if ($env:XHS_APPLICATION_CONTACT_OCR_CONTEXT_TOKENS -match '^\d+$') {
+        $contextTokens = [Math]::Max(2048, [Math]::Min(8192, [int]$env:XHS_APPLICATION_CONTACT_OCR_CONTEXT_TOKENS))
+    }
+    $payload = @{
+        model = $model
+        stream = $false
+        think = $false
+        keep_alive = $keepAlive
+        options = @{ num_ctx = $contextTokens; num_predict = 1; temperature = 0 }
+        messages = @(@{ role = 'user'; content = 'Reply OK.' })
+    } | ConvertTo-Json -Depth 6 -Compress
+    try {
+        Invoke-RestMethod -Method Post -Uri "$($Endpoint.TrimEnd('/'))/api/chat" -ContentType 'application/json' -Body $payload -TimeoutSec 180 | Out-Null
+    } catch {
+        throw "Dedicated OCR model warm-up failed for ${model}: $($_.Exception.Message)"
+    }
+    Write-Host "Dedicated OCR model is warm: $model (keep-alive=$keepAlive)"
+}
+
+function Ensure-DedicatedOcrRuntime {
+    if (-not (Test-EnabledValue $env:XHS_APPLICATION_CONTACT_OCR_DEDICATED_ENABLED)) { return }
+    $endpoint = if ($env:XHS_APPLICATION_CONTACT_OCR_DEDICATED_ENDPOINT) {
+        $env:XHS_APPLICATION_CONTACT_OCR_DEDICATED_ENDPOINT.TrimEnd('/')
+    } else {
+        'http://127.0.0.1:11435'
+    }
+    if (Test-OllamaEndpoint $endpoint) {
+        Write-Host "Dedicated OCR runtime is ready: $endpoint"
+        Warm-DedicatedOcrModel $endpoint
+        return
+    }
+    $uri = [Uri]$endpoint
+    if (Test-PortOpen $uri.Host $uri.Port) {
+        throw "Dedicated OCR port $($uri.Port) is occupied by a non-Ollama service."
+    }
+    $ollamaCommand = Get-Command ollama.exe -ErrorAction SilentlyContinue
+    if (-not $ollamaCommand) { $ollamaCommand = Get-Command ollama -ErrorAction SilentlyContinue }
+    if (-not $ollamaCommand) { throw 'Ollama is required for the dedicated OCR runtime.' }
+
+    $runtimeDir = Join-Path $root '.runtime'
+    New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+    $stdoutLog = Join-Path $runtimeDir "ollama-ocr-$($uri.Port).out.log"
+    $stderrLog = Join-Path $runtimeDir "ollama-ocr-$($uri.Port).err.log"
+    $saved = @{}
+    foreach ($name in @('OLLAMA_HOST', 'OLLAMA_NUM_PARALLEL', 'OLLAMA_MAX_LOADED_MODELS', 'OLLAMA_CONTEXT_LENGTH')) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    try {
+        $ocrParallel = 2
+        if ($env:XHS_APPLICATION_CONTACT_OCR_MODEL_PARALLEL -match '^\d+$') {
+            $ocrParallel = [Math]::Max(1, [Math]::Min(4, [int]$env:XHS_APPLICATION_CONTACT_OCR_MODEL_PARALLEL))
+        }
+        $env:OLLAMA_HOST = "$($uri.Host):$($uri.Port)"
+        $env:OLLAMA_NUM_PARALLEL = [string]$ocrParallel
+        $env:OLLAMA_MAX_LOADED_MODELS = '1'
+        $env:OLLAMA_CONTEXT_LENGTH = if ($env:XHS_APPLICATION_CONTACT_OCR_CONTEXT_TOKENS) {
+            $env:XHS_APPLICATION_CONTACT_OCR_CONTEXT_TOKENS
+        } else {
+            '4096'
+        }
+        $process = Start-Process -FilePath $ollamaCommand.Source -ArgumentList @('serve') -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
+    } finally {
+        foreach ($name in $saved.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process')
+        }
+    }
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+        if ($process.HasExited) { throw "Dedicated OCR runtime exited with code $($process.ExitCode)." }
+        if (Test-OllamaEndpoint $endpoint) {
+            Write-Host "Dedicated OCR runtime started: $endpoint (PID $($process.Id), parallel=$ocrParallel)"
+            Warm-DedicatedOcrModel $endpoint
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+    throw "Dedicated OCR runtime did not become ready: $endpoint"
+}
+
 function Open-App {
     param([string]$Url)
     if (-not $NoBrowser) { Start-Process $Url }
@@ -120,6 +228,7 @@ if (-not $CheckOnly) {
     & (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -InstallRuntime -InstallTools -EnsureBrowserRelay
     if ($LASTEXITCODE -ne 0) { throw 'Windows prerequisites are not ready.' }
     Refresh-ProcessPath
+    Ensure-DedicatedOcrRuntime
 }
 
 if (Test-AppHealth $url -and -not $CheckOnly) {

@@ -37,6 +37,57 @@ class ApplicationGenerationTests(unittest.TestCase):
         self.assertNotIn("path", first["resumeArtifacts"][0])
         self.assertEqual(first["resumeArtifacts"][0]["sha256"], "a" * 64)
 
+    def test_snapshot_includes_full_resume_experience_as_atomic_evidence(self):
+        profile = {
+            **self.profile,
+            "experience": [{
+                "organization": "示例公司",
+                "period": {"start": "2025-01", "end": "2025-06"},
+                "claims": [
+                    {"claim": "访谈 20 位用户并输出需求报告。", "evidence": "resume:p1"},
+                    {"claim": "存在冲突的结果。", "evidence": "resume:p1", "conflict": True},
+                ],
+            }],
+        }
+
+        snapshot = build_profile_snapshot(profile)
+
+        experience = snapshot["evidence"][0]
+        self.assertEqual(experience["id"], "resume-experience-1")
+        self.assertEqual(experience["organization"], "示例公司")
+        self.assertIn("访谈 20 位用户", experience["detail"])
+        self.assertNotIn("存在冲突", experience["detail"])
+
+    def test_snapshot_drops_duplicate_resume_summaries_when_full_experiences_exist(self):
+        profile = {
+            **self.profile,
+            "evidence_items": [
+                {"id": "resume-summary", "label": "重复摘要", "detail": "摘要内容"},
+                {"id": "github-project", "label": "公开项目", "detail": "项目内容"},
+            ],
+            "experience": [{
+                "organization": "示例公司",
+                "claims": [{"claim": "负责用户访谈。", "evidence": "resume:p1"}],
+            }],
+        }
+
+        snapshot = build_profile_snapshot(profile)
+        evidence_ids = [item["id"] for item in snapshot["evidence"]]
+        self.assertEqual(evidence_ids, ["resume-experience-1", "github-project"])
+
+    def test_snapshot_includes_resume_skills_and_education(self):
+        profile = {
+            **self.profile,
+            "skills": [{"skill": "英语", "detail": "雅思6.5"}],
+            "education": [{"institution": "测试大学", "degree": "硕士", "field": "传播学"}],
+        }
+
+        snapshot = build_profile_snapshot(profile)
+        evidence = {item["id"]: item for item in snapshot["evidence"]}
+
+        self.assertIn("雅思6.5", evidence["resume-skills"]["detail"])
+        self.assertEqual(evidence["resume-education-1"]["organization"], "测试大学")
+
     def test_generation_payload_only_contains_ready_records(self):
         snapshot = build_profile_snapshot(self.profile)
         payload = build_generation_payload([

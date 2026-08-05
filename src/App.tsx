@@ -24,6 +24,8 @@ import {
   Images,
   BrainCircuit,
   BookOpenCheck,
+  Code2,
+  Info,
   KeyRound,
   Layers3,
   LoaderCircle,
@@ -71,12 +73,13 @@ import { createDataCopilotTransport } from './data-copilot-transport'
 import type { DataCopilotContextSource, DataCopilotModel } from './DataCopilotContext'
 import { ExpansionWorkspace } from './ExpansionWorkspace'
 import { JobJourneyPanel } from './JobJourneyPanel'
-import { experienceSnapshotForJob } from './job-experience'
+import { experienceSnapshotForJob, jobExperienceView } from './job-experience'
 import { UnsavedDraftDialog } from './UnsavedDraftDialog'
 import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
 import type { DraftSaveRequest } from './useUnsavedDraftGuard'
 import type {
   Artifact,
+  AuthSession,
   ApplicationAttachment,
   ApplicationAttachmentList,
   ApplicationContext,
@@ -119,8 +122,11 @@ import type {
   WorkspaceView,
 } from './types'
 
+const FEATURED_JOB_ID = '20260804081657-caf8f451'
+
 const CANDIDATE_PROFILE_STORAGE_KEY = 'xhs-candidate-application-profile'
 const CUSTOM_MODEL_OPTION = '__custom_model__'
+const COVER_LETTER_MIN_NON_WHITESPACE_CHARS = 800
 
 type AiConnectionCheck = {
   status: 'checking' | 'verified' | 'error'
@@ -471,6 +477,13 @@ function imageSourceLabel(source?: string) {
   return source === 'detail' ? '正文图片' : source === 'cover' ? '封面' : source === 'card' ? '搜索卡片' : '内容图片'
 }
 
+function imageAnalysisStatusLabel(source?: string) {
+  if (source === 'vision_model') return 'AI 已看图'
+  if (['image_ocr_model', 'image_ocr', 'ocr'].includes(source || '')) return '本地 OCR 已识别'
+  if (source === 'image_alt_text') return '基于图片文字'
+  return '等待图片理解'
+}
+
 const IMAGE_RETRY_DELAYS_MS = [450, 1200]
 
 function imageSources(image: PreviewImage) {
@@ -691,12 +704,26 @@ type DeliveryRouteView = {
   sourceImageIndex?: number
   sourceImageUrl?: string
   verificationStatus?: string
+  evidenceHash?: string
+  sourceRevision?: string
   actionable: boolean
 }
 
 function deliveryRoutes(result: ApplicationResult): DeliveryRouteView[] {
+  const discovered = (result.contactDiscovery?.candidates || []).map((candidate) => ({
+    channel: 'email' as const,
+    label: '邮件投递',
+    target: candidate.address,
+    evidence: candidate.evidenceText,
+    confidence: candidate.confidence,
+    sourceField: candidate.sourceFields?.join('+') || candidate.source,
+    verificationStatus: candidate.verificationStatus,
+    evidenceHash: candidate.evidenceHash,
+    sourceRevision: candidate.sourceRevision,
+    actionable: candidate.actionable !== false && Boolean(candidate.evidenceHash && candidate.sourceRevision),
+  }))
   const routes = [...(result.application_info?.contacts || []), ...(result.application_info?.application_routes || [])]
-  const normalized = routes.flatMap((route) => normalizeDeliveryRoute(route))
+  const normalized = [...discovered, ...routes.flatMap((route) => normalizeDeliveryRoute(route))]
   const seen = new Set<string>()
   return normalized.filter((route) => {
     const key = `${route.channel}:${route.target.toLowerCase()}`
@@ -716,10 +743,20 @@ function normalizeDeliveryRoute(route: ApplicationRoute): DeliveryRouteView[] {
     sourceImageIndex: route.source_image_index,
     sourceImageUrl: route.source_image_url,
     verificationStatus: route.verification_status,
+    evidenceHash: route.evidence_hash,
+    sourceRevision: route.source_revision,
     actionable: route.actionable !== false,
   }
   if (emails.length) {
-    return emails.map((target) => ({ channel: 'email', label: '邮件投递', target, evidence: evidence || value, confidence: route.confidence, ...metadata }))
+    return emails.map((target) => ({
+      channel: 'email',
+      label: '邮件投递',
+      target,
+      evidence: evidence || value,
+      confidence: route.confidence,
+      ...metadata,
+      actionable: metadata.actionable && Boolean(metadata.evidenceHash && metadata.sourceRevision),
+    }))
   }
   const channel = route.channel
     || (/私信|站内|direct.?message|\bdm\b|message/.test(`${type} ${value}`) ? 'direct_message'
@@ -779,7 +816,7 @@ function outreachDraft(result: ApplicationResult): OutreachDraft {
   const outreach = result.outreach ?? {}
   return {
     greeting: outreach.greeting || '',
-    email_subject: outreach.email_subject || '',
+    email_subject: result.emailSubjectPreview || outreach.email_subject || '',
     email_body: outreach.email_body || '',
     cover_letter: outreach.cover_letter || '',
   }
@@ -1035,7 +1072,7 @@ function GeneralResultsWorkspace({
         {selectedResult ? <article className="result-detail general-content-detail">
           <header><div><span>{selectedResult.publish_time?.value || '日期待核验'} · {analysisReady ? (analysis?.content_type || '内容类型待识别') : '内容类型待识别'}</span><h3>{selectedResult.title || '未命名内容'}</h3><small>采集时间 {formatTime(selectedResult.collected_at)} · 与“{results.keyword}”相关度 {analysisReady ? analysis?.relevance_score ?? '-' : '-'} / 100</small></div>{selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer" title="打开原链接"><ExternalLink size={17} /></a>}</header>
           {selectedImages.length > 0 && <section className="result-media" aria-label="采集图片与 AI 理解结果">
-            <div className="result-media-heading"><span><Images size={16} /><strong>采集图片</strong><small>{selectedImages.length} 张</small></span><i>{selectedResult.media?.analysis?.source === 'vision_model' ? 'AI 已看图' : '等待视觉模型理解'}</i></div>
+            <div className="result-media-heading"><span><Images size={16} /><strong>采集图片</strong><small>{selectedImages.length} 张</small></span><i>{imageAnalysisStatusLabel(selectedResult.media?.analysis?.source)}</i></div>
             <div className="result-media-grid">{selectedImages.map((image, index) => <button key={`${image.url}-${index}`} type="button" onClick={() => onPreview(selectedResult.title || '未命名内容', selectedImages, index)} title={image.alt || `查看第 ${index + 1} 张图片`}><RetryingImage image={image} alt={image.alt || `${selectedResult.title || '内容'}图片 ${index + 1}`} loading="lazy" /><small>{imageSourceLabel(image.source)}</small><span><Maximize2 size={13} /></span></button>)}</div>
             <AiSectionBoundary resetSignal={selectedResult.media?.analysis} fallback={<AiSectionUnavailable label="图片理解" />}>
               <div className="image-analysis"><strong>图片信息理解</strong><p>{selectedResult.media?.analysis?.summary || '已保存原图，等待视觉模型读取。'}</p>{selectedResult.media?.analysis?.visible_text?.trim() && <div className="image-analysis-transcript"><div><span><strong>图片识别正文</strong><small>按原有换行展示</small></span><button type="button" title="复制图片识别正文" onClick={() => onCopy(selectedResult.media?.analysis?.visible_text?.trim() || '')}><Copy size={14} /></button></div><pre>{selectedResult.media?.analysis?.visible_text?.trim()}</pre></div>}</div>
@@ -1301,7 +1338,7 @@ function AudienceWorkspace({
         <div><dt>独立用户</dt><dd>{audienceMetric(summary?.usersDiscovered)}<small> 位</small></dd></div>
         <div><dt>主页已补全</dt><dd>{audienceMetric(summary?.profilesComplete)}<small> 位 / {audienceMetric(summary?.usersDiscovered)}</small></dd></div>
       </dl>
-      {incomplete && <button type="button" className="audience-resume-button" disabled={resuming || growing || loading || taskActive} onClick={onResume}>{resuming || taskActive ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{taskGrowing ? '正在扩充帖子池' : taskActive ? (audienceTask?.status === 'queued' ? '已排队，等待自动启动' : '正在补采未完成帖子') : results?.available ? '继续补采未完成帖子' : '开始采集评论与用户'}</button>}
+      {incomplete && <button type="button" className="audience-resume-button" disabled={resuming || growing} onClick={onResume}>{resuming ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{taskGrowing ? '正在扩充帖子池' : taskActive ? (audienceTask?.status === 'queued' ? '刷新排队状态' : '刷新采集状态') : results?.available ? '继续补采未完成帖子' : '开始采集评论与用户'}</button>}
       <div className="audience-growth-controls">
         <label><span>扩量轮次</span><select value={growthScrolls} disabled={resuming || growing || loading || taskActive} onChange={(event) => onGrowthScrolls(Number(event.target.value))}><option value={40}>40 轮</option><option value={60}>60 轮</option><option value={100}>100 轮</option></select></label>
         <button type="button" className="audience-grow-button" disabled={resuming || growing || loading || taskActive} onClick={onGrow}>{growing || taskGrowing ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}{taskGrowing ? (audienceTask?.status === 'queued' ? '扩量任务已排队' : '正在发现更多帖子') : '继续发现更多帖子'}</button>
@@ -1394,8 +1431,8 @@ function AudienceWorkspace({
   </div>
 }
 
-function StatusPill({ status }: { status: JobStatus }) {
-  return <span className={`status-pill status-${status}`}><i />{statusText[status]}</span>
+function StatusPill({ status, label }: { status: JobStatus; label?: string }) {
+  return <span className={`status-pill status-${status}`}><i />{label || statusText[status]}</span>
 }
 
 function MissingCompletionFlowPanel({ flow, job, noun, onDismiss }: {
@@ -1464,6 +1501,10 @@ function replaceJobInPlace(jobs: Job[], next: Job) {
   const index = jobs.findIndex((job) => job.id === next.id)
   if (index < 0) return [next, ...jobs]
   return jobs.map((job, itemIndex) => itemIndex === index ? mergeJobUpdate(job, next) : job)
+}
+
+function nonWhitespaceCharacterCount(value: string): number {
+  return Array.from(value.replace(/\s/gu, '')).length
 }
 
 function mergeJobUpdate(current: Job, next: Job) {
@@ -1621,6 +1662,12 @@ function isIncompleteApplicationResult(result: ApplicationResult) {
 }
 
 function App() {
+  const [authSession, setAuthSession] = useState<AuthSession | null>(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authSubmitting, setAuthSubmitting] = useState(false)
+  const [authError, setAuthError] = useState('')
   const [workspaceMode, setWorkspaceMode] = useState<AnalysisMode>(() => workspaceModeFromLocation())
   const [applicationView, setApplicationView] = useState<ApplicationView>(() => applicationViewFromLocation())
   const [generalResultModule, setGeneralResultModule] = useState<GeneralResultModule>(() => generalResultModuleFromLocation())
@@ -1668,6 +1715,11 @@ function App() {
   const attachmentSourceRef = useRef<ApplicationAttachment['source']>('uploaded')
   const replacementAttachmentRef = useRef<string | null>(null)
   const draftDirtyRef = useRef(false)
+  const [coverLetterRewriteOpen, setCoverLetterRewriteOpen] = useState(false)
+  const [coverLetterRewriteInstructions, setCoverLetterRewriteInstructions] = useState('')
+  const [coverLetterUseLocalModel, setCoverLetterUseLocalModel] = useState(false)
+  const [coverLetterRewriting, setCoverLetterRewriting] = useState(false)
+  const [coverLetterRewriteError, setCoverLetterRewriteError] = useState('')
   const [emailSending, setEmailSending] = useState(false)
   const [deliveryUpdating, setDeliveryUpdating] = useState(false)
   const [resultOffset, setResultOffset] = useState(0)
@@ -1697,6 +1749,7 @@ function App() {
   const [advanced, setAdvanced] = useState(false)
   const [collectionEntryMode, setCollectionEntryMode] = useState<'search' | 'import'>('search')
   const [loading, setLoading] = useState(true)
+  const [jobsRefreshing, setJobsRefreshing] = useState(false)
   const [relayConnecting, setRelayConnecting] = useState(false)
   const [relaySettingUp, setRelaySettingUp] = useState(false)
   const [securityRecovering, setSecurityRecovering] = useState(false)
@@ -1739,11 +1792,44 @@ function App() {
   const draftSaveResponseRef = useRef(0)
   const audienceRequestRef = useRef(0)
   const audienceForegroundRequestRef = useRef(0)
+  const aiBootstrapStartedRef = useRef(false)
+
+  useEffect(() => {
+    let cancelled = false
+    void api.authMe()
+      .then((session) => {
+        if (!cancelled) setAuthSession(session)
+      })
+      .catch((error: ApiError) => {
+        if (!cancelled) setAuthError(error.message)
+      })
+      .finally(() => {
+        if (!cancelled) setAuthLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setAuthSubmitting(true)
+    setAuthError('')
+    try {
+      await api.authLogin(authEmail, authPassword)
+      window.location.reload()
+    } catch (error) {
+      setAuthError((error as ApiError).message || '登录失败，请稍后重试。')
+    } finally {
+      setAuthSubmitting(false)
+    }
+  }
 
   useEffect(() => {
     const jobId = activeJob?.id
     const noteId = selectedResult?.note_id
     let cancelled = false
+    setCoverLetterRewriteOpen(false)
+    setCoverLetterRewriteInstructions('')
+    setCoverLetterRewriteError('')
     setEmailPreview(null)
     setArtifactAttachmentId('')
     setApplicationAttachments(null)
@@ -2287,6 +2373,7 @@ function App() {
   }, [request.relayPort])
 
   const loadJobs = useCallback(async () => {
+    setJobsRefreshing(true)
     try {
       const response = await api.jobs()
       const next = Array.isArray(response) ? response : []
@@ -2301,7 +2388,7 @@ function App() {
       setActiveJob((current) => {
         const rememberedJobId = activeJobIdCache.current[workspaceMode]
         const nextCandidate = current && jobAnalysisMode(current) === workspaceMode
-          ? scoped.find((job) => job.id === current.id) || current
+          ? scoped.find((job) => job.id === current.id)
           : scoped.find((job) => job.id === rememberedJobId)
             || scoped.find((job) => !isAudienceOnlyJob(job))
             || scoped[0]
@@ -2312,6 +2399,8 @@ function App() {
       })
     } catch (error) {
       setNotice((error as Error).message)
+    } finally {
+      setJobsRefreshing(false)
     }
   }, [workspaceMode])
 
@@ -2633,7 +2722,10 @@ function App() {
 
   const activateLocalAi = async (preferredModel?: string) => {
     const localProvider = providers.find((item) => item.id === 'local_qwen')
-    if (!localProvider) return setNotice('本地免费模型配置未加载。')
+    if (!localProvider) {
+      setNotice('本地免费模型配置未加载。')
+      return null
+    }
     setActivatingLocalAi(true)
     setNotice(null)
     setProviderId(localProvider.id)
@@ -2669,8 +2761,10 @@ function App() {
       })
       rememberAiSession(session)
       setNotice(`本地免费模型 ${model} 已就绪，文本整理不产生 API 费用。`)
+      return session
     } catch (error) {
       setNotice(`${(error as Error).message} 可使用上方入口一键安装。`)
+      return null
     } finally {
       setActivatingLocalAi(false)
     }
@@ -2746,6 +2840,7 @@ function App() {
       if (requestId !== resultsRequestRef.current) return
       if (payload.analysisMode !== requestMode) throw new Error('结果所属工作台与当前页面不一致')
       setResults(payload)
+      setCoverage(payload.coverage || parseCoverage(payload) || null)
       setResultOffset(offset)
       if (!options.preserveDraft || !draftDirtyRef.current) {
         setSelectedResult((current) => payload.items.find((item) => item.note_id === current?.note_id) || payload.items[0] || null)
@@ -2908,6 +3003,8 @@ function App() {
   }, [loading, relay])
 
   useEffect(() => {
+    if (aiBootstrapStartedRef.current) return
+    aiBootstrapStartedRef.current = true
     Promise.all([api.aiProviders(), api.profiles(), api.localModels().catch(() => null)]).then(([options, saved, localStatus]) => {
       const expandedOptions = localStatus ? options.map((item) => item.id === 'local_qwen'
         ? { ...item, models: [...new Set([...item.models, ...localStatus.installedModels.map((model) => model.name)])] }
@@ -3122,6 +3219,7 @@ function App() {
     }).then((payload) => {
       if (workspaceMode === mode) {
         setResults(payload)
+        setCoverage(payload.coverage || parseCoverage(payload) || null)
         setResultOffset(0)
         if (!draftDirtyRef.current) {
           setSelectedResult((current) => payload.items.find((item) => item.note_id === current?.note_id) || payload.items[0] || null)
@@ -3280,6 +3378,42 @@ function App() {
     return generation
   }, [applyEvent, loadJobs])
 
+  const syncAuthoritativeJob = useCallback((job: Job) => {
+    setJobs((current) => replaceJobInPlace(current, job))
+    setActiveJob((current) => current?.id === job.id ? mergeJobUpdate(current, job) : current)
+    if (isAudienceOnlyJob(job) || job.config?.audienceOnly || job.config?.collectAudience) setAudienceTask(job)
+    if (['queued', 'resuming', 'running'].includes(job.status)) connectJob(job)
+  }, [connectJob])
+
+  const reconcileActionAfterTransportError = useCallback(async (
+    job: Job,
+    action: () => Promise<Job>,
+  ): Promise<Job> => {
+    // A lost response does not prove that the server rejected the action. Read
+    // the persisted job first, then retry once with the same idempotency key.
+    try {
+      const current = await api.job(job.id)
+      syncAuthoritativeJob(current)
+      if (['queued', 'resuming', 'running'].includes(current.status)) return current
+    } catch {
+      // The retry below is still useful when the status endpoint is temporarily unavailable.
+    }
+    try {
+      const retried = await action()
+      syncAuthoritativeJob(retried)
+      return retried
+    } catch (retryError) {
+      try {
+        const current = await api.job(job.id)
+        syncAuthoritativeJob(current)
+        if (['queued', 'resuming', 'running'].includes(current.status)) return current
+      } catch {
+        // Preserve the original action error when both reconciliation reads fail.
+      }
+      throw retryError
+    }
+  }, [syncAuthoritativeJob])
+
   const activeExpansionRuntimeStatus = String(
     activeJob?.workflowSummary?.expansion && typeof activeJob.workflowSummary.expansion === 'object'
       ? (activeJob.workflowSummary.expansion as Record<string, unknown>).runtimeStatus || ''
@@ -3417,6 +3551,10 @@ function App() {
       setNotice(message)
       return
     }
+    const operationId = `${resumeTargetJobId}:audience`
+    const idempotencyKey = resumeIdempotencyKeys.current.get(operationId)
+      || newResumeIdempotencyKey(resumeTargetJobId, 'audience')
+    resumeIdempotencyKeys.current.set(operationId, idempotencyKey)
     setAudienceResuming(true)
     setAudienceActionMessage(forceRateLimitRecovery ? '正在解除限流等待并从检查点续跑…' : '正在从检查点恢复原任务…')
     setNotice(null)
@@ -3424,13 +3562,36 @@ function App() {
       const rateLimitRecovery = forceRateLimitRecovery || Boolean(
         resumeTargetJob.rateLimit?.detected && resumeTargetJob.rateLimit.status !== 'cleared',
       )
-      const response = rateLimitRecovery
-        ? await api.recoverAudienceRateLimit(resumeTargetJobId)
-        : await api.resumeAudience(resumeTargetJobId)
+      const requestAudience = () => rateLimitRecovery
+        ? api.recoverAudienceRateLimit(resumeTargetJobId, idempotencyKey)
+        : api.resumeAudience(resumeTargetJobId, idempotencyKey)
+      let response: Awaited<ReturnType<typeof api.resumeAudience>>
+      try {
+        response = await requestAudience()
+      } catch (error) {
+        const apiError = error as ApiError
+        let current: Job | null = null
+        try {
+          current = await api.job(resumeTargetJobId)
+          syncAuthoritativeJob(current)
+        } catch {
+          // The retry below uses the same key, so a late first response stays idempotent.
+        }
+        if (current && ['queued', 'resuming', 'running'].includes(current.status)) {
+          response = {
+            action: 'attached',
+            sourceJobId: audienceSourceJobId || resumeTargetJobId,
+            job: current,
+            message: '任务已在运行，已重新连接当前进度。',
+          }
+        } else if (apiError.code === 'REQUEST_TIMEOUT' || apiError.status === 0 || !apiError.code) {
+          response = await requestAudience()
+        } else {
+          throw error
+        }
+      }
       const resumedJob = response.job
-      setAudienceTask(resumedJob)
-      setJobs((current) => replaceJobInPlace(current, resumedJob))
-      if (['queued', 'resuming', 'running'].includes(resumedJob.status)) connectJob(resumedJob)
+      syncAuthoritativeJob(resumedJob)
       performSwitchGeneralResultModule('audience', resumeTargetJobId)
       setAudienceDataJobId(resumeTargetJobId)
       writeAudienceDataJobToLocation(resumeTargetJobId)
@@ -3459,15 +3620,21 @@ function App() {
       setNotice(message)
     } finally {
       setAudienceResuming(false)
+      window.setTimeout(() => {
+        if (resumeIdempotencyKeys.current.get(operationId) === idempotencyKey) {
+          resumeIdempotencyKeys.current.delete(operationId)
+        }
+      }, 5_000)
     }
   }
 
-  const resumeAudienceCollection = (forceRateLimitRecovery = false, forcedJobId?: string) => (
-    draftGuard.requestTransition(
+  const resumeAudienceCollection = (forceRateLimitRecovery = false, forcedJobId?: string) => {
+    if (draftGuard.dirty) setAudienceActionMessage('当前投递文案有未保存修改，请在弹窗中选择保存或放弃后继续。')
+    return draftGuard.requestTransition(
       forceRateLimitRecovery ? '立即检查平台是否恢复' : '恢复其他任务',
       () => performResumeAudienceCollection(forceRateLimitRecovery, forcedJobId),
     )
-  )
+  }
 
   const performGrowAudienceCollection = async () => {
     const growthTargetJobId = selectedAudienceDataJob?.id || linkedAudienceTask?.id || audienceSourceJobId
@@ -3580,7 +3747,7 @@ function App() {
       try {
         resumedJob = await requestResume()
       } catch (error) {
-        const apiError = error as Error & { code?: string }
+        const apiError = error as Error & { code?: string; status?: number }
         if (apiError.code === 'JOB_ALREADY_RUNNING' || apiError.code === 'JOB_ATTEMPT_ACTIVE') {
           resumedJob = await api.job(job.id)
         } else if (apiError.code === 'AI_SESSION_EXPIRED' && needsAi) {
@@ -3591,6 +3758,8 @@ function App() {
             setRestoringAi(false)
           }
           resumedJob = await requestResume()
+        } else if (apiError.code === 'REQUEST_TIMEOUT' || apiError.status === 0 || !apiError.code) {
+          resumedJob = await reconcileActionAfterTransportError(job, requestResume)
         } else {
           throw error
         }
@@ -3885,6 +4054,14 @@ function App() {
     void selectJob(job)
   }
 
+  const openFeaturedJob = () => {
+    if (!featuredJob) {
+      setNotice('竞赛演示任务尚未迁移到当前数据目录。')
+      return
+    }
+    openHistoryJob(featuredJob)
+  }
+
   const tabCount = Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)
   const xiaohongshuTabCount = Number(relay?.xiaohongshuTabs || 0)
   const relayConfigValid = Number.isInteger(relayConfig.port) && relayConfig.port >= 1024 && relayConfig.port <= 65535 && Boolean(relayConfig.profile.trim())
@@ -3939,6 +4116,23 @@ function App() {
     () => historyScope === 'all' ? jobs : jobs.filter((job) => jobAnalysisMode(job) === historyScope),
     [historyScope, jobs],
   )
+  const featuredJob = useMemo(() => jobs.find((job) => job.id === FEATURED_JOB_ID) || null, [jobs])
+  const featuredSummary = featuredJob?.workflowSummary || {}
+  const featuredExperience = featuredJob
+    ? jobExperienceView(featuredJob, jobAnalysisMode(featuredJob), 'live', null)
+    : null
+  const featuredDiscovered = Number(featuredExperience?.counts.discovered ?? featuredSummary.cardsDiscovered ?? featuredJob?.discoveredCount ?? 0)
+  const featuredBodies = Number(featuredExperience?.counts.fullText ?? featuredSummary.bodiesCaptured ?? featuredJob?.bodyProcessedCount ?? 0)
+  const featuredDrafts = Number(featuredJob?.applicationCount ?? featuredSummary.applicationCopyGenerated ?? 0)
+  const featuredPending = Number(featuredExperience?.counts.pending ?? Math.max(0, featuredDiscovered - featuredBodies))
+  const featuredCollectionComplete = featuredDiscovered > 0 && featuredBodies >= featuredDiscovered && featuredPending === 0
+  const featuredQualityNeedsReview = String(featuredSummary.status || '') === 'failed'
+  const featuredAccessIssue = featuredExperience?.issues.find((issue) => ['RATE_LIMITED', 'SECURITY_VERIFICATION', 'LOGIN_REQUIRED'].includes(issue.code))
+  const featuredStateLabel = featuredAccessIssue?.userTitle
+    || (featuredCollectionComplete
+      ? featuredQualityNeedsReview ? '采集完成 · 材料待检查' : '采集完成'
+      : null)
+    || (featuredJob ? statusText[featuredJob.status] : '待迁移')
   const effectiveHistoryPageSize = historyPageSize === 0 ? Math.max(historyJobs.length, 1) : historyPageSize
   const historyPageCount = Math.max(1, Math.ceil(historyJobs.length / effectiveHistoryPageSize))
   const currentHistoryPage = Math.min(historyPage, historyPageCount)
@@ -3973,6 +4167,29 @@ function App() {
     && clock.getTime() - new Date(jobLastEventAt).getTime() > 30_000
     ? 'stale'
     : jobConnectionState
+  const readableJobView = activeJob
+    ? jobExperienceView(activeJob, activeAnalysisMode, displayJobConnectionState, jobLastEventAt)
+    : null
+  const accessIssue = readableJobView?.issues.find((issue) => ['RATE_LIMITED', 'SECURITY_VERIFICATION', 'LOGIN_REQUIRED'].includes(issue.code))
+  const readableIssue = accessIssue
+    || readableJobView?.issues.find((issue) => issue.requiresUserAction || issue.severity === 'blocking')
+  const readableStage = readableJobView?.stages.find((stage) => ['running', 'waiting_system', 'waiting_user', 'retrying'].includes(stage.state))
+    || readableJobView?.stages.find((stage) => stage.state === 'partial')
+    || null
+  const readableSavedCount = readableJobView
+    ? Math.max(readableJobView.counts.fullText, readableJobView.counts.resultReady)
+    : 0
+  const readableNextStep = accessIssue
+    ? accessIssue.userMessage
+    : readableIssue?.requiresUserAction
+    ? `请先处理“${readableIssue.userTitle}”，完成后点击上方的继续按钮。`
+    : activeJob && ['queued', 'resuming', 'running'].includes(activeJob.status)
+      ? '系统会继续处理，并在每完成一项后保存进度；你可以先离开页面。'
+      : activeJob?.status === 'completed'
+        ? '这项任务已经完成，可以直接查看下方结果。'
+        : activeJob && ['incomplete', 'interrupted', 'cancelled', 'blocked'].includes(activeJob.status)
+          ? '已有结果会保留，点击上方的继续按钮即可从剩余内容接着处理。'
+          : '当前没有需要你处理的事项。'
   const workflowSummary = activeJob?.workflowSummary || {}
   const expansionSummary = workflowSummary.expansion && typeof workflowSummary.expansion === 'object'
     ? workflowSummary.expansion as Record<string, unknown>
@@ -3994,6 +4211,11 @@ function App() {
   const codexRuntime = results?.codexRuntime || (workflowSummary.codexRuntime as Record<string, unknown> | undefined)
   const selectedProvider = providers.find((item) => item.id === providerId)
   const selectedLocalModel = localModelStatus?.catalog.find((item) => item.id === localModelChoice)
+  const installedLocalModelNames = localModelStatus?.installedModels.map((item) => item.name).filter(Boolean) || []
+  const selectedCoverLetterLocalModel = installedLocalModelNames.find((model) => model.toLowerCase() === localModelChoice.toLowerCase())
+    || installedLocalModelNames[0]
+    || ''
+  const coverLetterLocalReady = Boolean(localModelStatus?.runtime.ready && selectedCoverLetterLocalModel)
   const localModelGroups = (localModelStatus?.catalog || []).reduce<Array<{ family: string; models: LocalModelStatus['catalog'] }>>((groups, model) => {
     const group = groups.find((item) => item.family === model.family)
     if (group) group.models.push(model)
@@ -4068,12 +4290,16 @@ function App() {
   } as Record<string, string>)[selectedApplicationContext.recipientType] || selectedApplicationContext.recipientType
   const importableArtifacts = artifacts.filter((artifact) => /\.(pdf|docx?|txt|png|jpe?g)$/i.test(artifact.name))
   const selectedResultIncomplete = Boolean(selectedResult && isIncompleteApplicationResult(selectedResult))
-  const draftOperationPending = draftSaving || emailSending || deliveryUpdating
+  const draftOperationPending = draftSaving || coverLetterRewriting || emailSending || deliveryUpdating
   const selectedDraftQualityVerified = Boolean(selectedResult && !selectedResultIncomplete && hasVerifiedDraftQuality(selectedResult))
   const selectedDraftQualityStale = Boolean(selectedResult && !selectedResultIncomplete && selectedResult.draftVersion?.qualityStatus === 'stale')
   const selectedDraftQualityUnchecked = Boolean(selectedResult && !selectedResultIncomplete && hasUncheckedDraftQuality(selectedResult))
   const selectedDraftQualityModelFallback = Boolean(selectedResult && !selectedResultIncomplete && selectedResult.outreach?.runtime_status === 'fallback_model_error')
+  const selectedSubjectNeedsReview = selectedResult?.emailSubjectGuard?.requiresReview === true
   const selectedDraftQualityRetryable = Boolean(selectedResult?.draftVersion && !draftDirty && !selectedDraftQualityVerified)
+  const selectedCoverLetterCharacterCount = selectedResult
+    ? nonWhitespaceCharacterCount(outreachDraft(selectedResult).cover_letter)
+    : 0
   const draftSaveLabel = draftSaving
     ? '保存中'
     : draftGuard.saveStatus === 'error'
@@ -4154,6 +4380,7 @@ function App() {
     setEmailPreview(null)
     replaceResult({
       ...selectedResult,
+      ...(field === 'email_subject' ? { emailSubjectPreview: value } : {}),
       outreach: { ...selectedResult.outreach, [field]: value },
       draftVersion: selectedResult.draftVersion
         ? { ...selectedResult.draftVersion, qualityStatus: 'stale' }
@@ -4164,6 +4391,94 @@ function App() {
   const copyText = (value: string) => {
     if (!value) return
     void navigator.clipboard.writeText(value).then(() => setNotice('内容已复制到剪贴板'))
+  }
+
+  const rewriteCoverLetter = async () => {
+    if (!activeJob || !selectedResult || coverLetterRewriting) return
+    const submittedVersion = selectedResult.draftVersion
+    if (!submittedVersion) {
+      setCoverLetterRewriteError('当前文案还没有服务端版本，请先保存文案再重写。')
+      return
+    }
+    const submittedResult = selectedResult
+    const submittedDraft = outreachDraft(submittedResult)
+    const submittedApplicationContext = { ...selectedApplicationContext }
+    const jobId = activeJob.id
+    const draftView = captureDraftView()
+    setCoverLetterRewriting(true)
+    setCoverLetterRewriteError('')
+    setEmailPreview(null)
+    try {
+      let session: AiSession
+      if (coverLetterUseLocalModel) {
+        const localSession = await activateLocalAi(selectedCoverLetterLocalModel)
+        if (!localSession) throw new Error('本地模型会话未就绪；当前 Cover Letter 已保留。')
+        session = localSession
+      } else {
+        session = aiSession && aiSessionMatchesSelection(aiSession)
+          ? aiSession
+          : await restoreAiSession()
+      }
+      const requestRewrite = () => api.rewriteCoverLetter(jobId, {
+        noteId: submittedResult.note_id,
+        aiSessionId: session.id,
+        instructions: coverLetterRewriteInstructions.trim(),
+        outreach: submittedDraft,
+        applicationContext: submittedApplicationContext,
+        draftId: submittedVersion.draftId,
+        baseVersion: submittedVersion.version,
+      })
+      let response
+      try {
+        response = await requestRewrite()
+      } catch (error) {
+        const requestError = error as ApiError
+        if (requestError.code !== 'AI_SESSION_EXPIRED') throw error
+        session = await restoreAiSession()
+        response = await requestRewrite()
+      }
+      const rewritten = response.outreach?.cover_letter?.trim()
+      if (!rewritten) throw new Error('高级模型没有返回 Cover Letter，请保留当前版本并重试。')
+      const rewrittenCharacterCount = nonWhitespaceCharacterCount(rewritten)
+      if (rewrittenCharacterCount < COVER_LETTER_MIN_NON_WHITESPACE_CHARS) {
+        throw new Error(`高级模型返回的 Cover Letter 只有 ${rewrittenCharacterCount} 个非空白字符，未达到 ${COVER_LETTER_MIN_NON_WHITESPACE_CHARS} 字最低要求；已保留当前版本。`)
+      }
+      const responseHash = draftContentHash(response.outreach)
+      if (response.draftVersion.contentHash !== responseHash) {
+        throw new Error('服务端返回的重写版本哈希不一致，请保留当前版本并重试。')
+      }
+      const next: ApplicationResult = {
+        ...submittedResult,
+        outreach: {
+          ...submittedResult.outreach,
+          ...response.outreach,
+          generation_mode: 'model_rewrite',
+          runtime_status: 'generated_pending_quality',
+          status: 'needs_review',
+          applicationContext: submittedApplicationContext,
+        },
+        draftVersion: response.draftVersion,
+        delivery: response.delivery,
+        cover_letter_evaluation: response.cover_letter_evaluation || submittedResult.cover_letter_evaluation,
+      }
+      if (!replaceResultInDraftView(draftView, next)) return
+      setCoverLetterRewriteOpen(false)
+      setCoverLetterRewriteInstructions('')
+      const localReview = response.generation.strategy === 'local_plan_write_review'
+        ? `，本地模型完成 ${response.generation.modelCalls || 3} 次规划/写作/终审${response.generation.reviewScore == null ? '' : `，终审 ${response.generation.reviewScore} 分`}`
+        : ''
+      const signatureEvidence = response.generation.signatureEvidenceIds?.length
+        ? `，采用 ${response.generation.signatureEvidenceIds.length} 项 Signature Evidence`
+        : ''
+      setNotice(`已由 ${response.generation.provider} / ${response.generation.model} 完成专属重写${localReview}${signatureEvidence}，共 ${rewrittenCharacterCount} 个非空白字符，禁句 ${response.generation.styleViolationCount || 0} 项；请运行质量检查后投递。`)
+    } catch (error) {
+      if (!draftViewIsCurrent(draftView)) return
+      const message = (error as Error).message || 'Cover Letter 重写失败，请稍后重试。'
+      setCoverLetterRewriteError(message)
+      setNotice(message)
+    } finally {
+      setCoverLetterRewriting(false)
+    }
   }
 
   const saveDraft = async (saveRequest: DraftSaveRequest): Promise<boolean> => {
@@ -4428,7 +4743,10 @@ function App() {
     const draftView = captureDraftView()
     setEmailSending(true)
     try {
-      const preview = await api.previewEmail(jobId, submittedResult.note_id, submittedRoute.target, selectedAttachmentIds, submittedResult.draftVersion)
+      const preview = await api.previewEmail(jobId, submittedResult.note_id, submittedRoute.target, selectedAttachmentIds, submittedResult.draftVersion, {
+        evidenceHash: submittedRoute.evidenceHash,
+        sourceRevision: submittedRoute.sourceRevision,
+      })
       if (!draftViewIsCurrent(draftView)) return
       setEmailPreview(preview)
     } catch (error) {
@@ -4447,7 +4765,10 @@ function App() {
     const draftView = captureDraftView()
     setEmailSending(true)
     try {
-      const response = await api.sendEmail(jobId, submittedResult.note_id, submittedRoute.target, outreachDraft(submittedResult), submittedPreview.attachmentSummary.attachments.map((item) => item.attachmentId), submittedPreview, submittedResult.draftVersion)
+      const response = await api.sendEmail(jobId, submittedResult.note_id, submittedRoute.target, outreachDraft(submittedResult), submittedPreview.attachmentSummary.attachments.map((item) => item.attachmentId), submittedPreview, submittedResult.draftVersion, {
+        evidenceHash: submittedRoute.evidenceHash,
+        sourceRevision: submittedRoute.sourceRevision,
+      })
       if (replaceResultInDraftView(draftView, {
         ...submittedResult,
         outreach: { ...submittedResult.outreach, ...response.outreach },
@@ -4530,6 +4851,15 @@ function App() {
     ]
   }, [activeJob, audienceResults?.totals.comments, audienceResults?.totals.users, currentArtifacts.length, discoveredCount, workspaceMode])
 
+  const contactOcr = results?.contactResolution
+  const contactOcrAfter = contactOcr?.report?.after
+  const contactOcrQueue = contactOcr?.report?.queue
+  const contactOcrPending = contactOcrAfter?.imageOcrPending ?? contactOcr?.baseline?.imageOcrPending
+  const contactOcrComplete = contactOcrAfter?.imageOcrComplete ?? contactOcr?.baseline?.imageOcrComplete
+  const contactOcrSkippedBodyEmail = contactOcrAfter?.imageOcrSkippedBodyEmail ?? contactOcr?.baseline?.imageOcrSkippedBodyEmail
+  const contactOcrProcessed = contactOcr?.processed ?? contactOcrQueue?.processed ?? 0
+  const contactOcrTotal = contactOcr?.totalQueued ?? contactOcrQueue?.total ?? 0
+
   const coverageCards = activeAnalysisMode === 'general' ? [
     { label: '发现内容', value: coverage?.discovered, icon: Search },
     { label: '正文尝试', value: coverage?.bodyAttempted, icon: FileText },
@@ -4547,6 +4877,23 @@ function App() {
     { label: '投递语', value: coverage?.draftsGenerated, icon: Mail },
     { label: '质量通过', value: coverage?.qualityPassed, icon: ShieldCheck },
   ]
+
+  if (authLoading) {
+    return <main className="auth-shell"><section className="auth-card"><LoaderCircle className="spin" size={24} /><span>正在检查登录状态…</span></section></main>
+  }
+  if (authSession?.required && !authSession.authenticated) {
+    return <main className="auth-shell"><section className="auth-card">
+      <div className="auth-brand"><ShieldCheck size={22} /><span><strong>Relay 招聘情报工作台</strong><small>竞赛演示入口</small></span></div>
+      <h1>登录后查看历史数据</h1>
+      <p className="auth-description">登录后可查看已保存的 AI 产品经理招聘任务、Relay 抓取结果、分析和导出文件。</p>
+      <form onSubmit={submitAuth} className="auth-form">
+        <label className="field"><span>账号邮箱</span><input type="email" autoComplete="username" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} required /></label>
+        <label className="field"><span>密码</span><input type="password" autoComplete="current-password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} required /></label>
+        {authError && <div className="auth-error"><CircleAlert size={15} /><span>{authError}</span></div>}
+        <button type="submit" className="primary-button auth-submit" disabled={authSubmitting}>{authSubmitting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}{authSubmitting ? '登录中…' : '登录工作台'}</button>
+      </form>
+    </section></main>
+  }
 
   return (
     <div className={`app-shell ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
@@ -5075,22 +5422,46 @@ function App() {
 
             <details className="panel log-panel technical-details-panel">
               <summary className="panel-heading dark-heading">
-                <div><span className="step-label">TECHNICAL DETAILS</span><h2>技术详情</h2><small>排查问题时再展开查看</small></div>
-                <span className="technical-details-toggle">{logs.length} 条记录<ChevronDown size={17} /></span>
+                <div><span className="step-label">STATUS EXPLAINED</span><h2>系统状态说明</h2><small>先看日常说明；原始记录只在需要排查时展开</small></div>
+                <span className="technical-details-toggle"><Info size={15} />{logs.length ? `还有 ${logs.length} 条系统记录` : '暂无系统记录'}<ChevronDown size={17} /></span>
               </summary>
               {activeJob && (
-                <dl className="technical-job-meta">
-                  <div><dt>任务 ID</dt><dd>{activeJob.id}</dd></div>
-                  <div><dt>运行批次</dt><dd>{activeJob.currentAttemptId || '-'}</dd></div>
-                  <div><dt>数据版本</dt><dd>{activeJob.revision ?? '-'}</dd></div>
-                  <div><dt>内部阶段</dt><dd>{activeJob.progressPhase || '-'}</dd></div>
-                  {activeJob.message && <div className="technical-job-error"><dt>原始信息</dt><dd>{activeJob.message}</dd></div>}
-                </dl>
+                <div className={`readable-job-summary job-state-${activeJob.status}`}>
+                  <div className="readable-job-banner">
+                    <span className="readable-job-icon">{activeJob.status === 'completed' ? <Check size={18} /> : readableIssue ? <CircleAlert size={18} /> : activeJob.status === 'queued' ? <Clock3 size={18} /> : <Activity size={18} />}</span>
+                    <div>
+                      <span className="readable-job-eyebrow">现在发生了什么</span>
+                      <strong>{readableJobView?.headline || statusText[activeJob.status]}</strong>
+                      <p>{readableJobView?.detail || '系统正在整理已保存的任务信息。'}</p>
+                    </div>
+                  </div>
+                  <div className="readable-job-grid">
+                    <div><span>正在处理</span><strong>{readableStage?.label || (activeJob.status === 'completed' ? '所有步骤' : '准备下一步')}</strong><small>{readableStage?.detail || '暂无需要补充的步骤'}</small></div>
+                    <div><span>已保存结果</span><strong>{readableSavedCount ? `${readableSavedCount} 条` : '暂未产生'}</strong><small>{readableSavedCount ? '刷新页面也会保留' : '完成第一项后会显示'}</small></div>
+                    <div><span>最近保存</span><strong>{formatTime(activeJob.progressUpdatedAt || activeJob.updatedAt || activeJob.createdAt)}</strong><small>系统会持续保存进度</small></div>
+                  </div>
+                  <div className={`readable-next-step ${readableIssue?.requiresUserAction ? 'needs-action' : ''}`}>
+                    <Info size={16} />
+                    <span><strong>你下一步可以做什么</strong><small>{readableNextStep}</small></span>
+                  </div>
+                </div>
               )}
-              <div className="log-console" ref={logConsole}>
-                {logs.length ? logs.map((line, index) => <p key={`${index}-${line}`}><span>{String(index + 1).padStart(2, '0')}</span>{line}</p>) : <div className="log-placeholder"><SquareTerminal size={25} /><span>暂无技术日志</span></div>}
-                <div ref={logEnd} />
-              </div>
+              <details className="raw-log-disclosure">
+                <summary><Code2 size={15} /><span>需要排查时查看原始记录</span><small>{logs.length} 条</small><ChevronDown size={15} /></summary>
+                {activeJob && (
+                  <dl className="technical-job-meta">
+                    <div><dt>任务编号</dt><dd>{activeJob.id}</dd></div>
+                    <div><dt>本次运行编号</dt><dd>{activeJob.currentAttemptId || '-'}</dd></div>
+                    <div><dt>保存版本</dt><dd>{activeJob.revision ?? '-'}</dd></div>
+                    <div><dt>系统阶段名</dt><dd>{activeJob.progressPhase || '-'}</dd></div>
+                    {activeJob.message && <div className="technical-job-error"><dt>系统原话</dt><dd>{activeJob.message}</dd></div>}
+                  </dl>
+                )}
+                <div className="log-console" ref={logConsole}>
+                  {logs.length ? logs.map((line, index) => <p key={`${index}-${line}`}><span>{String(index + 1).padStart(2, '0')}</span>{line}</p>) : <div className="log-placeholder"><SquareTerminal size={25} /><span>暂无原始记录</span></div>}
+                  <div ref={logEnd} />
+                </div>
+              </details>
             </details>
           </div>
 
@@ -5104,6 +5475,15 @@ function App() {
                 {coverageCards.map(({ label, value, icon: Icon }) => <div className="coverage-metric" key={label}><Icon size={17} /><span>{label}</span><strong>{value ?? '-'}</strong></div>)}
               </div>
               <p className={`coverage-note ${securityTimedOut ? 'warning' : ''}`}><ShieldCheck size={16} />{securityTimedOut ? `安全验证在 ${securityTimeoutLabel}内未解除，采集已按规则停止；当前结果来自已保存正文的整理与分析，未采集链接保留缺失状态。` : activeAnalysisMode === 'general' ? '所有已发现内容均会尝试采集正文和原图；AI 栏目必须给出原文依据，无法确认的信息保留待补全状态。' : '所有已发现卡片均会尝试打开正文；失败、访问受限或缺少联系方式的记录保留状态与原因，不补造内容。'}</p>
+              {activeAnalysisMode === 'job' && contactOcr && <p className={`coverage-note ${contactOcr.status === 'failed' || contactOcr.status === 'partial' ? 'warning' : ''}`}><Images size={16} />{contactOcr.active || ['starting', 'running'].includes(contactOcr.status)
+                ? `图片邮箱识别正在后台运行：本轮已处理 ${contactOcrProcessed} / ${contactOcrTotal || '待统计'}；与正文采集并行，不阻塞当前任务。`
+                : contactOcr.status === 'completed'
+                  ? `图片邮箱识别已处理 ${contactOcrComplete ?? 0} 条，正文已有邮箱直接跳过 ${contactOcrSkippedBodyEmail ?? 0} 条，仍有 ${contactOcrPending ?? 0} 条待处理；识别结果会带图片证据进入投递预检。`
+                  : contactOcr.status === 'partial'
+                    ? `图片邮箱识别部分完成：成功 ${contactOcr.succeeded ?? contactOcrQueue?.succeeded ?? 0} 条，失败 ${contactOcr.failed ?? contactOcrQueue?.failed ?? 0} 条，失败项可从检查点重试。`
+                    : contactOcr.status === 'failed'
+                      ? '图片邮箱识别队列启动失败，已保留原图和检查点，可在修复本地模型后继续。'
+                      : '图片邮箱识别队列等待启动；正文没有邮箱时，评论采集状态仍会保留为待确认。'}</p>}
             </div>
           </section>
 
@@ -5307,7 +5687,7 @@ function App() {
                     )}
                     {Boolean(selectedResult.media?.images?.length) && (
                       <section className="result-media" aria-label="岗位图片与理解结果">
-                        <div className="result-media-heading"><span><Images size={16} /><strong>采集图片</strong><small>{selectedResult.media?.images.length} 张</small></span><i>{selectedResult.media?.analysis?.source === 'vision_model' ? 'AI 已看图' : selectedResult.media?.analysis?.source === 'image_alt_text' ? '基于图片文字' : '等待图片理解'}</i></div>
+                        <div className="result-media-heading"><span><Images size={16} /><strong>采集图片</strong><small>{selectedResult.media?.images.length} 张</small></span><i>{imageAnalysisStatusLabel(selectedResult.media?.analysis?.source)}</i></div>
                         <div className="result-media-grid">
                           {selectedResult.media?.images.map((image, index) => <button key={`${image.url}-${index}`} type="button" onClick={() => openImagePreview(selectedResult.title || '未命名岗位', selectedResult.media?.images || [], index)} title={image.alt || `查看第 ${index + 1} 张岗位图片`}><RetryingImage image={image} alt={image.alt || `${selectedResult.title || '岗位'}图片 ${index + 1}`} loading="lazy" /><small>{imageSourceLabel(image.source)}</small><span><Maximize2 size={13} /></span></button>)}
                         </div>
@@ -5347,8 +5727,42 @@ function App() {
                         <p><strong>{selectedApplicationContext.channel === 'email' ? '邮件' : '私信'}</strong><span>{selectedApplicationContext.contactStage === 'follow_up' ? '跟进联系' : '首次联系'} · {selectedRecipientTypeLabel} · {selectedApplicationContext.resumeAttached ? '已附简历' : '未附简历'} · {selectedApplicationContext.coverLetterAttached ? '已附 Cover Letter' : '未附 Cover Letter'}</span></p>
                       </div>
                       <section className="draft-editor"><div><h4><MessageSquare size={15} />私信文案</h4><button title="复制私信文案" disabled={draftOperationPending} onClick={() => copyText(outreachDraft(selectedResult).greeting)}><Copy size={15} /></button></div><textarea aria-label="私信文案" value={outreachDraft(selectedResult).greeting} disabled={draftOperationPending} onChange={(event) => updateDraft('greeting', event.target.value)} rows={4} /><small>{outreachDraft(selectedResult).greeting.length} 字</small></section>
-                      <section className="draft-editor email-editor"><div><h4><Mail size={15} />邮件文案</h4><button title="复制投递邮件" disabled={draftOperationPending} onClick={() => copyText(`${outreachDraft(selectedResult).email_subject}\n\n${outreachDraft(selectedResult).email_body}`)}><Copy size={15} /></button></div><label><span>邮件主题</span><input aria-label="邮件主题" value={outreachDraft(selectedResult).email_subject} disabled={draftOperationPending} onChange={(event) => updateDraft('email_subject', event.target.value)} /></label><label><span>邮件正文（实际发送）</span><textarea aria-label="邮件正文" value={outreachDraft(selectedResult).email_body} disabled={draftOperationPending} onChange={(event) => updateDraft('email_body', event.target.value)} rows={7} /></label><small>{outreachDraft(selectedResult).email_body.length} 字</small></section>
-                      <section className="draft-editor"><div><h4><FileText size={15} />专属 Cover Letter</h4><button title="复制 Cover Letter" disabled={draftOperationPending} onClick={() => copyText(outreachDraft(selectedResult).cover_letter)}><Copy size={15} /></button></div><textarea aria-label="Cover Letter" value={outreachDraft(selectedResult).cover_letter} disabled={draftOperationPending} onChange={(event) => updateDraft('cover_letter', event.target.value)} rows={10} /><small>{outreachDraft(selectedResult).cover_letter.length} 字 · 初稿可编辑，发送仍需通过 90 分门槛</small></section>
+                      <section className="draft-editor email-editor">
+                        <div><h4><Mail size={15} />邮件文案</h4><button title={selectedSubjectNeedsReview ? '请先补全准确岗位名并重新生成邮件主题' : '复制投递邮件'} disabled={draftOperationPending || selectedSubjectNeedsReview} onClick={() => copyText(`${outreachDraft(selectedResult).email_subject}\n\n${outreachDraft(selectedResult).email_body}`)}><Copy size={15} /></button></div>
+                        <label><span>邮件主题</span><input aria-label="邮件主题" value={outreachDraft(selectedResult).email_subject} disabled={draftOperationPending} onChange={(event) => updateDraft('email_subject', event.target.value)} /></label>
+                        {selectedSubjectNeedsReview && <p className="email-subject-review">原帖标题已排除；请补全准确岗位名并重新生成，当前主题不会进入投递。</p>}
+                        <label><span>邮件正文（实际发送）</span><textarea aria-label="邮件正文" value={outreachDraft(selectedResult).email_body} disabled={draftOperationPending} onChange={(event) => updateDraft('email_body', event.target.value)} rows={7} /></label>
+                        <small>{outreachDraft(selectedResult).email_body.length} 字</small>
+                      </section>
+                      <section className="draft-editor cover-letter-editor">
+                        <div>
+                          <h4><FileText size={15} />专属 Cover Letter</h4>
+                          <span className="cover-letter-heading-actions">
+                            <button type="button" className="cover-letter-rewrite-toggle" title="输入要求并选择高级或本地模型重写" aria-label="AI 重写求职信" aria-expanded={coverLetterRewriteOpen} disabled={draftOperationPending} onClick={() => { setCoverLetterRewriteOpen((current) => !current); setCoverLetterRewriteError('') }}><WandSparkles size={15} />AI 重写</button>
+                            <button type="button" title="复制 Cover Letter" aria-label="复制求职信" disabled={draftOperationPending} onClick={() => copyText(outreachDraft(selectedResult).cover_letter)}><Copy size={15} /></button>
+                          </span>
+                        </div>
+                        {coverLetterRewriteOpen && <form className="cover-letter-rewrite-panel" aria-label="Cover Letter AI 重写" onSubmit={(event) => { event.preventDefault(); void rewriteCoverLetter() }}>
+                          <div className="cover-letter-model-row">
+                            <div className="cover-letter-model-mode" role="group" aria-label="Cover Letter 重写模型">
+                              <button type="button" className={coverLetterUseLocalModel ? '' : 'active'} disabled={coverLetterRewriting} aria-pressed={!coverLetterUseLocalModel} onClick={() => setCoverLetterUseLocalModel(false)}><BrainCircuit size={14} />当前模型</button>
+                              <button type="button" className={coverLetterUseLocalModel ? 'active' : ''} disabled={coverLetterRewriting || !coverLetterLocalReady} aria-pressed={coverLetterUseLocalModel} onClick={() => setCoverLetterUseLocalModel(true)}><Cpu size={14} />本地模型</button>
+                            </div>
+                            {coverLetterUseLocalModel && <label className="cover-letter-local-model"><span className="sr-only">Cover Letter 本地模型</span><select aria-label="Cover Letter 本地模型" value={selectedCoverLetterLocalModel} disabled={coverLetterRewriting || !coverLetterLocalReady} onChange={(event) => setLocalModelChoice(event.target.value)}>{installedLocalModelNames.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>}
+                            <small>{coverLetterUseLocalModel
+                              ? coverLetterLocalReady ? `local_qwen / ${selectedCoverLetterLocalModel} · 岗位规划 + 成稿 + 本地终审` : '本地运行器或模型未就绪'
+                              : aiSession && aiSessionMatchesSelection(aiSession) ? `${aiSession.provider} / ${aiSession.model}` : '提交时恢复当前模型会话'}</small>
+                          </div>
+                          <label><span>本次重写要求（可选）</span><textarea aria-label="Cover Letter 重写要求" value={coverLetterRewriteInstructions} disabled={coverLetterRewriting} maxLength={2000} rows={3} placeholder="例如：重点突出内容运营与剪辑经验，语气自然，详细回应前两项岗位职责。" onChange={(event) => setCoverLetterRewriteInstructions(event.target.value)} /></label>
+                          <div className="cover-letter-rewrite-submit">
+                            <small>{coverLetterUseLocalModel ? `将真实调用本地 ${selectedCoverLetterLocalModel || '模型'}` : aiSession && aiSessionMatchesSelection(aiSession) ? `将真实调用 ${aiSession.provider} / ${aiSession.model}` : '提交时将恢复当前已配置的模型会话'} · 最少 {COVER_LETTER_MIN_NON_WHITESPACE_CHARS} 个非空白字符</small>
+                            <button type="submit" disabled={coverLetterRewriting || !selectedResult.draftVersion || (coverLetterUseLocalModel && !coverLetterLocalReady)}>{coverLetterRewriting ? <LoaderCircle className="spin" size={15} /> : coverLetterUseLocalModel ? <Cpu size={15} /> : <WandSparkles size={15} />}{coverLetterRewriting ? coverLetterUseLocalModel ? '本地模型重写中' : '模型重写中' : '立即重写'}</button>
+                          </div>
+                          {coverLetterRewriteError && <p className="cover-letter-rewrite-error" role="alert"><CircleAlert size={14} />{coverLetterRewriteError}</p>}
+                        </form>}
+                        <textarea aria-label="Cover Letter" value={outreachDraft(selectedResult).cover_letter} disabled={draftOperationPending} onChange={(event) => updateDraft('cover_letter', event.target.value)} rows={18} />
+                        <small className={selectedCoverLetterCharacterCount < COVER_LETTER_MIN_NON_WHITESPACE_CHARS ? 'length-warning' : ''}>{selectedCoverLetterCharacterCount} 个非空白字符 · {selectedCoverLetterCharacterCount < COVER_LETTER_MIN_NON_WHITESPACE_CHARS ? `未达到 ${COVER_LETTER_MIN_NON_WHITESPACE_CHARS} 字最低要求` : `已达到 ${COVER_LETTER_MIN_NON_WHITESPACE_CHARS} 字要求`} · 发送仍需通过 90 分门槛</small>
+                      </section>
                     </div>
                     <section className="attachment-workspace" aria-label="投递附件">
                       <input ref={attachmentInputRef} className="attachment-file-input" type="file" multiple accept=".pdf,.doc,.docx,.txt,.png,.jpg,.jpeg" onInput={(event) => void uploadAttachmentFiles(event)} />
@@ -5397,13 +5811,13 @@ function App() {
                         <div><small>邮件收件人</small><strong>{selectedEmailRoute?.target || '岗位正文未提取到邮箱'}</strong><p>{health?.emailDelivery?.configured ? `${health.emailDelivery.authMode === 'oauth2' ? 'Outlook OAuth2' : 'SMTP'} 已就绪 · 发件人 ${health.emailDelivery.from}` : '发件邮箱尚未配置，可在当前页面保存并测试后立即启用'}</p></div>
                       </div>
                       <div className="delivery-actions">
-                        <button className="send-email-action" disabled={draftDirty || !selectedDraftQualityVerified || !selectedEmailRoute || !health?.emailDelivery?.configured || !smtpConfig?.verified || draftOperationPending || attachmentUploading || attachmentsLoading} onClick={() => void sendEmail()} title={!selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : !smtpConfig?.verified ? '请先测试 SMTP' : attachmentsLoading ? '正在读取当前岗位附件' : '预览收件人、完整正文与附件后发送'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Eye size={16} />}{emailSending ? '生成预览' : '预览并发送'}</button>
+                        <button className="send-email-action" disabled={draftDirty || !selectedDraftQualityVerified || selectedSubjectNeedsReview || !selectedEmailRoute || !health?.emailDelivery?.configured || !smtpConfig?.verified || draftOperationPending || attachmentUploading || attachmentsLoading} onClick={() => void sendEmail()} title={selectedSubjectNeedsReview ? '邮件主题正在等待准确岗位名复核' : !selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : !smtpConfig?.verified ? '请先测试 SMTP' : attachmentsLoading ? '正在读取当前岗位附件' : '预览收件人、完整正文与附件后发送'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Eye size={16} />}{emailSending ? '生成预览' : '预览并发送'}</button>
                         <button onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={16} />发件邮箱</button>
                         <button disabled={draftDirty || !selectedDraftQualityVerified || !selectedMessageRoute || draftOperationPending} onClick={() => void prepareMessage()}><MessageSquare size={16} />复制私信</button>
                         {selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer"><ExternalLink size={16} />打开岗位</a>}
                       </div>
                     </div>
-                    <footer><span>生成方式：<strong>{selectedResult.outreach?.generation_mode || '-'}</strong></span><span>当前状态：<strong>{deliveryStatusLabel(selectedResult.delivery?.email?.status || selectedResult.delivery?.action)}</strong></span>{selectedResult.delivery?.email?.sentAt && <span>发送时间：<strong>{formatTime(selectedResult.delivery.email.sentAt)}</strong></span>}</footer>
+                    <footer><span>生成方式：<strong>{selectedResult.delivery?.generation?.provider && selectedResult.delivery?.generation?.model ? `${selectedResult.delivery.generation.provider} / ${selectedResult.delivery.generation.model}` : selectedResult.outreach?.generation_mode || '-'}</strong></span><span>当前状态：<strong>{deliveryStatusLabel(selectedResult.delivery?.email?.status || selectedResult.delivery?.action)}</strong></span>{selectedResult.delivery?.email?.sentAt && <span>发送时间：<strong>{formatTime(selectedResult.delivery.email.sentAt)}</strong></span>}</footer>
                   </article>
                 ) : <div className="result-empty"><FileText size={28} /><strong>选择一个岗位查看详情</strong></div>}
               </div>
@@ -5418,7 +5832,24 @@ function App() {
                 <div className="history-heading-actions">
                   <span>已保存 {jobs.length} 条任务</span>
                   <button className="icon-text-button" disabled={dataManaging} onClick={() => void draftGuard.requestTransition('删除当前任务或本地数据', manageLocalData)}>{dataManaging ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}本地数据</button>
-                  <button className="icon-text-button" onClick={loadJobs}><RefreshCw size={15} />刷新</button>
+                  <button className="icon-text-button" disabled={dataManaging || jobsRefreshing} onClick={() => void loadJobs()}>{jobsRefreshing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}{jobsRefreshing ? '正在刷新状态…' : '刷新状态'}</button>
+                </div>
+              </div>
+              <div className={`featured-job-banner ${featuredJob ? '' : 'missing'}`}>
+                <div className="featured-job-copy">
+                  <span className="featured-job-label"><Target size={14} />竞赛演示任务</span>
+                  <strong>AI 产品经理招聘 · 最新 Relay 抓取</strong>
+                  <small>{featuredJob ? `关键词：${featuredJob.keyword} · ${featuredStateLabel} · 任务 ${featuredJob.id}` : '迁移数据后将自动显示指定历史任务'}</small>
+                </div>
+                {featuredJob && <div className="featured-job-stats">
+                  <span><b>{featuredDiscovered}</b><small>发现</small></span>
+                  <span><b>{featuredBodies}</b><small>正文</small></span>
+                  <span><b>{featuredDrafts}</b><small>投递文案</small></span>
+                  <span><b>{featuredPending}</b><small>待补全</small></span>
+                </div>}
+                <div className="featured-job-action">
+                  {featuredJob && <StatusPill status={featuredJob.status} label={featuredStateLabel} />}
+                  <button type="button" className="secondary-button" onClick={openFeaturedJob} disabled={!featuredJob}><Target size={15} />打开演示任务</button>
                 </div>
               </div>
               <div className="history-scope-control" aria-label="历史任务类型筛选">

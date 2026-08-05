@@ -72,6 +72,8 @@ function dateTime(value: string | null) {
   const date = new Date(value)
   if (!Number.isFinite(date.getTime())) return ''
   return date.toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
     month: 'numeric',
     day: 'numeric',
     hour: '2-digit',
@@ -210,7 +212,7 @@ export function JobJourneyPanel({
                   <strong>{problemTitle}</strong>
                   <p>{problemMessage}</p>
                   {problem.automaticAction && <small>系统处理：{problem.automaticAction}</small>}
-                  {problem.retryAt && <small>下次自动检查：{dateTime(problem.retryAt)}</small>}
+                  {problem.retryAt && <small>下次自动检查：{dateTime(problem.retryAt)}（北京时间）</small>}
                 </div>
                 {problem.action && actionId && onProblemAction && (
                   <button type="button" onClick={() => onProblemAction(problem, actionId)} disabled={disabled}>

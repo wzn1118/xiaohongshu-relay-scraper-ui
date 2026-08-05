@@ -335,7 +335,7 @@ test("job email composition and delivery preview preserve the recruitment subjec
     }),
     "utf8",
   );
-  const { registry } = fixture({ outputDir });
+  const { registry, sent } = fixture({ outputDir });
   const state = {};
   const draft = await registry.execute(
     "applications.compose_email",
@@ -365,19 +365,60 @@ test("job email composition and delivery preview preserve the recruitment subjec
   assert.equal(preview.preview.application.subjectRule.status, "compliant");
   assert.deepEqual(preview.preview.application.post.images, draft.post.images);
 
+  await registry.execute(
+    "email.send",
+    {
+      applicationNoteId: draft.noteId,
+      to: draft.to,
+      subject: "随意标题",
+      text: draft.text,
+      candidateName: "王梓楠",
+      school: "示例大学",
+    },
+    { reference: REFERENCE, state, approved: true },
+  );
+  assert.equal(sent.at(-1).subject, draft.subject);
+});
+
+test("job email delivery blocks a recruitment slogan until a precise role is recovered", async (t) => {
+  const outputDir = await mkdtemp(path.join(tmpdir(), "copilot-application-title-guard-"));
+  t.after(() => rm(outputDir, { recursive: true, force: true }));
+  const noisyTitle = "急急急！有8月能来实习的吗？聘继任";
+  await writeFile(
+    path.join(outputDir, "application_intelligence.json"),
+    JSON.stringify({
+      records: [
+        {
+          note_id: "note-noisy-title-001",
+          title: noisyTitle,
+          body: "投递邮箱 talent@example.test",
+          application_info: {
+            contacts: [{ type: "email", value: "talent@example.test" }],
+          },
+          outreach: {
+            email_subject: noisyTitle,
+            email_body: "您好，我希望应聘贵公司的实习岗位。",
+          },
+        },
+      ],
+    }),
+    "utf8",
+  );
+  const { registry, sent } = fixture({ outputDir });
+
   await assert.rejects(
     registry.execute(
       "email.send",
       {
-        applicationNoteId: draft.noteId,
-        to: draft.to,
-        subject: "随意标题",
-        text: draft.text,
+        applicationNoteId: "note-noisy-title-001",
+        to: "talent@example.test",
+        subject: noisyTitle,
+        text: "您好，我希望应聘贵公司的实习岗位。",
         candidateName: "王梓楠",
-        school: "示例大学",
       },
-      { reference: REFERENCE, state, approved: true },
+      { reference: REFERENCE, state: {}, approved: true },
     ),
-    (error) => error?.code === "COPILOT_APPLICATION_SUBJECT_MISMATCH",
+    (error) => error.code === "COPILOT_APPLICATION_SUBJECT_TITLE_REVIEW_REQUIRED",
   );
+  assert.equal(sent.length, 0);
 });

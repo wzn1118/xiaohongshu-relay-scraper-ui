@@ -179,6 +179,7 @@ class AIProvider:
             self.http_max_retries = 5
         self.last_request_used_images = False
         self.last_request_model = ""
+        self.last_image_error = ""
         self._vision_model_cache: str | None = None
         self._terminal_error = ""
         self._budget_deadline = 0.0
@@ -212,6 +213,7 @@ class AIProvider:
         user: str,
         schema: dict[str, Any],
         image_urls: list[str] | None = None,
+        image_files: list[str] | None = None,
     ) -> dict[str, Any]:
         if self._terminal_error:
             raise AIProviderTimeoutError(self._terminal_error)
@@ -221,6 +223,11 @@ class AIProvider:
             for value in (image_urls or [])
             if isinstance(value, str) and value.strip().lower().startswith(("http://", "https://"))
         ][:4]
+        local_image_files = [
+            value.strip()
+            for value in (image_files or [])
+            if isinstance(value, str) and value.strip()
+        ][:4]
         self.last_request_used_images = False
         self.last_request_model = ""
         schema_instruction = (
@@ -228,7 +235,9 @@ class AIProvider:
             + json.dumps(schema, ensure_ascii=False)
         )
         if self.provider == "local_qwen":
-            local_images = self._download_local_images(images)
+            local_images = self._read_local_images(local_image_files)
+            if len(local_images) < 4:
+                local_images.extend(self._download_local_images(images[:4 - len(local_images)]))
             vision_model = self._select_local_vision_model() if local_images else ""
             if local_images and vision_model:
                 try:
@@ -241,7 +250,8 @@ class AIProvider:
                     )
                     self.last_request_used_images = True
                     return result
-                except AIProviderError:
+                except AIProviderError as error:
+                    self.last_image_error = str(error)
                     # Text-only local models still produce a useful result from the note and image alt text.
                     pass
             return self._local_chat(system + schema_instruction, user, schema, model=self.model)
@@ -257,6 +267,44 @@ class AIProvider:
             # Some OpenAI-compatible relays expose text-only models under the same API.
             # Retry without image parts so the record still receives text/alt-text analysis.
             return self._openai_compatible(system + schema_instruction, user, self.wire_api)
+
+    def generate_text(self, system: str, user: str) -> str:
+        """Generate long-form local text without forcing it into a JSON string."""
+        if self._terminal_error:
+            raise AIProviderTimeoutError(self._terminal_error)
+        self._remaining_timeout()
+        self.last_request_used_images = False
+        self.last_request_model = ""
+        if self.provider != "local_qwen":
+            raise AIProviderError("Plain-text generation is only configured for the local AI provider")
+        return self._local_text(system, user)
+
+    def _read_local_images(self, image_files: list[str]) -> list[str]:
+        encoded_images: list[str] = []
+        total_bytes = 0
+        for value in image_files:
+            path = Path(value).resolve()
+            try:
+                image_bytes = path.read_bytes()
+            except (OSError, ValueError):
+                continue
+            remaining_bytes = _LOCAL_IMAGE_TOTAL_MAX_BYTES - total_bytes
+            byte_limit = min(_LOCAL_IMAGE_MAX_BYTES, remaining_bytes)
+            if not image_bytes or len(image_bytes) > byte_limit:
+                continue
+            content_type = ""
+            if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+                content_type = "image/webp"
+            elif b"ftypavif" in image_bytes[:32]:
+                content_type = "image/avif"
+            prepared = self._prepare_local_image(image_bytes, content_type)
+            if not prepared or len(prepared) > byte_limit:
+                continue
+            encoded_images.append(base64.b64encode(prepared).decode("ascii"))
+            total_bytes += len(prepared)
+            if len(encoded_images) >= 4:
+                break
+        return encoded_images
 
     def _download_local_images(self, image_urls: list[str]) -> list[str]:
         encoded_images: list[str] = []
@@ -405,6 +453,7 @@ class AIProvider:
                 "model": selected_model,
                 "stream": False,
                 "think": False,
+                "keep_alive": os.environ.get("XHS_AI_KEEP_ALIVE", "15m").strip() or "15m",
                 "format": schema,
                 "options": options,
                 "messages": [
@@ -437,6 +486,51 @@ class AIProvider:
         raise AIProviderError(
             f"Local AI provider returned invalid structured JSON after 3 attempts: {parse_error}"
         ) from parse_error
+
+    def _local_text(self, system: str, user: str) -> str:
+        if not self.base_url or not self.model:
+            raise AIProviderError("Local AI provider configuration is incomplete")
+        root_url = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        for attempt in range(1, 4):
+            content = f"{user}\n/no_think"
+            if attempt > 1:
+                content += "\nThe previous response was empty. Write the complete requested text now."
+            options = {"temperature": 0, "num_predict": self.max_output_tokens}
+            if self.model_context_tokens:
+                options["num_ctx"] = self.model_context_tokens
+            payload = {
+                "model": self.model,
+                "stream": False,
+                "think": False,
+                "keep_alive": os.environ.get("XHS_AI_KEEP_ALIVE", "15m").strip() or "15m",
+                "options": options,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content},
+                ],
+            }
+            request = urllib.request.Request(
+                f"{root_url}/api/chat",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                self.last_request_model = self.model
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                raise AIProviderError(f"Local AI provider returned HTTP {error.code}: {detail}") from error
+            except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as error:
+                raise AIProviderError(f"Local AI provider request failed: {error}") from error
+            try:
+                text = str(result["message"]["content"]).strip()
+            except (KeyError, TypeError) as error:
+                raise AIProviderError("Local AI provider response did not contain a message") from error
+            if text:
+                return text
+        raise AIProviderError("Local AI provider returned empty text after 3 attempts")
 
     def _openai_compatible(
         self,
@@ -481,6 +575,7 @@ class AIProvider:
         try:
             with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
                 result = json.loads(response.read().decode("utf-8"))
+            self.last_request_model = str(result.get("model") or self.model)
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:500]
             raise AIProviderError(f"AI provider returned HTTP {error.code}: {detail}") from error
@@ -525,6 +620,7 @@ class AIProvider:
             try:
                 with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
                     result = json.loads(response.read().decode("utf-8"))
+                self.last_request_model = str(result.get("model") or self.model)
                 break
             except urllib.error.HTTPError as error:
                 detail = error.read().decode("utf-8", errors="replace")[:500]
@@ -619,7 +715,31 @@ def _parse_json_object(value: str) -> dict[str, Any]:
     text = value.strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    parsed = json.loads(text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = json.loads(_escape_json_string_controls(text))
     if not isinstance(parsed, dict):
         raise AIProviderError("AI response must be a JSON object")
     return parsed
+
+
+def _escape_json_string_controls(value: str) -> str:
+    """Escape literal controls inside JSON strings while preserving JSON structure."""
+    repaired: list[str] = []
+    inside_string = False
+    escaped = False
+    replacements = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for character in value:
+        if inside_string and character in replacements:
+            repaired.append(replacements[character])
+            escaped = False
+            continue
+        repaired.append(character)
+        if character == '"' and not escaped:
+            inside_string = not inside_string
+        if inside_string and character == "\\" and not escaped:
+            escaped = True
+        else:
+            escaped = False
+    return "".join(repaired)

@@ -7,8 +7,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { createApp, writeDeliveryState } from './app.mjs';
+import { createApp, previewApplicationEmail, writeDeliveryState } from './app.mjs';
 import { artifactId } from './lib/artifacts.mjs';
+import { applicationContactSourceRevision, resolveApplicationContacts } from './lib/application-contact-resolver.mjs';
 import { hashDraftContent } from './lib/draft-store.mjs';
 
 const JOB_ID = '20260731220000-abcdef12';
@@ -91,6 +92,7 @@ async function startFixture(t, options = {}) {
     keyword: '内容运营实习',
     analysis_mode: 'job',
     records: [record],
+    ...(options.profileSnapshot ? { profile_snapshot: options.profileSnapshot } : {}),
     codex_runtime: { status: 'completed', generated: 1 },
     quality_gate: { passed: true },
   }, null, 2), 'utf8');
@@ -180,6 +182,7 @@ async function startFixture(t, options = {}) {
     ...(options.profileStore ? { profileStore: options.profileStore } : {}),
     mailSender,
     draftQualityChecker: options.draftQualityChecker || (async () => qualityReport()),
+    ...(options.coverLetterRewriter ? { coverLetterRewriter: options.coverLetterRewriter } : {}),
     ...(options.deliveryStateWriter ? { deliveryStateWriter: options.deliveryStateWriter } : {}),
     ...(options.sendAuditAppender ? { sendAuditAppender: options.sendAuditAppender } : {}),
     ...(options.sendAuditReader ? { sendAuditReader: options.sendAuditReader } : {}),
@@ -187,6 +190,40 @@ async function startFixture(t, options = {}) {
   }));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
+  const recipientEvidencePromise = resolveApplicationContacts(record, { outputDir }).then((resolution) => (
+    (resolution.candidates || []).map((candidate) => ({
+      ...candidate,
+      sourceRevision: applicationContactSourceRevision(candidate),
+    }))
+  ));
+
+  const recipientEvidence = async (to) => {
+    const candidates = await recipientEvidencePromise;
+    return candidates.find((candidate) => candidate.address === String(to || '').trim().toLowerCase()) || candidates[0] || null;
+  };
+
+  const post = async (route, body) => {
+    let requestBody = body;
+    if (
+      (route === 'send-email' || route === 'send-email/preview')
+      && body?.to
+      && (!body.evidenceHash || !body.sourceRevision)
+    ) {
+      const evidence = await recipientEvidence(body.to);
+      if (evidence) {
+        requestBody = {
+          ...body,
+          evidenceHash: evidence.evidenceHash,
+          sourceRevision: evidence.sourceRevision,
+        };
+      }
+    }
+    return requestJson(origin, `/api/jobs/${JOB_ID}/${route}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(requestBody),
+    });
+  };
 
   t.after(async () => {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -202,11 +239,7 @@ async function startFixture(t, options = {}) {
     resolvedAiSessions,
     getResults: () => requestJson(origin, `/api/jobs/${JOB_ID}/results?limit=20`),
     request: (route, init) => requestJson(origin, route, init),
-    post: (route, body) => requestJson(origin, `/api/jobs/${JOB_ID}/${route}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
+    post,
   };
 }
 
@@ -435,6 +468,36 @@ test('direct body injection and an unchecked saved version are both blocked', as
   });
   assert.equal(unchecked.status, 400);
   assert.equal(unchecked.body.error.code, 'DRAFT_QUALITY_STALE');
+  assert.equal(fixture.sentMessages.length, 0);
+});
+
+test('direct preview requires the displayed recipient evidence revision', async (t) => {
+  const fixture = await startFixture(t);
+  const initial = (await fixture.getResults()).body.items[0];
+  const candidate = initial.contactDiscovery.candidates.find((item) => item.address === RECIPIENT);
+  assert.ok(candidate?.evidenceHash);
+  assert.ok(candidate?.sourceRevision);
+
+  const missing = await fixture.request(`/api/jobs/${JOB_ID}/send-email/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ noteId: NOTE_ID, to: RECIPIENT }),
+  });
+  assert.equal(missing.status, 400);
+  assert.equal(missing.body.error.code, 'EMAIL_RECIPIENT_EVIDENCE_REQUIRED');
+
+  const stale = await fixture.request(`/api/jobs/${JOB_ID}/send-email/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      noteId: NOTE_ID,
+      to: RECIPIENT,
+      evidenceHash: '0'.repeat(64),
+      sourceRevision: candidate.sourceRevision,
+    }),
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.error.code, 'EMAIL_RECIPIENT_EVIDENCE_STALE');
   assert.equal(fixture.sentMessages.length, 0);
 });
 
@@ -2441,4 +2504,250 @@ test('generation writeback rejects a resume recommendation outside the snapshot 
   assert.equal(response.body.saved, 0);
   assert.equal(response.body.items[0].status, 'writeback_failed');
   assert.match(response.body.items[0].error.message, /resumeArtifactIds/);
+});
+
+function validRewrittenCoverLetter() {
+  const responseSentence = '针对内容策划职责，我会先拆解目标用户、使用场景和信息需求，再形成可以验证的选题判断。';
+  const researchSentence = '在基金会用户研究与直播活动中，我通过访谈和问卷收集 520 位用户反馈，并据此归纳需求、策划活动和推进公开直播。';
+  const communitySentence = '在垂类达人社群与 KOL 共创经历中，我从零搭建达人社群，挖掘 30 余位 KOL 合作并组织内容共创。';
+  const paragraphs = Array.from({ length: 14 }, (_, index) => (
+    `第${index + 1}项执行说明中，我会把岗位目标拆成具体问题、判断依据、协作动作和复盘结论，`
+    + '并记录内容调整前后的变化，让每次优化都能回到用户需求和业务目标，而不是依赖空泛表达。'
+  ));
+  return {
+    coverLetter: `主题：内容运营实习申请｜内容策划与数据复盘\n尊敬的招聘负责人：\n\n${researchSentence}\n\n${communitySentence}\n\n${responseSentence}\n\n${paragraphs.join('\n\n')}\n\n此致\n敬礼`,
+    responseSentence,
+    researchSentence,
+    communitySentence,
+  };
+}
+
+test('an explicit batch recipient allowlist rejects another email from the same record', async (t) => {
+  const otherRecipient = 'other@example.com';
+  const record = applicationRecord();
+  record.application_info.application_routes.push({
+    type: 'email',
+    channel: 'email',
+    value: otherRecipient,
+    evidence: `Please send to ${otherRecipient}`,
+    actionable: true,
+    verification_status: 'verified',
+    confidence: 100,
+  });
+  const fixture = await startFixture(t, { record });
+
+  await assert.rejects(
+    previewApplicationEmail(
+      fixture.outputDir,
+      { noteId: NOTE_ID, to: otherRecipient },
+      '',
+      {},
+      {},
+      undefined,
+      undefined,
+      { allowedRecipients: [RECIPIENT] },
+    ),
+    /Recipient must be an email extracted from this application record\./u,
+  );
+});
+
+test('a non-persistent preview returns the full preview without writing delivery state', async (t) => {
+  const fixture = await startFixture(t);
+  const initial = (await fixture.getResults()).body.items[0];
+  const beforeEntries = (await readdir(fixture.outputDir)).sort();
+  let writes = 0;
+  const smtpConfig = {
+    getPublic: () => ({
+      from: 'sender@example.com',
+      revision: 7,
+      configHash: 'read-only-preview-config',
+      credentialRevision: 2,
+      lastVerifiedAt: VERIFIED_AT,
+    }),
+  };
+
+  const preview = await previewApplicationEmail(
+    fixture.outputDir,
+    {
+      noteId: NOTE_ID,
+      to: RECIPIENT,
+      draftId: initial.draftVersion.draftId,
+      version: initial.draftVersion.version,
+      attachmentIds: [],
+    },
+    '',
+    { status: () => ({ configured: true, from: 'sender@example.com' }) },
+    smtpConfig,
+    undefined,
+    async () => { writes += 1; },
+    { allowedRecipients: [RECIPIENT], persist: false },
+  );
+
+  assert.equal(preview.recipient, RECIPIENT);
+  assert.match(preview.previewRevision, /^[a-f0-9]{64}$/u);
+  assert.equal(writes, 0);
+  assert.deepEqual((await readdir(fixture.outputDir)).sort(), beforeEntries);
+});
+
+test('Cover Letter rewrite sends the exact role context and instructions to the configured model and saves a new version', async (t) => {
+  const calls = [];
+  const generated = validRewrittenCoverLetter();
+  const rootRoleRecord = applicationRecord();
+  rootRoleRecord.responsibilities = ['内容策划'];
+  rootRoleRecord.requirements = ['数据分析'];
+  rootRoleRecord.application_info.responsibilities = [];
+  rootRoleRecord.application_info.requirements = [];
+  const profileSnapshot = {
+    profileSnapshotId: 'profile-snapshot-resume-grounded',
+    candidate: { name: '示例用户', school: '示例大学' },
+    evidence: [
+      {
+        id: 'resume-user-research',
+        label: '基金会用户研究与直播活动',
+        detail: '通过访谈和问卷收集 520 位用户反馈，归纳需求并策划活动。',
+        source: 'resume:ops:p1',
+      },
+      {
+        id: 'resume-community',
+        label: '垂类达人社群与 KOL 共创',
+        detail: '从零搭建达人社群，挖掘 30 余位 KOL 合作并组织内容共创。',
+        source: 'resume:mkt:p1',
+      },
+    ],
+    resumeArtifacts: [{ id: 'resume-ops', filename: '运营简历.pdf' }],
+  };
+  const fixture = await startFixture(t, {
+    record: rootRoleRecord,
+    profileSnapshot,
+    coverLetterRewriter: async (payload, ai) => {
+      calls.push({ payload: structuredClone(payload), ai: structuredClone(ai) });
+      return {
+        cover_letter: generated.coverLetter,
+        used_evidence_ids: ['resume-user-research', 'resume-community'],
+        evidence_coverage: [
+          { evidence_id: 'resume-user-research', evidence_sentence: generated.researchSentence },
+          { evidence_id: 'resume-community', evidence_sentence: generated.communitySentence },
+        ],
+        responsibility_coverage: [{
+          responsibility_id: 'responsibility-1',
+          responsibility: '内容策划',
+          response_sentence: generated.responseSentence,
+          evidence_ids: [],
+        }],
+        char_count: Array.from(generated.coverLetter.replace(/\s+/gu, '')).length,
+        attempts: 1,
+        prompt_version: 'cover-letter-rewrite-v1',
+      };
+    },
+  });
+  const initial = (await fixture.getResults()).body.items[0];
+  const customSubject = '申请内容运营实习｜示例用户';
+
+  const response = await fixture.post('draft/rewrite', {
+    noteId: NOTE_ID,
+    aiSessionId: 'advanced-cover-session',
+    instructions: '重点突出用户洞察与数据复盘，不要使用套话。',
+    outreach: { ...initial.outreach, email_subject: customSubject },
+    applicationContext: { channel: 'email', tone: 'natural', resumeAttached: true },
+    draftId: initial.draftVersion.draftId,
+    baseVersion: initial.draftVersion.version,
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].payload.instructions, '重点突出用户洞察与数据复盘，不要使用套话。');
+  assert.deepEqual(calls[0].payload.record.application_info.responsibilities, ['内容策划']);
+  assert.equal(calls[0].payload.outreach.cover_letter, initial.outreach.cover_letter);
+  assert.equal(calls[0].payload.candidateProfile.profile_snapshot.profileSnapshotId, profileSnapshot.profileSnapshotId);
+  assert.equal(calls[0].payload.candidateProfile.evidence_items.length, 2);
+  assert.equal(calls[0].payload.candidateProfile.evidence_items[0].id, 'resume-user-research');
+  assert.equal(calls[0].payload.candidateProfile.resumeArtifacts[0].id, 'resume-ops');
+  assert.equal(calls[0].ai.model, 'fixture-quality-model');
+  assert.equal(fixture.resolvedAiSessions.at(-1), 'advanced-cover-session');
+  assert.equal(response.body.outreach.cover_letter, generated.coverLetter);
+  assert.equal(response.body.outreach.email_subject, customSubject);
+  assert.equal(response.body.draftVersion.version, 2);
+  assert.equal(response.body.generation.model, 'fixture-quality-model');
+  assert.equal(response.body.generation.promptVersion, 'cover-letter-rewrite-v1');
+  assert.ok(response.body.generation.charCount >= 800);
+  const state = await readDeliveryState(fixture.outputDir);
+  assert.equal(state[NOTE_ID].draftStore.currentVersion, 2);
+  assert.equal(state[NOTE_ID].draftStore.versions[0].content.cover_letter, initial.outreach.cover_letter);
+  assert.equal(state[NOTE_ID].draftStore.versions[1].content.cover_letter, generated.coverLetter);
+  const expectedInputHash = createHash('sha256')
+    .update(JSON.stringify([
+      'cover-letter-rewrite-input:v3-signature-evidence',
+      NOTE_ID,
+      hashDraftContent(calls[0].payload.outreach),
+      calls[0].payload.instructions,
+      calls[0].payload.applicationContext,
+      calls[0].payload.record.job_card.role_name,
+      calls[0].payload.record.application_info.responsibilities,
+      calls[0].payload.record.application_info.requirements,
+      profileSnapshot.profileSnapshotId,
+      ['resume-user-research', 'resume-community'],
+      ['resume-ops'],
+    ]), 'utf8')
+    .digest('hex');
+  assert.equal(state[NOTE_ID].generation.inputHash, expectedInputHash);
+  assert.equal(state[NOTE_ID].generation.profileSnapshotId, profileSnapshot.profileSnapshotId);
+  assert.deepEqual(state[NOTE_ID].generation.resumeArtifactIds, ['resume-ops']);
+  assert.deepEqual(state[NOTE_ID].generation.usedEvidenceIds, ['resume-user-research', 'resume-community']);
+  assert.notEqual(hashDraftContent(calls[0].payload.outreach), initial.draftVersion.contentHash);
+  const refreshed = (await fixture.getResults()).body.items[0];
+  assert.equal(refreshed.outreach.generation_mode, 'model_rewrite');
+  assert.equal(refreshed.delivery.generation.provider, 'fixture');
+  assert.equal(refreshed.delivery.generation.model, 'fixture-quality-model');
+});
+
+test('Cover Letter rewrite rejects an under-800 response without overwriting the saved draft', async (t) => {
+  const fixture = await startFixture(t, {
+    coverLetterRewriter: async () => ({
+      cover_letter: '主题：内容运营实习申请\n尊敬的招聘负责人：\n我想申请这个岗位。\n此致\n敬礼',
+      used_evidence_ids: [],
+      responsibility_coverage: [],
+      char_count: 34,
+      prompt_version: 'cover-letter-rewrite-v1',
+    }),
+  });
+  const initial = (await fixture.getResults()).body.items[0];
+
+  const response = await fixture.post('draft/rewrite', {
+    noteId: NOTE_ID,
+    aiSessionId: 'advanced-cover-session',
+    instructions: '重写',
+    outreach: initial.outreach,
+    draftId: initial.draftVersion.draftId,
+    baseVersion: initial.draftVersion.version,
+  });
+
+  assert.equal(response.status, 502);
+  assert.equal(response.body.error.code, 'AI_COVER_LETTER_REWRITE_FAILED');
+  const after = (await fixture.getResults()).body.items[0];
+  assert.equal(after.draftVersion.version, initial.draftVersion.version);
+  assert.equal(after.outreach.cover_letter, initial.outreach.cover_letter);
+});
+
+test('Cover Letter rewrite rejects a stale baseVersion before calling the model', async (t) => {
+  let calls = 0;
+  const fixture = await startFixture(t, {
+    coverLetterRewriter: async () => {
+      calls += 1;
+      return {};
+    },
+  });
+  const initial = (await fixture.getResults()).body.items[0];
+
+  const response = await fixture.post('draft/rewrite', {
+    noteId: NOTE_ID,
+    aiSessionId: 'advanced-cover-session',
+    instructions: '重写',
+    outreach: initial.outreach,
+    draftId: initial.draftVersion.draftId,
+    baseVersion: initial.draftVersion.version + 1,
+  });
+
+  assert.equal(response.status, 409);
+  assert.equal(response.body.error.code, 'DRAFT_VERSION_CONFLICT');
+  assert.equal(calls, 0);
 });

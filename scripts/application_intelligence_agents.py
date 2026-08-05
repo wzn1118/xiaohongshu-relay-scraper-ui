@@ -8,8 +8,15 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from codex_runtime_outreach import PROMPT_VERSION, _canonical_email_subject, _subject_requirement_focus
+from codex_runtime_outreach import (
+    COVER_LETTER_MIN_CHARS,
+    PROMPT_VERSION,
+    _canonical_email_subject,
+    _resolve_email_subject,
+    _subject_requirement_focus,
+)
 from application_generation import build_generation_payload, build_profile_snapshot, writeback_generated_drafts
+from job_role_title import normalize_role_title
 from note_identity import record_key as canonical_record_key, record_note_id
 
 
@@ -694,7 +701,10 @@ ROLE_MATCH_EXPANSIONS = (
 NON_NARRATIVE_EVIDENCE_CATEGORIES = {"skills", "education"}
 OUTREACH_FORMAT_VERSION = "fixed-cn-application-v2"
 
-AI_PRODUCT_EXPLICIT_PATTERN = re.compile(r"AI\s*产品", re.I)
+AI_PRODUCT_EXPLICIT_PATTERN = re.compile(
+    r"(?:AI\s*(?:策略|产品|应用)|chatbot|(?:大模型|模型训练|评测).{0,12}(?:产品|策略|场景|效率))",
+    re.I,
+)
 AI_CONTEXT_PATTERN = re.compile(r"(?:\bAI\b|BA\s*Agent|Agent|智能体|大模型|LLM|vibe\s*coding)", re.I)
 PRODUCT_OPERATIONS_CONTEXT_PATTERN = re.compile(
     r"(?:产品运营|用户运营|增长|拉新|留存|召回|用户洞察|用户\s*query|案例库|运营活动|运营策略)",
@@ -903,7 +913,7 @@ class OutreachWriterAgent:
     @staticmethod
     def _evidence_sentence(item: dict[str, Any], target: str = "") -> str:
         detail = re.sub(
-            r"^(?:多份|三份)?简历(?:共同)?(?:确认|显示|记载)的?[：:]?\s*",
+            r"^(?:(?:多份|三份)?(?:候选人)?简历(?:共同)?(?:确认|显示|记载)的?|候选人简历记载)[：:]?\s*",
             "",
             _text(item.get("detail")),
         ).strip()
@@ -982,6 +992,244 @@ class OutreachWriterAgent:
         return "我会先对齐目标和交付标准，再用事实验证判断，并将结论转化为可执行、可复盘的动作"
 
     @staticmethod
+    def _role_points(application_info: dict[str, Any], field: str, limit: int) -> list[str]:
+        values = application_info.get(field, [])
+        if not isinstance(values, list):
+            return []
+        points: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            value = _text(item.get("text")) if isinstance(item, dict) else _text(item)
+            marker = re.sub(r"\s+", "", value).casefold()
+            if not marker or marker in seen:
+                continue
+            seen.add(marker)
+            points.append(value[:80].rstrip("，。； "))
+            if len(points) >= limit:
+                break
+        return points
+
+    @staticmethod
+    def _responsibility_method(responsibility: str, focus: str) -> str:
+        source = f"{responsibility} {focus}".lower()
+        if re.search(r"内容|选题|文案|脚本|剪辑|视频|账号|发布", source):
+            return (
+                "我会先确认受众、场景和内容目标，再拆解选题、素材、脚本与发布节点；"
+                "交付后结合反馈和表现数据复盘，明确下一轮保留、修改与验证的部分"
+            )
+        if re.search(r"数据|分析|指标|报告|研究|调研|竞品", source):
+            return (
+                "我会先确认业务问题、数据口径和判断标准，再完成信息收集、清洗、交叉核验与结论整理；"
+                "最终把依据、限制和下一步动作写进可复核的交付物"
+            )
+        if re.search(r"用户|社群|增长|转化|活动|运营", source):
+            return (
+                "我会先梳理目标人群、关键行为和当前问题，再设计小范围动作并记录过程数据与用户反馈；"
+                "复盘时区分事实、判断和待验证假设，避免只汇报表面结果"
+            )
+        if re.search(r"沟通|协作|推进|项目|对接", source):
+            return (
+                "我会先对齐目标、输入、负责人、截止时间和验收标准，再用清单与版本记录同步风险；"
+                "遇到分歧时回到事实和交付目标，确保讨论能形成明确决定"
+            )
+        return (
+            "我会先确认任务对象、现有输入和验收标准，再把工作拆成可检查的阶段结果；"
+            "每个阶段都保留依据、反馈与修改记录，让最终交付可以复核和继续使用"
+        )
+
+    @staticmethod
+    def _requirement_matches(
+        requirements: list[dict[str, Any]],
+        evidence: list[dict[str, Any]],
+    ) -> list[str]:
+        matches: list[str] = []
+        for requirement in requirements:
+            text = _text(requirement.get("text"))
+            if not text or re.search(
+                r"(?:在校|本科|研究生|学历|base|地点|到岗|每周|实习期|实习\s*天|投递|邮箱|联系方式|@)",
+                text,
+                re.I,
+            ):
+                continue
+            ranked = sorted(
+                ((_match_metrics(_expand_role_target(text), item), item) for item in evidence),
+                key=lambda pair: (-pair[0]["score"], -pair[0]["confidence"], _text(pair[1].get("id"))),
+            )
+            if not ranked or not ranked[0][0]["accepted"]:
+                continue
+            metrics, item = ranked[0]
+            evidence_text = _evidence_search_text(item)
+            if re.search(r"(?:AI|大模型|Agent|智能体|chatbot)", text, re.I) and not re.search(
+                r"(?:AI|大模型|Agent|智能体|chatbot|Asteria|Codex)", evidence_text, re.I
+            ):
+                continue
+            if re.search(r"(?:产品经理|需求分析|产品设计)", text, re.I) and not re.search(
+                r"(?:产品|需求|用户洞察|场景)", evidence_text, re.I
+            ):
+                continue
+            matched_terms = "、".join(metrics.get("matched_terms", [])[:4])
+            suffix = f"（匹配：{matched_terms}）" if matched_terms else ""
+            matches.append(f"{text}：对应证据 {_text(item.get('id'))}{suffix}")
+        return matches[:4]
+
+    @staticmethod
+    def _with_content_quality(
+        outreach: dict[str, Any],
+        *,
+        title: str,
+        application_info: dict[str, Any],
+    ) -> dict[str, Any]:
+        role_target = " ".join(
+            [
+                title,
+                *[
+                    _text(item.get("text"))
+                    for field in ("responsibilities", "requirements")
+                    for item in application_info.get(field, [])
+                    if isinstance(item, dict)
+                ],
+            ]
+        )
+        cover = _text(outreach.get("cover_letter"))
+        email_body = _text(outreach.get("email_body"))
+        ai_role = _is_ai_product_role(role_target)
+        ai_chain_pass = all(
+            re.search(pattern, cover, re.I)
+            for pattern in (r"query|反馈", r"场景|分类", r"案例库|评测集|策略", r"指标|验证|复盘", r"迭代|回写|优化")
+        )
+        attachment_claim = bool(re.search(r"简历随信附上|附件已附|见附件", email_body, re.I))
+        outreach["content_quality"] = {
+            "cover_letter_chars": len(re.sub(r"\s+", "", cover)),
+            "cover_letter_length_pass": len(re.sub(r"\s+", "", cover)) >= COVER_LETTER_MIN_CHARS,
+            "role_evidence_count": len(outreach.get("used_evidence_ids", [])),
+            "ai_product_role": ai_role,
+            "ai_product_mechanism_pass": (not ai_role) or ai_chain_pass,
+            "attachment_claim_without_context": attachment_claim,
+            "batch_ready": (
+                len(re.sub(r"\s+", "", cover)) >= COVER_LETTER_MIN_CHARS
+                and ((not ai_role) or ai_chain_pass)
+                and not attachment_claim
+                and outreach.get("status") == "ready"
+            ),
+        }
+        return outreach
+
+    @classmethod
+    def _grounded_cover_letter(
+        cls,
+        *,
+        subject: str,
+        title: str,
+        introduction: str,
+        focus: str,
+        availability_sentence: str,
+        evidence_lines: list[str],
+        application_info: dict[str, Any],
+        contact_lines: list[str],
+    ) -> str:
+        responsibilities = cls._role_points(application_info, "responsibilities", 6)
+        requirements = cls._role_points(application_info, "requirements", 4)
+        paragraphs = [
+            (
+                f"您好！{introduction}，希望申请「{title}」。我会把这封申请聚焦在岗位真实要求与可核验经历上："
+                f"先说明我对{focus}的理解，再逐项回应已经提取的职责，并把没有直接经历支撑的部分明确写成入职后的执行方法。"
+            )
+        ]
+
+        if evidence_lines:
+            for line in evidence_lines[:5]:
+                evidence = line.strip()[:220].rstrip("，。； ")
+                if evidence:
+                    paragraphs.append(
+                        f"与该岗位最直接相关的已核验事实是：{evidence}。"
+                        "我会把这项经历迁移到当前岗位的工作对象、交付标准和复盘要求中，不把工具名或岗位关键词本身当作成果。"
+                    )
+        else:
+            paragraphs.append(
+                "当前候选人资料没有提供足以直接支撑全部职责的经历证据，因此我不会把岗位要求改写成既往成绩。"
+                "下面的对应内容均表示入职后的执行思路；如进入沟通环节，我会再用简历原文、项目材料或可展示交付物补充事实依据。"
+            )
+
+        role_source = " ".join([title, focus, *responsibilities, *requirements])
+        if _is_ai_product_role(role_source):
+            paragraphs.append(
+                "针对 AI 产品和 chatbot 场景，我会把用户 query、用户反馈与失败案例先按意图、场景和错误类型分类，"
+                "沉淀为可检索的案例库与评测集；再结合通过率、错误分布、人工复核时长等信号确定策略优先级，"
+                "把验证结果回写到 prompt、流程和产品设计中，形成可追踪的迭代闭环。"
+                "这段话描述的是入职后的执行方法，历史材料没有提供的指标不会被写成既往成果。"
+            )
+
+        if responsibilities:
+            for index, responsibility in enumerate(responsibilities, start=1):
+                paragraphs.append(
+                    f"对于职责{index}“{responsibility}”，{cls._responsibility_method(responsibility, focus)}。"
+                )
+        else:
+            paragraphs.extend([
+                (
+                    f"针对「{title}」目前尚未拆出逐条职责的情况，{cls._work_method(focus)}；"
+                    "同时与负责人确认服务对象、可用输入和验收口径，再把首个任务拆成当天可启动、当周可检查的阶段结果。"
+                ),
+                (
+                    "在信息仍不完整时，我不会自行假设公司策略或历史数据，而会列出已知事实、关键问题和待验证项。"
+                    "得到反馈后再确定优先级、交付格式和复盘时点，使工作从一开始就建立在可核验信息上。"
+                ),
+            ])
+
+        if requirements:
+            requirement_text = "；".join(requirements)
+            paragraphs.append(
+                f"岗位同时提出“{requirement_text}”。我会逐项区分已有证据和待验证能力：有材料支撑的部分提供具体案例，"
+                "没有材料支撑的部分通过试做、样稿或阶段任务验证，不使用“熟练”“擅长”等无法复核的表述。"
+            )
+
+        operating_paragraphs = [
+            (
+                "进入实际任务后，我会先建立一份轻量工作底稿，记录目标、输入来源、关键判断、待确认问题和版本变化。"
+                "这样既能减少重复沟通，也能让负责人快速看到我为何做出某项选择，以及结论发生变化时应回到哪条证据。"
+            ),
+            (
+                "对外发布或提交前，我会分别检查事实准确性、表达是否服务目标、格式是否符合渠道要求，以及交付物是否便于团队继续编辑。"
+                "提交后主动收集反馈，把问题定位到信息、判断或执行环节，并在下一版本中说明具体修改。"
+            ),
+            (
+                "我重视把分析和执行连接起来：结论需要明确对应的动作、负责人、时间点和验证信号，执行结果也要回到原始目标复盘。"
+                "如果结果与预期不一致，我会保留差异并解释可能原因，而不是只展示有利部分。"
+            ),
+            (
+                "在协作中，我会提前同步依赖项和风险，不等到截止时间才暴露信息缺口。对于需要多方确认的内容，"
+                "我会整理选项、依据与影响，推动团队做出可执行决定，并用清晰版本记录减少反复。"
+            ),
+            (
+                "我会以首个可验收任务作为磨合起点，在完成质量、响应速度和复盘深度之间建立稳定节奏。"
+                "每次交付都尽量留下结构化材料，使后续成员能够理解、复用并继续迭代，而不是只得到一次性的文字结论。"
+            ),
+        ]
+        signature = "\n".join(line for line in contact_lines if line) or "应聘者"
+
+        def render() -> str:
+            availability = (
+                f"到岗安排方面，{availability_sentence}。我会在确认工作地点、协作节奏和任务周期后如实同步可投入时间，确保承诺与实际一致。"
+                if availability_sentence
+                else "到岗时间与工作安排需要在沟通后确认；确认前我不会写入未经核实的承诺，确认后会按团队节奏稳定投入。"
+            )
+            body = "\n\n".join([*paragraphs, availability])
+            return (
+                f"主题：{subject}\n"
+                "尊敬的招聘负责人：\n"
+                f"{body}\n\n"
+                f"以上是我针对「{title}」当前职责形成的申请说明。感谢您阅读，期待进一步沟通首个任务的目标、输入与验收方式。\n\n"
+                "此致\n敬礼！\n"
+                f"{signature}"
+            )
+
+        for paragraph in operating_paragraphs:
+            if len(re.sub(r"\s+", "", render())) >= max(900, COVER_LETTER_MIN_CHARS):
+                break
+            paragraphs.append(paragraph)
+        return render()
+
+    @staticmethod
     def _role_focus(title: str, application_info: dict[str, Any], fit_evidence: list[dict[str, Any]]) -> str:
         role_source = " ".join([
             title,
@@ -998,6 +1246,8 @@ class OutreachWriterAgent:
             if isinstance(item, dict)
         ).lower()
         matched = [term for term in MATCH_TERMS if term in role_source and term in evidence_source]
+        if _is_ai_product_role(role_source):
+            return "AI 产品策略与场景评测"
         specific = [term for term in matched if term not in {"活动", "市场", "运营", "文案", "项目"}]
         if specific:
             return "、".join(dict.fromkeys(specific[:2]))
@@ -1017,7 +1267,7 @@ class OutreachWriterAgent:
         fit_evidence: list[dict[str, Any]],
     ) -> dict[str, Any]:
         job_card = note.get("job_card") if isinstance(note.get("job_card"), dict) else {}
-        title = _text(job_card.get("role_name")) or _text(note.get("title")) or "实习岗位"
+        title = normalize_role_title(job_card.get("role_name")) or "待确认岗位"
         salutation = "您好"
         name = "" if self.name == "候选人" else self.name
         focus = self._role_focus(title, application_info, fit_evidence)
@@ -1074,12 +1324,14 @@ class OutreachWriterAgent:
             ],
             "body_excerpt": _text(note.get("body"))[:6000],
         }
-        subject = _canonical_email_subject(
+        subject = _resolve_email_subject(
             "",
-            title,
+            subject_source,
             name,
-            availability,
-            _subject_requirement_focus(subject_source),
+            {
+                **self.application_profile,
+                "availabilityDays": availability,
+            },
         )
         if writing_evidence:
             evidence_preview = self._evidence_sentence(writing_evidence[0], role_target)
@@ -1102,7 +1354,7 @@ class OutreachWriterAgent:
                 f"您好！我是{name or '应聘者'}{identity_text}，了解到贵公司的「{title}」岗位后，希望申请该职位。\n\n"
                 "我希望进一步了解岗位负责的业务方向、核心任务与交付要求，并据此补充最相关的项目案例。\n\n"
                 f"{availability_sentence + '。' if availability_sentence else ''}希望在实际工作中持续提升业务理解和分析能力。\n\n"
-                "简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n"
+                "感谢您的阅读，期待有机会进一步沟通！\n\n"
                 "此致\n敬礼！\n"
                 f"{name}"
             )
@@ -1111,19 +1363,18 @@ class OutreachWriterAgent:
                 f"电话/微信：{self.application_profile.get('phoneWeChat', '')}" if self.application_profile.get("phoneWeChat") else "",
                 f"邮箱：{self.application_profile.get('email', '')}" if self.application_profile.get("email") else "",
             ]
-            cover_letter = (
-                f"主题：{subject}\n"
-                "尊敬的招聘负责人：\n"
-                f"您好！我是{name or '应聘者'}{identity_text}，了解到贵公司的「{title}」岗位后，希望申请该职位。\n\n"
-                "我希望进一步了解该岗位负责的业务方向、核心分析任务和交付标准，"
-                "并结合最相关的项目案例说明我的判断方法、实际行动与交付结果。\n\n"
-                f"{availability_sentence + '。' if availability_sentence else ''}"
-                "希望在实际工作中持续提升业务理解和分析能力。\n\n"
-                "简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n"
-                "此致\n敬礼！\n"
-                + "\n".join(line for line in contact_lines if line)
+            introduction = f"我是{name or '应聘者'}{identity_text}"
+            cover_letter = self._grounded_cover_letter(
+                subject=subject,
+                title=title,
+                introduction=introduction,
+                focus=focus,
+                availability_sentence=availability_sentence,
+                evidence_lines=[],
+                application_info=application_info,
+                contact_lines=contact_lines,
             )
-            return {
+            return self._with_content_quality({
                 "greeting": greeting,
                 "email_subject": subject,
                 "email_body": email_body,
@@ -1136,7 +1387,7 @@ class OutreachWriterAgent:
                 "runtime_status": "fallback_missing_candidate_evidence",
                 "status": "needs_review",
                 "format_version": OUTREACH_FORMAT_VERSION,
-            }
+            }, title=title, application_info=application_info)
 
         evidence_lines = []
         for item in writing_evidence:
@@ -1149,13 +1400,12 @@ class OutreachWriterAgent:
                 evidence_lines.append(f"{self._evidence_lead(item)}{summary}。")
         requirements = application_info.get("requirements", [])
         evidence_block = "".join(evidence_lines)
-        work_method = self._work_method(focus)
         email_body = (
             "尊敬的招聘负责人：\n"
             f"您好！我是{name or '应聘者'}{identity_text}，了解到贵公司的「{title}」岗位后，希望申请该职位。\n\n"
             f"{evidence_block}这些经历使我能够围绕{focus}梳理事实、形成判断并推进交付。\n\n"
             f"{availability_sentence + '。' if availability_sentence else ''}希望将这些能力应用于实际业务，并持续提升业务理解和分析能力。\n\n"
-            "简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n"
+            "感谢您的阅读，期待有机会进一步沟通！\n\n"
             "此致\n敬礼！\n"
             f"{name}"
         )
@@ -1175,34 +1425,30 @@ class OutreachWriterAgent:
             f"电话/微信：{self.application_profile.get('phoneWeChat', '')}" if self.application_profile.get("phoneWeChat") else "",
             f"邮箱：{self.application_profile.get('email', '')}" if self.application_profile.get("email") else "",
         ]
-        cover_letter = (
-            f"主题：{subject}\n"
-            "尊敬的招聘负责人：\n"
-            f"您好！{introduction}，了解到贵公司的「{title}」岗位后，希望申请该职位。\n\n"
-            f"{evidence_block}这些工作要求我从具体目标出发筛选信息、核对关键事实，并把分析结果整理成团队可以继续使用的交付物。"
-            "我也会根据反馈及时修正判断，确保结论能够服务于后续决策和执行。\n\n"
-            f"{availability_sentence + '。' if availability_sentence else ''}希望将这些能力应用于贵公司的实际业务。若有机会加入，{work_method}，从明确、可验收的任务开始稳定交付。\n\n"
-            "简历随信附上，感谢您的阅读，期待有机会进一步沟通！\n\n"
-            "此致\n敬礼！\n"
-            + "\n".join(line for line in contact_lines if line)
+        cover_letter = self._grounded_cover_letter(
+            subject=subject,
+            title=title,
+            introduction=introduction,
+            focus=focus,
+            availability_sentence=availability_sentence,
+            evidence_lines=evidence_lines,
+            application_info=application_info,
+            contact_lines=contact_lines,
         )
-        return {
+        return self._with_content_quality({
             "greeting": greeting,
             "email_subject": subject,
             "email_body": email_body,
             "cover_letter": cover_letter,
             "used_evidence_ids": evidence_ids,
-            "requirement_matches": [
-                f"{_text(item.get('text'))}：对应证据 {writing_evidence[0]['id']}"
-                for item in requirements[:2]
-            ],
+            "requirement_matches": self._requirement_matches(requirements, writing_evidence),
             "recommended_resume": "",
             "resume_reason": "",
             "generation_mode": "deterministic",
             "runtime_status": "not_requested",
             "status": "ready",
             "format_version": OUTREACH_FORMAT_VERSION,
-        }
+        }, title=title, application_info=application_info)
 
 
 def build_job_card(
@@ -1221,8 +1467,11 @@ def build_job_card(
     )
     contacts = application_info.get("contacts", [])
     routes = application_info.get("application_routes", [])
+    source_title = _text(note.get("title")) or _text(note.get("card_title"))
+    role_name = normalize_role_title(application_info.get("role_name"))
     return {
-        "title": _text(note.get("title")) or _text(note.get("card_title")) or "未命名岗位",
+        "title": source_title or "未命名岗位",
+        "role_name": role_name,
         "source_url": _text(note.get("note_url"))
         or _text(note.get("search_result_url"))
         or _text(note.get("card_search_result_url")),

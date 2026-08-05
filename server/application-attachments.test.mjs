@@ -78,6 +78,33 @@ test('PDF, DOCX, and UTF-8 filenames persist in a revisioned manifest', async (t
   assert.equal(manifest.attachments.some((item) => path.isAbsolute(item.relativePath)), false);
 });
 
+test('MIME filename overrides change the frozen send bundle without mutating the attachment manifest', async (t) => {
+  const outputDir = await fixtureDir(t);
+  const created = await createApplicationAttachment(outputDir, upload({
+    originalName: 'resume.pdf', clientMediaType: 'application/pdf', buffer: PDF,
+  }), LIMITS);
+  const attachmentId = created.attachment.attachmentId;
+  const source = await resolveApplicationAttachments(outputDir, NOTE_ID, [attachmentId], LIMITS);
+  const planned = await resolveApplicationAttachments(
+    outputDir,
+    NOTE_ID,
+    [attachmentId],
+    LIMITS,
+    { [attachmentId]: 'Candidate-Product Manager-resume.pdf' },
+  );
+
+  assert.equal(source.snapshots[0].filename, 'resume.pdf');
+  assert.equal(planned.attachments[0].sourceDisplayName, 'resume.pdf');
+  assert.equal(planned.snapshots[0].filename, 'Candidate-Product Manager-resume.pdf');
+  assert.notEqual(planned.attachmentBundleHash, source.attachmentBundleHash);
+  const sendBundle = await prepareSendBundle(outputDir, planned);
+  assert.equal(sendBundle.mailAttachments[0].filename, 'Candidate-Product Manager-resume.pdf');
+  assert.deepEqual(await readFile(sendBundle.mailAttachments[0].path), PDF);
+
+  const restored = await listApplicationAttachments(outputDir, NOTE_ID, LIMITS);
+  assert.equal(restored.attachments[0].displayName, 'resume.pdf');
+});
+
 test('invalid, empty, oversized, mismatched, and traversing uploads are rejected', async (t) => {
   const outputDir = await fixtureDir(t);
   const cases = [

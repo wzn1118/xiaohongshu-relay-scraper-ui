@@ -6,8 +6,11 @@ import { searchToolCatalog } from "./copilot-capability-resolver.mjs";
 import { filterRowsByContextSelection } from "./copilot-context-source.mjs";
 import {
   applicationContactEmails,
+  normalizeApplicationRoleTitle,
+  applicationSubjectGuard,
   applicationSubjectRule,
   buildApplicationEmailDraft,
+  resolveApplicationEmailSubject,
   validateApplicationEmailSubject,
 } from "./lib/application-email-draft.mjs";
 import { detectApplicationAttachmentRule } from "./lib/application-attachment-rule.mjs";
@@ -980,7 +983,7 @@ export class DataToolRegistry {
     const replyTo = input.replyTo
       ? validEmail(String(input.replyTo).trim(), "Reply-To address")
       : "";
-    const subject = String(input.subject || "")
+    let subject = String(input.subject || "")
       .trim()
       .slice(0, 300);
     const text = String(input.text || input.body || "")
@@ -993,6 +996,7 @@ export class DataToolRegistry {
       );
 
     let application = null;
+    let applicationDraft = null;
     const applicationNoteId = String(input.applicationNoteId || "").trim();
     if (applicationNoteId) {
       const loaded = await this.#dataset("applications", context);
@@ -1017,6 +1021,16 @@ export class DataToolRegistry {
           "The recipient must be a recruitment email extracted from this application record.",
         );
       }
+      applicationDraft = buildApplicationEmailDraft(record, input);
+      const resolvedSubject = resolveApplicationEmailSubject(record, subject, input);
+      subject = resolvedSubject.subject;
+      const subjectGuard = applicationSubjectGuard(record, subject, input);
+      if (context.toolName === "email.send" && subjectGuard.requiresReview) {
+        throw toolError(
+          "COPILOT_APPLICATION_SUBJECT_TITLE_REVIEW_REQUIRED",
+          "The recruitment post title was excluded from the email subject. Add the precise role name before sending.",
+        );
+      }
       const subjectValidation = validateApplicationEmailSubject(record, subject, input);
       if (
         context.toolName === "email.send" &&
@@ -1027,10 +1041,14 @@ export class DataToolRegistry {
           "The email subject does not satisfy the recruitment post's subject-format requirement.",
         );
       }
-      const applicationDraft = buildApplicationEmailDraft(record, input);
       application = {
         noteId: applicationNoteId,
-        jobTitle: firstString(record.job_card?.role_name, record.title, record.job_card?.title),
+        jobTitle: normalizeApplicationRoleTitle(firstString(
+          record.job_card?.role_name,
+          record.job_card?.title,
+          record.role_name,
+          record.title,
+        )),
         company: firstString(record.job_card?.company_name, record.company_name, record.company),
         sourceUrl: firstString(record.note_url, record.source_url, record.job_card?.source_url),
         post: applicationDraft.post,
@@ -1040,6 +1058,7 @@ export class DataToolRegistry {
           missingFields: subjectValidation.missingFields,
           missingValues: subjectValidation.missingValues,
         },
+        subjectGuard,
       };
     }
 
@@ -1314,7 +1333,7 @@ function applicationEmailRequirement(row) {
     noteId: recordId(row),
     title: firstString(row?.title, row?.job_card?.title, row?.job_card?.role_name),
     company: firstString(row?.job_card?.company_name, row?.company_name, row?.company),
-    jobTitle: firstString(row?.job_card?.role_name, row?.title, row?.job_card?.title),
+    jobTitle: normalizeApplicationRoleTitle(firstString(row?.job_card?.role_name, row?.job_card?.title, row?.title)),
     recipientEmails,
     subjectRuleDetected: subjectRule.detected,
     subjectFormat: subjectRule.template,

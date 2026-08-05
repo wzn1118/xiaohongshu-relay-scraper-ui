@@ -87,6 +87,41 @@ class AiProviderRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["options"]["num_ctx"], 16_384)
         self.assertTrue(payload["messages"][-1]["content"].endswith("/no_think"))
 
+    def test_local_model_plain_text_omits_json_format(self) -> None:
+        provider = AIProvider(
+            provider="local_qwen",
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3.5:4b",
+            timeout=30,
+            model_context_tokens=16_384,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps({
+                    "message": {"content": "第一段个人经历。\n\n第二段岗位匹配。"},
+                }, ensure_ascii=False).encode("utf-8")
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", return_value=Response()) as open_url:
+            result = provider.generate_text("system", "user")
+
+        self.assertEqual(result, "第一段个人经历。\n\n第二段岗位匹配。")
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/chat")
+        self.assertNotIn("Authorization", request.headers)
+        payload = json.loads(request.data)
+        self.assertNotIn("format", payload)
+        self.assertEqual(payload["think"], False)
+        self.assertEqual(payload["options"]["num_predict"], 4096)
+        self.assertEqual(payload["options"]["num_ctx"], 16_384)
+        self.assertEqual(payload["keep_alive"], "15m")
+
     def test_local_model_honors_bounded_output_token_override(self) -> None:
         provider = AIProvider(
             provider="local_qwen",
@@ -157,6 +192,37 @@ class AiProviderRuntimeTests(unittest.TestCase):
         retry_payload = json.loads(open_url.call_args.args[0].data)
         self.assertIn("previous response was invalid", retry_payload["messages"][-1]["content"])
 
+    def test_local_model_repairs_literal_newlines_inside_json_strings(self) -> None:
+        provider = AIProvider(
+            provider="local_qwen",
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3.5:4b",
+            timeout=30,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps({
+                    "message": {
+                        "content": '{"cover_letter":"第一行\n第二行\t正文"}',
+                    },
+                }, ensure_ascii=False).encode("utf-8")
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", return_value=Response()):
+            result = provider.generate_json(
+                "system",
+                "user",
+                {"type": "object", "required": ["cover_letter"]},
+            )
+
+        self.assertEqual(result["cover_letter"], "第一行\n第二行\t正文")
+
     def test_local_model_downloads_and_sends_image_bytes(self) -> None:
         provider = AIProvider(
             provider="local_qwen",
@@ -200,6 +266,51 @@ class AiProviderRuntimeTests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         payload = json.loads(getattr(requests[-1], "data"))
         self.assertEqual(payload["messages"][-1]["images"], [base64.b64encode(image_bytes).decode("ascii")])
+
+    def test_local_model_reads_cached_image_file_without_network_download(self) -> None:
+        provider = AIProvider(
+            provider="local_qwen",
+            base_url="http://127.0.0.1:11434/v1",
+            model="qwen3-vl:4b",
+            timeout=30,
+        )
+        requests: list[object] = []
+
+        class Response:
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+                self.headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, *_args: object) -> bytes:
+                return self.body
+
+        with tempfile.TemporaryDirectory() as directory:
+            cached = Path(directory) / "cached.image"
+            cached.write_bytes(b"cached-image-bytes")
+
+            def open_url(request: object, **_kwargs: object) -> Response:
+                requests.append(request)
+                return Response(b'{"message":{"content":"{\\"summary\\":\\"cached-ready\\"}"}}')
+
+            with patch("scripts.ai_provider_runtime.urllib.request.urlopen", side_effect=open_url):
+                result = provider.generate_json(
+                    "system",
+                    "user",
+                    {"type": "object"},
+                    image_files=[str(cached)],
+                )
+
+        self.assertEqual(result, {"summary": "cached-ready"})
+        self.assertTrue(provider.last_request_used_images)
+        self.assertEqual(len(requests), 1)
+        payload = json.loads(getattr(requests[0], "data"))
+        self.assertEqual(payload["messages"][-1]["images"], [base64.b64encode(b"cached-image-bytes").decode("ascii")])
 
     def test_local_model_retries_without_images_when_model_is_text_only(self) -> None:
         provider = AIProvider(

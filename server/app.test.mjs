@@ -4,12 +4,28 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { createApp } from './app.mjs';
+import { contactOcrDrainState, createApp } from './app.mjs';
 import { createDiagnostics } from './lib/diagnostics.mjs';
 
 function readyPreflightReport() {
   return { schemaVersion: 1, kind: 'preflight', status: 'ready', ready: true, checkedAt: new Date().toISOString(), durationMs: 0, checks: [] };
 }
+
+test('OCR drain waits for source stability and a fully processed queue', () => {
+  const caughtUp = {
+    status: 'watching',
+    active: true,
+    sourceArtifactChanged: false,
+    sourceArtifactModifiedAt: 123,
+    report: { finishedAt: '2026-08-05T02:00:00.000Z', queue: { processed: 4, total: 4 } },
+  };
+  assert.equal(contactOcrDrainState(caughtUp).ready, true);
+  assert.equal(contactOcrDrainState({ ...caughtUp, sourceArtifactChanged: true }).ready, false);
+  assert.equal(contactOcrDrainState({
+    ...caughtUp,
+    report: { ...caughtUp.report, queue: { processed: 3, total: 4 } },
+  }).ready, false);
+});
 
 test('HTTP contract exposes direct frontend-compatible responses', async () => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-app-'));
@@ -30,7 +46,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       note_id: 'n1',
       title: '内容运营实习',
       note_url: 'https://www.xiaohongshu.com/explore/n1',
-      body: '负责内容运营，请投递 jobs@example.com',
+      body: '负责内容运营。\n邮件标题：姓名-学校-应聘岗位\n请投递 jobs@example.com',
       media: { cover_url: 'https://sns-webpic-qc.xhscdn.com/n1-cover.webp' },
       application_info: {
         contacts: [],
@@ -38,13 +54,16 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
         responsibilities: [],
         requirements: [],
       },
-      job_card: { parse_basis: 'full_body' },
+      job_card: { parse_basis: 'full_body', role_name: '内容运营实习' },
       outreach: {
         runtime_status: 'fallback_missing_candidate_evidence',
         ...checkedDraft,
       },
       cover_letter_evaluation: { score: 94, passed: true },
     }],
+    profile_snapshot: {
+      candidate: { name: '示例用户', school: '示例大学' },
+    },
     codex_runtime: { status: 'completed', generated: 1 },
     quality_gate: { passed: true },
   }), 'utf8');
@@ -71,7 +90,11 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     ...job,
     outputDir,
     logPath: path.join(fixture, 'run.log'),
-    params: { keyword: job.keyword, candidateProfile: { email: 'candidate@example.com' } },
+    params: {
+      keyword: job.keyword,
+      candidateProfile: { email: 'candidate@example.com' },
+      aiSessionId: 'fixture-ai-session',
+    },
   };
   const startCalls = [];
   const resumeCalls = [];
@@ -142,8 +165,19 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     config,
     diagnostics,
     preflightService: { run: async () => readyPreflightReport() },
+    draftQualityChecker: async () => ({
+      score: 96,
+      threshold: 90,
+      passed: true,
+      attempts: 1,
+      strengths: ['邮件标题符合正文要求'],
+      problems: [],
+      rewrite_instructions: [],
+      rubric: { relevance: 96, evidence: 95, clarity: 97 },
+    }),
     aiSessions: {
       providers: () => [{ id: 'openai', models: ['gpt-4.1-mini'] }],
+      resolve: () => ({ provider: 'openai', model: 'gpt-4.1-mini', wireApi: 'responses' }),
       discoverModels: async (value) => {
         modelDiscoveryCalls.push(value);
         return { provider: value.provider, baseUrl: value.baseUrl, models: ['gpt-5.6-terra', 'gpt-4.1-mini'], fetchedAt: new Date().toISOString() };
@@ -541,10 +575,40 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       }),
     });
     assert.equal(savedDraft.status, 200);
-    assert.equal((await savedDraft.json()).delivery.action, 'draft_saved');
+    const savedDraftPayload = await savedDraft.json();
+    assert.equal(savedDraftPayload.delivery.action, 'draft_saved');
 
     const resultsWithDraft = await fetch(`${origin}/api/jobs/${job.id}/results?limit=20`).then((response) => response.json());
-    assert.equal(resultsWithDraft.items[0].outreach.email_subject, '应聘内容运营实习｜示例用户');
+    const deliveryCandidatesResponse = await fetch(`${origin}/api/jobs/${job.id}/application-delivery-candidates?limit=20`);
+    const deliveryCandidatesPayload = await deliveryCandidatesResponse.json();
+    assert.equal(deliveryCandidatesResponse.status, 200, JSON.stringify(deliveryCandidatesPayload));
+    assert.equal(deliveryCandidatesPayload.total, 1);
+    assert.equal(deliveryCandidatesPayload.items[0].note_id, 'n1');
+    assert.ok(deliveryCandidatesPayload.items[0].deliveryManifestSummary);
+      assert.ok(deliveryCandidatesPayload.selectionSnapshot.selectionSnapshotHash);
+      assert.deepEqual(deliveryCandidatesPayload.selectionSnapshot.noteIds, ['n1']);
+      assert.deepEqual(deliveryCandidatesPayload.selectionSnapshot.selectableNoteIds, ['n1']);
+    const recipientCandidate = resultsWithDraft.items[0].contactDiscovery.candidates.find((candidate) => candidate.address === 'jobs@example.com');
+    assert.ok(recipientCandidate?.evidenceHash);
+    assert.ok(recipientCandidate?.sourceRevision);
+    const recipientEvidence = {
+      evidenceHash: recipientCandidate.evidenceHash,
+      sourceRevision: recipientCandidate.sourceRevision,
+    };
+    assert.equal(resultsWithDraft.items[0].outreach.email_subject, '示例用户-示例大学-内容运营实习');
+
+    const checkedNormalizedDraft = await fetch(`${origin}/api/jobs/${job.id}/draft/quality`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        noteId: 'n1',
+        draftId: savedDraftPayload.draftVersion.draftId,
+        version: savedDraftPayload.draftVersion.version,
+      }),
+    });
+    const checkedNormalizedDraftPayload = await checkedNormalizedDraft.json();
+    assert.equal(checkedNormalizedDraft.status, 200, JSON.stringify(checkedNormalizedDraftPayload));
+    assert.equal(checkedNormalizedDraftPayload.cover_letter_evaluation.passed, true);
 
     const sentEmail = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',
@@ -552,15 +616,17 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       body: JSON.stringify({
         noteId: 'n1',
         to: 'jobs@example.com',
+        ...recipientEvidence,
         outreach: resultsWithDraft.items[0].outreach,
       }),
     });
-    assert.equal(sentEmail.status, 200);
-    assert.equal((await sentEmail.json()).delivery.action, 'email_sent');
+    const sentEmailPayload = await sentEmail.json();
+    assert.equal(sentEmail.status, 200, JSON.stringify(sentEmailPayload));
+    assert.equal(sentEmailPayload.delivery.action, 'email_sent');
     assert.equal(sentMessages.length, 1);
     assert.equal(sentMessages[0].to, 'jobs@example.com');
     assert.equal(sentMessages[0].replyTo, 'candidate@example.com');
-    assert.equal(sentMessages[0].subject, '应聘内容运营实习｜示例用户');
+    assert.equal(sentMessages[0].subject, '示例用户-示例大学-内容运营实习');
 
     const rejectedLowQualityEdit = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',
@@ -568,6 +634,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
       body: JSON.stringify({
         noteId: 'n1',
         to: 'jobs@example.com',
+        ...recipientEvidence,
         outreach: {
           ...resultsWithDraft.items[0].outreach,
           email_subject: '申请岗位',
@@ -581,9 +648,11 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     const invalidRecipient = await fetch(`${origin}/api/jobs/${job.id}/send-email`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ noteId: 'n1', to: 'other@example.com', outreach: resultsWithDraft.items[0].outreach }),
+      body: JSON.stringify({ noteId: 'n1', to: 'other@example.com', ...recipientEvidence, outreach: resultsWithDraft.items[0].outreach }),
     });
-    assert.equal(invalidRecipient.status, 400);
+    const invalidRecipientPayload = await invalidRecipient.json();
+    assert.equal(invalidRecipient.status, 409);
+    assert.equal(invalidRecipientPayload.error.code, 'EMAIL_RECIPIENT_EVIDENCE_STALE');
 
     const homepage = await fetch(`${origin}/`).then((response) => response.text());
     assert.match(homepage, /XHS Control/);
@@ -736,7 +805,11 @@ test('audience supplements read through queued checkpoints and resume from the l
     assert.equal(resumeCalls[0][1].scope, 'audience');
     assert.deepEqual(resumeCalls[0][1].resumeCheckpointJobIds, [rootId, childId]);
 
-    const resumed = await fetch(`${origin}/api/jobs/${rootId}/audience/resume`, { method: 'POST' });
+    const resumed = await fetch(`${origin}/api/jobs/${rootId}/audience/resume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ idempotencyKey: 'audience-click-1' }),
+    });
     assert.equal(resumed.status, 202);
     const payload = await resumed.json();
     assert.equal(payload.action, 'started');
@@ -746,6 +819,7 @@ test('audience supplements read through queued checkpoints and resume from the l
     assert.equal(payload.job.id, rootId);
     assert.equal(resumeCalls[1][0], rootId);
     assert.equal(resumeCalls[1][1].scope, 'audience');
+    assert.equal(resumeCalls[1][1].idempotencyKey, 'audience-click-1');
     assert.equal(resumeCalls[1][1].params.resumeFromJobId, rootId);
     assert.equal(resumeCalls[1][1].params.keyword, 'original-content-query');
     assert.deepEqual(resumeCalls[1][1].resumeCheckpointJobIds, [rootId, childId]);

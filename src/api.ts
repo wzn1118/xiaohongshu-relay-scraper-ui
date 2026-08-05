@@ -1,4 +1,4 @@
-import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationAttachment, ApplicationAttachmentList, ApplicationBatch, ApplicationBatchCreateResponse, ApplicationBatchPreflight, ApplicationBatchRequest, ApplicationBatchStreamEvent, ApplicationContext, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, BodyImportOptions, BodyImportResponse, CandidateProfile, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, EmailPreview, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult, UserProblem, WorkflowConnectionState, WorkflowSnapshotV3 } from './types'
+import type { AiModelDiscovery, AiProviderOption, AiSession, ApplicationAttachment, ApplicationAttachmentList, ApplicationBatch, ApplicationBatchCreateResponse, ApplicationBatchPreflight, ApplicationBatchRequest, ApplicationBatchStreamEvent, ApplicationContext, ApplicationDeliveryCandidatesQuery, ApplicationDeliveryCandidatesResponse, ApplicationMutationResponse, ApplicationResultsQuery, ApplicationResultsResponse, Artifact, AudienceAiActionResponse, AudienceAiAnchor, AudienceAiOverview, AudienceAiPreview, AudienceAiResultsModule, AudienceAiResultsResponse, AudienceAiScope, AudienceAiStartRequest, AudienceGrowthResponse, AudienceResultsResponse, AudienceResumeResponse, AuthSession, BodyImportOptions, BodyImportResponse, CandidateProfile, CoverLetterRewriteRequest, CoverLetterRewriteResponse, DataDeletionPreview, DataDeletionResult, DataDeletionSpec, DataRetentionCleanup, DataRetentionPolicy, DraftVersionRef, EmailPreview, ExpansionActionResponse, ExpansionConfig, ExpansionWorkspaceState, Health, Job, JobEvent, JobRequest, LocalModelInstall, LocalModelStatus, MissingCompletionResponse, OutreachDraft, PreflightReport, RelayConfig, RelayRecoveryResult, RelayStatus, ResumeJobOptions, SmtpConfig, SmtpConfigUpdate, SmtpTestResult, UserProblem, WorkflowConnectionState, WorkflowSnapshotV3 } from './types'
 
 export type ApiError = Error & {
   code?: string
@@ -26,13 +26,37 @@ export type JobExperienceActionResponse = {
   snapshot: WorkflowSnapshotV3 | null
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+const AI_GENERATION_REQUEST_TIMEOUT_MS = 720_000
+
+async function request<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
   const headers = new Headers(init?.headers)
   if (!(init?.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  const response = await fetch(path, {
-    ...init,
-    headers,
-  })
+  const controller = timeoutMs && !init?.signal ? new AbortController() : null
+  let timedOut = false
+  const timeout = controller ? setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs) : null
+  let response: Response
+  try {
+    response = await fetch(path, {
+      ...init,
+      credentials: 'include',
+      headers,
+      ...(controller ? { signal: controller.signal } : {}),
+    })
+  } catch (cause) {
+    if (timedOut) {
+      const error = new Error('请求响应超时，正在核对任务状态。') as ApiError
+      error.code = 'REQUEST_TIMEOUT'
+      error.status = 0
+      error.details = { path, timeoutMs }
+      throw error
+    }
+    throw cause
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }))
     const nestedError = body.error && typeof body.error === 'object' ? body.error : null
@@ -54,6 +78,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<Health>('/api/health'),
+  authMe: () => request<AuthSession>('/api/auth/me'),
+  authLogin: (email: string, password: string) => request<AuthSession>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  }),
+  authLogout: () => request<{ authenticated: false }>('/api/auth/logout', { method: 'POST', body: '{}' }),
   aiProviders: () => request<AiProviderOption[]>('/api/ai/providers'),
   localModels: () => request<LocalModelStatus>('/api/ai/local-models'),
   installLocalModel: (modelId: string) => request<LocalModelInstall>('/api/ai/local-models/install', {
@@ -153,14 +183,28 @@ export const api = {
     if (options.timeRange) params.set('timeRange', options.timeRange)
     return request<ApplicationResultsResponse>(`/api/jobs/${encodeURIComponent(id)}/results?${params}`)
   },
+  applicationDeliveryCandidates: (id: string, options: ApplicationDeliveryCandidatesQuery = {}) => {
+    const params = new URLSearchParams()
+    for (const [key, value] of Object.entries(options)) {
+      if (value === undefined || value === null || value === '') continue
+      params.set(key, String(value))
+    }
+    return request<ApplicationDeliveryCandidatesResponse>(`/api/jobs/${encodeURIComponent(id)}/application-delivery-candidates?${params}`)
+  },
   audience: (id: string, kind: 'comments' | 'users' = 'comments', offset = 0, limit = 40, options: { postId?: string; query?: string } = {}) => {
     const params = new URLSearchParams({ kind, offset: String(offset), limit: String(limit) })
     if (options.postId) params.set('postId', options.postId)
     if (options.query?.trim()) params.set('query', options.query.trim())
     return request<AudienceResultsResponse>(`/api/jobs/${encodeURIComponent(id)}/audience?${params}`)
   },
-  resumeAudience: (id: string) => request<AudienceResumeResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/resume`, { method: 'POST' }),
-  recoverAudienceRateLimit: (id: string) => request<AudienceResumeResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/recover-rate-limit`, { method: 'POST' }),
+  resumeAudience: (id: string, idempotencyKey?: string) => request<AudienceResumeResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/resume`, {
+    method: 'POST',
+    body: JSON.stringify(idempotencyKey ? { idempotencyKey } : {}),
+  }),
+  recoverAudienceRateLimit: (id: string, idempotencyKey?: string) => request<AudienceResumeResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/recover-rate-limit`, {
+    method: 'POST',
+    body: JSON.stringify(idempotencyKey ? { idempotencyKey } : {}),
+  }),
   growAudience: (id: string, maxScrolls: number) => request<AudienceGrowthResponse>(`/api/jobs/${encodeURIComponent(id)}/audience/grow`, {
     method: 'POST',
     body: JSON.stringify({ maxScrolls }),
@@ -206,6 +250,11 @@ export const api = {
     request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/delivery`, { method: 'POST', body: JSON.stringify({ noteId, action, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
   saveDraft: (jobId: string, noteId: string, outreach: OutreachDraft, draftVersion?: DraftVersionRef, applicationContext?: ApplicationContext) =>
     request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft`, { method: 'POST', body: JSON.stringify({ noteId, outreach, ...(applicationContext ? { applicationContext } : {}), ...(draftVersion ? { draftId: draftVersion.draftId, baseVersion: draftVersion.version } : {}) }) }),
+  rewriteCoverLetter: (jobId: string, payload: CoverLetterRewriteRequest) =>
+    request<CoverLetterRewriteResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft/rewrite`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }, AI_GENERATION_REQUEST_TIMEOUT_MS),
   checkDraft: (jobId: string, noteId: string, draftVersion: DraftVersionRef, aiSessionId?: string, attachmentIds: string[] = [], applicationContext?: ApplicationContext) =>
     request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/draft/quality`, { method: 'POST', body: JSON.stringify({ noteId, draftId: draftVersion.draftId, version: draftVersion.version, attachmentIds, ...(applicationContext ? { applicationContext } : {}), ...(aiSessionId ? { aiSessionId } : {}) }) }),
   applicationAttachments: (jobId: string, noteId: string) =>
@@ -265,10 +314,10 @@ export const api = {
     request<{ attachmentId: string; deleted: boolean; revision: number }>(`/api/jobs/${encodeURIComponent(jobId)}/application-attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' }),
   applicationAttachmentUrl: (jobId: string, attachmentId: string) =>
     `/api/jobs/${encodeURIComponent(jobId)}/application-attachments/${encodeURIComponent(attachmentId)}/content`,
-  previewEmail: (jobId: string, noteId: string, to: string, attachmentIds: string[], draftVersion?: DraftVersionRef) =>
-    request<EmailPreview>(`/api/jobs/${encodeURIComponent(jobId)}/send-email/preview`, { method: 'POST', body: JSON.stringify({ noteId, to, attachmentIds, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
-  sendEmail: (jobId: string, noteId: string, to: string, outreach: OutreachDraft, attachmentIds: string[], preview: EmailPreview, draftVersion?: DraftVersionRef) =>
-    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/send-email`, { method: 'POST', body: JSON.stringify({ noteId, to, outreach, attachmentIds, previewRevision: preview.previewRevision, attachmentBundleHash: preview.attachmentBundleHash, idempotencyKey: preview.previewRevision, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
+  previewEmail: (jobId: string, noteId: string, to: string, attachmentIds: string[], draftVersion?: DraftVersionRef, recipientEvidence?: { evidenceHash?: string; sourceRevision?: string }) =>
+    request<EmailPreview>(`/api/jobs/${encodeURIComponent(jobId)}/send-email/preview`, { method: 'POST', body: JSON.stringify({ noteId, to, attachmentIds, ...recipientEvidence, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
+  sendEmail: (jobId: string, noteId: string, to: string, outreach: OutreachDraft, attachmentIds: string[], preview: EmailPreview, draftVersion?: DraftVersionRef, recipientEvidence?: { evidenceHash?: string; sourceRevision?: string }) =>
+    request<ApplicationMutationResponse>(`/api/jobs/${encodeURIComponent(jobId)}/send-email`, { method: 'POST', body: JSON.stringify({ noteId, to, outreach, attachmentIds, ...recipientEvidence, previewRevision: preview.previewRevision, attachmentBundleHash: preview.attachmentBundleHash, idempotencyKey: preview.previewRevision, ...(draftVersion ? { draftId: draftVersion.draftId, version: draftVersion.version } : {}) }) }),
   dryRunApplicationBatch: (jobId: string, payload: ApplicationBatchRequest) =>
     request<ApplicationBatchPreflight>(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/dry-run`, { method: 'POST', body: JSON.stringify(payload) }),
   createApplicationBatch: (jobId: string, payload: ApplicationBatchRequest) =>
@@ -294,7 +343,7 @@ export const api = {
     }),
   subscribeApplicationBatch: (jobId: string, batchId: string, onEvent: (event: ApplicationBatchStreamEvent) => void, onDisconnect: () => void, afterSequence = 0) => {
     const params = afterSequence > 0 ? `?after=${Math.floor(afterSequence)}` : ''
-    const stream = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/${encodeURIComponent(batchId)}/events${params}`)
+    const stream = new EventSource(`/api/jobs/${encodeURIComponent(jobId)}/application-batches/${encodeURIComponent(batchId)}/events${params}`, { withCredentials: true })
     const receive = (event: Event) => {
       if (!(event instanceof MessageEvent)) return
       try {
@@ -316,7 +365,7 @@ export const api = {
     const initialSequence = Number(options.afterSequence)
     if (Number.isFinite(initialSequence) && initialSequence > 0) params.set('after', String(Math.floor(initialSequence)))
     const query = params.size ? `?${params}` : ''
-    const stream = new EventSource(`/api/jobs/${encodeURIComponent(id)}/events${query}`)
+    const stream = new EventSource(`/api/jobs/${encodeURIComponent(id)}/events${query}`, { withCredentials: true })
     let highestSequence = Number.isFinite(initialSequence) ? Math.max(0, Math.floor(initialSequence)) : 0
     let highestRevision = -1
     let closed = false

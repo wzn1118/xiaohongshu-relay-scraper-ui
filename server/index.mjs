@@ -23,10 +23,20 @@ import { McpDataAdapter } from './mcp-data-adapter.mjs';
 import { DataCopilotRuntime } from './data-copilot-runtime.mjs';
 import { DataCopilotService } from './data-copilot-service.mjs';
 import { createCopilotProductionStore } from './copilot/production-store.mjs';
+import { createAuthStore } from './auth-store.mjs';
 
 const diagnostics = createDiagnostics({ filePath: config.diagnosticsPath });
+const authStore = createAuthStore({
+  usersPath: config.authUsersPath,
+  sessionSecretPath: config.authSessionSecretPath,
+  required: config.authRequired,
+  cookieName: config.authCookieName,
+  secureCookie: config.authSecureCookie,
+  sessionTtlSeconds: config.authSessionTtlSeconds,
+});
+await authStore.initialize({ bootstrapEmail: config.authBootstrapEmail, bootstrapPassword: config.authBootstrapPassword });
 
-const aiSessions = new AiSessionStore({ filePath: config.aiConfigPath });
+const aiSessions = new AiSessionStore({ filePath: config.aiConfigPath, localModelEndpoint: config.localModelEndpoint });
 const profileStore = new ProfileStore({
   root: config.profileDir,
   pythonBin: config.pythonBin,
@@ -39,7 +49,7 @@ await aiSessions.initialize();
 await relayConfig.initialize();
 await smtpConfig.initialize();
 const mailSender = createMailSender(smtpConfig.getForMailer());
-const localModels = new LocalModelManager();
+const localModels = new LocalModelManager({ endpoint: config.localModelEndpoint });
 const manager = new JobManager({ ...config, aiSessions, profileStore, diagnostics });
 await manager.initialize();
 diagnostics.record('state_initialization_completed', {
@@ -113,7 +123,7 @@ const relaySupervisor = createRelaySupervisor({
   connectTimeoutMs: config.relayConnectTimeoutMs,
   playwrightTimeoutMs: config.relayPlaywrightTimeoutMs,
 });
-const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relaySupervisor, dataLifecycle, diagnostics, audienceAiService: audienceAi, dataCopilotService: dataCopilot }));
+const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relaySupervisor, dataLifecycle, diagnostics, audienceAiService: audienceAi, dataCopilotService: dataCopilot, authStore }));
 server.listen(config.port, config.host, () => {
   diagnostics.record('server_started', { status: 'ready' });
   console.log(`Xiaohongshu relay scraper API listening at http://${config.host}:${config.port}`);

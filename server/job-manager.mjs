@@ -627,6 +627,29 @@ export class JobManager {
     const resumeScope = rateLimitResumeScope(job);
     const rateLimitStatus = job.rateLimit?.status;
     const waitingRecovery = ['waiting', 'resuming'].includes(rateLimitStatus);
+    const body = bodyMetricsForJob(job);
+    if (
+      resumeScope === 'body_completion'
+      && bodyCoverageIsComplete(body)
+      && RATE_LIMIT_RECOVERY_STATUSES.has(rateLimitStatus)
+    ) {
+      const now = new Date().toISOString();
+      job.rateLimit = {
+        ...job.rateLimit,
+        status: 'cleared',
+        autoRecoveryEnabled: false,
+        nextRetryAt: null,
+        retryAfterSeconds: 0,
+        recoveryAction: null,
+        clearedAt: job.rateLimit?.clearedAt || now,
+      };
+      if (String(job.progressPhase || '').startsWith('rate_limit')) {
+        job.progressPhase = 'body_complete';
+        job.progressLabel = `正文采集已完成：${body.succeeded} / ${body.discovered} 篇已保存`;
+        job.progressUpdatedAt = now;
+      }
+      return true;
+    }
     if (
       !this.rateLimitRecovery.enabled
       || (!RATE_LIMIT_TERMINAL_STATUSES.has(rateLimitStatus) && !waitingRecovery)
@@ -708,6 +731,12 @@ export class JobManager {
     if (!job || !RATE_LIMIT_TERMINAL_STATUSES.has(job.rateLimit?.status)) return;
     const resumeScope = rateLimitResumeScope(job);
     if (!resumeScope) return;
+    if (resumeScope === 'body_completion' && bodyCoverageIsComplete(bodyMetricsForJob(job))) {
+      this.#armRateLimitRecovery(job);
+      await this.persist();
+      this.#emit(id, 'state', publicJob(job));
+      return;
+    }
     if (this.active || this.relaySubtask) {
       this.#armRateLimitRecovery(job, { busy: true });
       await this.persist();
@@ -1287,7 +1316,7 @@ export class JobManager {
         && Number(eventSnapshot.throughSequence) === event.sequence
         && event.sequence > Number(reducedSnapshot.throughSequence || 0)
       ) {
-        reducedSnapshot = eventSnapshot;
+        reducedSnapshot = normalizeExperienceSnapshotBodyCoverage(eventSnapshot);
         hasWorkflowProjection = true;
         continue;
       }
@@ -1297,6 +1326,7 @@ export class JobManager {
       }
     }
     if (hasWorkflowProjection) job.experienceSnapshot = reducedSnapshot;
+    if (hasWorkflowProjection) job.experienceSnapshot = normalizeExperienceSnapshotBodyCoverage(job.experienceSnapshot);
     const projectionChanged = hasWorkflowProjection && (
       !storedSnapshot || reducedSnapshot.throughSequence !== storedThroughSequence
     );
@@ -2231,6 +2261,27 @@ export function bodyMetricsForJob(job) {
     );
   }
 
+  const topLevel = job?.bodyMetrics;
+  if (topLevel && typeof topLevel === 'object' && [
+    'discovered', 'attempted', 'succeeded', 'failed',
+    'notAttempted', 'blocked', 'cancelled', 'pending',
+  ].every((field) => Number.isFinite(Number(topLevel[field])))) {
+    return bodyMetricsFromCounts({
+      discovered: bodyMetricNumber(topLevel.discovered),
+      attempted: bodyMetricNumber(topLevel.attempted),
+      succeeded: bodyMetricNumber(topLevel.succeeded),
+      failed: bodyMetricNumber(topLevel.failed),
+      notAttempted: bodyMetricNumber(topLevel.notAttempted),
+      blocked: bodyMetricNumber(topLevel.blocked),
+      cancelled: bodyMetricNumber(topLevel.cancelled),
+      pending: bodyMetricNumber(topLevel.pending),
+      statisticsSource: String(topLevel.statisticsSource || 'bodyCompletionLedger'),
+      statusCounts: topLevel.statusCounts && typeof topLevel.statusCounts === 'object'
+        ? structuredClone(topLevel.statusCounts)
+        : {},
+    });
+  }
+
   const summary = job?.workflowSummary && typeof job.workflowSummary === 'object'
     ? job.workflowSummary
     : {};
@@ -2336,6 +2387,16 @@ function finishAttempt(attempt, values = {}) {
     checkpointRevisionAtEnd: values.checkpointRevisionAtEnd ?? attempt.checkpointRevisionAtEnd ?? null,
     processedCount: Math.max(0, Number(values.processedCount ?? attempt.processedCount ?? 0)),
   });
+}
+
+function bodyCoverageIsComplete(body) {
+  return Number(body?.discovered || 0) > 0
+    && Number(body?.succeeded || 0) >= Number(body?.discovered || 0)
+    && Number(body?.failed || 0) === 0
+    && Number(body?.notAttempted || 0) === 0
+    && Number(body?.blocked || 0) === 0
+    && Number(body?.cancelled || 0) === 0
+    && Number(body?.pending || 0) === 0;
 }
 
 function attemptBaselineForJob(job, scope) {
@@ -2731,21 +2792,44 @@ function applySourceCoverageStatus(job) {
 
 function mergeLegacyExperienceSnapshot(current, legacy) {
   if (current?.schemaVersion !== 3) return legacy;
-  const currentStages = new Map(current.stages.map((stage) => [stage.stage || stage.id, stage]));
+  const currentStages = new Map(current.stages.map((stage) => [
+    stage.stage === 'bodyCompletion' ? 'body' : stage.stage || stage.id,
+    stage,
+  ]));
   const stages = legacy.stages.map((stage) => {
     const id = stage.stage || stage.id;
-    if (id === 'body' && currentStages.has(id)) {
-      const currentBody = currentStages.get(id);
+    if (id === 'body') {
+      const mappedBody = currentStages.get(id);
+      const currentBody = mappedBody
+        || current.stages.find((candidate) => candidate?.progress?.unit === 'body')
+        || stage;
+      const legacyTotal = stage.progress?.total ?? stage.progress?.coverageTotal;
+      const bodyProgress = {
+        ...currentBody.progress,
+        ...stage.progress,
+        unit: currentBody.progress?.unit || 'body',
+        done: currentBody.progress?.done ?? stage.progress?.done,
+        total: legacyTotal ?? currentBody.progress?.total ?? stage.progress?.total,
+        coverageDone: Number(currentBody.progress?.coverageDone || current.counts?.fullText || stage.progress?.coverageDone || 0),
+        coverageTotal: Number(currentBody.progress?.coverageTotal || current.counts?.discovered || stage.progress?.coverageTotal || 0) || null,
+      };
+      const bodyState = currentBody.state === 'queued'
+        && [...(current.issues || []), ...(legacy.issues || [])]
+          .some((issue) => ['RATE_LIMITED', 'SECURITY_VERIFICATION', 'LOGIN_REQUIRED'].includes(issue.code))
+        ? 'waiting_system'
+        : currentBody.state;
       return legacy.state === 'completed'
-        ? { ...currentBody, state: 'completed', detail: '已完成并保存' }
-        : currentBody;
+        ? { ...currentBody, progress: bodyProgress, state: 'completed', detail: '已完成并保存' }
+        : { ...currentBody, progress: bodyProgress, state: bodyState };
     }
-    return stage;
+    return currentStages.get(id) || stage;
   });
-  const discovered = Math.max(Number(current.counts?.discovered || 0), Number(legacy.counts?.discovered || 0));
+  // The current body ledger is the authoritative source for discovery/body totals.
+  // Keep historical analysis counters below, but never resurrect an older snapshot total.
+  const discovered = Number(legacy.counts?.discovered || 0);
   const fullText = Math.min(
     discovered || Number.MAX_SAFE_INTEGER,
-    Math.max(Number(current.counts?.fullText || 0), Number(legacy.counts?.fullText || 0)),
+    Number(legacy.counts?.fullText || 0),
   );
   return {
     ...current,
@@ -2789,6 +2873,95 @@ function mergeLegacyExperienceSnapshot(current, legacy) {
   };
 }
 
+function normalizeExperienceSnapshotBodyCoverage(snapshot, bodyMetrics = null) {
+  if (snapshot?.schemaVersion !== 3) return snapshot;
+  const body = snapshot.stages?.find((stage) => (stage.stage || stage.id) === 'body');
+  const progress = body?.progress;
+  const ledgerDiscovered = Number(bodyMetrics?.discovered);
+  const ledgerSucceeded = Number(bodyMetrics?.succeeded);
+  if (Number.isFinite(ledgerDiscovered) && Number.isFinite(ledgerSucceeded)) {
+    const normalized = structuredClone(snapshot);
+    const discovered = Math.max(0, ledgerDiscovered);
+    const fullText = Math.min(discovered || Number.MAX_SAFE_INTEGER, Math.max(0, ledgerSucceeded));
+    normalized.counts = {
+      ...(normalized.counts || {}),
+      discovered,
+      fullText,
+      pending: Math.max(0, discovered - fullText),
+    };
+    const normalizedBody = normalized.stages.find((stage) => (stage.stage || stage.id) === 'body');
+    if (normalizedBody?.progress) {
+      normalizedBody.progress = {
+        ...normalizedBody.progress,
+        done: fullText,
+        total: discovered || null,
+        coverageDone: fullText,
+        coverageTotal: discovered || null,
+        coveragePercent: discovered ? Math.round((fullText / discovered) * 10_000) / 100 : 0,
+      };
+    }
+    const bodyComplete = discovered > 0
+      && fullText >= discovered
+      && Number(bodyMetrics?.failed || 0) === 0
+      && Number(bodyMetrics?.notAttempted || 0) === 0
+      && Number(bodyMetrics?.blocked || 0) === 0
+      && Number(bodyMetrics?.cancelled || 0) === 0
+      && Number(bodyMetrics?.pending || 0) === 0;
+    if (bodyComplete) {
+      if (normalizedBody) {
+        normalizedBody.state = 'completed';
+        normalizedBody.detail = `本次已完成 ${fullText} / ${discovered}`;
+      }
+      const removedBodyIssues = (normalized.issues || []).filter((issue) => (
+        issue?.affectedStage === 'body'
+        && ['RATE_LIMITED', 'SECURITY_VERIFICATION'].includes(issue?.code)
+      ));
+      normalized.issues = (normalized.issues || []).filter((issue) => !removedBodyIssues.includes(issue));
+      normalized.counts.retryable = 0;
+      if (removedBodyIssues.length > 0) {
+        const nextStage = normalized.stages.find((stage) => (
+          (stage.stage || stage.id) !== 'body'
+          && ['running', 'waiting_system', 'waiting_user', 'retrying', 'partial', 'failed'].includes(stage.state)
+        ));
+        const qualityNeedsReview = normalized.stages.some((stage) => (
+          (stage.stage || stage.id) === 'quality' && ['partial', 'failed'].includes(stage.state)
+        ));
+        normalized.state = nextStage ? 'partial' : 'completed';
+        normalized.activeStage = nextStage ? nextStage.stage || nextStage.id : null;
+        normalized.headline = qualityNeedsReview
+          ? '正文采集已完成，求职材料仍需检查'
+          : '正文采集已完成';
+        normalized.detail = `已找到 ${discovered} 条，完整正文 ${fullText} 条，待处理 0 条`;
+      }
+    }
+    return normalized;
+  }
+  const coverageDone = Number(progress?.coverageDone);
+  const coverageTotal = Number(progress?.coverageTotal);
+  if (!Number.isFinite(coverageDone) && !Number.isFinite(coverageTotal)) return snapshot;
+
+  const normalized = structuredClone(snapshot);
+  const counts = normalized.counts || {};
+  const fullText = Math.max(0, Number(counts.fullText || 0), Number.isFinite(coverageDone) ? coverageDone : 0);
+  const discovered = Math.max(fullText, Number(counts.discovered || 0), Number.isFinite(coverageTotal) ? coverageTotal : 0);
+  normalized.counts = {
+    ...counts,
+    discovered,
+    fullText,
+    pending: Math.max(0, discovered - fullText),
+  };
+  const normalizedBody = normalized.stages.find((stage) => (stage.stage || stage.id) === 'body');
+  if (normalizedBody?.progress) {
+    normalizedBody.progress = {
+      ...normalizedBody.progress,
+      coverageDone: fullText,
+      coverageTotal: discovered || null,
+      coveragePercent: discovered ? Math.round((fullText / discovered) * 10_000) / 100 : 0,
+    };
+  }
+  return normalized;
+}
+
 export function publicJob(job) {
   const status = job.status === 'succeeded' ? 'completed' : job.status;
   const bodyMetrics = bodyMetricsForJob(job);
@@ -2826,12 +2999,43 @@ export function publicJob(job) {
         }
       : null
   );
+  const bodyCompletionPending = !bodyCoverageIsComplete(bodyMetrics);
   const resumeAvailable = resumableStatus && (
     Boolean(job.checkpointAvailable)
     || securityRestriction?.status === 'timed_out'
-    || RATE_LIMIT_RECOVERY_STATUSES.has(rateLimit?.status)
+    || (bodyCompletionPending && RATE_LIMIT_RECOVERY_STATUSES.has(rateLimit?.status))
     || hasRecoverableStageState(job.stages)
   );
+  const canonicalPendingCount = Math.max(0, discoveredCount - bodyMetrics.succeeded);
+  const canonicalWorkflowSummary = job.workflowSummary && typeof job.workflowSummary === 'object'
+    ? {
+        ...job.workflowSummary,
+        cardsDiscovered: discoveredCount,
+        notesCollected: bodyMetrics.succeeded,
+        bodiesCaptured: bodyMetrics.succeeded,
+        bodyCoveragePercent: discoveredCount > 0
+          ? Math.round((bodyMetrics.succeeded / discoveredCount) * 10000) / 100
+          : 100,
+        missingBodies: canonicalPendingCount,
+        bodyMetrics,
+        legacyInferred: bodyMetrics.legacyInferred,
+        sourceCoverage: {
+          ...(job.workflowSummary.sourceCoverage && typeof job.workflowSummary.sourceCoverage === 'object'
+            ? job.workflowSummary.sourceCoverage
+            : {}),
+          targetCount: discoveredCount,
+          readyCount: bodyMetrics.succeeded,
+          pendingCount: canonicalPendingCount,
+          totalRecordCount: bodyMetrics.succeeded,
+          fullBodyCount: bodyMetrics.succeeded,
+          statisticsSource: bodyMetrics.statisticsSource,
+          status: canonicalPendingCount > 0 ? 'partial' : 'complete',
+          reason: canonicalPendingCount > 0
+            ? String(job.workflowSummary.sourceCoverage?.reason || job.workflowSummary.stopReason || 'body_completion_incomplete')
+            : '',
+        },
+      }
+    : null;
   const exposed = {
     id: job.id,
     schemaVersion: Number(job.schemaVersion || 1),
@@ -2869,13 +3073,7 @@ export function publicJob(job) {
     throughSequence: Math.max(0, Number(job.eventSequence || 0)),
     attemptProgress: attemptProgressForJob(job, bodyMetrics),
     bodyMetrics,
-    workflowSummary: job.workflowSummary && typeof job.workflowSummary === 'object'
-      ? {
-          ...job.workflowSummary,
-          bodyMetrics,
-          legacyInferred: bodyMetrics.legacyInferred,
-        }
-      : null,
+    workflowSummary: canonicalWorkflowSummary,
     securityRestriction,
     rateLimit,
     resumeAvailable,
@@ -2887,10 +3085,14 @@ export function publicJob(job) {
   const experienceSnapshot = job.experienceSnapshot?.schemaVersion === 3
     ? structuredClone(mergeLegacyExperienceSnapshot(job.experienceSnapshot, legacySnapshot))
     : legacySnapshot;
+  const normalizedExperienceSnapshot = normalizeExperienceSnapshotBodyCoverage(
+    experienceSnapshot,
+    bodyMetrics.legacyInferred ? null : bodyMetrics,
+  );
   return {
     ...exposed,
-    experienceSnapshot,
-    experience: experienceSnapshot,
+    experienceSnapshot: normalizedExperienceSnapshot,
+    experience: normalizedExperienceSnapshot,
   };
 }
 
@@ -3622,12 +3824,19 @@ function mergeBodyCheckpointSummary(current, checkpoint) {
     : null;
   if (!metrics) return current;
   const pendingCount = Math.max(0, Number(metrics.discovered || 0) - Number(metrics.succeeded || 0));
+  const succeededCount = Number(metrics.succeeded || 0);
+  const discoveredCount = Number(metrics.discovered || 0);
+  const coveragePercent = discoveredCount > 0
+    ? Math.round((succeededCount / discoveredCount) * 10000) / 100
+    : 100;
   return {
     ...(current || {}),
-    cardsDiscovered: Number(metrics.discovered || 0),
-    notesCollected: Number(metrics.succeeded || 0),
+    cardsDiscovered: discoveredCount,
+    notesCollected: succeededCount,
+    bodiesCaptured: succeededCount,
+    bodyCoveragePercent: coveragePercent,
     bodyAttempted: Number(metrics.attempted || 0),
-    bodySucceeded: Number(metrics.succeeded || 0),
+    bodySucceeded: succeededCount,
     bodyFailed: Number(metrics.failed || 0),
     bodyNotAttempted: Number(metrics.notAttempted || 0),
     bodyBlocked: Number(metrics.blocked || 0),
@@ -3641,9 +3850,12 @@ function mergeBodyCheckpointSummary(current, checkpoint) {
       ...((current?.sourceCoverage && typeof current.sourceCoverage === 'object') ? current.sourceCoverage : {}),
       status: pendingCount > 0 ? 'partial' : 'complete',
       reason: pendingCount > 0 ? String(summary.stopReason || 'body_completion_incomplete') : '',
-      targetCount: Number(metrics.discovered || 0),
-      readyCount: Number(metrics.succeeded || 0),
+      targetCount: discoveredCount,
+      readyCount: succeededCount,
       pendingCount,
+      totalRecordCount: succeededCount,
+      fullBodyCount: succeededCount,
+      statisticsSource: String(metrics.statisticsSource || 'bodyCompletionLedger'),
     },
   };
 }

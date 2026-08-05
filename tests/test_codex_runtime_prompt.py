@@ -3,11 +3,23 @@ from __future__ import annotations
 import unittest
 
 from scripts.codex_runtime_outreach import (
+    COVER_LETTER_MAX_CHARS,
+    COVER_LETTER_MIN_CHARS,
+    COVER_LETTER_TARGET_MAX_CHARS,
+    COVER_LETTER_TARGET_MIN_CHARS,
     CodexRuntimeOutreachAgent,
     _output_schema,
     _prompt,
     _record_input,
+    _resolve_email_subject,
+    _subject_rule,
 )
+
+
+def _with_cover_letter_depth(cover_letter: str, paragraphs: list[str]) -> str:
+    marker = "\n\n此致"
+    depth = "\n\n".join(paragraphs)
+    return cover_letter.replace(marker, f"\n\n{depth}{marker}")
 
 
 class CodexRuntimePromptTests(unittest.TestCase):
@@ -42,15 +54,25 @@ class CodexRuntimePromptTests(unittest.TestCase):
                 "我曾使用 Python 清洗用户数据并输出分析报告，这段经历对应岗位的用户数据分析与报告交付。\n"
                 "期待进一步沟通岗位当前的数据任务。"
             ),
-            "cover_letter": (
-                "主题：数据分析实习申请｜张三｜Python 数据分析\n"
-                "尊敬的招聘负责人：\n"
-                "您好！我是张三，希望申请数据分析实习。\n\n"
-                "我曾使用 Python 清洗用户数据并输出分析报告，过程中先整理数据口径，再检查异常信息，最后把分析结果整理成可阅读的报告。这段经历让我形成了从问题拆解、数据处理到结论表达的完整工作习惯，也与岗位需要分析用户数据并输出报告的职责直接对应。\n\n"
-                "如果有机会加入，我会先确认团队对指标和报告的判断口径，再从具体任务开始核验数据、记录过程并及时同步结论，确保交付内容能够服务后续讨论。"
-                "我也会根据反馈持续复盘数据口径与报告表达，确保结论准确、可追踪。期待进一步了解岗位当前最需要推进的工作。\n\n"
-                "此致\n敬礼！\n"
-                "姓名：张三"
+            "cover_letter": _with_cover_letter_depth(
+                (
+                    "主题：数据分析实习申请｜张三｜Python 数据分析\n"
+                    "尊敬的招聘负责人：\n"
+                    "您好！我是张三，希望申请数据分析实习。\n\n"
+                    "我曾使用 Python 清洗用户数据并输出分析报告，过程中先整理数据口径，再检查异常信息，最后把分析结果整理成可阅读的报告。这段经历让我形成了从问题拆解、数据处理到结论表达的完整工作习惯，也与岗位需要分析用户数据并输出报告的职责直接对应。\n\n"
+                    "如果有机会加入，我会先确认团队对指标和报告的判断口径，再从具体任务开始核验数据、记录过程并及时同步结论，确保交付内容能够服务后续讨论。"
+                    "我也会根据反馈持续复盘数据口径与报告表达，确保结论准确、可追踪。期待进一步了解岗位当前最需要推进的工作。\n\n"
+                    "此致\n敬礼！\n"
+                    "姓名：张三"
+                ),
+                [
+                    "我理解这项工作的首要职责不是机械汇总数字，而是把业务问题转换成可检查的数据任务。面对用户数据分析，我会先明确分析对象、时间范围、指标定义和使用场景，再确认原始数据能否支持判断。这样可以让后续清洗、计算和结论始终围绕同一个问题推进，也让报告接收者清楚每项结论适用于什么范围。",
+                    "针对岗位强调的 Python 能力，我能提供的直接证据是已经用 Python 完成用户数据清洗和报告输出。我不会把一次项目经历写成对所有工具的熟练掌握，但这段经历证明我能把处理规则落实为可执行步骤，并在发现缺失、重复或异常记录时回到口径核对，而不是直接给出缺少依据的结论。",
+                    "在报告交付环节，我会把关键指标、处理过程、主要发现和限制条件分开表达。对影响判断的异常值，我会保留核验记录；对暂时无法确认的原因，我会标注待验证项，并说明下一步需要补充的数据。这样的交付既便于负责人快速阅读，也便于团队在复盘时追踪结论如何产生。",
+                    "如果职责还包括与业务同学沟通分析需求，我会先复述问题和预期决策，确认双方理解一致，再开始处理数据。阶段性结果出来后，我会用简短示例说明口径差异可能造成的影响，及时收集反馈并调整报告重点，减少分析完成后才发现方向偏差的返工。",
+                    "对于持续性的用户数据任务，我会建立任务清单与检查节点：开始前记录输入和目标，处理中检查字段质量与计算逻辑，交付前核对图表、文字和数字是否一致，交付后记录新增问题。即使当前证据没有覆盖团队的全部内部流程，我也会用这些明确步骤进入工作，而不是把尚未做过的内容写成既有成果。",
+                    "我希望进一步了解团队当前的数据来源、报告使用者以及最优先解决的用户问题，从而判断应先提升数据质量、分析效率还是结论表达。若有机会沟通，我也愿意围绕一项真实任务说明自己的拆解思路，并根据团队反馈调整执行顺序和交付形式。",
+                ],
             ),
             "used_evidence_ids": ["e1"],
             "requirement_matches": [
@@ -86,7 +108,7 @@ class CodexRuntimePromptTests(unittest.TestCase):
         }
 
     def _valid_ai_product_output(self) -> dict[str, object]:
-        return {
+        output = {
             "note_id": "n1",
             "greeting": (
                 "您好，我是张三，想应聘美团 AI产品运营。我曾从0到1搭建Asteria数据分析交付系统，"
@@ -118,6 +140,17 @@ class CodexRuntimePromptTests(unittest.TestCase):
                 "分析用户 query 与高频场景 -> e_insight -> 1v1深访并沉淀4类核心用户需求与场景",
             ],
         }
+        output["cover_letter"] = _with_cover_letter_depth(
+            str(output["cover_letter"]),
+            [
+                "我理解这一岗位的优先职责，是让 BA Agent 的真实使用信号进入稳定的运营决策，而不是把运营理解为单次活动。用户提出的 query、失败反馈和重复追问都应被整理成可分析的问题单元，再结合使用阶段判断它们影响的是首次体验、持续使用还是召回，这样团队才能把资源放到影响最大的环节。",
+                "已有的产品建设与用户洞察经验可以分别支撑这条链路的两个部分：前者让我理解输入、场景和输出需要统一结构，后者让我知道不能只看表面反馈，而要追问用户目标、使用环境和未被满足的需求。写入求职信的每项事实都只用于说明这种可迁移的方法，不把岗位尚未提供的数据写成我的历史成果。",
+                "针对案例沉淀与运营优先级，我会先按用户任务、问题类型、发生频率和影响程度建立分类，再把高价值问题转成案例补充、内容引导或产品反馈。每项动作都明确服务对象、预期变化和验证窗口，避免案例库只增加数量却不能帮助用户完成任务，也避免运营动作与产品问题彼此脱节。",
+                "针对拉新、留存和召回，我会区分不同阶段的用户行为：拉新关注用户是否理解产品价值并完成首次关键动作，留存关注核心场景能否稳定得到结果，召回则要识别离开的原因和重新触达的条件。若当前证据没有这些历史指标，我只会把它们写成入职后的观察与实验计划，并在获得真实数据后再确定基线和目标。",
+                "执行中我会把用户反馈、场景分类、运营动作和指标变化保留在同一复盘记录中，定期检查哪些判断得到验证、哪些动作没有产生预期影响，以及下一轮应调整产品能力还是运营表达。希望进一步了解团队当前最优先验证的 BA Agent 用户场景、已有的数据口径和运营节奏，以便围绕真实问题展开更具体的讨论。",
+            ],
+        )
+        return output
 
     def test_prompt_requires_matrix_and_does_not_offer_copyable_placeholders(self) -> None:
         prompt = _prompt(
@@ -137,7 +170,7 @@ class CodexRuntimePromptTests(unittest.TestCase):
         )
 
         self.assertIn("阶段 2｜匹配矩阵", prompt)
-        self.assertIn("岗位能力点 -> evidence id -> 证据中的具体动作/对象/结果", prompt)
+        self.assertIn("岗位能力点 -> evidence id -> 证据中的具体行动/交付物/结果 -> 可迁移价值", prompt)
         self.assertIn("first_person_claim", prompt)
         self.assertIn("AI 产品工作机制", prompt)
         self.assertIn("query/用户反馈 -> 痛点与场景分类", prompt)
@@ -147,8 +180,165 @@ class CodexRuntimePromptTests(unittest.TestCase):
         self.assertIn("禁止按经历逐段罗列", prompt)
         self.assertIn("在市场营销实习期间", prompt)
         self.assertIn("证据段必须从可核验动作或项目对象起笔", prompt)
+        self.assertIn("全部有效职责（最多六条）", prompt)
+        self.assertIn("priority 最靠前的核心职责", prompt)
+        self.assertIn("具体行动/交付物/结果 -> 可迁移价值", prompt)
+        self.assertIn("目标 900-1200 个非空白字符", prompt)
+        self.assertIn("使用 2-5 条互补证据", prompt)
+        self.assertIn("通用回退句或其近义改写凑字", prompt)
         self.assertNotIn("我是学校、专业、年级/学历学生姓名", prompt)
         self.assertNotIn("目前我每周可实习可用天数天", prompt)
+
+    def test_explicit_subject_rule_overrides_model_subject(self) -> None:
+        source = {
+            "title": "AI产品经理",
+            "body_excerpt": "请以“姓名-学校-应聘岗位-每周实习天数”作为邮件标题。",
+            "requirements": [],
+            "responsibilities": [],
+        }
+        self.assertEqual(
+            _subject_rule(source)["fields"],
+            ["candidateName", "school", "jobTitle", "availabilityDays"],
+        )
+        self.assertEqual(
+            _resolve_email_subject(
+                "模型自拟标题",
+                source,
+                "张三",
+                {"school": "曼彻斯特大学", "availabilityDays": "4"},
+            ),
+            "张三-曼彻斯特大学-AI产品经理-每周4天",
+        )
+
+    def test_fixed_subject_rule_is_kept_literal(self) -> None:
+        source = {
+            "title": "AI产品经理",
+            "body_excerpt": "邮件标题要求：AI产品经理实习申请",
+            "requirements": [],
+            "responsibilities": [],
+        }
+        rule = _subject_rule(source)
+        self.assertTrue(rule["literal"])
+        self.assertEqual(_resolve_email_subject("其他标题", source, "张三", {}), "AI产品经理实习申请")
+
+        source["body_excerpt"] = "邮件的标题要求：姓名-学校-应聘岗位"
+        self.assertEqual(_subject_rule(source)["fields"], ["candidateName", "school", "jobTitle"])
+        source["body_excerpt"] = "标题请使用‘姓名-学校-应聘岗位’"
+        self.assertEqual(_subject_rule(source)["fields"], ["candidateName", "school", "jobTitle"])
+        self.assertEqual(
+            _resolve_email_subject("其他标题", source, "张三", {"school": "曼彻斯特大学"}),
+            "张三-曼彻斯特大学-AI产品经理",
+        )
+
+    def test_subject_rule_excludes_attachment_and_follow_up_copy(self) -> None:
+        source = {
+            "title": "视觉设计实习",
+            "body_excerpt": "邮件标题：[辉瑞实习]姓名+年级学校+入职时间+一周几天，需附上简历和作品集，作品集可提供海报、长图文等相关设计作品",
+            "requirements": [],
+            "responsibilities": [],
+        }
+        self.assertEqual(
+            _subject_rule(source)["template"],
+            "[辉瑞实习]姓名+年级学校+入职时间+一周几天",
+        )
+
+        source["body_excerpt"] = "标题格式：姓名-学校-到岗时间-实习时长 合适会尽快安排面试！"
+        self.assertEqual(
+            _subject_rule(source)["template"],
+            "姓名-学校-到岗时间-实习时长",
+        )
+
+        source["body_excerpt"] = "简历命名：学校-姓名-到岗时间\n投递邮箱 talent@example.com"
+        self.assertFalse(_subject_rule(source)["detected"])
+
+        source["body_excerpt"] = "请将PDF版本简历按照以下格式命名：姓名-学校-每周可实习时间-可实习月份\n投递邮箱 talent@example.com"
+        self.assertFalse(_subject_rule(source)["detected"])
+
+        source["body_excerpt"] = "邮件及简历标题请命名为：姓名-学校-到岗时间"
+        self.assertEqual(_subject_rule(source)["template"], "姓名-学校-到岗时间")
+
+        source["body_excerpt"] = (
+            "投递主题：应聘岗位｜姓名｜每周实习天数\n"
+            "简历命名为：姓名-岗位-简历"
+        )
+        self.assertEqual(
+            _subject_rule(source)["template"],
+            "应聘岗位｜姓名｜每周实习天数",
+        )
+
+    def test_subject_rule_fills_real_profile_aliases_and_splits_arrival(self) -> None:
+        source = {
+            "title": "AI产品经理",
+            "body_excerpt": "邮件标题：姓名-届数-最快入职时间-持续时长-一周几天-手机号",
+            "requirements": [],
+            "responsibilities": [],
+        }
+        profile = {
+            "name": "王梓楠",
+            "degreeYear": "2026-12",
+            "availabilityDays": "4",
+            "internshipDuration": "6个月，2周内到岗",
+            "contact": {"phone": "13811817014"},
+        }
+        self.assertEqual(
+            _subject_rule(source)["fields"],
+            [
+                "candidateName",
+                "degreeYear",
+                "arrivalDate",
+                "internshipDuration",
+                "availabilityDays",
+                "phone",
+            ],
+        )
+        self.assertEqual(
+            _resolve_email_subject("模型自拟标题", source, "王梓楠", profile),
+            "王梓楠-2026-12-2周内到岗-6个月-每周4天-13811817014",
+        )
+
+    def test_subject_rule_rejects_non_email_title_statements(self) -> None:
+        source = {
+            "title": "AI产品经理",
+            "body_excerpt": "今天的课程主题是「AI产品经理辩论」。",
+            "requirements": [],
+            "responsibilities": [],
+        }
+        self.assertFalse(_subject_rule(source)["detected"])
+        source["body_excerpt"] = "标题是我许愿的hh。。"
+        self.assertFalse(_subject_rule(source)["detected"])
+
+    def test_subject_rule_keeps_undergraduate_and_graduate_education_distinct(self) -> None:
+        source = {
+            "title": "AI产品经理",
+            "body_excerpt": "邮件标题：姓名-年级-本科学校专业-硕士学校专业-可实习时间-联系电话",
+            "requirements": [],
+            "responsibilities": [],
+        }
+        profile = {
+            "name": "王梓楠",
+            "degreeYear": "2026-12",
+            "internshipDuration": "6个月，2周内到岗",
+            "phone": "13811817014",
+            "education": [
+                {"degree": "本科", "institution": "首都经济贸易大学", "field": "电子商务"},
+                {"degree": "硕士", "institution": "曼彻斯特大学", "field": "全球发展"},
+            ],
+        }
+        self.assertEqual(
+            _subject_rule(source)["fields"],
+            [
+                "candidateName",
+                "degreeYear",
+                "undergraduateEducation",
+                "graduateEducation",
+                "internshipDuration",
+                "phone",
+            ],
+        )
+        self.assertEqual(
+            _resolve_email_subject("模型自拟标题", source, "王梓楠", profile),
+            "王梓楠-2026-12-首都经济贸易大学电子商务-曼彻斯特大学全球发展-6个月-13811817014",
+        )
 
     def test_record_input_preserves_evidence_skills_and_outcomes(self) -> None:
         normalized = _record_input({
@@ -173,8 +363,15 @@ class CodexRuntimePromptTests(unittest.TestCase):
 
         self.assertEqual((properties["greeting"]["minLength"], properties["greeting"]["maxLength"]), (30, 180))
         self.assertEqual((properties["email_body"]["minLength"], properties["email_body"]["maxLength"]), (80, 300))
-        self.assertEqual((properties["cover_letter"]["minLength"], properties["cover_letter"]["maxLength"]), (280, 520))
-        self.assertEqual(properties["used_evidence_ids"]["maxItems"], 2)
+        self.assertEqual(
+            (properties["cover_letter"]["minLength"], properties["cover_letter"]["maxLength"]),
+            (COVER_LETTER_MIN_CHARS, COVER_LETTER_MAX_CHARS),
+        )
+        self.assertEqual(
+            (COVER_LETTER_TARGET_MIN_CHARS, COVER_LETTER_TARGET_MAX_CHARS),
+            (900, 1200),
+        )
+        self.assertEqual(properties["used_evidence_ids"]["maxItems"], 5)
         self.assertTrue(properties["used_evidence_ids"]["uniqueItems"])
 
     def test_output_schema_can_constrain_runtime_ids_to_exact_input_values(self) -> None:
@@ -184,21 +381,47 @@ class CodexRuntimePromptTests(unittest.TestCase):
         self.assertEqual(properties["note_id"]["enum"], ["n1"])
         self.assertEqual(properties["used_evidence_ids"]["items"]["enum"], ["evidence-full-id"])
 
-    def test_record_input_strips_social_post_prefix_from_role_title(self) -> None:
+    def test_record_input_uses_reviewed_role_instead_of_social_post_title(self) -> None:
         normalized = _record_input({
             "note_id": "n1",
             "title": "给自己找实习继任--美团 AI产品运营",
+            "job_card": {"role_name": "AI产品运营"},
             "application_info": {},
             "fit_evidence": [],
         })
 
-        self.assertEqual(normalized["title"], "美团 AI产品运营")
+        self.assertEqual(normalized["title"], "AI产品运营")
+
+        missing_role = _record_input({
+            "note_id": "n2",
+            "title": "给自己找实习继任--美团 AI产品运营",
+            "application_info": {},
+            "fit_evidence": [],
+        })
+        self.assertEqual(missing_role["title"], "")
 
     def test_semantically_grounded_copy_passes(self) -> None:
         result = self.agent._validate_output(self._valid_output(), self.source)
 
         self.assertEqual(result["used_evidence_ids"], ["e1"])
         self.assertTrue(result["requirement_matches"])
+
+    def test_cover_letter_below_800_non_whitespace_characters_is_rejected(self) -> None:
+        output = self._valid_output()
+        output["cover_letter"] = str(output["cover_letter"])[:700]
+
+        with self.assertRaisesRegex(ValueError, "strict length contract"):
+            self.agent._validate_output(output, self.source)
+
+    def test_cover_letter_fallback_boilerplate_is_rejected(self) -> None:
+        output = self._valid_output()
+        output["cover_letter"] = str(output["cover_letter"]).replace(
+            "此致",
+            "我与该岗位高度匹配，也期待为团队贡献力量。\n\n此致",
+        )
+
+        with self.assertRaisesRegex(ValueError, "fallback boilerplate"):
+            self.agent._validate_output(output, self.source)
 
     def test_email_subject_is_standardized_and_synced_to_cover_letter(self) -> None:
         output = self._valid_output()
@@ -337,17 +560,23 @@ class CodexRuntimePromptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "experience catalog"):
             self.agent._validate_output(output, self._ai_product_source())
 
-    def test_used_evidence_must_be_unique_and_limited_to_two(self) -> None:
+    def test_used_evidence_must_be_unique_and_limited_to_five(self) -> None:
         source = self._ai_product_source()
-        source["candidate_evidence"].append({
-            "id": "e_ops",
-            "role_axis": "operations",
-            "label": "社群运营",
-            "detail": "从0到1运营150人社群",
-            "first_person_claim": "我从0到1运营150人社群",
-        })
+        source["candidate_evidence"].extend([
+            {
+                "id": f"e_extra_{index}",
+                "role_axis": "operations",
+                "label": f"运营证据{index}",
+                "detail": f"完成运营任务{index}",
+                "first_person_claim": f"我完成运营任务{index}",
+            }
+            for index in range(1, 5)
+        ])
 
-        for used_ids in (["e_ai", "e_ai"], ["e_ai", "e_insight", "e_ops"]):
+        for used_ids in (
+            ["e_ai", "e_ai"],
+            ["e_ai", "e_insight", "e_extra_1", "e_extra_2", "e_extra_3", "e_extra_4"],
+        ):
             with self.subTest(used_ids=used_ids):
                 output = self._valid_ai_product_output()
                 output["used_evidence_ids"] = used_ids
@@ -427,11 +656,12 @@ class CodexRuntimePromptTests(unittest.TestCase):
             "主题：实习申请｜张三\n"
             "尊敬的招聘负责人：\n"
             "您好！我是张三，希望申请这个职位。\n\n"
-            f"{generic_paragraph}{generic_paragraph}{generic_paragraph}\n\n"
+            f"{generic_paragraph * 10}\n\n"
             "期待进一步了解团队当前的任务安排，也希望有机会就工作重点进行沟通。\n\n"
             "此致\n敬礼！\n姓名：张三"
         )
-        self.assertTrue(280 <= len(str(output["cover_letter"])) <= 520)
+        cover_chars = len("".join(str(output["cover_letter"]).split()))
+        self.assertTrue(COVER_LETTER_MIN_CHARS <= cover_chars <= COVER_LETTER_MAX_CHARS)
 
         with self.assertRaisesRegex(ValueError, "Cover Letter without a job-specific signal"):
             self.agent._validate_output(output, self.source)

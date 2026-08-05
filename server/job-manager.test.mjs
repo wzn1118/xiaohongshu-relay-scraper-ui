@@ -458,10 +458,13 @@ test('JobManager restores scoped body ledger metrics instead of stale workflow c
     assert.deepEqual(restored.workflowSummary.sourceCoverage, {
       status: 'partial',
       reason: 'cache_only',
-      targetCount: 3,
-      readyCount: 1,
-      pendingCount: 2,
-    });
+    targetCount: 3,
+    readyCount: 1,
+    pendingCount: 2,
+    totalRecordCount: 1,
+    fullBodyCount: 1,
+    statisticsSource: 'bodyCompletionLedger',
+  });
   } finally {
     await manager.shutdown();
     await rm(dataDir, { recursive: true, force: true });
@@ -702,6 +705,59 @@ test('manual recovery starts a new automatic idempotency cycle after earlier att
     const automaticEnded = waitForEnd(manager, jobId);
     children[1].emit('close', 0, null);
     await automaticEnded;
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('completed body coverage clears a stale scheduled body recovery during startup', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-complete-body-recovery-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const jobId = '20260805082000-c0ffee01';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'failed',
+    outputDir,
+    params: { analysisMode: 'job', keyword: 'ai product manager' },
+    progressPhase: 'rate_limit_scheduled',
+    bodyMetrics: {
+      discovered: 2,
+      attempted: 2,
+      succeeded: 2,
+      failed: 0,
+      notAttempted: 0,
+      blocked: 0,
+      cancelled: 0,
+      pending: 0,
+    },
+    rateLimit: {
+      detected: true,
+      status: 'scheduled',
+      resumeScope: 'body_completion',
+      nextRetryAt: '2026-08-05T00:47:29.045Z',
+      recoveryAction: 'automatic_resume',
+    },
+  }]), 'utf8');
+
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+  });
+
+  try {
+    await manager.initialize();
+    const job = manager.get(jobId);
+    assert.equal(job.bodyMetrics.discovered, 2);
+    assert.equal(job.bodyMetrics.succeeded, 2);
+    assert.equal(job.rateLimit.status, 'cleared');
+    assert.equal(job.rateLimit.nextRetryAt, null);
+    assert.equal(job.rateLimit.recoveryAction, null);
+    assert.equal(job.progressPhase, 'body_complete');
   } finally {
     await manager.shutdown();
     await rm(dataDir, { recursive: true, force: true });
@@ -1342,6 +1398,81 @@ test('public job derives body progress only from the persisted per-note ledger',
     },
   });
   assert.deepEqual(job.workflowSummary.bodyMetrics, job.bodyMetrics);
+});
+
+test('public job reconciles stale workflow and experience totals to the body ledger', () => {
+  const source = {
+    id: 'body-summary-drift',
+    status: 'failed',
+    params: { keyword: 'test', analysisMode: 'job' },
+    discoveredCount: 912,
+    scrapedCount: 715,
+    bodyProcessedCount: 715,
+    bodyMetrics: {
+      schemaVersion: 1,
+      statisticsSource: 'bodyCompletionLedger',
+      discovered: 715,
+      attempted: 715,
+      succeeded: 715,
+      failed: 0,
+      notAttempted: 0,
+      blocked: 0,
+      cancelled: 0,
+      pending: 0,
+    },
+    workflowSummary: {
+      status: 'failed',
+      cardsDiscovered: 715,
+      notesCollected: 715,
+      bodiesCaptured: 692,
+      bodyCoveragePercent: 96.78,
+      applicationCopyGenerated: 692,
+      sourceCoverage: {
+        targetCount: 715,
+        readyCount: 715,
+        pendingCount: 0,
+        totalRecordCount: 692,
+        fullBodyCount: 692,
+      },
+    },
+    rateLimit: {
+      detected: true,
+      status: 'scheduled',
+      nextRetryAt: '2026-08-04T22:47:29.045Z',
+      resumeScope: 'body_completion',
+    },
+  };
+  const staleSnapshot = adaptLegacyJobSnapshot(source);
+  staleSnapshot.counts = { ...staleSnapshot.counts, discovered: 912, fullText: 715, pending: 197 };
+  staleSnapshot.state = 'waiting_system';
+  staleSnapshot.activeStage = 'body';
+  staleSnapshot.headline = '平台暂时限制访问';
+  staleSnapshot.issues = [mapUserProblem('RATE_LIMITED', {
+    saved: 715,
+    total: 715,
+    retryAt: source.rateLimit.nextRetryAt,
+  })];
+  staleSnapshot.stages = staleSnapshot.stages.map((stage) => stage.stage === 'body'
+    ? { ...stage, progress: { ...stage.progress, total: 912 } }
+    : stage);
+
+  const job = publicJob({ ...source, experienceSnapshot: staleSnapshot });
+  const bodyStage = job.experienceSnapshot.stages.find((stage) => stage.stage === 'body');
+
+  assert.equal(job.discoveredCount, 715);
+  assert.equal(job.bodyMetrics.succeeded, 715);
+  assert.equal(job.workflowSummary.bodiesCaptured, 715);
+  assert.equal(job.workflowSummary.sourceCoverage.totalRecordCount, 715);
+  assert.equal(job.workflowSummary.sourceCoverage.fullBodyCount, 715);
+  assert.equal(job.experienceSnapshot.counts.discovered, 715);
+  assert.equal(job.experienceSnapshot.counts.fullText, 715);
+  assert.equal(job.experienceSnapshot.counts.pending, 0);
+  assert.equal(bodyStage.progress.total, 715);
+  assert.equal(bodyStage.state, 'completed');
+  assert.equal(job.experienceSnapshot.issues.some((issue) => issue.code === 'RATE_LIMITED'), false);
+  assert.notEqual(job.experienceSnapshot.state, 'waiting_system');
+  assert.notEqual(job.experienceSnapshot.headline, '平台暂时限制访问');
+  assert.equal(job.resumeAvailable, false);
 });
 
 test('legacy body summaries remain readable and are explicitly marked inferred', () => {

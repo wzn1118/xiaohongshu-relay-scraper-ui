@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 
 import { createApp, createPersistentSmtpSendGate, streamApplicationBatchEvents } from './app.mjs';
 import { ApplicationBatchManager } from './application-batch-manager.mjs';
@@ -30,9 +30,9 @@ function readyRecord(noteId) {
   return {
     note_id: noteId,
     post_id: noteId,
-    title: `Role ${noteId}`,
+    title: `Recruitment post ${noteId}`,
     body: 'Apply by email.',
-    job_card: { role_name: `Role ${noteId}` },
+    job_card: { role_name: 'AI Product Manager Intern' },
     application_info: {
       contacts: [{
         type: 'email',
@@ -47,8 +47,9 @@ function readyRecord(noteId) {
       application_routes: [],
     },
     outreach: {
-      email_subject: `Subject ${noteId}`,
+      email_subject: `Application for AI Product Manager Intern | Candidate`,
       email_body: `Body ${noteId}`,
+      cover_letter: `Cover letter ${noteId}`,
     },
     draftVersion: {
       draftId: `draft-${noteId}`,
@@ -80,6 +81,7 @@ async function readyServiceFixture(t, {
   const outputDir = await temporaryOutputDir(t);
   const records = new Map(noteIds.map((noteId) => [noteId, readyRecord(noteId)]));
   const attachments = new Map(noteIds.map((noteId) => [noteId, readyAttachment(noteId)]));
+  const previewCalls = [];
   const manager = new ApplicationBatchManager({
     rootDir: outputDir,
     now: () => new Date(FIXED_TIME),
@@ -96,6 +98,7 @@ async function readyServiceFixture(t, {
     renameAttachment: async () => assert.fail('A matching deterministic filename must not be renamed.'),
     checkQuality: async () => assert.fail('A passed draft must not be quality-checked again.'),
     previewEmail: async (value, allowedRecipients) => {
+      previewCalls.push(structuredClone(value));
       assert.deepEqual(allowedRecipients, [value.to]);
       return {
         readiness: 'ready',
@@ -129,14 +132,21 @@ async function readyServiceFixture(t, {
     sleep: async () => {},
   });
 
-  return { outputDir, records, manager, service };
+  return { outputDir, records, manager, previewCalls, service };
 }
 
 async function freezeAndApprove(service, noteIds) {
-  const created = await service.createBatch({
+  const request = {
     noteIds,
     defaultAttachmentTemplate: 'resume',
     minIntervalMs: 0,
+  };
+  const dryRun = await service.dryRun(request);
+  const created = await service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
   });
   const approved = await service.approveBatch(created.batch.batchId, {
     expectedRevision: created.batch.revision,
@@ -183,13 +193,122 @@ test('dry run keeps partial comment collection pending instead of reporting no e
   assert.equal(result.items[0].contactResolution.reason, 'comment_collection_incomplete');
 });
 
+test('copy quality failure blocks batch preflight before preview', async (t) => {
+  const { service, records } = await readyServiceFixture(t, { noteIds: ['copy-quality-note'] });
+  records.get('copy-quality-note').outreach.content_quality = {
+    batch_ready: false,
+    cover_letter_length_pass: false,
+    ai_product_mechanism_pass: false,
+  };
+
+  const result = await service.dryRun({ noteIds: ['copy-quality-note'], defaultAttachmentTemplate: 'resume' });
+
+  assert.equal(result.counts.copy_quality_failed, 1);
+  assert.equal(result.items[0].status, 'copy_quality_failed');
+  assert.equal(result.items[0].blockers[0].code, 'APPLICATION_COPY_QUALITY_FAILED');
+  assert.equal(result.items[0].preview, null);
+});
+
+test('missing Cover Letter is an explicit blocker and never reaches preview', async (t) => {
+  const { service, records, previewCalls } = await readyServiceFixture(t, { noteIds: ['missing-cover-letter'] });
+  records.get('missing-cover-letter').outreach.cover_letter = '   ';
+
+  const result = await service.dryRun({ noteIds: ['missing-cover-letter'], defaultAttachmentTemplate: 'resume' });
+
+  assert.equal(result.items[0].status, 'draft_pending');
+  assert.equal(result.items[0].blockers[0].code, 'APPLICATION_COVER_LETTER_REQUIRED');
+  assert.deepEqual(result.readyNoteIds, []);
+  assert.deepEqual(previewCalls, []);
+});
+
+test('Dry Run keeps delivery state, attachment manifest, and batch artifacts byte-for-byte unchanged', async (t) => {
+  const { outputDir, service, previewCalls } = await readyServiceFixture(t, { noteIds: ['read-only-preview'] });
+  const deliveryStatePath = path.join(outputDir, 'delivery-state.json');
+  const attachmentDir = path.join(outputDir, 'application-attachments');
+  const attachmentManifestPath = path.join(attachmentDir, 'manifest.json');
+  const batchDir = path.join(outputDir, 'artifacts', 'application-batches');
+  await mkdir(attachmentDir, { recursive: true });
+  await Promise.all([
+    writeFile(deliveryStatePath, '{"_schemaVersion":2,"_revision":7}\n', 'utf8'),
+    writeFile(attachmentManifestPath, '{"schemaVersion":1,"attachments":[]}\n', 'utf8'),
+  ]);
+  const before = {
+    deliveryState: await readFile(deliveryStatePath, 'utf8'),
+    attachmentManifest: await readFile(attachmentManifestPath, 'utf8'),
+    batchEntries: await readdir(batchDir),
+  };
+
+  const result = await service.dryRun({ noteIds: ['read-only-preview'], defaultAttachmentTemplate: 'resume' });
+
+  assert.deepEqual(result.readyNoteIds, ['read-only-preview']);
+  assert.deepEqual(previewCalls.map((call) => call.persist), [false]);
+  assert.equal(await readFile(deliveryStatePath, 'utf8'), before.deliveryState);
+  assert.equal(await readFile(attachmentManifestPath, 'utf8'), before.attachmentManifest);
+  assert.deepEqual(await readdir(batchDir), before.batchEntries);
+});
+
+test('freezing a confirmed Dry Run regenerates a persistent preview', async (t) => {
+  const { service, previewCalls } = await readyServiceFixture(t, { noteIds: ['persistent-freeze-preview'] });
+  const request = { noteIds: ['persistent-freeze-preview'], defaultAttachmentTemplate: 'resume' };
+  const dryRun = await service.dryRun(request);
+
+  await service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  });
+
+  assert.deepEqual(previewCalls.map((call) => call.persist), [false, true]);
+});
+
+test('new batches require an exact confirmed Dry Run selection', async (t) => {
+  const noteIds = ['confirmed-a', 'confirmed-b'];
+  const { service } = await readyServiceFixture(t, { noteIds });
+  const request = { noteIds, defaultAttachmentTemplate: 'resume' };
+
+  await assert.rejects(
+    service.createBatch(request),
+    { code: 'APPLICATION_BATCH_PREFLIGHT_REQUIRED' },
+  );
+
+  const dryRun = await service.dryRun(request);
+  await assert.rejects(
+    service.createBatch({ ...request, preflightId: dryRun.preflightId, manifestHash: dryRun.manifestHash }),
+    { code: 'APPLICATION_BATCH_CONFIRMATION_REQUIRED' },
+  );
+  await assert.rejects(
+    service.createBatch({
+      ...request,
+      preflightId: dryRun.preflightId,
+      manifestHash: dryRun.manifestHash,
+      confirmedNoteIds: ['confirmed-a'],
+    }),
+    { code: 'APPLICATION_BATCH_PREFLIGHT_STALE' },
+  );
+  const created = await service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: [...noteIds].reverse(),
+  });
+  assert.deepEqual(created.batch.items.map((item) => item.noteId), noteIds);
+});
+
 test('batch creation replays the same idempotency key and rejects changed content', async (t) => {
   const { service } = await readyServiceFixture(t, { noteIds: ['note-idempotent'] });
-  const request = {
+  const baseRequest = {
     noteIds: ['note-idempotent'],
     defaultAttachmentTemplate: 'resume',
     minIntervalMs: 0,
     idempotencyKey: 'batch-idempotency-1',
+  };
+  const dryRun = await service.dryRun(baseRequest);
+  const request = {
+    ...baseRequest,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
   };
 
   const first = await service.createBatch(request);
@@ -387,18 +506,20 @@ test('persistent SMTP gate serializes intervals across a service restart', async
   assert.equal(state.nextAllowedAt, '2026-08-04T04:00:02.000Z');
 });
 
-test('attachment rename failure rolls every changed display name back', async (t) => {
+test('attachment naming stays MIME-only and preserves the source attachment hash', async (t) => {
   const outputDir = await temporaryOutputDir(t, 'application-batch-rename-');
   const manager = new ApplicationBatchManager({ rootDir: outputDir });
   await manager.initialize();
   const record = readyRecord('note-rename');
   record.job_card.role_name = 'Product Manager';
+  record.outreach.email_subject = '应聘Product Manager｜Candidate';
   record.application_info.contacts[0].evidence = 'Apply to note-rename@example.com';
   const attachments = [
     { ...readyAttachment('note-rename'), attachmentId: 'attachment-a', originalName: 'resume.pdf', displayName: 'resume.pdf' },
   ];
   const names = new Map(attachments.map((attachment) => [attachment.attachmentId, attachment.displayName]));
   let renameCalls = 0;
+  let previewRequest = null;
   const service = new ApplicationBatchService({
     jobId: JOB_ID,
     outputDir,
@@ -409,19 +530,118 @@ test('attachment rename failure rolls every changed display name back', async (t
     renameAttachment: async (attachmentId, displayName) => {
       renameCalls += 1;
       names.set(attachmentId, displayName);
-      if (renameCalls === 1) throw Object.assign(new Error('rename failed'), { code: 'ATTACHMENT_WRITE_FAILED' });
     },
-    checkQuality: async () => assert.fail('quality should not run after rename failure'),
-    previewEmail: async () => assert.fail('preview should not run after rename failure'),
-    sendEmail: async () => assert.fail('send should not run after rename failure'),
+    checkQuality: async () => assert.fail('quality should not run for a passed draft'),
+    previewEmail: async (value) => {
+      previewRequest = value;
+      const filename = value.attachmentFilenameOverrides['attachment-a'];
+      return {
+        readiness: 'ready',
+        warnings: [],
+        recipient: value.to,
+        from: 'sender@example.com',
+        replyTo: 'candidate@example.com',
+        subject: 'Application for Product Manager',
+        text: 'Body note-rename',
+        draftId: value.draftId,
+        draftVersion: value.version,
+        quality: { contentHash: 'b'.repeat(64), qualityReportRef: null },
+        attachmentBundleHash: 'bundle-note-rename',
+        attachmentSummary: {
+          attachments: [{
+            attachmentId: 'attachment-a',
+            filename,
+            sha256: 'a'.repeat(64),
+            size: 1_024,
+            mediaType: 'application/pdf',
+          }],
+        },
+        previewRevision: 'preview-note-rename',
+        smtpConfigurationRevision: 7,
+        smtpConfigurationFingerprint: 'smtp-fingerprint',
+        estimatedMessageSize: 2_048,
+      };
+    },
+    sendEmail: async () => assert.fail('send should not run while creating a batch'),
   });
 
-  await assert.rejects(
-    service.createBatch({ noteIds: ['note-rename'], defaultAttachmentTemplate: '{jobTitle}-{candidateName}-resume' }),
-    { code: 'ATTACHMENT_WRITE_FAILED' },
-  );
+  const request = {
+    noteIds: ['note-rename'],
+    defaultAttachmentTemplate: '{jobTitle}-{candidateName}-resume',
+  };
+  const dryRun = await service.dryRun(request);
+  const created = await service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  });
+
+  assert.equal(dryRun.schemaVersion, 2);
+  assert.match(dryRun.preflightId, /^[a-f0-9-]{36}$/u);
+  assert.match(dryRun.manifestHash, /^[a-f0-9]{64}$/u);
+  assert.ok(Date.parse(dryRun.expiresAt) - Date.parse(dryRun.generatedAt) >= 29 * 60_000);
+  assert.ok(Date.parse(dryRun.expiresAt) - Date.parse(dryRun.generatedAt) <= 31 * 60_000);
+  assert.equal(dryRun.items[0].status, 'ready');
+  assert.equal(dryRun.items[0].attachments[0].currentDisplayName, 'resume.pdf');
+  assert.equal(dryRun.items[0].attachments[0].finalDisplayName, 'Product Manager-Candidate-resume.pdf');
+  assert.equal(dryRun.items[0].attachments[0].renameRequired, true);
+  assert.equal(dryRun.items[0].payload.coverLetter, 'Cover letter note-rename');
+  assert.equal(dryRun.deliveryManifest.items[0].body, 'Body note-rename');
+  assert.equal(dryRun.deliveryManifest.items[0].coverLetter, 'Cover letter note-rename');
+  assert.equal(dryRun.deliveryManifest.items[0].attachments[0].finalDisplayName, 'Product Manager-Candidate-resume.pdf');
+  assert.equal(previewRequest.attachmentFilenameOverrides['attachment-a'], 'Product Manager-Candidate-resume.pdf');
   assert.deepEqual([...names.values()], ['resume.pdf']);
-  assert.equal(renameCalls, 2);
+  assert.equal(renameCalls, 0);
+  assert.equal(created.preflight.preflightValidated, true);
+  assert.equal(created.preflight.manifestHash, dryRun.manifestHash);
+  assert.equal(created.batch.items[0].payload.sendRequest.manifestHash, dryRun.manifestHash);
+  assert.equal(
+    created.batch.items[0].payload.sendRequest.recipientEvidenceHash,
+    created.batch.items[0].payload.recipientEvidence.evidenceHash,
+  );
+  assert.equal(created.batch.items[0].payload.sendRequest.attachmentFilenameOverrides['attachment-a'], 'Product Manager-Candidate-resume.pdf');
+  assert.equal(created.preflight.items[0].attachments[0].currentDisplayName, 'resume.pdf');
+  assert.equal(created.preflight.items[0].attachments[0].finalDisplayName, 'Product Manager-Candidate-resume.pdf');
+  assert.equal(created.preflight.items[0].attachments[0].sha256, 'a'.repeat(64));
+});
+
+test('freezing rejects a Dry Run manifest after recipient evidence changes', async (t) => {
+  const { service, records } = await readyServiceFixture(t, { noteIds: ['manifest-stale'] });
+  const request = { noteIds: ['manifest-stale'], defaultAttachmentTemplate: 'resume' };
+  const dryRun = await service.dryRun(request);
+  records.get('manifest-stale').application_info.contacts[0].value = 'updated@example.com';
+  records.get('manifest-stale').application_info.contacts[0].evidence = 'Send the application to updated@example.com';
+
+  await assert.rejects(
+    service.createBatch({
+      ...request,
+      preflightId: dryRun.preflightId,
+      manifestHash: dryRun.manifestHash,
+      confirmedNoteIds: dryRun.readyNoteIds,
+    }),
+    { code: 'APPLICATION_BATCH_PREFLIGHT_STALE' },
+  );
+});
+
+test('sending pauses before SMTP when frozen recipient evidence changes', async (t) => {
+  const sends = [];
+  const { service, records } = await readyServiceFixture(t, {
+    noteIds: ['recipient-stale-before-send'],
+    sendEmail: async (request) => sends.push(request),
+  });
+  const { created, approved } = await freezeAndApprove(service, ['recipient-stale-before-send']);
+  records.get('recipient-stale-before-send').application_info.contacts[0].value = 'replacement@example.com';
+  records.get('recipient-stale-before-send').application_info.contacts[0].evidence = 'Send the application to replacement@example.com';
+
+  await service.startBatch(created.batch.batchId, { expectedRevision: approved.revision });
+  await service.waitForIdle(created.batch.batchId);
+  const paused = await service.getBatch(created.batch.batchId);
+
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.items[0].status, 'failed_retryable');
+  assert.equal(paused.items[0].error.code, 'APPLICATION_BATCH_RECIPIENT_STALE');
+  assert.deepEqual(sends, []);
 });
 
 test('HTTP dry-run route exposes the partial-comment blocker', async (t) => {
@@ -476,6 +696,26 @@ test('HTTP dry-run route exposes the partial-comment blocker', async (t) => {
     assert.equal(body.items[0].status, 'blocked_ambiguous');
     assert.equal(body.items[0].blockers[0].code, 'APPLICATION_COMMENTS_INCOMPLETE');
     assert.equal(body.items[0].contactResolution.collectionStatus, 'partial');
+
+    const missingPreviewRecipient = await fetch(`${origin}/api/jobs/${JOB_ID}/send-email/preview`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ noteId: 'partial-http' }),
+    });
+    const missingPreviewBody = await missingPreviewRecipient.json();
+    assert.equal(missingPreviewRecipient.status, 400);
+    assert.equal(missingPreviewBody.error.code, 'VALIDATION_ERROR');
+    assert.equal(missingPreviewBody.error.message, 'Recipient is required.');
+
+    const missingSendRecipient = await fetch(`${origin}/api/jobs/${JOB_ID}/send-email`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ noteId: 'partial-http' }),
+    });
+    const missingSendBody = await missingSendRecipient.json();
+    assert.equal(missingSendRecipient.status, 400);
+    assert.equal(missingSendBody.error.code, 'VALIDATION_ERROR');
+    assert.equal(missingSendBody.error.message, 'Recipient is required.');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

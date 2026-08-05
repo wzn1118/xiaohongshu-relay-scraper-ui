@@ -3,6 +3,8 @@ import { mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
 import { LOCAL_MODEL_CATALOG } from './local-model-manager.mjs';
 
+const DEFAULT_LOCAL_MODEL_ENDPOINT = 'http://127.0.0.1:11434';
+
 const PROVIDERS = Object.freeze({
   local_qwen: {
     label: '本地免费模型库',
@@ -73,11 +75,18 @@ const PROVIDERS = Object.freeze({
 });
 
 export class AiSessionStore {
-  constructor({ ttlMs = 8 * 60 * 60 * 1000, filePath = null, fetchImpl = globalThis.fetch, modelDiscoveryTimeoutMs = 10000 } = {}) {
+  constructor({ ttlMs = 8 * 60 * 60 * 1000, filePath = null, fetchImpl = globalThis.fetch, modelDiscoveryTimeoutMs = 10000, localModelEndpoint = DEFAULT_LOCAL_MODEL_ENDPOINT } = {}) {
     this.ttlMs = ttlMs;
     this.filePath = filePath;
     this.fetchImpl = fetchImpl;
     this.modelDiscoveryTimeoutMs = modelDiscoveryTimeoutMs;
+    this.definitions = Object.freeze({
+      ...PROVIDERS,
+      local_qwen: Object.freeze({
+        ...PROVIDERS.local_qwen,
+        baseUrl: localModelOpenAiBaseUrl(localModelEndpoint),
+      }),
+    });
     this.sessions = new Map();
     this.configurations = new Map();
   }
@@ -90,8 +99,8 @@ export class AiSessionStore {
       const entries = payload && typeof payload === 'object' ? payload.providers : null;
       if (!entries || typeof entries !== 'object') return;
       for (const [provider, value] of Object.entries(entries)) {
-        if (PROVIDERS[provider] && value && typeof value === 'object') {
-          this.configurations.set(provider, sanitizeConfiguration(provider, value));
+        if (this.definitions[provider] && value && typeof value === 'object') {
+          this.configurations.set(provider, sanitizeConfiguration(provider, value, this.definitions));
         }
       }
     } catch (error) {
@@ -100,13 +109,14 @@ export class AiSessionStore {
   }
 
   providers() {
-    return Object.entries(PROVIDERS).map(([id, value]) => {
+    return Object.entries(this.definitions).map(([id, value]) => {
       const saved = this.configurations.get(id);
       return {
         id,
         ...value,
         models: [...value.models],
-        baseUrl: saved?.baseUrl || value.baseUrl,
+        // The production endpoint is authoritative for the bundled local runtime.
+        baseUrl: id === 'local_qwen' ? value.baseUrl : saved?.baseUrl || value.baseUrl,
         model: saved?.model || value.model,
         wireApi: saved?.wireApi || value.wireApi,
         configured: Boolean(saved && (!value.requiresKey || saved.apiKey)),
@@ -118,11 +128,13 @@ export class AiSessionStore {
   async create(value = {}) {
     this.cleanup();
     const provider = String(value.provider || '').trim().toLowerCase();
-    const definition = PROVIDERS[provider];
+    const definition = this.definitions[provider];
     if (!definition) throw validation('Unsupported AI provider.');
     const saved = this.configurations.get(provider) || {};
     const suppliedApiKey = String(value.apiKey || '').trim();
-    const requestedBaseUrl = normalizeBaseUrl(value.baseUrl || saved.baseUrl || definition.baseUrl);
+    const requestedBaseUrl = normalizeBaseUrl(provider === 'local_qwen'
+      ? definition.baseUrl
+      : value.baseUrl || saved.baseUrl || definition.baseUrl);
     if (!suppliedApiKey && saved.apiKey && saved.baseUrl && requestedBaseUrl !== normalizeBaseUrl(saved.baseUrl)) {
       throw validation('Enter the API key again after changing the Base URL.');
     }
@@ -150,12 +162,14 @@ export class AiSessionStore {
 
   async discoverModels(value = {}) {
     const provider = String(value.provider || '').trim().toLowerCase();
-    const definition = PROVIDERS[provider];
+    const definition = this.definitions[provider];
     if (!definition) throw validation('Unsupported AI provider.');
     const saved = this.configurations.get(provider) || {};
     const suppliedApiKey = String(value.apiKey || '').trim();
     const apiKey = suppliedApiKey || String(saved.apiKey || '').trim();
-    const baseUrl = normalizeBaseUrl(value.baseUrl || saved.baseUrl || definition.baseUrl);
+    const baseUrl = normalizeBaseUrl(provider === 'local_qwen'
+      ? definition.baseUrl
+      : value.baseUrl || saved.baseUrl || definition.baseUrl);
     if (definition.requiresKey && !apiKey) throw validation('API key is required to read the model list.');
     if (!suppliedApiKey && saved.apiKey && saved.baseUrl && baseUrl !== normalizeBaseUrl(saved.baseUrl)) {
       throw validation('Enter the API key again after changing the Base URL.');
@@ -268,8 +282,13 @@ function normalizeWireApi(value) {
   throw validation('Wire API must be responses or chat_completions.');
 }
 
-function sanitizeConfiguration(provider, value) {
-  const definition = PROVIDERS[provider];
+export function localModelOpenAiBaseUrl(endpoint = DEFAULT_LOCAL_MODEL_ENDPOINT) {
+  const baseUrl = normalizeBaseUrl(endpoint);
+  return `${baseUrl.replace(/\/v1$/iu, '')}/v1`;
+}
+
+function sanitizeConfiguration(provider, value, definitions = PROVIDERS) {
+  const definition = definitions[provider];
   return {
     provider,
     apiKey: String(value.apiKey || '').trim(),

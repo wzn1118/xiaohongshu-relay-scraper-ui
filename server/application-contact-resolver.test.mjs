@@ -7,6 +7,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import {
   enrichApplicationRecordContacts,
   resolveApplicationContacts,
+  resolveApplicationContactsBatch,
 } from './lib/application-contact-resolver.mjs';
 
 async function fixtureDir(t) {
@@ -58,6 +59,35 @@ test('a verified body email wins without reading comment artifacts', async (t) =
   assert.equal(result.selectedCandidate.confidence, 98);
   assert.equal(result.selectedCandidate.collectionStatus, 'complete');
   assert.match(result.selectedCandidate.evidenceHash, /^[a-f0-9]{64}$/u);
+});
+
+test('an all-body-email batch skips the comment artifact entirely', async (t) => {
+  const outputDir = await fixtureDir(t);
+  await writeFile(path.join(outputDir, 'audience-comments.json'), '{invalid', 'utf8');
+  const records = ['first@example.com', 'second@example.com'].map((address, index) => ({
+    ...applicationRecord({
+      contacts: [{
+        type: 'email',
+        value: address,
+        evidence: `Apply at ${address}`,
+        source_field: 'body',
+        verification_status: 'body_verified',
+        confidence: 98,
+        actionable: true,
+      }],
+    }),
+    note_id: `post-${index + 1}`,
+    note_url: `https://www.xiaohongshu.com/explore/post-${index + 1}`,
+  }));
+
+  const results = await resolveApplicationContactsBatch(records, { outputDir });
+
+  assert.deepEqual(results.map((result) => result.status), ['ready', 'ready']);
+  assert.deepEqual(results.map((result) => result.selectedCandidate.address), [
+    'first@example.com',
+    'second@example.com',
+  ]);
+  assert.deepEqual(results.map((result) => result.commentFallbackUsed), [false, false]);
 });
 
 test('an actionable image route is retained as an image candidate', async () => {
@@ -381,4 +411,41 @@ test('invalid audience JSON fails closed instead of reporting no_email', async (
   assert.equal(result.reason, 'audience_artifact_invalid');
   assert.equal(result.issues[0].code, 'AUDIENCE_ARTIFACT_INVALID');
   assert.equal(result.issues[0].artifact, 'audience-comments.json');
+});
+
+test('batch resolution reuses one audience snapshot while preserving exact post matching', async (t) => {
+  const outputDir = await fixtureDir(t);
+  await writeAudience(outputDir, {
+    posts: [
+      { post_id: 'post-1', status: 'complete', author: { user_id: 'author-1' } },
+      { post_id: 'post-2', status: 'partial', author: { user_id: 'author-2' } },
+    ],
+    comments: [
+      {
+        comment_id: 'comment-1',
+        post_id: 'post-1',
+        text: '简历投递 first@example.com',
+        user: { user_id: 'author-1' },
+      },
+      {
+        comment_id: 'comment-2',
+        post_id: 'post-2',
+        text: '仍在招聘，邮箱 second@example.com',
+        user: { user_id: 'author-2' },
+      },
+    ],
+  });
+
+  const records = [
+    applicationRecord(),
+    { ...applicationRecord(), note_id: 'post-2', note_url: 'https://www.xiaohongshu.com/explore/post-2' },
+  ];
+  const results = await resolveApplicationContactsBatch(records, { outputDir });
+
+  assert.deepEqual(results.map((result) => result.candidates[0].address), [
+    'first@example.com',
+    'second@example.com',
+  ]);
+  assert.deepEqual(results.map((result) => result.candidates[0].commentId), ['comment-1', 'comment-2']);
+  assert.deepEqual(results.map((result) => result.collectionStatus), ['complete', 'partial']);
 });

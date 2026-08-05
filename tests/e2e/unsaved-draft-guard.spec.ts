@@ -19,6 +19,8 @@ const baseDraft = {
   cover_letter: '这是一封基于岗位事实生成的测试 Cover Letter。',
 }
 
+const rewrittenCoverLetter = `${'我申请岗位 A1，并针对分析业务数据和熟悉 SQL 两项要求说明匹配经历。'.repeat(24)}感谢招聘团队审阅。`
+
 function job(id: string, keyword: string, status: 'completed' | 'failed' = 'completed') {
   const now = '2026-08-01T08:00:00.000Z'
   return {
@@ -222,9 +224,24 @@ type DraftRequest = {
   applicationContext: QualityRequest['applicationContext']
 }
 
+type CoverLetterRewriteRequest = {
+  noteId: string
+  aiSessionId: string
+  instructions: string
+  outreach: typeof baseDraft
+  applicationContext: QualityRequest['applicationContext']
+  draftId: string
+  baseVersion: number
+}
+
 type ApiState = {
+  aiSessionRequests: number
   draftRequests: number
   draftPayloads: DraftRequest[]
+  rewriteRequests: number
+  rewritePayloads: CoverLetterRewriteRequest[]
+  rewriteCoverLetter: string
+  localModelReady: boolean
   saveDelayMs: number
   saveFails: boolean
   qualityFails: boolean
@@ -274,8 +291,13 @@ function readMultipartUpload(request: Request): AttachmentUploadRequest {
 
 async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
   const state: ApiState = {
+    aiSessionRequests: 0,
     draftRequests: 0,
     draftPayloads: [],
+    rewriteRequests: 0,
+    rewritePayloads: [],
+    rewriteCoverLetter: rewrittenCoverLetter,
+    localModelReady: false,
     saveDelayMs: 0,
     saveFails: false,
     qualityFails: false,
@@ -322,9 +344,23 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     if (path === '/api/relay/config') return fulfillJson(route, { port: 18800, profile: 'openclaw', autoConnect: true })
     if (path === '/api/relay/status') return fulfillJson(route, { running: true, cdpReady: true, ready: true, authenticated: true, tabs: 1, xiaohongshuTabs: 1, port: 18800, profile: 'openclaw' })
     if (path === '/api/email/config') return fulfillJson(route, { provider: 'custom', host: state.emailConfigured ? 'smtp.example.test' : '', port: 465, secure: true, requireTls: false, auth: 'login', authMode: 'login', user: state.emailConfigured ? 'sender@example.test' : '', from: state.emailConfigured ? 'sender@example.test' : '', hasPassword: state.emailConfigured, oauth: { tenant: '', clientId: '', scope: '', hasClientSecret: false, hasRefreshToken: false }, configured: state.emailConfigured, verified: state.emailConfigured, maskedFrom: state.emailConfigured ? 's***@example.test' : '' })
-    if (path === '/api/ai/providers') return fulfillJson(route, [{ id: 'codex', label: 'Codex', baseUrl: 'http://127.0.0.1', model: 'test-model', models: ['test-model'], requiresKey: false, wireApi: 'responses', configured: true, hasApiKey: true }])
-    if (path === '/api/ai/local-models') return fulfillJson(route, { runtime: { ready: false, endpoint: '', message: 'not used' }, catalog: [], installedModels: [], install: null, fetchedAt: '2026-08-01T08:00:00.000Z' })
-    if (path === '/api/ai/sessions' && method === 'POST') return fulfillJson(route, { id: 'session-1', provider: 'codex', model: 'test-model', baseUrl: 'http://127.0.0.1', wireApi: 'responses', configured: true, expiresAt: '2026-08-02T08:00:00.000Z' })
+    if (path === '/api/ai/providers') return fulfillJson(route, [
+      { id: 'codex', label: 'Codex', baseUrl: 'http://127.0.0.1', model: 'test-model', models: ['test-model'], requiresKey: false, wireApi: 'responses', configured: true, hasApiKey: true },
+      ...(state.localModelReady ? [{ id: 'local_qwen', label: '本地免费模型库', baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen3.5:4b', models: ['qwen3.5:4b'], requiresKey: false, wireApi: 'chat_completions', configured: true, hasApiKey: false, local: true, free: true }] : []),
+    ])
+    if (path === '/api/ai/local-models') return fulfillJson(route, state.localModelReady
+      ? { runtime: { ready: true, endpoint: 'http://127.0.0.1:11434', version: '0.11.0', message: 'ready' }, catalog: [{ id: 'qwen3.5:4b', label: 'Qwen3.5 4B', description: 'fixture', downloadBytes: 1, family: 'Qwen3.5', tier: '均衡', recommended: true, custom: false, installed: true }], installedModels: [{ name: 'qwen3.5:4b', size: 1 }], install: null, fetchedAt: '2026-08-01T08:00:00.000Z' }
+      : { runtime: { ready: false, endpoint: '', message: 'not used' }, catalog: [], installedModels: [], install: null, fetchedAt: '2026-08-01T08:00:00.000Z' })
+    if (path === '/api/ai/models' && method === 'POST') {
+      const payload = request.postDataJSON() as { provider: string; baseUrl: string }
+      return fulfillJson(route, { provider: payload.provider, baseUrl: payload.baseUrl, models: ['qwen3.5:4b'], fetchedAt: '2026-08-01T08:00:00.000Z' })
+    }
+    if (path === '/api/ai/sessions' && method === 'POST') {
+      state.aiSessionRequests += 1
+      const payload = request.postDataJSON() as { provider: string; model: string; baseUrl: string; wireApi: 'responses' | 'chat_completions' }
+      const local = payload.provider === 'local_qwen'
+      return fulfillJson(route, { id: local ? 'session-local' : 'session-1', provider: payload.provider, model: payload.model, baseUrl: payload.baseUrl, wireApi: payload.wireApi, configured: true, expiresAt: '2026-08-02T08:00:00.000Z' })
+    }
     if (path === '/api/profiles') return fulfillJson(route, [
       { id: 'profile-a', display_name: '档案甲', summary: '测试档案甲', skills: ['SQL'], sourceFiles: ['resume.pdf'], updatedAt: '2026-08-01T08:00:00.000Z', candidate_application: candidateProfile },
       { id: 'profile-b', display_name: '档案乙', summary: '测试档案乙', skills: ['Python'], sourceFiles: ['resume-b.pdf'], updatedAt: '2026-08-01T08:00:00.000Z', candidate_application: candidateProfile },
@@ -502,6 +538,39 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     if (/^\/api\/jobs\/[^/]+\/complete-missing$/.test(path) && method === 'POST') {
       return fulfillJson(route, { action: 'started', sourceJobId: 'job-a', incompleteBefore: 1, job: { ...jobs[0], status: 'resuming' }, message: 'started' })
     }
+    if (/^\/api\/jobs\/[^/]+\/draft\/rewrite$/.test(path) && method === 'POST') {
+      state.rewriteRequests += 1
+      const payload = request.postDataJSON() as CoverLetterRewriteRequest
+      state.rewritePayloads.push(payload)
+      const outreach = { ...payload.outreach, cover_letter: state.rewriteCoverLetter }
+      const contentHash = draftContentHash(outreach)
+      savedDrafts.set(payload.noteId, { contentHash, version: payload.baseVersion + 1 })
+      return fulfillJson(route, {
+        noteId: payload.noteId,
+        outreach,
+        draftVersion: {
+          draftId: payload.draftId,
+          version: payload.baseVersion + 1,
+          contentHash,
+          qualityStatus: 'stale',
+          qualityCheckedVersion: null,
+          qualityCheckedHash: null,
+          createdAt: '2026-08-01T08:00:00.000Z',
+          updatedAt: '2026-08-01T08:01:30.000Z',
+        },
+        delivery: null,
+        generation: {
+          provider: payload.aiSessionId === 'session-local' ? 'local_qwen' : 'codex',
+          model: payload.aiSessionId === 'session-local' ? 'qwen3.5:4b' : 'test-model',
+          wireApi: payload.aiSessionId === 'session-local' ? 'chat_completions' : 'responses',
+          strategy: payload.aiSessionId === 'session-local' ? 'local_plan_write_review' : 'direct_model_rewrite',
+          modelCalls: payload.aiSessionId === 'session-local' ? 3 : 1,
+          reviewScore: payload.aiSessionId === 'session-local' ? 94 : null,
+          requestId: 'rewrite-request-1',
+          generatedAt: '2026-08-01T08:01:30.000Z',
+        },
+      })
+    }
     if (/^\/api\/jobs\/[^/]+\/draft\/quality$/.test(path) && method === 'POST') {
       if (state.qualityFails) return fulfillJson(route, { error: 'mock quality check failed' }, 500)
       const payload = request.postDataJSON() as QualityRequest
@@ -603,6 +672,64 @@ test('统一 Guard 覆盖岗位、任务、恢复、新任务、重新生成、P
   await page.getByLabel('Cover Letter').fill(`${baseDraft.cover_letter} 修改`)
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
   await expectGuard(page, '切换岗位')
+})
+
+test('Cover Letter 自定义要求和高级模型会话进入重写 API 并回写新版本', async ({ page }) => {
+  const state = await mockApi(page)
+  await expect.poll(() => state.aiSessionRequests).toBe(1)
+  await page.getByRole('button', { name: 'AI 重写求职信' }).click()
+  await page.getByLabel('Cover Letter 重写要求').fill('突出 SQL 项目，并逐项回应岗位职责，语气自然。')
+  await page.getByRole('button', { name: '立即重写' }).click()
+
+  await expect(page.getByRole('textbox', { name: 'Cover Letter', exact: true })).toHaveValue(rewrittenCoverLetter)
+  await expect(page.getByText(/已由 codex \/ test-model 完成专属重写/)).toBeVisible()
+  await expect(page.getByRole('button', { name: '重新质量检查' })).toBeVisible()
+  expect(state.rewriteRequests).toBe(1)
+  expect(state.rewritePayloads).toEqual([{
+    noteId: 'job-a-note-1',
+    aiSessionId: 'session-1',
+    instructions: '突出 SQL 项目，并逐项回应岗位职责，语气自然。',
+    outreach: baseDraft,
+    applicationContext: {
+      channel: 'email',
+      contactStage: 'first_contact',
+      tone: 'natural',
+      resumeAttached: false,
+      coverLetterAttached: false,
+      recipientType: 'recruiter',
+    },
+    draftId: 'draft-job-a-note-1',
+    baseVersion: 1,
+  }])
+})
+
+test('Cover Letter 本地模式创建本地会话并将真实模型送入重写 API', async ({ page }) => {
+  const state = await mockApi(page, { localModelReady: true })
+  await expect.poll(() => state.aiSessionRequests).toBe(1)
+  await page.getByRole('button', { name: 'AI 重写求职信' }).click()
+  await page.getByRole('button', { name: '本地模型', exact: true }).click()
+  await expect(page.getByLabel('Cover Letter 本地模型')).toHaveValue('qwen3.5:4b')
+  await page.getByLabel('Cover Letter 重写要求').fill('优先突出用户反馈与数据复盘。')
+  await page.getByRole('button', { name: '立即重写' }).click()
+
+  await expect(page.getByRole('textbox', { name: 'Cover Letter', exact: true })).toHaveValue(rewrittenCoverLetter)
+  await expect(page.getByText(/local_qwen \/ qwen3.5:4b 完成专属重写/)).toBeVisible()
+  await expect(page.getByText(/本地模型完成 3 次规划\/写作\/终审，终审 94 分/)).toBeVisible()
+  expect(state.aiSessionRequests).toBe(2)
+  expect(state.rewritePayloads[0].aiSessionId).toBe('session-local')
+  expect(state.rewritePayloads[0].instructions).toBe('优先突出用户反馈与数据复盘。')
+})
+
+test('Cover Letter 重写拒绝不足 800 个非空白字符的异常响应并保留当前稿', async ({ page }) => {
+  const state = await mockApi(page, { rewriteCoverLetter: '过短的异常模型响应。' })
+  await page.getByRole('button', { name: 'AI 重写求职信' }).click()
+  await page.getByRole('button', { name: '立即重写' }).click()
+
+  await expect(page.getByRole('textbox', { name: 'Cover Letter', exact: true })).toHaveValue(baseDraft.cover_letter)
+  const rewriteForm = page.getByRole('form', { name: 'Cover Letter AI 重写' })
+  await expect(rewriteForm.getByRole('alert')).toContainText('未达到 800 字最低要求')
+  await expect(rewriteForm).toBeVisible()
+  expect(state.rewriteRequests).toBe(1)
 })
 
 test('取消、放弃和保存并继续分别保留、回滚和持久化草稿', async ({ page }) => {

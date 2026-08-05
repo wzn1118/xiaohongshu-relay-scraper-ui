@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { buildApplicationAttachmentRule } from './lib/application-attachment-rule.mjs';
-import { resolveApplicationContacts } from './lib/application-contact-resolver.mjs';
+import { applicationRoleTitle, applicationSubjectGuard, applicationSubjectRule } from './lib/application-email-draft.mjs';
+import { applicationContactSourceRevision, resolveApplicationContacts } from './lib/application-contact-resolver.mjs';
 
 const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const IDEMPOTENCY_KEY = /^[\p{L}\p{N}_.:-]{8,160}$/u;
@@ -9,6 +10,9 @@ const DEFAULT_MAX_BATCH_SIZE = 10;
 const MAX_BATCH_SIZE = 100;
 const DEFAULT_MIN_INTERVAL_MS = 1_000;
 const MAX_MIN_INTERVAL_MS = 60_000;
+const PREFLIGHT_PLAN_TTL_MS = 30 * 60_000;
+const PREFLIGHT_ID = /^[a-f0-9-]{36}$/u;
+const MANIFEST_HASH = /^[a-f0-9]{64}$/u;
 const RETRYABLE_CODES = new Set([
   'EMAIL_PREVIEW_STALE',
   'SMTP_NOT_CONFIGURED',
@@ -43,7 +47,6 @@ export class ApplicationBatchService {
     maxBatchSize = DEFAULT_MAX_BATCH_SIZE,
     loadRecord,
     listAttachments,
-    renameAttachment,
     checkQuality,
     previewEmail,
     sendEmail,
@@ -52,7 +55,7 @@ export class ApplicationBatchService {
     sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   }) {
     if (!manager) throw batchServiceError('APPLICATION_BATCH_MANAGER_REQUIRED', 'Application batch manager is required.', 500);
-    for (const [name, callback] of Object.entries({ loadRecord, listAttachments, renameAttachment, checkQuality, previewEmail, sendEmail })) {
+    for (const [name, callback] of Object.entries({ loadRecord, listAttachments, checkQuality, previewEmail, sendEmail })) {
       if (typeof callback !== 'function') {
         throw batchServiceError('APPLICATION_BATCH_CALLBACK_REQUIRED', `Application batch callback ${name} is required.`, 500);
       }
@@ -65,7 +68,6 @@ export class ApplicationBatchService {
     this.maxBatchSize = boundedInteger(maxBatchSize, 1, MAX_BATCH_SIZE, DEFAULT_MAX_BATCH_SIZE);
     this.loadRecord = loadRecord;
     this.listAttachments = listAttachments;
-    this.renameAttachment = renameAttachment;
     this.checkQuality = checkQuality;
     this.previewEmail = previewEmail;
     this.sendEmail = sendEmail;
@@ -76,21 +78,47 @@ export class ApplicationBatchService {
     this.now = now;
     this.sleep = sleep;
     this.runners = new Map();
+    this.preflightPlans = new Map();
   }
 
   async dryRun(value = {}) {
-    const batchId = randomUUID();
-    const prepared = await this.#prepare(value, { batchId, applyChanges: false });
+    const preflightId = randomUUID();
+    const prepared = await this.#prepare(value, { batchId: preflightId, applyChanges: false });
+    const deliveryManifest = buildDeliveryManifest(this.jobId, prepared.items);
+    const manifestHash = hashJson(deliveryManifest);
+    const generatedAt = isoNow(this.now);
+    const expiresAt = new Date(epochNow(this.now) + PREFLIGHT_PLAN_TTL_MS).toISOString();
+    this.#rememberPreflightPlan(preflightId, manifestHash, prepared.readyNoteIds, value);
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       dryRun: true,
-      generatedAt: isoNow(this.now),
+      generatedAt,
+      expiresAt,
       maxBatchSize: this.maxBatchSize,
       ...prepared,
+      planId: preflightId,
+      preflightId,
+      manifestHash,
+      deliveryManifest,
     };
   }
 
   async createBatch(value = {}) {
+    const preflightId = optionalPreflightId(value.preflightId ?? value.planId);
+    const requestedManifestHash = optionalManifestHash(value.manifestHash);
+    if (!preflightId && !requestedManifestHash) {
+      throw batchServiceError(
+        'APPLICATION_BATCH_PREFLIGHT_REQUIRED',
+        'Run Dry Run and confirm its delivery manifest before freezing a new batch.',
+      );
+    }
+    if (Boolean(preflightId) !== Boolean(requestedManifestHash)) {
+      throw batchServiceError(
+        'APPLICATION_BATCH_PREFLIGHT_REFERENCE_INVALID',
+        'preflightId and manifestHash must be supplied together.',
+      );
+    }
+    const confirmedNoteIds = normalizedConfirmedNoteIds(value.confirmedNoteIds, this.maxBatchSize);
     const createIdentity = normalizedCreateIdentity(value, this.maxBatchSize);
     const createIdempotencyKey = optionalIdempotencyKey(value.idempotencyKey);
     const createRequestHash = hashJson(createIdentity);
@@ -101,7 +129,30 @@ export class ApplicationBatchService {
       const replay = await this.#idempotentReplay(batchId, createIdempotencyKey, createRequestHash);
       if (replay) return replay;
     }
+    const preflightPlan = this.#requirePreflightPlan(preflightId, value, confirmedNoteIds);
     const prepared = await this.#prepare(value, { batchId, applyChanges: true });
+    const deliveryManifest = buildDeliveryManifest(this.jobId, prepared.items);
+    const manifestHash = hashJson(deliveryManifest);
+    if (
+      preflightPlan
+      && (
+        requestedManifestHash !== preflightPlan.manifestHash
+        || manifestHash !== preflightPlan.manifestHash
+      )
+    ) {
+      throw batchServiceError(
+        'APPLICATION_BATCH_PREFLIGHT_STALE',
+        'The delivery preview changed after Dry Run. Review the current manifest before freezing the batch.',
+        409,
+        {
+          ...prepared,
+          preflightId,
+          requestedManifestHash,
+          manifestHash,
+          deliveryManifest,
+        },
+      );
+    }
     const readyItems = prepared.items.filter((item) => item.status === 'ready');
     if (!readyItems.length) {
       throw batchServiceError(
@@ -112,12 +163,26 @@ export class ApplicationBatchService {
       );
     }
     const readyIds = new Set(readyItems.map((item) => item.noteId));
+    const deliveryPlanId = preflightId || batchId;
     const items = prepared.items.map((item) => ({
       itemId: item.noteId,
       noteId: item.noteId,
       contactCandidateId: item.contact?.evidenceHash || null,
       status: readyIds.has(item.noteId) ? 'ready' : 'skipped',
-      payload: item.payload || preflightPayload(item),
+      payload: item.payload ? {
+        ...item.payload,
+        deliveryPlanId,
+        manifestHash,
+        sendRequest: {
+          ...item.payload.sendRequest,
+          deliveryPlanId,
+          manifestHash,
+          recipientEvidenceHash: item.payload.recipientEvidence?.evidenceHash || '',
+          recipientSourceRevision: item.payload.sourceRevision || '',
+          bodyHash: item.payload.bodyHash,
+          coverLetterHash: item.payload.coverLetterHash,
+        },
+      } : preflightPayload(item),
       error: readyIds.has(item.noteId) ? null : {
         code: item.blockers[0]?.code || 'APPLICATION_BATCH_ITEM_EXCLUDED',
         message: item.blockers[0]?.message || 'The item was excluded by preflight.',
@@ -136,6 +201,11 @@ export class ApplicationBatchService {
         readyCount: readyItems.length,
         excludedCount: prepared.items.length - readyItems.length,
         preflightHash: hashJson(prepared.items.map(preflightPayload)),
+        deliveryPlanId,
+        preflightId,
+        manifestHash,
+        confirmedNoteIds,
+        preflightValidated: true,
         ...(createIdempotencyKey ? {
           createIdempotencyKey,
           createRequestHash,
@@ -156,7 +226,19 @@ export class ApplicationBatchService {
       }
       throw error;
     }
-    return { schemaVersion: 1, batch, preflight: prepared };
+    return {
+      schemaVersion: 2,
+      batch,
+      preflight: {
+        ...prepared,
+        planId: deliveryPlanId,
+        preflightId,
+        manifestHash,
+        confirmedNoteIds,
+        deliveryManifest,
+        preflightValidated: true,
+      },
+    };
   }
 
   async reconcileItem(batchId, itemId, value = {}) {
@@ -280,11 +362,56 @@ export class ApplicationBatchService {
       );
     }
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       batch: existing,
       preflight: null,
       idempotentReplay: true,
     };
+  }
+
+  #rememberPreflightPlan(preflightId, manifestHash, readyNoteIds, value) {
+    const now = epochNow(this.now);
+    for (const [candidateId, plan] of this.preflightPlans.entries()) {
+      if (plan.expiresAt <= now) this.preflightPlans.delete(candidateId);
+    }
+    this.preflightPlans.set(preflightId, {
+      manifestHash,
+      readyNoteIds: [...readyNoteIds],
+      defaultAttachmentTemplate: normalizedText(value?.defaultAttachmentTemplate, 240),
+      expiresAt: now + PREFLIGHT_PLAN_TTL_MS,
+    });
+  }
+
+  #requirePreflightPlan(preflightId, value, confirmedNoteIds) {
+    const plan = this.preflightPlans.get(preflightId);
+    if (!plan || plan.expiresAt <= epochNow(this.now)) {
+      this.preflightPlans.delete(preflightId);
+      throw batchServiceError(
+        'APPLICATION_BATCH_PREFLIGHT_EXPIRED',
+        'The Dry Run plan is unavailable or expired. Run Dry Run again before freezing the batch.',
+        409,
+      );
+    }
+    const selectedNoteIds = normalizedNoteIds(value?.noteIds, this.maxBatchSize);
+    const defaultAttachmentTemplate = normalizedText(value?.defaultAttachmentTemplate, 240);
+    if (
+      !sameOrderedStrings(selectedNoteIds, plan.readyNoteIds)
+      || !sameStringSet(confirmedNoteIds, plan.readyNoteIds)
+      || defaultAttachmentTemplate !== plan.defaultAttachmentTemplate
+    ) {
+      throw batchServiceError(
+        'APPLICATION_BATCH_PREFLIGHT_STALE',
+        'The selected rows or attachment naming rule changed after Dry Run.',
+        409,
+        {
+          preflightId,
+          expectedNoteIds: plan.readyNoteIds,
+          selectedNoteIds,
+          confirmedNoteIds,
+        },
+      );
+    }
+    return plan;
   }
 
   async #prepare(value, { batchId, applyChanges }) {
@@ -317,7 +444,7 @@ export class ApplicationBatchService {
     } catch (error) {
       return blockedItem(noteId, 'draft_pending', 'APPLICATION_RECORD_UNAVAILABLE', publicErrorMessage(error));
     }
-    const roleName = String(record?.job_card?.role_name || record?.job_card?.title || record?.title || '未命名岗位').trim();
+    const roleName = applicationRoleTitle(record, this.candidateProfile) || '未命名岗位';
     const contactResolution = await resolveApplicationContacts(record, {
       outputDir: this.outputDir,
       fallbackOutputDirs: this.fallbackOutputDirs,
@@ -333,8 +460,21 @@ export class ApplicationBatchService {
       };
     }
 
-    let attachmentList = await this.listAttachments(noteId);
-    let selected = selectedReadyAttachments(attachmentList);
+    const subjectGuard = applicationSubjectGuard(record, record?.outreach?.email_subject);
+    if (subjectGuard.requiresReview || ['rejected_noisy_title', 'rejected_bare_title', 'rejected_unverified_subject'].includes(subjectGuard.sourceStatus)) {
+      return {
+        ...blockedItem(noteId, 'subject_pending', 'APPLICATION_SUBJECT_TITLE_REVIEW_REQUIRED', subjectGuard.rawTitle
+          ? '原帖标题是招聘口号，已排除出邮件主题；请先补全准确岗位名并重新生成主题。'
+          : '邮件主题缺少可识别的岗位名；请先补全准确岗位名并重新生成主题。'),
+        title: String(record?.title || roleName),
+        roleName,
+        contact,
+        contactResolution,
+      };
+    }
+
+    const attachmentList = await this.listAttachments(noteId);
+    const selected = selectedReadyAttachments(attachmentList);
     if (!selected.length) {
       return {
         ...blockedItem(noteId, 'filename_pending', 'APPLICATION_ATTACHMENT_REQUIRED', '该岗位没有已选择且校验通过的附件。'),
@@ -377,45 +517,33 @@ export class ApplicationBatchService {
         attachments: attachmentPreviews(planned),
       };
     }
-    const renameRequired = planned.some(({ attachment, rule }) => attachment.displayName !== rule.displayName);
-    if (!applyChanges && renameRequired) {
+    const attachmentFilenameOverrides = Object.fromEntries(planned.map(({ attachment, rule }) => [
+      attachment.attachmentId,
+      rule.displayName,
+    ]));
+    // Source files stay immutable; final names are applied only to preview and MIME attachments.
+
+    const attachmentIds = selected.map((attachment) => attachment.attachmentId);
+    if (!String(record?.outreach?.cover_letter || '').trim()) {
       return {
-        ...blockedItem(noteId, 'filename_pending', 'APPLICATION_ATTACHMENT_RENAME_PENDING', '冻结批次时将应用确定性的附件发送名，并使旧预览与旧审批失效。', true),
+        ...blockedItem(noteId, 'draft_pending', 'APPLICATION_COVER_LETTER_REQUIRED', 'The application is missing a Cover Letter and cannot be frozen.'),
         title: String(record?.title || roleName),
         roleName,
         contact,
         contactResolution,
-        attachments: attachmentPreviews(planned),
+        attachments: attachmentPreviewsFromSelected(selected, planned),
       };
     }
-    if (applyChanges && renameRequired) {
-      try {
-        for (const { attachment, rule } of planned) {
-          if (attachment.displayName === rule.displayName) continue;
-          await this.renameAttachment(attachment.attachmentId, rule.displayName);
-        }
-      } catch (error) {
-        const originalNames = new Map(planned.map(({ attachment }) => [attachment.attachmentId, attachment.displayName]));
-        try {
-          const currentAttachments = await this.listAttachments(noteId);
-          for (const attachment of selectedReadyAttachments(currentAttachments)) {
-            const originalName = originalNames.get(attachment.attachmentId);
-            if (originalName && attachment.displayName !== originalName) {
-              await this.renameAttachment(attachment.attachmentId, originalName);
-            }
-          }
-        } catch (rollbackError) {
-          error.rollbackCode = String(rollbackError?.code || 'APPLICATION_ATTACHMENT_RENAME_ROLLBACK_FAILED');
-          error.rollbackMessage = publicErrorMessage(rollbackError);
-        }
-        throw error;
-      }
-      attachmentList = await this.listAttachments(noteId);
-      selected = selectedReadyAttachments(attachmentList);
-      record = await this.loadRecord(noteId);
+    if (record?.outreach?.content_quality?.batch_ready === false) {
+      return {
+        ...blockedItem(noteId, 'copy_quality_failed', 'APPLICATION_COPY_QUALITY_FAILED', '个性化申请文案未通过长度、岗位映射或 AI 产品机制门禁。'),
+        title: String(record?.title || roleName),
+        roleName,
+        contact,
+        contactResolution,
+        attachments: attachmentPreviewsFromSelected(selected, planned),
+      };
     }
-
-    const attachmentIds = selected.map((attachment) => attachment.attachmentId);
     if (!hasUsableDraft(record)) {
       return {
         ...blockedItem(noteId, 'draft_pending', 'APPLICATION_DRAFT_REQUIRED', '该岗位缺少可发送的个性化邮件主题或正文。'),
@@ -458,8 +586,10 @@ export class ApplicationBatchService {
         noteId,
         to: contact.address,
         attachmentIds,
+        attachmentFilenameOverrides,
         draftId: record.draftVersion?.draftId,
         version: record.draftVersion?.version,
+        persist: applyChanges,
       }, [contact.address]);
     } catch (error) {
       return {
@@ -479,11 +609,14 @@ export class ApplicationBatchService {
         roleName,
         contact,
         contactResolution,
-        attachments: attachmentPreviewsFromPreview(preview, selected),
+        attachments: attachmentPreviewsFromPreview(preview, selected, planned),
         preview: publicPreview(preview),
       };
     }
     const idempotencyKey = `${batchId}:${noteId}:${preview.previewRevision}`.slice(0, 200);
+    const coverLetter = String(record?.outreach?.cover_letter || '');
+    const resolvedSubjectRule = applicationSubjectRule(record);
+    const sourceRevision = applicationContactSourceRevision(contact);
     const payload = {
       title: String(record?.title || roleName),
       roleName,
@@ -492,6 +625,9 @@ export class ApplicationBatchService {
       subject: preview.subject,
       body: preview.text,
       bodyHash: sha256(preview.text),
+      coverLetter,
+      coverLetterHash: sha256(coverLetter),
+      coverLetterVersion: Number(preview.draftVersion || record?.draftVersion?.version || 0),
       draftId: preview.draftId,
       draftVersion: preview.draftVersion,
       contentHash: String(preview.quality?.contentHash || record?.draftVersion?.contentHash || ''),
@@ -499,6 +635,26 @@ export class ApplicationBatchService {
       attachmentBundleHash: preview.attachmentBundleHash,
       attachments: preview.attachmentSummary.attachments,
       finalFilenames: preview.attachmentSummary.attachments.map((item) => item.filename),
+      subjectRule: {
+        ...resolvedSubjectRule,
+        source: resolvedSubjectRule.detected ? 'post_requirement' : 'generated_default',
+      },
+      attachmentRules: planned.map(({ attachment, rule }) => ({
+        attachmentId: attachment.attachmentId,
+        source: rule.detected ? 'post_requirement' : 'batch_default',
+        template: rule.template,
+        evidence: rule.evidence,
+        fields: rule.fields,
+        finalDisplayName: rule.displayName,
+      })),
+      recipientEvidence: {
+        evidenceHash: String(contact.evidenceHash || ''),
+        source: String(contact.source || ''),
+        sourceRevision,
+        collectionStatus: String(contact.collectionStatus || ''),
+        verificationStatus: String(contact.verificationStatus || ''),
+      },
+      sourceRevision,
       previewRevision: preview.previewRevision,
       smtpConfigurationRevision: Number(preview.smtpConfigurationRevision || 0),
       smtpConfigurationFingerprint: String(preview.smtpConfigurationFingerprint || ''),
@@ -506,6 +662,7 @@ export class ApplicationBatchService {
         noteId,
         to: preview.recipient,
         attachmentIds: preview.attachmentSummary.attachments.map((item) => item.attachmentId),
+        attachmentFilenameOverrides,
         attachmentBundleHash: preview.attachmentBundleHash,
         previewRevision: preview.previewRevision,
         idempotencyKey,
@@ -522,7 +679,7 @@ export class ApplicationBatchService {
       blockers: [],
       contact: publicContact(contact),
       contactResolution,
-      attachments: attachmentPreviewsFromPreview(preview, selected),
+      attachments: attachmentPreviewsFromPreview(preview, selected, planned),
       preview: publicPreview(preview),
       payload,
     };
@@ -534,6 +691,71 @@ export class ApplicationBatchService {
       .then(() => this.#run(batchId))
       .finally(() => this.runners.delete(batchId));
     this.runners.set(batchId, runner);
+  }
+
+  async #assertFrozenDelivery(batch, payload) {
+    const manifestHash = String(payload?.manifestHash || '');
+    if (!manifestHash) return;
+
+    const request = payload?.sendRequest || {};
+    const attachmentIds = Array.isArray(request.attachmentIds) ? request.attachmentIds.map(String) : [];
+    const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+    const filenameOverrides = request.attachmentFilenameOverrides && typeof request.attachmentFilenameOverrides === 'object'
+      ? request.attachmentFilenameOverrides
+      : {};
+    const finalFilenames = attachments.map((attachment) => String(attachment.filename || ''));
+    const contractMatches = (
+      manifestHash === String(batch?.metadata?.manifestHash || '')
+      && manifestHash === String(request.manifestHash || '')
+      && String(request.deliveryPlanId || '') === String(payload.deliveryPlanId || '')
+      && String(request.noteId || '') === String(payload.contact?.noteId || request.noteId || '')
+      && String(request.to || '').toLocaleLowerCase('en-US') === String(payload.recipient || '').toLocaleLowerCase('en-US')
+      && String(request.recipientEvidenceHash || '') === String(payload.recipientEvidence?.evidenceHash || '')
+      && String(request.recipientSourceRevision || '') === String(payload.sourceRevision || '')
+      && String(request.bodyHash || '') === String(payload.bodyHash || '')
+      && String(request.coverLetterHash || '') === String(payload.coverLetterHash || '')
+      && sha256(payload.body) === String(payload.bodyHash || '')
+      && sha256(payload.coverLetter) === String(payload.coverLetterHash || '')
+      && sameOrderedStrings(attachmentIds, attachments.map((attachment) => String(attachment.attachmentId || '')))
+      && sameOrderedStrings(finalFilenames, (Array.isArray(payload.finalFilenames) ? payload.finalFilenames : []).map(String))
+      && attachments.every((attachment) => (
+        String(filenameOverrides[attachment.attachmentId] || '') === String(attachment.filename || '')
+      ))
+    );
+    if (!contractMatches) {
+      throw knownNotSentError(
+        'APPLICATION_BATCH_MANIFEST_STALE',
+        'The frozen delivery manifest no longer matches the queued email. Run Dry Run and freeze a new batch.',
+      );
+    }
+
+    let record;
+    try {
+      record = await this.loadRecord(request.noteId);
+    } catch {
+      throw knownNotSentError(
+        'APPLICATION_BATCH_RECIPIENT_STALE',
+        'The recipient source is unavailable. Run Dry Run again before sending.',
+      );
+    }
+    const resolution = await resolveApplicationContacts(record, {
+      outputDir: this.outputDir,
+      fallbackOutputDirs: this.fallbackOutputDirs,
+    });
+    const recipient = String(payload.recipient || '').toLocaleLowerCase('en-US');
+    const frozenEvidenceHash = String(payload.recipientEvidence?.evidenceHash || '');
+    const frozenSourceRevision = String(payload.sourceRevision || '');
+    const currentContact = resolution.candidates?.find((candidate) => (
+      String(candidate.address || '').toLocaleLowerCase('en-US') === recipient
+      && String(candidate.evidenceHash || '') === frozenEvidenceHash
+      && applicationContactSourceRevision(candidate) === frozenSourceRevision
+    ));
+    if (!currentContact) {
+      throw knownNotSentError(
+        'APPLICATION_BATCH_RECIPIENT_STALE',
+        'The frozen recipient or its source evidence changed. Run Dry Run and freeze a new batch.',
+      );
+    }
   }
 
   async #run(batchId) {
@@ -565,6 +787,7 @@ export class ApplicationBatchService {
       });
       let sendStarted = false;
       try {
+        await this.#assertFrozenDelivery(batch, current.payload);
         if (this.acquireSendSlot) await this.acquireSendSlot(minIntervalMs);
         lastAttemptAt = this.now().getTime();
         sendStarted = true;
@@ -640,6 +863,7 @@ function normalizedCreateIdentity(value, maxBatchSize) {
   const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   return {
     noteIds: normalizedNoteIds(input.noteIds, maxBatchSize),
+    confirmedNoteIds: normalizedConfirmedNoteIds(input.confirmedNoteIds, maxBatchSize).sort(),
     contactApprovals: [...normalizedContactApprovals(input.contactApprovals).entries()]
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([noteId, evidenceHash]) => ({ noteId, evidenceHash })),
@@ -647,7 +871,37 @@ function normalizedCreateIdentity(value, maxBatchSize) {
     aiSessionId: normalizedText(input.aiSessionId, 160),
     title: normalizedText(input.title, 240),
     minIntervalMs: boundedInteger(input.minIntervalMs, 0, MAX_MIN_INTERVAL_MS, DEFAULT_MIN_INTERVAL_MS),
+    preflightId: optionalPreflightId(input.preflightId ?? input.planId) || '',
+    manifestHash: optionalManifestHash(input.manifestHash) || '',
   };
+}
+
+function normalizedConfirmedNoteIds(value, maxBatchSize) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw batchServiceError(
+      'APPLICATION_BATCH_CONFIRMATION_REQUIRED',
+      'confirmedNoteIds must contain every ready row shown by the latest Dry Run.',
+    );
+  }
+  return normalizedNoteIds(value, maxBatchSize);
+}
+
+function optionalPreflightId(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const preflightId = String(value).trim().toLowerCase();
+  if (!PREFLIGHT_ID.test(preflightId)) {
+    throw batchServiceError('APPLICATION_BATCH_PREFLIGHT_ID_INVALID', 'preflightId is invalid.');
+  }
+  return preflightId;
+}
+
+function optionalManifestHash(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const manifestHash = String(value).trim().toLowerCase();
+  if (!MANIFEST_HASH.test(manifestHash)) {
+    throw batchServiceError('APPLICATION_BATCH_MANIFEST_HASH_INVALID', 'manifestHash must be a SHA-256 digest.');
+  }
+  return manifestHash;
 }
 
 function optionalIdempotencyKey(value) {
@@ -701,6 +955,8 @@ function attachmentPreviews(planned) {
     originalName: attachment.originalName,
     currentDisplayName: attachment.displayName,
     finalDisplayName: rule.displayName,
+    renameRequired: attachment.displayName !== rule.displayName,
+    ruleSource: rule.detected ? 'post_requirement' : 'batch_default',
     sha256: attachment.sha256,
     rule,
   }));
@@ -713,21 +969,27 @@ function attachmentPreviewsFromSelected(selected, planned) {
     originalName: attachment.originalName,
     currentDisplayName: attachment.displayName,
     finalDisplayName: rules.get(attachment.attachmentId)?.displayName || attachment.displayName,
+    renameRequired: attachment.displayName !== (rules.get(attachment.attachmentId)?.displayName || attachment.displayName),
+    ruleSource: rules.get(attachment.attachmentId)?.detected ? 'post_requirement' : 'batch_default',
     sha256: attachment.sha256,
     rule: rules.get(attachment.attachmentId) || null,
   }));
 }
 
-function attachmentPreviewsFromPreview(preview, selected) {
+function attachmentPreviewsFromPreview(preview, selected, planned = []) {
   const originals = new Map(selected.map((item) => [item.attachmentId, item]));
+  const rules = new Map(planned.map((item) => [item.attachment.attachmentId, item.rule]));
   return preview.attachmentSummary.attachments.map((item) => ({
     attachmentId: item.attachmentId,
     originalName: originals.get(item.attachmentId)?.originalName || item.filename,
-    currentDisplayName: item.filename,
+    currentDisplayName: originals.get(item.attachmentId)?.displayName || item.filename,
     finalDisplayName: item.filename,
+    renameRequired: (originals.get(item.attachmentId)?.displayName || item.filename) !== item.filename,
+    ruleSource: rules.get(item.attachmentId)?.detected ? 'post_requirement' : 'batch_default',
     sha256: item.sha256,
     size: item.size,
     mediaType: item.mediaType,
+    rule: rules.get(item.attachmentId) || null,
   }));
 }
 
@@ -770,6 +1032,54 @@ function preflightPayload(item) {
   };
 }
 
+function buildDeliveryManifest(jobId, items) {
+  const readyItems = items.filter((item) => item.status === 'ready' && item.payload);
+  return {
+    schemaVersion: 2,
+    jobId: String(jobId || ''),
+    selectionSnapshot: readyItems.map((item) => item.noteId),
+    items: readyItems.map(deliveryManifestItem),
+  };
+}
+
+function deliveryManifestItem(item) {
+  const payload = item.payload;
+  return {
+    noteId: item.noteId,
+    roleName: payload.roleName,
+    recipient: payload.recipient,
+    recipientEvidence: payload.recipientEvidence,
+    sourceRevision: payload.sourceRevision,
+    subject: payload.subject,
+    subjectRule: payload.subjectRule,
+    body: payload.body,
+    bodyHash: payload.bodyHash,
+    coverLetter: payload.coverLetter,
+    coverLetterHash: payload.coverLetterHash,
+    coverLetterVersion: payload.coverLetterVersion,
+    draftId: payload.draftId,
+    draftVersion: payload.draftVersion,
+    contentHash: payload.contentHash,
+    qualityReportRef: payload.qualityReportRef,
+    attachmentBundleHash: payload.attachmentBundleHash,
+    attachments: item.attachments.map((attachment) => ({
+      attachmentId: attachment.attachmentId,
+      originalName: attachment.originalName,
+      currentDisplayName: attachment.currentDisplayName,
+      finalDisplayName: attachment.finalDisplayName,
+      sha256: attachment.sha256,
+      size: Number(attachment.size || 0),
+      mediaType: String(attachment.mediaType || ''),
+      ruleSource: attachment.ruleSource,
+      rule: attachment.rule,
+    })),
+    attachmentRules: payload.attachmentRules,
+    previewRevision: payload.previewRevision,
+    smtpConfigurationRevision: payload.smtpConfigurationRevision,
+    smtpConfigurationFingerprint: payload.smtpConfigurationFingerprint,
+  };
+}
+
 function publicContact(candidate) {
   return candidate ? {
     address: candidate.address,
@@ -786,6 +1096,7 @@ function publicContact(candidate) {
     ownershipStatus: candidate.ownershipStatus,
     normalizationApplied: Boolean(candidate.normalizationApplied),
     sourceFields: Array.isArray(candidate.sourceFields) ? candidate.sourceFields : [],
+    sourceRevision: applicationContactSourceRevision(candidate),
   } : null;
 }
 
@@ -890,6 +1201,20 @@ function isoNow(now) {
   return date.toISOString();
 }
 
+function epochNow(now) {
+  const value = now();
+  const date = value instanceof Date ? value : new Date(value);
+  return date.getTime();
+}
+
+function sameOrderedStrings(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameStringSet(left, right) {
+  return left.length === right.length && left.every((value) => right.includes(value));
+}
+
 function sha256(value) {
   return createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
 }
@@ -900,4 +1225,11 @@ function hashJson(value) {
 
 function batchServiceError(code, message, status = 400, details = undefined) {
   return new ApplicationBatchServiceError(code, message, status, details);
+}
+
+function knownNotSentError(code, message, details = undefined) {
+  const error = batchServiceError(code, message, 409, details);
+  error.safeToRetry = true;
+  error.deliveryStatus = 'not_sent';
+  return error;
 }

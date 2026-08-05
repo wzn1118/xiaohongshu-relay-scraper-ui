@@ -2,6 +2,7 @@ node_modules/
 dist/
 .vite/
 .playwright-cli/
+.runtime/
 data/
 output/
 test-results/

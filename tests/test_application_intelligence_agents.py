@@ -325,8 +325,10 @@ class ApplicationAgentTests(unittest.TestCase):
         self.assertEqual(result["email_subject"], "应聘商业分析实习生｜示例候选人｜每周可实习5天")
         self.assertTrue(result["greeting"].startswith("您好，我是示例候选人"))
         self.assertTrue(result["email_body"].startswith("尊敬的招聘负责人：\n您好！我是示例候选人"))
-        self.assertIn("简历随信附上", result["email_body"])
+        self.assertNotIn("简历随信附上", result["email_body"])
+        self.assertFalse(result["content_quality"]["attachment_claim_without_context"])
         self.assertIn("此致\n敬礼！", result["cover_letter"])
+        self.assertGreaterEqual(len("".join(result["cover_letter"].split())), 800)
         self.assertNotIn("skills相关实践", str(result))
         self.assertNotIn("我R", str(result))
 
@@ -383,6 +385,7 @@ class ApplicationAgentTests(unittest.TestCase):
 
         self.assertIn(f"{claim}。", result["email_body"])
         self.assertIn(f"{claim}。", result["cover_letter"])
+        self.assertGreaterEqual(len("".join(result["cover_letter"].split())), 800)
         self.assertEqual(result["used_evidence_ids"], ["project-verified"])
         self.assertNotIn("resume.txt", str(result))
         self.assertNotIn("我我", str(result))
@@ -587,7 +590,7 @@ class ApplicationAgentTests(unittest.TestCase):
         outreach = record["outreach"]
         self.assertEqual(record["fit_evidence"], [])
         self.assertEqual(outreach["status"], "needs_review")
-        self.assertIn("简历随信附上", outreach["email_body"])
+        self.assertNotIn("简历随信附上", outreach["email_body"])
         self.assertNotIn("附件", outreach["email_body"])
         self.assertNotIn("岗位方向与我的经历", outreach["greeting"])
 
@@ -733,7 +736,7 @@ class ApplicationAgentTests(unittest.TestCase):
                         "greeting": "您好，我是示例用户，想应聘内容运营实习。我曾负责社交媒体内容运营、市场调研和英文沟通。请问岗位目前是否仍在招聘？",
                         "email_subject": "应聘内容运营实习｜示例用户",
                         "email_body": "您好，我希望申请内容运营实习。我在内容营销经历中负责社交媒体内容运营、市场调研和英文沟通，能够对应岗位对内容策划与数据分析的要求。期待进一步沟通岗位当前最需要推进的任务。",
-                        "cover_letter": "主题：应聘内容运营实习｜示例用户\n尊敬的招聘负责人：\n您好！我是示例用户，希望申请内容运营实习。我在内容营销经历中负责社交媒体内容运营、市场调研和英文沟通，能够把信息整理、内容判断和协作沟通连接起来，支持岗位所需的内容策划与数据分析。在具体工作中，我会先根据目标受众梳理选题方向，再结合调研反馈判断内容重点，并与相关成员确认发布节奏和交付标准。\n\n针对该岗位，我会先理解团队当前内容目标和数据口径，再从一个具体选题或活动开始验证判断：整理用户反馈和内容表现，识别需要优先优化的环节，把分析结论转化为可执行的内容动作，并在发布后继续复盘结果。这套方法来自我已有的内容营销实践，不依赖未经验证的工具或成果。\n\n我希望进一步了解团队当前最需要推进的内容任务，并具体沟通我可以优先承担的选题研究、内容执行或数据复盘工作。感谢您的阅读，期待进一步沟通。\n\n此致\n敬礼！\n姓名：示例用户",
+                        "cover_letter": "主题：应聘内容运营实习｜示例用户\n尊敬的招聘负责人：\n您好！我是示例用户，希望申请内容运营实习。我在内容营销经历中负责社交媒体内容运营、市场调研和英文沟通，能够把信息整理、内容判断和协作沟通连接起来，支持岗位所需的内容策划与数据分析。在具体工作中，我会先根据目标受众梳理选题方向，再结合调研反馈判断内容重点，并与相关成员确认发布节奏和交付标准。\n\n针对该岗位，我会先理解团队当前内容目标和数据口径，再从一个具体选题或活动开始验证判断：整理用户反馈和内容表现，识别需要优先优化的环节，把分析结论转化为可执行的内容动作，并在发布后继续复盘结果。这套方法来自我已有的内容营销实践，不依赖未经验证的工具或成果。\n\n我理解内容策划的起点是明确内容服务的对象和希望促成的行动。我会先确认目标受众、传播场景与交付边界，再把选题拆成核心信息、证据材料和表达顺序。这样可以让每项内容都有明确目的，也便于团队判断哪些信息需要保留、哪些表达需要调整。\n\n已有的社交媒体内容运营经历能够支撑这一工作方法。我负责过内容运营，并通过市场调研理解受众关注点；这些事实说明我能从外部信息中整理需求，但我不会把尚未取得的数据写成历史成果。进入岗位后，我会把已有经验用于选题判断、素材核验和发布准备。\n\n面对岗位提出的数据分析要求，我会先与负责人确认内容表现的观察口径，再结合用户反馈和内容表现识别问题。对于暂时缺少依据的判断，我会标注待验证项；对于能够行动的结论，我会写清调整对象、预期变化和复核时点，避免复盘只停留在描述现象。\n\n在内容执行阶段，我会建立清晰的交付检查：发布前核对信息来源、语气和版式，发布中记录节奏变化，发布后整理反馈并比较预期。若结果与判断不一致，我会回到受众、选题或表达环节定位原因，再决定下一轮调整重点，而不是简单重复同一种内容。\n\n英文沟通经历也能用于处理跨语言材料和沟通信息。我会先确认原始含义与使用场景，再进行整理和表达，遇到歧义时保留问题并及时核对。对于需要多方配合的内容任务，我会同步输入、截止时间和反馈版本，让讨论落到具体材料与动作。\n\n我还会把调研、策划、执行和复盘放在同一份记录中，使每次调整都能追溯到用户信息或内容表现。持续积累后，团队可以看到哪些主题更值得投入、哪些表达反复造成理解偏差，以及下一次应优先验证什么问题。\n\n我希望进一步了解团队当前最需要推进的内容任务，并具体沟通我可以优先承担的选题研究、内容执行或数据复盘工作。感谢您的阅读，期待进一步沟通。\n\n此致\n敬礼！\n姓名：示例用户",
                         "used_evidence_ids": ["marketing-experience"],
                         "requirement_matches": ["内容策划与数据分析 -> marketing-experience -> 社交媒体内容运营与市场调研"],
                         "recommended_resume": "用户运营",

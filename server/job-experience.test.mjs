@@ -8,6 +8,7 @@ import {
   WORKFLOW_EVENT_LINE_PREFIX,
   adaptLegacyJobSnapshot,
   createWorkflowEvent,
+  deriveUserProblems,
   mapUserProblem,
   parseWorkflowEventLine,
   reduceWorkflowSnapshot,
@@ -108,6 +109,45 @@ test('user-facing problem codes have stable Chinese titles and complete actions'
   assert.equal(mapUserProblem('SECURITY_VERIFICATION').action.id, 'open_verification');
   assert.equal(mapUserProblem('LOGIN_REQUIRED').action.id, 'open_login');
   assert.equal(mapUserProblem('PROCESS_INTERRUPTED').action.id, 'resume');
+
+  const scheduledAt = '2026-08-03T08:10:00.000Z';
+  const rateLimited = mapUserProblem('RATE_LIMITED', {
+    saved: 9,
+    total: 20,
+    retryAt: scheduledAt,
+  });
+  assert.equal(rateLimited.retryAt, scheduledAt);
+  assert.doesNotMatch(rateLimited.userMessage, /2026-08-03T08:10:00\.000Z/);
+});
+
+test('completed body coverage suppresses stale access recovery problems', () => {
+  const job = {
+    id: 'completed-body-with-stale-rate-limit',
+    status: 'interrupted',
+    params: { keyword: 'test', analysisMode: 'job' },
+    bodyMetrics: {
+      discovered: 715,
+      attempted: 715,
+      succeeded: 715,
+      failed: 0,
+      notAttempted: 0,
+      blocked: 0,
+      cancelled: 0,
+      pending: 0,
+    },
+    rateLimit: {
+      detected: true,
+      status: 'scheduled',
+      nextRetryAt: '2026-08-04T22:47:29.045Z',
+    },
+  };
+
+  const problems = deriveUserProblems(job);
+  assert.equal(problems.some((problem) => ['RATE_LIMITED', 'SECURITY_VERIFICATION'].includes(problem.code)), false);
+  const snapshot = adaptLegacyJobSnapshot(job);
+  assert.equal(snapshot.state, 'partial');
+  assert.equal(snapshot.issues.some((problem) => ['RATE_LIMITED', 'SECURITY_VERIFICATION'].includes(problem.code)), false);
+  assert.notEqual(snapshot.headline, USER_PROBLEM_TITLES.RATE_LIMITED);
 });
 
 test('a runner that exits before collecting content shows a concrete restart message', () => {

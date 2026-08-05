@@ -1111,7 +1111,15 @@ export type ApplicationRoute = {
   source_image_url?: string
   verification_status?: 'body_verified' | 'body_extracted' | 'image_format_verified' | 'cross_verified' | 'needs_manual_review' | string
   normalization_applied?: boolean
+  evidence_hash?: string
+  source_revision?: string
   actionable?: boolean
+}
+
+export type AuthSession = {
+  authenticated: boolean
+  required: boolean
+  user: { email: string; roles: string[] } | null
 }
 
 export type OutreachDraft = {
@@ -1119,6 +1127,33 @@ export type OutreachDraft = {
   email_subject: string
   email_body: string
   cover_letter: string
+}
+
+export type CoverLetterRewriteRequest = {
+  noteId: string
+  aiSessionId: string
+  instructions: string
+  outreach: OutreachDraft
+  applicationContext: ApplicationContext
+  draftId: string
+  baseVersion: number
+}
+
+export type CoverLetterRewriteResponse = ApplicationMutationResponse & {
+  outreach: OutreachDraft
+  draftVersion: DraftVersionRef
+  generation: {
+    provider: string
+    model: string
+    wireApi: 'responses' | 'chat_completions' | string
+    strategy?: 'local_plan_write_review' | 'direct_model_rewrite' | string
+    modelCalls?: number
+    reviewScore?: number | null
+    styleViolationCount?: number
+    signatureEvidenceIds?: string[]
+    requestId?: string
+    generatedAt: string
+  }
 }
 
 export type ApplicationTone = 'formal' | 'natural' | 'concise'
@@ -1152,6 +1187,22 @@ export type DeliveryRuntimeStatus = 'preview_ready' | 'preparing' | 'sending' | 
 export type DeliveryState = {
   action: 'draft_saved' | 'ready_to_apply' | 'ready_to_message' | 'applied' | 'messaged' | `email_${DeliveryRuntimeStatus}` | DeliveryRuntimeStatus | (string & {})
   updatedAt: string
+  generation?: {
+    runId?: string
+    promptVersion?: string
+    provider?: string
+    model?: string
+    strategy?: string
+    modelCalls?: number
+    reviewScore?: number | null
+    styleViolationCount?: number
+    signatureEvidenceIds?: string[]
+    profileSnapshotId?: string
+    inputHash?: string
+    usedEvidenceIds?: string[]
+    status?: string
+    generatedAt?: string
+  }
   email?: {
     status: DeliveryRuntimeStatus
     to?: string
@@ -1340,6 +1391,47 @@ export type ContentInsights = {
   }>
 }
 
+export type ApplicationCopyQuality = {
+  cover_letter_chars?: number
+  cover_letter_length_pass?: boolean
+  role_evidence_count?: number
+  ai_product_role?: boolean
+  ai_product_mechanism_pass?: boolean
+  attachment_claim_without_context?: boolean
+  batch_ready?: boolean
+}
+
+export type ApplicationDeliveryManifestSummary = {
+  schemaVersion: number
+  noteId: string
+  sourceRevision: string
+  deliveryStatus: string
+  recipientStatus: string
+  recipientSource: string
+  copyStatus: string
+  subjectRuleStatus: string
+  attachmentStatus: string
+  readiness: string
+  hasEmailBody: boolean
+  hasCoverLetter: boolean
+  recipient: {
+    address: string
+    normalizedAddress: string
+    source: string
+    evidenceHash: string
+    verificationStatus: string
+  } | null
+  latestBatch: {
+    batchId: string
+    batchStatus: string
+    itemId?: string
+    itemStatus?: string
+    updatedAt: string
+  } | null
+  blockers: Array<{ code: string; field: string; message: string }>
+  warnings: Array<{ code: string; field: string; message: string }>
+}
+
 export type ApplicationResult = {
   note_id: string
   title: string
@@ -1385,6 +1477,9 @@ export type ApplicationResult = {
     generation_mode: string
     runtime_status: string
     status: string
+    content_quality?: ApplicationCopyQuality
+    requirement_matches?: string[]
+    used_evidence_ids?: string[]
     applicationContext?: ApplicationContext
   }
   job_capabilities?: Array<{ id: string; capability: string; why_it_matters: string; priority: number }>
@@ -1412,6 +1507,31 @@ export type ApplicationResult = {
     evidence: string
     fields: string[]
   }
+  emailSubjectRequirement?: {
+    detected: boolean
+    template: string
+    evidence: string
+    fields: string[]
+    literal?: boolean
+  }
+  emailSubjectPreview?: string
+  emailSubjectGuard?: {
+    status: 'clean' | 'explicit_rule' | 'reconstructed_from_noisy_title' | 'rejected_noisy_title' | 'rejected_bare_title' | 'rejected_unverified_subject' | 'role_title_missing' | string
+    requestedNoisyTitle?: boolean
+    requestedBareTitle?: boolean
+    requestedSourceTitle?: boolean
+    requestedUnverifiedSubject?: boolean
+    safeDefaultSubject?: boolean
+    explicitRule?: boolean
+    rawTitle?: string
+    resolvedJobTitle?: string
+    requiresReview?: boolean
+    suggestedSubject?: string
+    rejectedSubject?: string
+    sourceStatus?: string
+  }
+  contactDiscovery?: ApplicationContactDiscovery | null
+  deliveryManifestSummary?: ApplicationDeliveryManifestSummary
   quality: Record<string, boolean>
 }
 
@@ -1450,6 +1570,45 @@ export type ApplicationResultsResponse = {
   }
   codexRuntime: Record<string, unknown> | null
   qualityGate: Record<string, unknown> | null
+  coverage?: CoverageSummary | null
+  contactResolution: {
+    action: 'started' | 'attached' | 'already_complete' | 'manual_retry_required' | 'status' | 'error'
+    status: 'idle' | 'starting' | 'running' | 'completed' | 'partial' | 'failed' | 'interrupted'
+    active: boolean
+    totalQueued?: number
+    processed?: number
+    succeeded?: number
+    failed?: number
+    emailsFound?: number
+    baseline?: {
+      withImages: number
+      imageOcrComplete: number
+      imageOcrPending: number
+      imageOcrSkippedBodyEmail?: number
+    }
+    report?: {
+      after?: {
+        withImages: number
+        imageOcrComplete: number
+        imageOcrPending: number
+        imageOcrSkippedBodyEmail?: number
+      }
+      queue?: {
+        total: number
+        processed: number
+        succeeded: number
+        failed: number
+        emailsFound: number
+      }
+    } | null
+    error?: string
+  } | null
+  contactDiscovery?: {
+    generatedAt?: string
+    sourceSignature?: string
+    summary?: ApplicationContactDiscoverySummary
+    error?: string
+  } | null
   sourceCoverage: {
     status: 'complete' | 'partial'
     reason: string
@@ -1469,6 +1628,50 @@ export type ApplicationResultsQuery = {
   timeRange?: 'all' | '1' | '3' | '7' | '30' | '90' | 'unknown'
 }
 
+export type ApplicationDeliveryCandidatesQuery = {
+  q?: string
+  deliveryStatus?: string
+  recipientStatus?: string
+  recipientSource?: string
+  copyStatus?: string
+  subjectRuleStatus?: string
+  attachmentStatus?: string
+  readiness?: string
+  hasCoverLetter?: boolean
+  batchId?: string
+  sort?: 'newest' | 'oldest' | 'readiness' | 'title'
+  cursor?: string
+  limit?: number
+}
+
+export type ApplicationDeliverySelectionSnapshot = {
+  schemaVersion: number
+  selectionSnapshotId: string
+  selectionSnapshotHash: string
+  queryHash: string
+    candidateCount: number
+    noteIds: string[]
+    selectableNoteIds: string[]
+    readyNoteIds: string[]
+  revisions: Array<{ noteId: string; revision: string }>
+}
+
+export type ApplicationDeliveryCandidatesResponse = {
+  schemaVersion: number
+  available: boolean
+  jobId: string
+  total: number
+  offset: number
+  limit: number
+  cursor: string | null
+  nextCursor: string | null
+  items: ApplicationResult[]
+  filters: Record<string, unknown>
+  facetCounts: Record<string, Record<string, number>>
+  blockerCounts: Record<string, number>
+  selectionSnapshot: ApplicationDeliverySelectionSnapshot
+}
+
 export type ApplicationContactSource = 'body' | 'image' | 'author_comment' | 'other_comment'
 
 export type ApplicationContactCandidate = {
@@ -1480,6 +1683,7 @@ export type ApplicationContactCandidate = {
   authorId: string
   evidenceText: string
   evidenceHash: string
+  sourceRevision: string
   confidence: number
   collectionStatus: 'pending' | 'partial' | 'complete'
   verificationStatus: string
@@ -1488,6 +1692,37 @@ export type ApplicationContactCandidate = {
   actionable?: boolean
   requiresReview?: boolean
   ownershipStatus?: string
+}
+
+export type ApplicationContactDiscovery = {
+  noteId: string
+  postId: string
+  title: string
+  imageCount: number
+  imageOcrStatus: string
+  imageOcrAttempts: number
+  status: 'ready' | 'manual_review' | 'pending' | 'no_email'
+  reason: string
+  collectionStatus: 'pending' | 'partial' | 'complete'
+  requiresReview: boolean
+  candidates: ApplicationContactCandidate[]
+}
+
+export type ApplicationContactDiscoverySummary = {
+  totalRecords: number
+  withImages: number
+  imageOcrComplete: number
+  imageOcrPending: number
+  imageOcrFailed: number
+  imageOcrSkippedBodyEmail: number
+  bodyEmailRecords: number
+  imageEmailRecords: number
+  commentEmailRecords: number
+  ready: number
+  manualReview: number
+  commentsPending: number
+  commentsPartial: number
+  noEmailConfirmed: number
 }
 
 export type ApplicationContactResolution = {
@@ -1506,14 +1741,22 @@ export type ApplicationContactResolution = {
 }
 
 export type ApplicationBatchItemStatus = 'resolving' | 'blocked_no_email' | 'blocked_ambiguous'
-  | 'draft_pending' | 'quality_pending' | 'filename_pending' | 'ready' | 'sending'
-  | 'sent' | 'failed_retryable' | 'unknown_manual_review' | 'skipped'
+  | 'subject_pending' | 'draft_pending' | 'quality_pending' | 'filename_pending' | 'ready' | 'sending'
+  | 'sent' | 'failed_retryable' | 'unknown_manual_review' | 'skipped' | 'copy_quality_failed'
 
 export type ApplicationBatchAttachmentPreview = {
   attachmentId: string
   originalName: string
   currentDisplayName: string
   finalDisplayName: string
+  plannedDisplayName?: string
+  appliedDisplayName?: string
+  namingStatus?: 'planned' | 'applied' | 'unchanged' | 'blocked' | string
+  requirementSource?: 'post' | 'batch_default' | 'profile' | string
+  willRename?: boolean
+  renameRequired?: boolean
+  ruleSource?: 'post_requirement' | 'batch_default' | string
+  rule?: Record<string, unknown> | null
   sha256: string
   size?: number
   mediaType?: string
@@ -1530,6 +1773,10 @@ export type ApplicationBatchPreflightItem = {
   contactResolution: ApplicationContactResolution | null
   attachments: ApplicationBatchAttachmentPreview[]
   preview: Pick<EmailPreview, 'recipient' | 'from' | 'replyTo' | 'subject' | 'text' | 'draftId' | 'draftVersion' | 'attachmentSummary' | 'attachmentBundleHash' | 'previewRevision' | 'smtpConfigurationRevision' | 'smtpConfigurationFingerprint' | 'warnings' | 'readiness' | 'estimatedMessageSize'> | null
+  coverLetter?: string
+  coverLetterHash?: string
+  manifestHash?: string
+  namingSummary?: { status?: string; plannedCount?: number; appliedCount?: number; source?: string }
   payload?: ApplicationBatchPayload | null
 }
 
@@ -1537,7 +1784,12 @@ export type ApplicationBatchPreflight = {
   schemaVersion?: number
   dryRun?: boolean
   batchId: string
+  planId?: string
+  preflightId?: string
+  manifestHash?: string
+  deliveryManifest?: Record<string, unknown>
   generatedAt?: string
+  expiresAt?: string
   maxBatchSize?: number
   items: ApplicationBatchPreflightItem[]
   counts: Partial<Record<ApplicationBatchItemStatus, number>>
@@ -1552,6 +1804,28 @@ export type ApplicationBatchPayload = {
   contact: ApplicationContactCandidate
   subject: string
   body: string
+  coverLetter?: string
+  coverLetterHash?: string
+  coverLetterVersion?: number
+  recipientHash?: string
+  recipientEvidenceHash?: string
+  recipientSourceRevision?: string | number
+  recipientEvidence?: {
+    evidenceHash: string
+    source: string
+    sourceRevision: string
+    collectionStatus: string
+    verificationStatus: string
+  }
+  sourceRevision?: string
+  subjectRule?: Record<string, unknown> | null
+  attachmentRules?: Array<Record<string, unknown>>
+  manifestHash?: string
+  planId?: string
+  deliveryPlanId?: string
+  plannedFilenames?: string[]
+  plannedFinalFilenames?: string[]
+  namingSummary?: { status?: string; source?: string; rule?: string }
   bodyHash: string
   draftId: string
   draftVersion: number
@@ -1605,11 +1879,17 @@ export type ApplicationBatch = {
 
 export type ApplicationBatchRequest = {
   noteIds: string[]
+  confirmedNoteIds?: string[]
   contactApprovals?: Array<{ noteId: string; evidenceHash: string; confirmed: true }>
   defaultAttachmentTemplate?: string
   minIntervalMs?: number
   aiSessionId?: string
   title?: string
+  preflightId?: string
+  manifestHash?: string
+  selectionSnapshotId?: string
+  selectionSnapshotHash?: string
+  selectionRevisions?: Array<{ noteId: string; revision: string }>
   idempotencyKey?: string
 }
 

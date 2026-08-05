@@ -97,15 +97,106 @@ def build_profile_snapshot(profile: dict[str, Any], output_dir: Path | None = No
     if not isinstance(profile, dict):
         raise ValueError("candidate profile must be an object")
     evidence_items: list[dict[str, Any]] = []
+
+    # Preserve each resume experience as one atomic evidence block.  The
+    # condensed evidence_items remain useful for retrieval, but the full
+    # structured claims are what let a model write concrete, resume-grounded
+    # application copy without merging facts across employers.
+    raw_experiences = profile.get("experience")
+    has_full_experiences = False
+    if isinstance(raw_experiences, list):
+        for index, item in enumerate(raw_experiences, start=1):
+            if not isinstance(item, dict):
+                continue
+            organization = _bounded(item.get("organization"), 180)
+            claims: list[str] = []
+            sources: list[str] = []
+            for claim in item.get("claims", []) if isinstance(item.get("claims"), list) else []:
+                if not isinstance(claim, dict) or claim.get("conflict") is True:
+                    continue
+                value = _bounded(claim.get("claim"), 700)
+                if value:
+                    claims.append(value)
+                claim_sources = claim.get("evidence")
+                if isinstance(claim_sources, list):
+                    sources.extend(_bounded(source, 80) for source in claim_sources if _text(source))
+                elif _text(claim_sources):
+                    sources.append(_bounded(claim_sources, 80))
+            if not organization or not claims:
+                continue
+            period = item.get("period") if isinstance(item.get("period"), dict) else {}
+            period_text = "-".join(
+                value for value in (_bounded(period.get("start"), 20), _bounded(period.get("end"), 20)) if value
+            )
+            evidence_items.append({
+                "id": f"resume-experience-{index}",
+                "category": "完整简历经历",
+                "label": f"{organization}工作经历",
+                "organization": organization,
+                "period": period_text,
+                "detail": _bounded("候选人简历记载：" + "；".join(claims), 3600),
+                "source": ";".join(dict.fromkeys(sources))[:500],
+            })
+            has_full_experiences = True
+
+    raw_skills = profile.get("skills")
+    if isinstance(raw_skills, list):
+        skill_details = [
+            "：".join(value for value in (_bounded(item.get("skill"), 120), _bounded(item.get("detail"), 360)) if value)
+            for item in raw_skills
+            if isinstance(item, dict) and (_text(item.get("skill")) or _text(item.get("detail")))
+        ]
+        if skill_details:
+            evidence_items.append({
+                "id": "resume-skills",
+                "category": "个人技能",
+                "label": "个人技能与工具",
+                "detail": _bounded("候选人简历记载：" + "；".join(skill_details), 1800),
+                "source": "resume:skills",
+            })
+
+    raw_education = profile.get("education")
+    if isinstance(raw_education, list):
+        for index, item in enumerate(raw_education, start=1):
+            if not isinstance(item, dict) or not _text(item.get("institution")):
+                continue
+            institution = _bounded(item.get("institution"), 180)
+            detail = "，".join(
+                value
+                for value in (
+                    institution,
+                    _bounded(item.get("degree"), 80),
+                    _bounded(item.get("field"), 120),
+                )
+                if value
+            )
+            period = item.get("period") if isinstance(item.get("period"), dict) else {}
+            period_text = "至".join(
+                value for value in (_bounded(period.get("start"), 20), _bounded(period.get("end"), 20)) if value
+            )
+            if period_text:
+                detail += f"，就读时间{period_text}"
+            evidence_items.append({
+                "id": f"resume-education-{index}",
+                "category": "教育经历",
+                "label": f"{institution}教育经历",
+                "organization": institution,
+                "detail": f"候选人简历记载：{detail}。",
+                "source": "resume:education",
+            })
+
     raw_evidence = profile.get("evidence_items")
     if isinstance(raw_evidence, list):
         for index, item in enumerate(raw_evidence, start=1):
             if not isinstance(item, dict):
                 continue
+            if has_full_experiences and _bounded(item.get("id"), 120).casefold().startswith("resume-"):
+                continue
             evidence = {
                 "id": _bounded(item.get("id"), 120) or f"evidence-{index}",
                 "category": _bounded(item.get("category"), 120),
                 "label": _bounded(item.get("label") or item.get("title"), 180),
+                "organization": _bounded(item.get("organization"), 180),
                 "detail": _bounded(item.get("detail") or item.get("description") or item.get("text"), 1400),
                 "first_person_claim": _bounded(item.get("first_person_claim"), 1400),
                 "skills": [_bounded(value, 120) for value in item.get("skills", []) if _text(value)][:12]
