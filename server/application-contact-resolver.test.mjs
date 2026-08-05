@@ -449,3 +449,39 @@ test('batch resolution reuses one audience snapshot while preserving exact post 
   assert.deepEqual(results.map((result) => result.candidates[0].commentId), ['comment-1', 'comment-2']);
   assert.deepEqual(results.map((result) => result.collectionStatus), ['complete', 'partial']);
 });
+
+test('cached audience index invalidates when the comment artifact changes', async (t) => {
+  const outputDir = await fixtureDir(t);
+  const posts = [{
+    post_id: 'post-1',
+    status: 'complete',
+    author: { user_id: 'author-1' },
+  }];
+  await writeAudience(outputDir, {
+    posts,
+    comments: [{
+      comment_id: 'comment-before',
+      post_id: 'post-1',
+      text: 'Application details are in the post.',
+      user: { user_id: 'author-1' },
+    }],
+  });
+
+  const before = await resolveApplicationContacts(applicationRecord(), { outputDir });
+  assert.equal(before.status, 'no_email');
+
+  await writeAudience(outputDir, {
+    posts,
+    comments: [{
+      comment_id: 'comment-after-with-longer-content',
+      post_id: 'post-1',
+      text: 'Send your application to refreshed-contact@example.com',
+      user: { user_id: 'author-1' },
+    }],
+  });
+
+  const after = await resolveApplicationContacts(applicationRecord(), { outputDir });
+  assert.equal(after.status, 'manual_review');
+  assert.equal(after.candidates[0].address, 'refreshed-contact@example.com');
+  assert.equal(after.candidates[0].commentId, 'comment-after-with-longer-content');
+});

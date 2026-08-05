@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 
 const INVALID_VERIFICATION_STATUSES = new Set(['invalid', 'rejected', 'unverified']);
 const COLLECTION_STATUS_RANK = Object.freeze({ pending: 0, partial: 1, complete: 2 });
+const AUDIENCE_SNAPSHOT_CACHE_LIMIT = 8;
+const audienceSnapshotCache = new Map();
+const audienceSnapshotLoads = new Map();
 const RECRUITMENT_CONTEXT = /(?:简历|投递|岗位|职位|招聘|应聘|申请|邮箱|邮件|发送|联系)/iu;
 const EMAIL_MATCH = /(?<![A-Z0-9._%+*\-/])([A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+)(?![A-Z0-9._%+*\-/])/giu;
 const EMAIL_ROUTE_KIND = /(?:e-?mail|邮箱|邮件)/iu;
@@ -65,8 +68,7 @@ export async function resolveApplicationContacts(record, {
   }
 
   const audience = audienceSnapshot || await readAudienceArtifacts(outputDir, fallbackOutputDirs);
-  const matchedComments = audience.comments.filter((comment) => commentPostId(comment) === postId);
-  const matchedPosts = audience.posts.filter((post) => audiencePostId(post) === postId);
+  const { comments: matchedComments, posts: matchedPosts } = audienceRecordsForPost(audience, postId);
   const collectionStatus = audienceCollectionStatus(matchedPosts, matchedComments);
   const redactedEvidence = uniqueStrings([
     ...recordRedactedEvidence,
@@ -565,14 +567,50 @@ async function readAudienceArtifacts(outputDir, fallbackOutputDirs) {
     ...asStrings(fallbackOutputDirs),
     outputDir,
   ]).map((directory) => path.resolve(directory));
+  const cacheKey = directories.join('\n');
+  const signature = await audienceArtifactSignature(directories);
+  const cached = audienceSnapshotCache.get(cacheKey);
+  if (cached?.signature === signature) {
+    audienceSnapshotCache.delete(cacheKey);
+    audienceSnapshotCache.set(cacheKey, cached);
+    return cached.snapshot;
+  }
+
+  const active = audienceSnapshotLoads.get(cacheKey);
+  if (active?.signature === signature) return active.operation;
+
+  const operation = loadAudienceArtifacts(directories);
+  const load = { signature, operation };
+  audienceSnapshotLoads.set(cacheKey, load);
+  try {
+    const snapshot = await operation;
+    if (audienceSnapshotLoads.get(cacheKey) === load) {
+      audienceSnapshotCache.delete(cacheKey);
+      audienceSnapshotCache.set(cacheKey, { signature, snapshot });
+      while (audienceSnapshotCache.size > AUDIENCE_SNAPSHOT_CACHE_LIMIT) {
+        audienceSnapshotCache.delete(audienceSnapshotCache.keys().next().value);
+      }
+    }
+    return snapshot;
+  } finally {
+    if (audienceSnapshotLoads.get(cacheKey) === load) audienceSnapshotLoads.delete(cacheKey);
+  }
+}
+
+async function loadAudienceArtifacts(directories) {
   const commentsById = new Map();
   const posts = [];
   const issues = [];
   let commentsArtifactFound = false;
 
-  for (const directory of directories) {
-    const commentsResult = await readJsonArray(path.join(directory, 'audience-comments.json'));
-    const postsResult = await readJsonArray(path.join(directory, 'audience-posts.json'));
+  const artifactResults = await Promise.all(directories.map(async (directory) => {
+    const [commentsResult, postsResult] = await Promise.all([
+      readJsonArray(path.join(directory, 'audience-comments.json')),
+      readJsonArray(path.join(directory, 'audience-posts.json')),
+    ]);
+    return { commentsResult, postsResult };
+  }));
+  for (const { commentsResult, postsResult } of artifactResults) {
     commentsArtifactFound ||= commentsResult.found;
     if (commentsResult.issue) issues.push(commentsResult.issue);
     if (postsResult.issue) issues.push(postsResult.issue);
@@ -585,11 +623,58 @@ async function readAudienceArtifacts(outputDir, fallbackOutputDirs) {
     }
   }
 
-  return {
+  return indexAudienceSnapshot({
     comments: [...commentsById.values()],
     posts,
     commentsArtifactFound,
     issues,
+  });
+}
+
+async function audienceArtifactSignature(directories) {
+  const filePaths = directories.flatMap((directory) => [
+    path.join(directory, 'audience-comments.json'),
+    path.join(directory, 'audience-posts.json'),
+  ]);
+  const revisions = await Promise.all(filePaths.map(async (filePath) => {
+    try {
+      const metadata = await stat(filePath);
+      return `${filePath}|${metadata.mtimeMs}|${metadata.size}`;
+    } catch (error) {
+      return `${filePath}|${error?.code === 'ENOENT' ? 'missing' : `error:${error?.code || 'unknown'}`}`;
+    }
+  }));
+  return revisions.join('\n');
+}
+
+function indexAudienceSnapshot(snapshot) {
+  return {
+    ...snapshot,
+    commentsByPostId: groupAudienceRecords(snapshot.comments, commentPostId),
+    postsByPostId: groupAudienceRecords(snapshot.posts, audiencePostId),
+  };
+}
+
+function groupAudienceRecords(records, idForRecord) {
+  const grouped = new Map();
+  for (const record of records) {
+    const postId = idForRecord(record);
+    if (!postId) continue;
+    const current = grouped.get(postId);
+    if (current) current.push(record);
+    else grouped.set(postId, [record]);
+  }
+  return grouped;
+}
+
+function audienceRecordsForPost(audience, postId) {
+  return {
+    comments: audience.commentsByPostId instanceof Map
+      ? audience.commentsByPostId.get(postId) || []
+      : audience.comments.filter((comment) => commentPostId(comment) === postId),
+    posts: audience.postsByPostId instanceof Map
+      ? audience.postsByPostId.get(postId) || []
+      : audience.posts.filter((post) => audiencePostId(post) === postId),
   };
 }
 
