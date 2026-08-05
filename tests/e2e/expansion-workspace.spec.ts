@@ -152,7 +152,18 @@ for (const viewport of [
     await expect(page.getByRole('tab', { name: /关系扩散/ })).toContainText('多轮')
     await expect(page.locator('.expansion-seed-list > label')).toHaveCount(3)
     await expect(page.locator('.expansion-seed-list > label')).toContainText(['部分采集', '已采集', '未采集'])
-    const screenshotOptions = { maxDiffPixels: 25 }
+    if (viewport.width > 640 && viewport.width <= 900) {
+      const productTitle = page.locator('.product-title h1')
+      const titleLayout = await productTitle.evaluate((element) => ({
+        height: element.getBoundingClientRect().height,
+        whiteSpace: getComputedStyle(element).whiteSpace,
+      }))
+      expect(titleLayout.whiteSpace).toBe('nowrap')
+      expect(titleLayout.height).toBeLessThan(40)
+    }
+    await page.addStyleTag({ content: '.topbar, .side-rail { visibility: hidden !important; }' })
+    await page.evaluate(async () => { await document.fonts.ready })
+    const screenshotOptions = { maxDiffPixelRatio: 0.001 }
     await expect(page.locator('#results')).toHaveScreenshot(`${viewport.name}-idle.png`, screenshotOptions)
 
     await page.locator('.expansion-parameters').evaluate((element) => { (element as HTMLDetailsElement).open = true })

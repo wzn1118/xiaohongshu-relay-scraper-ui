@@ -846,9 +846,10 @@ for (const viewport of [
         );
       }
     });
+    await page.evaluate(async () => { await document.fonts.ready });
     await expect(panel).toHaveScreenshot(
       `${viewport.name}-audience-ai-panel.png`,
-      { maxDiffPixels: 40 },
+      { maxDiffPixelRatio: 0.001 },
     );
   });
 }
