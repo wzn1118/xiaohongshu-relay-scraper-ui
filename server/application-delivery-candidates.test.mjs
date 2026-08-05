@@ -72,6 +72,37 @@ test('filters the full corpus, returns facet counts, and pages with a stable cur
   assert.equal(second.selectionSnapshot.selectionSnapshotHash, first.selectionSnapshot.selectionSnapshotHash);
 });
 
+test('defaults to 50 rows and safely caps larger page-size requests at 100', () => {
+  const records = Array.from({ length: 130 }, (_, index) => candidate(String(index + 1).padStart(3, '0')));
+  const defaultPage = buildApplicationDeliveryCandidates({ jobId: 'job-1', records });
+  assert.equal(defaultPage.limit, 50);
+  assert.equal(defaultPage.items.length, 50);
+  assert.ok(defaultPage.nextCursor);
+
+  const requestedPage = buildApplicationDeliveryCandidates({ jobId: 'job-1', records, limit: 75 });
+  assert.equal(requestedPage.limit, 75);
+  assert.equal(requestedPage.items.length, 75);
+
+  const cappedPage = buildApplicationDeliveryCandidates({ jobId: 'job-1', records, limit: 1_000 });
+  assert.equal(cappedPage.limit, 100);
+  assert.equal(cappedPage.items.length, 100);
+  assert.ok(cappedPage.nextCursor);
+
+  const secondPage = buildApplicationDeliveryCandidates({
+    jobId: 'job-1',
+    records,
+    query: { cursor: cappedPage.nextCursor },
+    limit: 100,
+  });
+  assert.equal(secondPage.offset, 100);
+  assert.equal(secondPage.items.length, 30);
+  assert.equal(secondPage.nextCursor, null);
+
+  const invalidPage = buildApplicationDeliveryCandidates({ jobId: 'job-1', records, limit: 25.5 });
+  assert.equal(invalidPage.limit, 50);
+  assert.equal(invalidPage.items.length, 50);
+});
+
 test('rejects a cursor when filters change', () => {
   const records = [candidate('1'), candidate('2')];
   const first = buildApplicationDeliveryCandidates({ jobId: 'job-1', records, limit: 1 });
@@ -120,6 +151,26 @@ test('classifies recipient, content, naming, and historical delivery blockers', 
   assert.equal(summary.readiness, 'needs_input');
   assert.deepEqual(summary.blockers.map((item) => item.code), ['RECIPIENT_REVIEW_REQUIRED']);
   assert.deepEqual(summary.warnings.map((item) => item.code), ['WILL_RENAME']);
+});
+
+test('blocks short or internal-token Cover Letters from batch readiness', () => {
+  const result = buildApplicationDeliveryCandidates({
+    jobId: 'job-1',
+    records: [candidate('1', {
+      outreach: {
+        email_subject: '应聘 AI 产品经理实习生',
+        email_body: '邮件正文',
+        cover_letter: 'exp_2022_xinhua 这是尚未清理的内部草稿',
+        content_quality: { batch_ready: true, cover_letter_chars: 373 },
+      },
+    })],
+  });
+
+  const summary = result.items[0].deliveryManifestSummary;
+  assert.equal(summary.copyStatus, 'quality_failed');
+  assert.equal(summary.readiness, 'needs_input');
+  assert.ok(summary.blockers.some((blocker) => blocker.code === 'COPY_QUALITY_FAILED'));
+  assert.deepEqual(result.selectionSnapshot.readyNoteIds, []);
 });
 
 test('selection snapshot changes when a source revision changes', () => {
@@ -226,6 +277,36 @@ test('delivery candidates expose the globally resolved subject instead of a nois
   assert.equal(item.outreach.email_subject, '应聘岗位');
   assert.equal(item.emailSubjectGuard.requiresReview, true);
   assert.equal(item.deliveryManifestSummary.subjectRuleStatus, 'needs_input');
+});
+
+test('delivery candidates expose an attachment-derived subject and its effective rule metadata', () => {
+  const result = buildApplicationDeliveryCandidates({
+    jobId: 'job-1',
+    records: [candidate('1', {
+      body: '简历命名：学校-姓名-到岗时间.pdf\n投递邮箱 one@example.test',
+      candidate_profile: {
+        name: '王梓楠',
+        school: '示例大学',
+        arrivalDate: '9月1日',
+      },
+      outreach: {
+        email_subject: '',
+        email_body: '邮件正文 1',
+        cover_letter: 'Cover Letter 1',
+        content_quality: { batch_ready: true },
+      },
+    })],
+  });
+
+  const item = result.items[0];
+  assert.equal(item.outreach.email_subject, '示例大学-王梓楠-9月1日');
+  assert.equal(item.emailSubjectPreview, '示例大学-王梓楠-9月1日');
+  assert.equal(item.emailSubjectRequirement.source, 'attachment_requirement');
+  assert.equal(item.emailSubjectRequirement.template, '学校-姓名-到岗时间');
+  assert.equal(item.emailSubjectRequirement.attachmentTemplate, '学校-姓名-到岗时间.pdf');
+  assert.match(item.emailSubjectRequirement.evidence, /简历命名/u);
+  assert.equal(item.deliveryManifestSummary.subjectRuleStatus, 'job_requirement_satisfied');
+  assert.equal(item.deliveryManifestSummary.readiness, 'ready_to_preview');
 });
 
 test('delivery candidates keep an unverified source subject blocked after generating a safe preview', () => {

@@ -579,15 +579,19 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(savedDraftPayload.delivery.action, 'draft_saved');
 
     const resultsWithDraft = await fetch(`${origin}/api/jobs/${job.id}/results?limit=20`).then((response) => response.json());
-    const deliveryCandidatesResponse = await fetch(`${origin}/api/jobs/${job.id}/application-delivery-candidates?limit=20`);
+    const deliveryCandidatesResponse = await fetch(`${origin}/api/jobs/${job.id}/application-delivery-candidates?limit=50`);
     const deliveryCandidatesPayload = await deliveryCandidatesResponse.json();
     assert.equal(deliveryCandidatesResponse.status, 200, JSON.stringify(deliveryCandidatesPayload));
     assert.equal(deliveryCandidatesPayload.total, 1);
+    assert.equal(deliveryCandidatesPayload.limit, 50);
     assert.equal(deliveryCandidatesPayload.items[0].note_id, 'n1');
     assert.ok(deliveryCandidatesPayload.items[0].deliveryManifestSummary);
       assert.ok(deliveryCandidatesPayload.selectionSnapshot.selectionSnapshotHash);
       assert.deepEqual(deliveryCandidatesPayload.selectionSnapshot.noteIds, ['n1']);
       assert.deepEqual(deliveryCandidatesPayload.selectionSnapshot.selectableNoteIds, ['n1']);
+    const cappedDeliveryCandidates = await fetch(`${origin}/api/jobs/${job.id}/application-delivery-candidates?limit=1000`)
+      .then((response) => response.json());
+    assert.equal(cappedDeliveryCandidates.limit, 100);
     const recipientCandidate = resultsWithDraft.items[0].contactDiscovery.candidates.find((candidate) => candidate.address === 'jobs@example.com');
     assert.ok(recipientCandidate?.evidenceHash);
     assert.ok(recipientCandidate?.sourceRevision);
@@ -694,7 +698,7 @@ test('audience supplements read through queued checkpoints and resume from the l
   const rootId = '20260730080000-aaaa1111';
   const childId = '20260730090000-bbbb2222';
   const rootParams = {
-    analysisMode: 'general',
+    analysisMode: 'job',
     keyword: 'original-content-query',
     collectAudience: false,
   };

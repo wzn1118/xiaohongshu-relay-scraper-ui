@@ -5,13 +5,13 @@ import {
   applicationDeliveryCandidateRevision,
 } from './application-delivery-candidates.mjs';
 import { buildApplicationAttachmentRule } from './lib/application-attachment-rule.mjs';
-import { applicationRoleTitle, applicationSubjectGuard, applicationSubjectRule } from './lib/application-email-draft.mjs';
+import { applicationRoleTitle, resolveApplicationEmailSubject } from './lib/application-email-draft.mjs';
 import { applicationContactSourceRevision, resolveApplicationContacts } from './lib/application-contact-resolver.mjs';
 
 const NOTE_ID = /^[\p{L}\p{N}_.:-]{1,160}$/u;
 const IDEMPOTENCY_KEY = /^[\p{L}\p{N}_.:-]{8,160}$/u;
-const DEFAULT_MAX_BATCH_SIZE = 10;
-const MAX_BATCH_SIZE = 100;
+export const DEFAULT_APPLICATION_BATCH_SIZE = 100;
+export const MAX_APPLICATION_BATCH_SIZE = 100;
 const DEFAULT_MIN_INTERVAL_MS = 1_000;
 const MAX_MIN_INTERVAL_MS = 60_000;
 const PREFLIGHT_PLAN_TTL_MS = 30 * 60_000;
@@ -50,7 +50,7 @@ export class ApplicationBatchService {
     manager,
     candidateProfile = {},
     fallbackOutputDirs = [],
-    maxBatchSize = DEFAULT_MAX_BATCH_SIZE,
+    maxBatchSize = DEFAULT_APPLICATION_BATCH_SIZE,
     loadRecord,
     listAttachments,
     checkQuality,
@@ -71,7 +71,12 @@ export class ApplicationBatchService {
     this.manager = manager;
     this.candidateProfile = candidateProfile && typeof candidateProfile === 'object' ? candidateProfile : {};
     this.fallbackOutputDirs = [...new Set((Array.isArray(fallbackOutputDirs) ? fallbackOutputDirs : []).map(String).filter(Boolean))];
-    this.maxBatchSize = boundedInteger(maxBatchSize, 1, MAX_BATCH_SIZE, DEFAULT_MAX_BATCH_SIZE);
+    this.maxBatchSize = boundedInteger(
+      maxBatchSize,
+      1,
+      MAX_APPLICATION_BATCH_SIZE,
+      DEFAULT_APPLICATION_BATCH_SIZE,
+    );
     this.loadRecord = loadRecord;
     this.listAttachments = listAttachments;
     this.checkQuality = checkQuality;
@@ -578,7 +583,12 @@ export class ApplicationBatchService {
       };
     }
 
-    const subjectGuard = applicationSubjectGuard(record, record?.outreach?.email_subject);
+    let subjectResolution = resolveApplicationEmailSubject(
+      record,
+      record?.outreach?.email_subject,
+      this.candidateProfile,
+    );
+    const subjectGuard = subjectResolution.subjectGuard;
     if (subjectGuard.requiresReview || ['rejected_noisy_title', 'rejected_bare_title', 'rejected_unverified_subject'].includes(subjectGuard.sourceStatus)) {
       return {
         ...blockedItem(noteId, 'subject_pending', 'APPLICATION_SUBJECT_TITLE_REVIEW_REQUIRED', subjectGuard.rawTitle
@@ -662,7 +672,7 @@ export class ApplicationBatchService {
         attachments: attachmentPreviewsFromSelected(selected, planned),
       };
     }
-    if (!hasUsableDraft(record)) {
+    if (!hasUsableDraft(record, subjectResolution)) {
       return {
         ...blockedItem(noteId, 'draft_pending', 'APPLICATION_DRAFT_REQUIRED', '该岗位缺少可发送的个性化邮件主题或正文。'),
         title: String(record?.title || roleName),
@@ -676,6 +686,11 @@ export class ApplicationBatchService {
       try {
         await this.checkQuality(noteId, attachmentIds, aiSessionId);
         record = await this.loadRecord(noteId);
+        subjectResolution = resolveApplicationEmailSubject(
+          record,
+          record?.outreach?.email_subject,
+          this.candidateProfile,
+        );
       } catch (error) {
         return {
           ...blockedItem(noteId, 'quality_pending', error?.code || 'APPLICATION_QUALITY_CHECK_FAILED', publicErrorMessage(error)),
@@ -705,6 +720,7 @@ export class ApplicationBatchService {
         to: contact.address,
         attachmentIds,
         attachmentFilenameOverrides,
+        subject: subjectResolution.subject,
         draftId: record.draftVersion?.draftId,
         version: record.draftVersion?.version,
         persist: applyChanges,
@@ -733,7 +749,7 @@ export class ApplicationBatchService {
     }
     const idempotencyKey = `${batchId}:${noteId}:${preview.previewRevision}`.slice(0, 200);
     const coverLetter = String(record?.outreach?.cover_letter || '');
-    const resolvedSubjectRule = applicationSubjectRule(record);
+    const resolvedSubjectRule = subjectResolution.rule;
     const sourceRevision = applicationContactSourceRevision(contact);
     const payload = {
       title: String(record?.title || roleName),
@@ -755,7 +771,6 @@ export class ApplicationBatchService {
       finalFilenames: preview.attachmentSummary.attachments.map((item) => item.filename),
       subjectRule: {
         ...resolvedSubjectRule,
-        source: resolvedSubjectRule.detected ? 'post_requirement' : 'generated_default',
       },
       attachmentRules: planned.map(({ attachment, rule }) => ({
         attachmentId: attachment.attachmentId,
@@ -1125,8 +1140,12 @@ function selectedReadyAttachments(value) {
     .filter((item) => item?.selected === true && item?.status === 'ready' && item?.validationStatus === 'passed');
 }
 
-function hasUsableDraft(record) {
-  return Boolean(String(record?.outreach?.email_subject || '').trim() && String(record?.outreach?.email_body || '').trim());
+function hasUsableDraft(record, subjectResolution) {
+  return Boolean(
+    String(subjectResolution?.subject || '').trim()
+    && subjectResolution?.missingFields?.length === 0
+    && String(record?.outreach?.email_body || '').trim(),
+  );
 }
 
 function candidateRuleValues(profile) {

@@ -55,6 +55,7 @@ import { ApplicationBatchManager } from './application-batch-manager.mjs';
 import { ApplicationBatchService, ApplicationBatchServiceError } from './application-batch-service.mjs';
 import {
   ApplicationDeliveryCandidateError,
+  normalizeApplicationDeliveryCandidateLimit,
   buildApplicationDeliveryCandidates,
   withResolvedApplicationSubject,
 } from './application-delivery-candidates.mjs';
@@ -67,12 +68,12 @@ import {
   resolveApplicationContactsBatch,
 } from './lib/application-contact-resolver.mjs';
 import {
-  applicationSubjectRule,
-  applicationSubjectGuard,
+  MAX_APPLICATION_EMAIL_SUBJECT_LENGTH,
   normalizeApplicationRoleTitle,
   resolveApplicationEmailSubject,
-  validateApplicationEmailSubject,
 } from './lib/application-email-draft.mjs';
+
+const INTERNAL_COVER_LETTER_TOKEN = /(?<![\w])(?:exp|resume|evidence)[_-][A-Za-z0-9][A-Za-z0-9_-]{3,}(?![\w])/i;
 import {
   AudienceAiValidationError,
   validateAudienceAiEmptyRequest,
@@ -1200,7 +1201,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             jobId: id,
             records,
             batches: await service.listBatches(),
-            limit: boundedInteger(url.searchParams.get('limit'), 20, 1, 100),
+            limit: normalizeApplicationDeliveryCandidateLimit(url.searchParams.get('limit')),
             query: {
               q: url.searchParams.get('q') || url.searchParams.get('query'),
               deliveryStatus: url.searchParams.get('deliveryStatus'),
@@ -2442,8 +2443,8 @@ function applicationResultSearchText(record) {
 
 function withApplicationAttachmentRequirement(record) {
   const rule = detectApplicationAttachmentRule(record);
-  const subjectRule = applicationSubjectRule(record);
   const subjectResolution = resolveApplicationEmailSubject(record, record?.outreach?.email_subject);
+  const subjectRule = subjectResolution.rule;
   return {
     ...record,
     attachmentRequirement: {
@@ -2457,6 +2458,10 @@ function withApplicationAttachmentRequirement(record) {
       template: subjectRule.template,
       evidence: subjectRule.evidence,
       fields: subjectRule.fields,
+      source: subjectRule.source,
+      ...(subjectRule.attachmentTemplate
+        ? { attachmentTemplate: subjectRule.attachmentTemplate }
+        : {}),
       ...(subjectRule.literal ? { literal: true } : {}),
     },
     emailSubjectPreview: subjectResolution.subject,
@@ -2566,17 +2571,20 @@ async function readApplicationContactRecords(outputDir, task = {}) {
   const delivery = await readDeliveryState(outputDir);
   const legacyMedia = await readLegacyMediaSources(outputDir);
   return Array.isArray(payload.records)
-    ? payload.records.map((record, recordIndex) => enrichApplicationRecordContacts(
-      localizeApplicationMedia(
-        mergeApplicationState(
-          hydrateApplicationMedia(record, legacyMedia.get(record.note_id)),
-          delivery[record.note_id],
-          recordIndex,
-          payload[APPLICATION_ARTIFACT_FILENAME],
+    ? payload.records.map((record, recordIndex) => {
+      const hydratedRecord = hydrateApplicationCandidateProfile(record, payload);
+      return enrichApplicationRecordContacts(
+        localizeApplicationMedia(
+          mergeApplicationState(
+            hydrateApplicationMedia(hydratedRecord, legacyMedia.get(record.note_id)),
+            delivery[record.note_id],
+            recordIndex,
+            payload[APPLICATION_ARTIFACT_FILENAME],
+          ),
+          task.id,
         ),
-        task.id,
-      ),
-    ))
+      );
+    })
     : [];
 }
 
@@ -3120,44 +3128,48 @@ async function readApplicationRecord(outputDir, noteId) {
       ? applicationInfo.requirements
       : Array.isArray(record.requirements) ? record.requirements : [],
   };
+  hydrateApplicationCandidateProfile(record, payload);
+  Object.defineProperty(record, APPLICATION_RECORD_INDEX, { value: recordIndex, enumerable: false });
+  Object.defineProperty(record, APPLICATION_ARTIFACT_FILENAME, {
+    value: payload[APPLICATION_ARTIFACT_FILENAME],
+    enumerable: false,
+  });
+  return record;
+}
+
+function hydrateApplicationCandidateProfile(record, payload) {
   const snapshot = payload?.profile_snapshot && typeof payload.profile_snapshot === 'object' && !Array.isArray(payload.profile_snapshot)
     ? payload.profile_snapshot
     : null;
-  const snapshotCandidate = snapshot?.candidate && typeof snapshot.candidate === 'object' && !Array.isArray(snapshot.candidate)
+  if (!snapshot || !record || typeof record !== 'object' || Array.isArray(record)) return record;
+  const snapshotCandidate = snapshot.candidate && typeof snapshot.candidate === 'object' && !Array.isArray(snapshot.candidate)
     ? snapshot.candidate
     : {};
   const existingCandidate = record.candidate_profile && typeof record.candidate_profile === 'object' && !Array.isArray(record.candidate_profile)
     ? record.candidate_profile
     : {};
-  if (snapshot) {
-    const evidence = Array.isArray(snapshot.evidence) ? snapshot.evidence : [];
-    const resumeArtifacts = Array.isArray(snapshot.resumeArtifacts) ? snapshot.resumeArtifacts : [];
-    const candidateProfile = {
-      ...snapshotCandidate,
-      ...existingCandidate,
-      evidence_items: evidence,
+  const evidence = Array.isArray(snapshot.evidence) ? snapshot.evidence : [];
+  const resumeArtifacts = Array.isArray(snapshot.resumeArtifacts) ? snapshot.resumeArtifacts : [];
+  const candidateProfile = {
+    ...snapshotCandidate,
+    ...existingCandidate,
+    evidence_items: evidence,
+    evidence,
+    resumeArtifacts,
+    profile_snapshot: {
+      profileSnapshotId: String(snapshot.profileSnapshotId || '').trim(),
       evidence,
       resumeArtifacts,
-      profile_snapshot: {
-        profileSnapshotId: String(snapshot.profileSnapshotId || '').trim(),
-        evidence,
-        resumeArtifacts,
-        provenancePolicy: snapshot.provenancePolicy && typeof snapshot.provenancePolicy === 'object'
-          ? snapshot.provenancePolicy
-          : {},
-      },
-    };
-    Object.defineProperty(record, 'candidate_profile', {
-      value: candidateProfile,
-      enumerable: false,
-      configurable: true,
-      writable: true,
-    });
-  }
-  Object.defineProperty(record, APPLICATION_RECORD_INDEX, { value: recordIndex, enumerable: false });
-  Object.defineProperty(record, APPLICATION_ARTIFACT_FILENAME, {
-    value: payload[APPLICATION_ARTIFACT_FILENAME],
+      provenancePolicy: snapshot.provenancePolicy && typeof snapshot.provenancePolicy === 'object'
+        ? snapshot.provenancePolicy
+        : {},
+    },
+  };
+  Object.defineProperty(record, 'candidate_profile', {
+    value: candidateProfile,
     enumerable: false,
+    configurable: true,
+    writable: true,
   });
   return record;
 }
@@ -3341,6 +3353,31 @@ async function rewriteApplicationCoverLetter(
     ...(record.candidate_profile && typeof record.candidate_profile === 'object' ? record.candidate_profile : {}),
     ...(candidateProfile && typeof candidateProfile === 'object' ? candidateProfile : {}),
   };
+  // Some historical jobs stored only role-matched resume evidence on each
+  // application record while the profile snapshot's evidence array was empty.
+  // Rehydrate that evidence before prompting and before the server-side gate.
+  const profileEvidence = Array.isArray(mergedCandidateProfile.evidence_items)
+    ? mergedCandidateProfile.evidence_items
+    : Array.isArray(mergedCandidateProfile.evidence)
+      ? mergedCandidateProfile.evidence
+      : [];
+  if (profileEvidence.length === 0 && Array.isArray(record.fit_evidence) && record.fit_evidence.length > 0) {
+    const fitEvidence = record.fit_evidence
+      .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+      .map((item) => ({
+        ...item,
+        source: String(item.source || 'application.fit_evidence').trim(),
+      }));
+    mergedCandidateProfile.evidence_items = fitEvidence;
+    mergedCandidateProfile.evidence = fitEvidence;
+    const snapshot = mergedCandidateProfile.profile_snapshot && typeof mergedCandidateProfile.profile_snapshot === 'object'
+      ? mergedCandidateProfile.profile_snapshot
+      : {};
+    mergedCandidateProfile.profile_snapshot = {
+      ...snapshot,
+      evidence: fitEvidence,
+    };
+  }
   const requestId = randomUUID();
   let rewritten;
   try {
@@ -3368,7 +3405,18 @@ async function rewriteApplicationCoverLetter(
     record,
   );
   const coverLetter = normalizedRewrite.coverLetter;
-  const emailSubject = normalizedRewrite.emailSubject;
+  const requestedEmailSubject = normalizedRewrite.emailSubject;
+  const emailSubjectResolution = resolveApplicationEmailSubject(record, requestedEmailSubject, {
+    ...currentDraft,
+    candidateProfile: mergedCandidateProfile,
+  });
+  const emailSubject = emailSubjectResolution.subject;
+  if (!emailSubject || emailSubjectResolution.missingFields.length > 0) {
+    throw applicationDraftError(
+      'AI_COVER_LETTER_REWRITE_FAILED',
+      'Cover Letter rewrite could not resolve a compliant email subject from the required naming rule.',
+    );
+  }
   const charCount = unicodeNonWhitespaceCount(coverLetter);
   const responsibilityCoverage = Array.isArray(rewritten?.responsibility_coverage)
     ? rewritten.responsibility_coverage
@@ -3484,7 +3532,6 @@ async function rewriteApplicationCoverLetter(
       email_subject: emailSubject,
       cover_letter: coverLetter,
     },
-    preserveEmailSubject: true,
     applicationContext,
     generation: {
       runId: requestId,
@@ -3572,6 +3619,12 @@ function assertCoverLetterRewriteResult(
   usedEvidenceIds,
   evidenceCoverage,
 ) {
+  if (INTERNAL_COVER_LETTER_TOKEN.test(String(coverLetter || ''))) {
+    throw applicationDraftError(
+      'AI_COVER_LETTER_REWRITE_FAILED',
+      'AI Cover Letter contains an internal evidence identifier and cannot be sent.',
+    );
+  }
   if (charCount < 800 || charCount > 1_600) {
     throw applicationDraftError(
       'AI_COVER_LETTER_REWRITE_FAILED',
@@ -3675,7 +3728,12 @@ async function updateApplicationDraft(outputDir, value, writeState = writeDelive
     const current = currentDraftVersion(store);
     const draft = normalizeDraft(value?.outreach, current.content);
     const subjectResolution = resolveApplicationEmailSubject(record, draft.email_subject, value?.outreach || {});
-    if (
+    if (subjectResolution.rule.detected && (
+      !subjectResolution.subject
+      || subjectResolution.missingFields.length > 0
+    )) {
+      draft.email_subject = '';
+    } else if (
       value?.preserveEmailSubject !== true
       && subjectResolution.subject
       && subjectResolution.missingFields.length === 0
@@ -4057,8 +4115,10 @@ export async function previewApplicationEmail(
       : qualityBundle;
     const resolved = resolveStoredDraftForAction(record, existing, value);
     const draft = { ...resolved.content };
+    const subjectResolution = assertApplicationSubjectRule(record, draft.email_subject);
+    assertRequestedApplicationSubject(value, subjectResolution.subject);
+    draft.email_subject = subjectResolution.subject;
     if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
-    assertApplicationSubjectRule(record, draft.email_subject);
     validateDeliveryDraft(draft, record);
     const peerCorpusHash = applicationPeerCorpusHash(savedPeerDrafts(state, noteId));
     const applicationContextHash = persistedApplicationContextHash(existing);
@@ -4325,8 +4385,10 @@ export async function sendApplicationEmail(outputDir, value, mailer, replyTo, sm
     existing = state[noteId] || {};
     const resolved = resolveStoredDraftForAction(record, existing, value);
     const draft = { ...resolved.content };
+    const subjectResolution = assertApplicationSubjectRule(record, draft.email_subject);
+    assertRequestedApplicationSubject(value, subjectResolution.subject);
+    draft.email_subject = subjectResolution.subject;
     if (!draft.email_subject || !draft.email_body) throw new ValidationError('Email subject and body are required.');
-    assertApplicationSubjectRule(record, draft.email_subject);
     validateDeliveryDraft(draft, record);
     const qualityAttachmentBundle = await resolveApplicationAttachments(outputDir, noteId, value?.attachmentIds, limits);
     const attachmentBundle = value?.attachmentFilenameOverrides
@@ -4938,11 +5000,10 @@ function applicationDraftError(code, message) {
 }
 
 function assertApplicationSubjectRule(record, subject) {
-  const subjectGuard = applicationSubjectGuard(record, subject);
+  const resolution = resolveApplicationEmailSubject(record, subject);
+  const subjectGuard = resolution.subjectGuard;
   if (!subjectGuard.explicitRule && (
-    subjectGuard.requestedNoisyTitle
-    || subjectGuard.requestedBareTitle
-    || subjectGuard.requestedUnverifiedSubject
+    ['rejected_noisy_title', 'rejected_bare_title', 'rejected_unverified_subject'].includes(subjectGuard.sourceStatus)
     || subjectGuard.requiresReview
   )) {
     const error = applicationDraftError(
@@ -4952,10 +5013,12 @@ function assertApplicationSubjectRule(record, subject) {
     error.subjectGuard = subjectGuard;
     throw error;
   }
-  const rule = applicationSubjectRule(record);
-  if (!rule.detected) return;
-  const validation = validateApplicationEmailSubject(record, subject);
-  if (validation.status === 'compliant') return;
+  const rule = resolution.rule;
+  if (!rule.detected) return resolution;
+  const validation = resolveApplicationEmailSubject(record, resolution.subject).validation;
+  if (validation.status === 'compliant' && resolution.missingFields.length === 0) {
+    return { ...resolution, validation };
+  }
   const error = applicationDraftError(
     'APPLICATION_SUBJECT_RULE_MISMATCH',
     '正文要求的邮件标题与当前草稿不一致，请重新保存或生成草稿后再发送。',
@@ -4966,6 +5029,18 @@ function assertApplicationSubjectRule(record, subject) {
     missingFields: validation.missingFields,
     missingValues: validation.missingValues,
   };
+  throw error;
+}
+
+function assertRequestedApplicationSubject(value, resolvedSubject) {
+  if (!Object.hasOwn(value || {}, 'subject')) return;
+  const requested = String(value?.subject || '').trim();
+  if (requested === resolvedSubject) return;
+  const error = applicationDraftError(
+    'APPLICATION_SUBJECT_RESOLUTION_MISMATCH',
+    '请求中的邮件主题与当前草稿及岗位命名要求不一致，请重新执行 Dry Run。',
+  );
+  error.expectedSubject = resolvedSubject;
   throw error;
 }
 
@@ -5490,8 +5565,8 @@ function normalizeDraft(value, base = {}) {
 function validateDeliveryDraft(draft, record) {
   const subject = String(draft.email_subject || '').trim();
   const body = String(draft.email_body || '').trim();
-  if (subject.length < 8 || subject.length > 120) {
-    throw new ValidationError('Email subject must contain 8-120 characters.');
+  if (subject.length < 8 || subject.length > MAX_APPLICATION_EMAIL_SUBJECT_LENGTH) {
+    throw new ValidationError(`Email subject must contain 8-${MAX_APPLICATION_EMAIL_SUBJECT_LENGTH} characters.`);
   }
   if (body.length < 80 || body.length > 300) {
     throw new ValidationError('Email body must contain 80-300 characters before delivery.');

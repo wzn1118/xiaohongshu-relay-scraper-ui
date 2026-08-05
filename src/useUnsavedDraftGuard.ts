@@ -96,19 +96,6 @@ export function useUnsavedDraftGuard({ content, draftVersion, save, discard }: U
     return pendingSave
   }, [currentContentHash, draftVersion?.draftId, draftVersion?.version])
 
-  const requestTransition = useCallback(<T>(reason: string, action: () => T | Promise<T>): Promise<T | undefined> => {
-    if (!dirtyRef.current) return Promise.resolve(action())
-    if (deferredRef.current) return Promise.resolve(undefined)
-    setPendingTransition({ reason })
-    return new Promise<T | undefined>((resolve, reject) => {
-      deferredRef.current = {
-        action,
-        resolve: (value) => resolve(value as T),
-        reject,
-      }
-    })
-  }, [])
-
   const completeTransition = useCallback(async (runAction: boolean) => {
     const deferred = deferredRef.current
     deferredRef.current = null
@@ -124,6 +111,29 @@ export function useUnsavedDraftGuard({ content, draftVersion, save, discard }: U
       deferred.reject(error)
     }
   }, [])
+
+  const requestTransition = useCallback(<T>(reason: string, action: () => T | Promise<T>): Promise<T | undefined> => {
+    if (!dirtyRef.current) return Promise.resolve(action())
+    if (deferredRef.current) return Promise.resolve(undefined)
+    const transition = new Promise<T | undefined>((resolve, reject) => {
+      deferredRef.current = {
+        action,
+        resolve: (value) => resolve(value as T),
+        reject,
+      }
+    })
+    // Draft changes are saved automatically before a navigation or other
+    // guarded action. Keep the confirmation dialog as a failure-only escape
+    // hatch so a transient API error still leaves the user in control.
+    void saveNow().then((saved) => {
+      if (saved) {
+        void completeTransition(true)
+      } else if (deferredRef.current) {
+        setPendingTransition({ reason })
+      }
+    })
+    return transition
+  }, [completeTransition, saveNow])
 
   const saveAndContinue = useCallback(async () => {
     if (!deferredRef.current) return

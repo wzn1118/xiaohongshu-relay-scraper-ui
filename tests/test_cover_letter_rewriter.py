@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from cover_letter_rewriter import (
     _local_evidence_locked_result,
     _local_fact_rewrite_control,
+    _local_review_floor_passes,
     build_cover_letter_rewrite_input,
     cover_letter_char_count,
     rewrite_cover_letter,
@@ -165,6 +166,23 @@ class LocalCapturingProvider(CapturingProvider):
 
 
 class CoverLetterRewriterTests(unittest.TestCase):
+    def test_local_review_floor_relaxes_only_score(self) -> None:
+        review = {
+            "score": 84,
+            "approved": True,
+            "responsibility_coverage_complete": True,
+            "evidence_grounded": True,
+            "resume_experience_integrated": True,
+            "personal_evidence_dominant": True,
+            "instruction_followed": True,
+            "signature_evidence_clear": True,
+            "style_violation_count": 0,
+        }
+
+        self.assertTrue(_local_review_floor_passes(review, valid_result()))
+        review["evidence_grounded"] = False
+        self.assertFalse(_local_review_floor_passes(review, valid_result()))
+
     def test_input_carries_role_responsibilities_current_draft_and_exact_user_instruction(self) -> None:
         payload = build_cover_letter_rewrite_input(
             fixture_record(),
@@ -249,6 +267,20 @@ class CoverLetterRewriterTests(unittest.TestCase):
         self.assertIn("Signature Evidence", provider.calls[0]["system"])
         self.assertIn("完成初稿后不要立即输出。", provider.calls[0]["system"])
         self.assertIn("高级求职投递 Agent", provider.calls[0]["system"])
+
+    def test_quality_gate_rejects_internal_evidence_token(self) -> None:
+        leaked = valid_result()
+        leaked["cover_letter"] = leaked["cover_letter"].replace(
+            "内容研究项目",
+            "exp_2022_xinhua 内容研究项目",
+        )
+        provider = CapturingProvider([leaked, valid_result()])
+
+        result = rewrite_cover_letter(provider, fixture_record(), {}, "保持事实准确")
+
+        self.assertEqual(result["attempts"], 2)
+        errors = provider.calls[1]["payload"]["correction"]["validation_errors"]
+        self.assertTrue(any("internal evidence identifier" in item for item in errors))
 
     def test_quality_gate_rejects_defensive_contrast_style(self) -> None:
         defensive = valid_result()
@@ -595,6 +627,11 @@ class CoverLetterRewriterTests(unittest.TestCase):
         self.assertTrue(any("丙公司" in value and "8位KOL" in value and "4项" in value for value in paragraphs))
         self.assertNotIn("简历称", body)
         self.assertNotIn("候选人简历记载", body)
+        self.assertIn("甲公司、乙公司、丙公司", paragraphs[1])
+        self.assertNotIn("玩家反馈与内容监测", body)
+        self.assertNotIn("用户深访与达人共创", body)
+        self.assertNotIn("直播话术与数据复盘", body)
+        self.assertNotIn("我会把每次任务中的目标、动作、交付物和反馈分别记录下来", body)
 
 
 if __name__ == "__main__":

@@ -1513,6 +1513,8 @@ export type ApplicationResult = {
     evidence: string
     fields: string[]
     literal?: boolean
+    source?: 'email_subject_requirement' | 'shared_subject_attachment_requirement' | 'attachment_requirement' | 'generated_default' | string
+    attachmentTemplate?: string
   }
   emailSubjectPreview?: string
   emailSubjectGuard?: {
@@ -1670,6 +1672,12 @@ export type ApplicationDeliveryCandidatesResponse = {
   facetCounts: Record<string, Record<string, number>>
   blockerCounts: Record<string, number>
   selectionSnapshot: ApplicationDeliverySelectionSnapshot
+  contactDiscovery?: {
+    generatedAt?: string
+    sourceSignature?: string
+    summary?: ApplicationContactDiscoverySummary
+    error?: string
+  } | null
 }
 
 export type ApplicationContactSource = 'body' | 'image' | 'author_comment' | 'other_comment'

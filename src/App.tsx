@@ -3673,7 +3673,7 @@ function App() {
   }
 
   const resumeAudienceCollection = (forceRateLimitRecovery = false, forcedJobId?: string) => {
-    if (draftGuard.dirty) setAudienceActionMessage('当前投递文案有未保存修改，请在弹窗中选择保存或放弃后继续。')
+    if (draftGuard.dirty) setAudienceActionMessage('当前投递文案将在切换前自动保存；若保存失败，再选择重试或放弃。')
     return draftGuard.requestTransition(
       forceRateLimitRecovery ? '立即检查平台是否恢复' : '恢复其他任务',
       () => performResumeAudienceCollection(forceRateLimitRecovery, forcedJobId),
@@ -3829,9 +3829,13 @@ function App() {
     }
   }
 
-  const resumeJob = (job: Job, scope: ResumeScope = 'full', sessionHint: AiSession | null = aiSession) => (
-    draftGuard.requestTransition(job.id === activeJob?.id ? '恢复当前任务' : '恢复其他任务', () => performResumeJob(job, scope, sessionHint))
-  )
+  const resumeJob = (job: Job, scope: ResumeScope = 'full', sessionHint: AiSession | null = aiSession) => {
+    const resume = () => performResumeJob(job, scope, sessionHint)
+    // Resuming the task already open on screen does not navigate away from the
+    // current draft, so it must not be swallowed by a pending navigation guard.
+    if (job.id === activeJob?.id) return resume()
+    return draftGuard.requestTransition('恢复其他任务', resume)
+  }
 
   const refreshSecurityAndContinue = async (job: Job) => {
     if (securityRecovering || submitting) return
@@ -3883,6 +3887,11 @@ function App() {
         const result = await api.openJobLogin(job.id)
         setNotice(result.message || '验证页面已打开；完成页面操作后可回到这里继续。')
         window.setTimeout(() => void refreshRelay(), 1500)
+        return
+      }
+
+      if (actionId === 'resume') {
+        await performResumeJob(job, 'full')
         return
       }
 
@@ -4235,7 +4244,7 @@ function App() {
       : activeJob?.status === 'completed'
         ? '这项任务已经完成，可以直接查看下方结果。'
         : activeJob && ['incomplete', 'interrupted', 'cancelled', 'blocked'].includes(activeJob.status)
-          ? '已有结果会保留，点击上方的继续按钮即可从剩余内容接着处理。'
+          ? '已有结果会保留，点击上方的“一键恢复未完成步骤”即可从剩余内容接着处理。'
           : '当前没有需要你处理的事项。'
   const workflowSummary = activeJob?.workflowSummary || {}
   const expansionSummary = workflowSummary.expansion && typeof workflowSummary.expansion === 'object'
@@ -5440,6 +5449,8 @@ function App() {
                     lastEventAt={jobLastEventAt}
                     now={clock}
                     actionBusy={submitting || audienceResuming || relayLoginOpening || securityRecovering || journeyActionBusy}
+                    onResume={() => void resumeJob(activeJob)}
+                    resumeDisabled={submitting || restoringAi || journeyActionBusy}
                     isProblemActionDisabled={(_problem, actionId) => actionId === 'open_login'
                       ? relayLoginOpening || journeyActionBusy
                       : actionId === 'check_recovery'
@@ -5467,7 +5478,7 @@ function App() {
               )}
             </section>
 
-            <details className="panel log-panel technical-details-panel">
+            <details className="panel log-panel technical-details-panel" open>
               <summary className="panel-heading dark-heading">
                 <div><span className="step-label">STATUS EXPLAINED</span><h2>系统状态说明</h2><small>先看日常说明；原始记录只在需要排查时展开</small></div>
                 <span className="technical-details-toggle"><Info size={15} />{logs.length ? `还有 ${logs.length} 条系统记录` : '暂无系统记录'}<ChevronDown size={17} /></span>
@@ -5494,14 +5505,14 @@ function App() {
                 </div>
               )}
               <details className="raw-log-disclosure">
-                <summary><Code2 size={15} /><span>需要排查时查看原始记录</span><small>{logs.length} 条</small><ChevronDown size={15} /></summary>
+                <summary><Code2 size={15} /><span>技术详情</span><small>需要排查时查看原始记录 · {logs.length} 条</small><ChevronDown size={15} /></summary>
                 {activeJob && (
                   <dl className="technical-job-meta">
                     <div><dt>任务编号</dt><dd>{activeJob.id}</dd></div>
                     <div><dt>本次运行编号</dt><dd>{activeJob.currentAttemptId || '-'}</dd></div>
                     <div><dt>保存版本</dt><dd>{activeJob.revision ?? '-'}</dd></div>
                     <div><dt>系统阶段名</dt><dd>{activeJob.progressPhase || '-'}</dd></div>
-                    {activeJob.message && <div className="technical-job-error"><dt>系统原话</dt><dd>{activeJob.message}</dd></div>}
+                    {activeJob.message && !/unknown/i.test(activeJob.message) && <div className="technical-job-error"><dt>系统原话</dt><dd>{activeJob.message}</dd></div>}
                   </dl>
                 )}
                 <div className="log-console" ref={logConsole}>

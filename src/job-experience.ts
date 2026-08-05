@@ -70,6 +70,10 @@ export function normalizeProblemActionId(actionId: unknown): SupportedProblemAct
 
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'resuming', 'running'])
 
+function containsUnknownCopy(value: unknown) {
+  return /未识别|未知|unknown/i.test(String(value || ''))
+}
+
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -423,7 +427,7 @@ export function jobExperienceView(
   ))
   const qualityNeedsReview = String(job.workflowSummary?.status || '') === 'failed'
     || normalizedStages.some((stage) => stage.id === 'quality' && ['partial', 'failed'].includes(stage.state))
-  const headline = staleBodyAccessHeadline
+  const rawHeadline = staleBodyAccessHeadline
     ? qualityNeedsReview ? '正文采集已完成，求职材料仍需检查' : '正文采集已完成'
     : snapshot?.headline?.trim()
     || (activeStage ? `正在${activeStage.label}`
@@ -431,6 +435,7 @@ export function jobExperienceView(
         : job.status === 'failed' ? '当前步骤没有完成'
           : ['incomplete', 'interrupted', 'cancelled', 'blocked'].includes(job.status) ? '本轮结果已保存'
             : '任务正在准备中')
+  const headline = containsUnknownCopy(rawHeadline) ? '当前步骤需要重新检查' : rawHeadline
   const detail = discovered > 0
     ? `已找到 ${discovered} 条，完整正文 ${fullText} 条，待处理 ${pending} 条`
     : snapshot?.detail?.trim()

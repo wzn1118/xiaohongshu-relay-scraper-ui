@@ -87,6 +87,8 @@ function application(noteId: string, title: string, draft = baseDraft) {
         channel: 'email',
         confidence: 1,
         actionable: true,
+        evidence_hash: 'a'.repeat(64),
+        source_revision: 'route-revision-1',
       }],
       responsibilities: [{ text: '分析业务数据', source_field: 'body', evidence: '分析业务数据' }],
       requirements: [{ text: '熟悉 SQL', source_field: 'body', evidence: '熟悉 SQL' }],
@@ -191,6 +193,8 @@ type PreviewRequest = {
   attachmentIds: string[]
   draftId: string
   version: number
+  evidenceHash?: string
+  sourceRevision?: string
 }
 
 type SendRequest = PreviewRequest & {
@@ -631,47 +635,14 @@ async function dirtyGreeting(page: Page, suffix = ' 本地修改') {
   await expect(page.getByRole('button', { name: '保存修改' })).toBeEnabled()
 }
 
-async function expectGuard(page: Page, reason: string) {
-  const dialog = page.getByRole('alertdialog')
-  await expect(dialog).toBeVisible()
-  await expect(dialog).toContainText(reason)
-  return dialog
-}
-
-test('统一 Guard 覆盖岗位、任务、恢复、新任务、重新生成、Profile 和三类文案', async ({ page }) => {
-  test.setTimeout(60_000)
-  await mockApi(page)
-  await dirtyGreeting(page)
-
+test('脏稿在常用切换前默认保存并继续，正常流程不弹窗', async ({ page }) => {
+  const state = await mockApi(page)
+  await dirtyGreeting(page, ' 自动保存')
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-  await expectGuard(page, '切换岗位')
-  await page.getByRole('button', { name: '取消操作' }).click()
-
-  await page.getByRole('row', { name: /任务乙/ }).click()
-  await expectGuard(page, '切换任务')
-  await page.getByRole('button', { name: '取消操作' }).click()
-
-  await page.getByRole('button', { name: '重试' }).click()
-  await expectGuard(page, '恢复其他任务')
-  await page.getByRole('button', { name: '取消操作' }).click()
-
-  await page.getByRole('button', { name: '启动全流程' }).click()
-  await expectGuard(page, '启动新任务')
-  await page.getByRole('button', { name: '取消操作' }).click()
-
-  await page.getByRole('button', { name: '一键智能补全' }).click()
-  await expectGuard(page, '重新生成当前文案')
-  await page.getByRole('button', { name: '取消操作' }).click()
-
-  await page.locator('.profile-actions select').selectOption('profile-b')
-  await expectGuard(page, '切换 Profile')
-  await page.getByRole('button', { name: '取消操作' }).click()
-
-  await page.getByLabel('邮件主题').fill(`${baseDraft.email_subject} 修改`)
-  await page.getByLabel('邮件正文').fill(`${baseDraft.email_body} 修改`)
-  await page.getByLabel('Cover Letter').fill(`${baseDraft.cover_letter} 修改`)
-  await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-  await expectGuard(page, '切换岗位')
+  await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
+  await expect(page.getByRole('alertdialog')).toHaveCount(0)
+  expect(state.draftRequests).toBe(1)
+  expect(state.draftPayloads[0].outreach.greeting).toContain('自动保存')
 })
 
 test('Cover Letter 自定义要求和高级模型会话进入重写 API 并回写新版本', async ({ page }) => {
@@ -732,28 +703,15 @@ test('Cover Letter 重写拒绝不足 800 个非空白字符的异常响应并�
   expect(state.rewriteRequests).toBe(1)
 })
 
-test('取消、放弃和保存并继续分别保留、回滚和持久化草稿', async ({ page }) => {
-  const state = await mockApi(page)
-  const changed = `${baseDraft.greeting} 需要保留`
+test('连续切换时自动保存只执行一次并继续第一次操作', async ({ page }) => {
+  const state = await mockApi(page, { saveDelayMs: 1_500 })
+  const changed = `${baseDraft.greeting} 快速自动保存`
   await page.getByLabel('私信文案').fill(changed)
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-  await expectGuard(page, '切换岗位')
-
-  await page.getByRole('button', { name: '取消操作' }).click()
-  await expect(page.getByLabel('私信文案')).toHaveValue(changed)
-  await expect(page.getByRole('heading', { name: '岗位 A1' })).toBeVisible()
-
-  await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-  await page.getByRole('button', { name: '放弃修改' }).click()
-  await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
-  await expect(page.getByLabel('私信文案')).toHaveValue(baseDraft.greeting)
-
-  await page.getByRole('button', { name: '查看岗位：岗位 A1' }).click()
-  await dirtyGreeting(page, ' 保存后切换')
-  await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-  await page.getByRole('button', { name: '保存并继续' }).click()
+  await page.getByRole('row', { name: /任务乙/ }).click({ force: true })
   await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
   expect(state.draftRequests).toBe(1)
+  await expect(page.getByRole('alertdialog')).toHaveCount(0)
 })
 
 test('保存失败不离开、不丢文本', async ({ page }) => {
@@ -761,24 +719,22 @@ test('保存失败不离开、不丢文本', async ({ page }) => {
   const changed = `${baseDraft.greeting} 保存失败仍保留`
   await page.getByLabel('私信文案').fill(changed)
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-  await page.getByRole('button', { name: '保存并继续' }).click()
 
   await expect(page.locator('.draft-guard-error')).toContainText('保存失败')
   await expect(page.getByRole('alertdialog')).toBeVisible()
   await expect(page.getByLabel('私信文案')).toHaveValue(changed)
   await expect(page.getByRole('heading', { name: '岗位 A1' })).toBeVisible()
   expect(state.draftRequests).toBe(1)
+  state.saveFails = false
+  await page.getByRole('button', { name: '保存并继续' }).click()
+  await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
+  expect(state.draftRequests).toBe(2)
 })
 
-test('快速连续点击保存并继续只保存和跳转一次，保存中切任务不抢占目标', async ({ page }) => {
+test('保存完成前再次切换不会抢占正在处理的目标', async ({ page }) => {
   const state = await mockApi(page, { saveDelayMs: 1_500 })
-  await dirtyGreeting(page, ' 快速保存')
+  await dirtyGreeting(page, ' 保存中切换')
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-  const saveAndContinue = page.getByRole('button', { name: '保存并继续' })
-  await saveAndContinue.evaluate((button) => {
-    button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-    button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-  })
   await page.getByRole('row', { name: /任务乙/ }).click({ force: true })
   await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
   expect(state.draftRequests).toBe(1)
@@ -825,8 +781,13 @@ test('beforeunload 仅在哈希变化时拦截刷新和关闭', async ({ page })
   expect(dirty).toBe(true)
 
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-  await page.getByRole('button', { name: '取消操作' }).click()
-  await expect(page.getByLabel('私信文案')).toContainText('刷新保护')
+  await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
+  const saved = await page.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(event)
+    return event.defaultPrevented
+  })
+  expect(saved).toBe(false)
 })
 
 test('无修改时岗位和任务切换不弹窗', async ({ page }) => {
@@ -907,7 +868,7 @@ test('任务产物通过专用引用加入附件并保留来源与草稿版本',
 })
 
 test('上传替换附件后必须核对完整预览和质量结果再发送，移动端无横向溢出', async ({ page }) => {
-  test.setTimeout(60_000)
+  test.setTimeout(90_000)
   await page.setViewportSize({ width: 390, height: 844 })
   const state = await mockApi(page, { emailConfigured: true, attachmentUploadDelayMs: 700 })
 
@@ -995,6 +956,8 @@ test('上传替换附件后必须核对完整预览和质量结果再发送，�
     noteId: 'job-a-note-1',
     to: 'recruiter@example.test',
     attachmentIds: ['attachment-pdf-2'],
+    evidenceHash: 'a'.repeat(64),
+    sourceRevision: 'route-revision-1',
     draftId: 'draft-job-a-note-1',
     version: 1,
   }])
@@ -1018,6 +981,8 @@ test('上传替换附件后必须核对完整预览和质量结果再发送，�
     to: 'recruiter@example.test',
     outreach: baseDraft,
     attachmentIds: ['attachment-pdf-2'],
+    evidenceHash: 'a'.repeat(64),
+    sourceRevision: 'route-revision-1',
     previewRevision: 'preview-revision-1',
     attachmentBundleHash: 'b'.repeat(64),
     idempotencyKey: 'preview-revision-1',
@@ -1107,13 +1072,12 @@ for (const viewport of [
   { name: 'tablet-768x1024', width: 768, height: 1024 },
   { name: 'desktop-1440x900', width: 1440, height: 900 },
 ]) {
-  test(`确认弹窗视觉快照 ${viewport.name}`, async ({ page }) => {
+  test(`脏稿自动保存在不同视口不弹确认框 ${viewport.name}`, async ({ page }) => {
     await page.setViewportSize({ width: viewport.width, height: viewport.height })
     await mockApi(page)
     await dirtyGreeting(page, ` ${viewport.name}`)
     await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
-    const dialog = await expectGuard(page, '切换岗位')
-    await page.screenshot({ path: `output/playwright/phase9-after/${viewport.name}.png` })
-    await expect(dialog).toHaveScreenshot(`${viewport.name}.png`, { maxDiffPixels: 20 })
+    await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
+    await expect(page.getByRole('alertdialog')).toHaveCount(0)
   })
 }

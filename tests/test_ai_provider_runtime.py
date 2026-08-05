@@ -48,6 +48,7 @@ class AiProviderRuntimeTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertTrue(provider.last_request_used_images)
         payload = json.loads(open_url.call_args.args[0].data)
+        self.assertEqual(payload["max_tokens"], 4_096)
         self.assertEqual(payload["messages"][-1]["content"][0]["type"], "text")
         self.assertEqual(payload["messages"][-1]["content"][1]["image_url"]["url"], "https://img.example/job.jpg")
 
@@ -147,7 +148,8 @@ class AiProviderRuntimeTests(unittest.TestCase):
         payload = json.loads(open_url.call_args.args[0].data)
         self.assertEqual(payload["options"]["num_predict"], 1_536)
         self.assertEqual(AIProvider(max_output_tokens=1).max_output_tokens, 256)
-        self.assertEqual(AIProvider(max_output_tokens=99_999).max_output_tokens, 16_384)
+        self.assertEqual(AIProvider(max_output_tokens=99_999).max_output_tokens, 99_999)
+        self.assertEqual(AIProvider(max_output_tokens=999_999).max_output_tokens, 262_144)
 
     def test_invalid_output_token_override_falls_back_to_default(self) -> None:
         with patch.dict(os.environ, {"XHS_AI_MAX_OUTPUT_TOKENS": "invalid"}):

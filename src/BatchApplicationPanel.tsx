@@ -21,6 +21,7 @@ import {
   Search,
   ShieldCheck,
   SlidersHorizontal,
+  WandSparkles,
   XCircle,
 } from 'lucide-react'
 
@@ -30,10 +31,14 @@ import type {
   ApplicationBatchItemStatus,
   ApplicationBatchPreflight,
   ApplicationBatchRequest,
+  ApplicationContext,
   ApplicationContactCandidate,
+  ApplicationContactDiscoverySummary,
   ApplicationDeliveryCandidatesQuery,
   ApplicationDeliverySelectionSnapshot,
   ApplicationResult,
+  OutreachDraft,
+  ProvenanceText,
 } from './types'
 
 type BatchApplicationPanelProps = {
@@ -62,6 +67,7 @@ type BatchWorkbenchPreferences = {
   query: string
   filters: BatchWorkbenchFilters
   selectionLimit: number
+  pageSize: number
 }
 
 type CandidateCorpusPage = {
@@ -73,6 +79,7 @@ type CandidateCorpusPage = {
   nextCursor: string | null
   items: ApplicationResult[]
   selectionSnapshot: ApplicationDeliverySelectionSnapshot
+  contactDiscovery: ApplicationContactDiscoverySummary | null
 }
 
 const DEFAULT_WORKBENCH_FILTERS: BatchWorkbenchFilters = {
@@ -120,16 +127,24 @@ const ATTACHMENT_FILTER_OPTIONS: Array<{ value: BatchAttachmentFilter; label: st
   { value: 'blocked', label: '命名阻塞' },
 ]
 
-const MAX_BATCH_SIZE = 10
-const CANDIDATE_PAGE_SIZE = 20
+const MAX_BATCH_SIZE = 100
+const DEFAULT_SELECTION_LIMIT = 50
+const DEFAULT_CANDIDATE_PAGE_SIZE = 50
+const CANDIDATE_PAGE_SIZE_OPTIONS = [20, 50, 100] as const
+const BATCH_SELECTION_PRESETS = [10, 20, 50, 100] as const
 const DEFAULT_ATTACHMENT_TEMPLATE = '{candidateName}-{jobTitle}-简历'
-const WORKBENCH_PREFERENCES_PREFIX = 'batch-application-workbench:v2:'
+const WORKBENCH_PREFERENCES_PREFIX = 'batch-application-workbench:v3:'
+const BULK_POLISH_INSTRUCTIONS = '保持所有事实可核验，逐项回应岗位职责，删除模板腔、重复和空泛表述，用自然、专业、具体的中文重写专属 Cover Letter；不要虚构经历或结果。'
 
 export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = false, onOpenItem }: BatchApplicationPanelProps) {
   const [expanded, setExpanded] = useState(standalone)
   const [query, setQuery] = useState(() => loadWorkbenchPreferences(jobId).query)
   const [workbenchFilters, setWorkbenchFilters] = useState<BatchWorkbenchFilters>(() => loadWorkbenchPreferences(jobId).filters)
   const [selectionLimit, setSelectionLimit] = useState(() => loadWorkbenchPreferences(jobId).selectionLimit)
+  const [selectionLimitMode, setSelectionLimitMode] = useState<'preset' | 'custom'>(() =>
+    isBatchSelectionPreset(loadWorkbenchPreferences(jobId).selectionLimit) ? 'preset' : 'custom',
+  )
+  const [candidatePageSize, setCandidatePageSize] = useState(() => loadWorkbenchPreferences(jobId).pageSize)
   const [preferencesJobId, setPreferencesJobId] = useState(jobId)
   const [expandedCoverLetters, setExpandedCoverLetters] = useState<Set<string>>(new Set())
   const [copiedDeliveryNoteId, setCopiedDeliveryNoteId] = useState('')
@@ -143,6 +158,8 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   const [candidateCorpus, setCandidateCorpus] = useState<CandidateCorpusPage | null>(null)
   const [candidateLoading, setCandidateLoading] = useState(false)
   const [candidateError, setCandidateError] = useState('')
+  const [contactDiscoverySummary, setContactDiscoverySummary] = useState<ApplicationContactDiscoverySummary | null>(null)
+  const [commentCollectionBusy, setCommentCollectionBusy] = useState(false)
   const [knownCandidateTotal, setKnownCandidateTotal] = useState(items.length)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [scopeNoteIds, setScopeNoteIds] = useState<string[]>([])
@@ -155,6 +172,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   const [attachmentTemplate, setAttachmentTemplate] = useState(DEFAULT_ATTACHMENT_TEMPLATE)
   const [minIntervalSeconds, setMinIntervalSeconds] = useState(1)
   const [busy, setBusy] = useState('')
+  const [bulkPolishProgress, setBulkPolishProgress] = useState({ completed: 0, total: 0, succeeded: 0, failed: 0 })
   const [notice, setNotice] = useState<{ tone: 'error' | 'success' | 'info'; text: string } | null>(null)
   const [streamState, setStreamState] = useState<'idle' | 'live' | 'reconnecting'>('idle')
   const refreshTimer = useRef<number | null>(null)
@@ -166,12 +184,18 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   const candidateSelectionRevisions = useRef<Map<string, string>>(new Map())
   const candidateSnapshotState = useRef<Map<string, string>>(new Map())
   const dryRunRequest = useRef(0)
+  const bulkPolishRequest = useRef(0)
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const candidateFilterQuery = useMemo(
     () => buildDeliveryCandidateQuery(candidateQuery, workbenchFilters),
     [candidateQuery, workbenchFilters],
   )
-  const candidateFilterSignature = useMemo(() => JSON.stringify(candidateFilterQuery), [candidateFilterQuery])
+  const candidateFilterSignature = useMemo(
+    () => JSON.stringify({ query: candidateFilterQuery, pageSize: candidatePageSize }),
+    [candidateFilterQuery, candidatePageSize],
+  )
+  const candidateFilterSignatureRef = useRef(candidateFilterSignature)
+  candidateFilterSignatureRef.current = candidateFilterSignature
   const itemsRevision = useMemo(() => JSON.stringify(items), [items])
   const candidateItemsRevisionState = useRef({ revision: itemsRevision, hydrated: items.length > 0 })
   const batchCandidateRevision = batchJobId === jobId && batch
@@ -188,6 +212,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   useEffect(() => {
     const preferences = loadWorkbenchPreferences(jobId)
     dryRunRequest.current += 1
+    bulkPolishRequest.current += 1
     selectionSeedJob.current = null
     setSelected(new Set())
     setScopeNoteIds([])
@@ -202,6 +227,8 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     setQuery(preferences.query)
     setWorkbenchFilters(preferences.filters)
     setSelectionLimit(preferences.selectionLimit)
+    setSelectionLimitMode(isBatchSelectionPreset(preferences.selectionLimit) ? 'preset' : 'custom')
+    setCandidatePageSize(preferences.pageSize)
     setPreferencesJobId(jobId)
     setExpandedCoverLetters(new Set())
     setCopiedDeliveryNoteId('')
@@ -210,6 +237,10 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     setCandidatePageRequest({ filterSignature: '', offset: 0, cursor: undefined })
     setCandidateCorpus(null)
     setCandidateError('')
+    setContactDiscoverySummary(null)
+    setCommentCollectionBusy(false)
+    setBusy('')
+    setBulkPolishProgress({ completed: 0, total: 0, succeeded: 0, failed: 0 })
     setKnownCandidateTotal(items.length)
     candidatePageCursors.current = new Map()
     candidatePageCache.current = new Map()
@@ -233,19 +264,19 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
 
   useEffect(() => {
     if (preferencesJobId !== jobId) return
-    saveWorkbenchPreferences(jobId, { query, filters: workbenchFilters, selectionLimit })
-  }, [jobId, preferencesJobId, query, selectionLimit, workbenchFilters])
+    saveWorkbenchPreferences(jobId, { query, filters: workbenchFilters, selectionLimit, pageSize: candidatePageSize })
+  }, [candidatePageSize, jobId, preferencesJobId, query, selectionLimit, workbenchFilters])
 
   useEffect(() => {
     if (!items.length || selectionSeedJob.current === jobId) return
     const readyItems = items.filter(likelyReady)
-    const defaults = readyItems.slice(0, MAX_BATCH_SIZE).map((item) => item.note_id)
+    const defaults = readyItems.slice(0, selectionLimit).map((item) => item.note_id)
     setSelected(new Set(defaults))
-    if (readyItems.length > MAX_BATCH_SIZE) {
-      setNotice({ tone: 'info', text: `发现 ${readyItems.length} 个可投递岗位，当前批次上限为 ${MAX_BATCH_SIZE}，已明确选择前 ${MAX_BATCH_SIZE} 个。` })
+    if (readyItems.length > selectionLimit) {
+      setNotice({ tone: 'info', text: `发现 ${readyItems.length} 个可投递岗位，已按批量数量选择前 ${selectionLimit} 个。` })
     }
     selectionSeedJob.current = jobId
-  }, [items, jobId])
+  }, [items, jobId, selectionLimit])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -283,6 +314,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
       setCandidateError('')
       setCandidateOffset(cachedPage.offset)
       setCandidateCorpus(cachedPage)
+      setContactDiscoverySummary(cachedPage.contactDiscovery)
       return
     }
     let startedRequestId = 0
@@ -295,7 +327,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
         const payload = await api.applicationDeliveryCandidates(jobId, {
           ...candidateFilterQuery,
           ...(candidatePageRequest.cursor ? { cursor: candidatePageRequest.cursor } : {}),
-          limit: CANDIDATE_PAGE_SIZE,
+          limit: candidatePageSize,
         })
         if (requestId !== candidateRequest.current) return
         if (candidatePageRequest.offset > 0 && payload.total > 0 && payload.items.length === 0) {
@@ -335,10 +367,21 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
           nextCursor: payload.nextCursor,
           items: payload.items,
           selectionSnapshot: payload.selectionSnapshot,
+          contactDiscovery: payload.contactDiscovery?.summary || null,
         }
         candidatePageCache.current.set(cacheKey, page)
         setCandidateOffset(payload.offset)
         setCandidateCorpus(page)
+        setContactDiscoverySummary(page.contactDiscovery)
+        if (
+          commentCollectionBusy
+          && page.contactDiscovery
+          && page.contactDiscovery.commentsPending === 0
+          && page.contactDiscovery.commentsPartial === 0
+        ) {
+          setCommentCollectionBusy(false)
+          setNotice({ tone: 'success', text: '当前岗位的评论邮箱采集已完成，候选岗位邮箱已刷新。' })
+        }
         if (!candidateQuery) setKnownCandidateTotal((current) => Math.max(current, sourceTotal, payload.total))
       })().catch((error: ApiError) => {
         if (requestId !== candidateRequest.current) return
@@ -368,7 +411,21 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
       window.clearTimeout(timer)
       if (startedRequestId && candidateRequest.current === startedRequestId) candidateRequest.current += 1
     }
-  }, [candidateFilterQuery, candidateFilterSignature, candidatePageRequest, expanded, jobId])
+  }, [candidateFilterQuery, candidateFilterSignature, candidatePageRequest, candidatePageSize, commentCollectionBusy, expanded, jobId])
+
+  useEffect(() => {
+    if (!commentCollectionBusy || !expanded) return
+    let ticks = 0
+    const timer = window.setInterval(() => {
+      ticks += 1
+      refreshCandidateCorpus()
+      if (ticks >= 100) {
+        setCommentCollectionBusy(false)
+        setNotice({ tone: 'info', text: '评论采集仍在后台运行，岗位投递清单已停止自动刷新，可稍后手动刷新。' })
+      }
+    }, 3_000)
+    return () => window.clearInterval(timer)
+  }, [commentCollectionBusy, expanded])
 
   useEffect(() => {
     const previous = candidateItemsRevisionState.current
@@ -485,6 +542,11 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   )
   const candidateTotal = hasCurrentCandidateCorpus ? candidateCorpus.total : matchingCandidateItems.length
   const selectionSnapshot = hasCurrentCandidateCorpus ? candidateCorpus.selectionSnapshot : null
+  const commentEmailCount = contactDiscoverySummary?.commentEmailRecords ?? 0
+  const commentsPending = contactDiscoverySummary?.commentsPending ?? 0
+  const commentsPartial = contactDiscoverySummary?.commentsPartial ?? 0
+  const shouldShowCommentCollection = Boolean(contactDiscoverySummary)
+    && (commentsPending > 0 || commentsPartial > 0 || commentEmailCount > 0)
   const visibleBatchItems = useMemo(() => {
     if (!batch) return []
     return batch.items.filter((item) => {
@@ -719,6 +781,160 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     setBusy((current) => current === 'dry-run' ? '' : current)
   }
 
+  function refreshCandidateCorpus() {
+    const filterSignature = candidateFilterSignatureRef.current
+    candidateRequest.current += 1
+    candidatePageCache.current.clear()
+    candidateItemCache.current.clear()
+    candidateSelectionRevisions.current.clear()
+    candidateSnapshotState.current.delete(filterSignature)
+    candidatePageCursors.current = new Map([
+      [filterSignature, new Map([[0, undefined]])],
+    ])
+    setCandidateLoading(true)
+    setCandidateOffset(0)
+    setCandidatePageRequest({ filterSignature, offset: 0, cursor: undefined })
+  }
+
+  async function startCommentCollection() {
+    if (commentCollectionBusy || candidateLoading) return
+    setCommentCollectionBusy(true)
+    setNotice({ tone: 'info', text: '正在为当前岗位投递清单采集评论邮箱；正文和图片邮箱不重复扫描。' })
+    try {
+      const idempotencyKey = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? `application-contact:${jobId}:${crypto.randomUUID()}`
+        : `application-contact:${jobId}:${Date.now()}`
+      const response = await api.resumeAudience(jobId, idempotencyKey)
+      if (response.action === 'already_complete') {
+        setCommentCollectionBusy(false)
+        setNotice({ tone: 'success', text: '当前岗位的评论数据已经完整，邮箱解析结果已刷新。' })
+        refreshCandidateCorpus()
+        return
+      }
+      setNotice({ tone: 'info', text: '评论邮箱采集已启动，岗位投递清单会自动更新。' })
+      refreshCandidateCorpus()
+    } catch (error) {
+      setCommentCollectionBusy(false)
+      setNotice({ tone: 'error', text: (error as ApiError).message || '评论邮箱采集启动失败，请稍后重试。' })
+    }
+  }
+
+  async function bulkPolishSelected() {
+    if (!selectedIds.length || busy) return
+    if (!aiSessionId) {
+      setNotice({ tone: 'error', text: 'AI 会话未就绪，请先启用高级模型后再批量润色。' })
+      return
+    }
+
+    const failures: string[] = []
+    const targets = selectedIds.flatMap((noteId) => {
+      const item = candidateById.get(noteId)
+      if (!item) {
+        failures.push(`${noteId}：候选数据尚未加载`)
+        return []
+      }
+      return [{ noteId, item }]
+    })
+    if (!targets.length) {
+      setBulkPolishProgress({ completed: failures.length, total: selectedIds.length, succeeded: 0, failed: failures.length })
+      setNotice({ tone: 'error', text: `没有可润色的已选岗位；${failures[0] || '请刷新候选清单后重试。'}` })
+      return
+    }
+
+    const requestId = ++bulkPolishRequest.current
+    let succeeded = 0
+    let failed = failures.length
+    let nextTarget = 0
+    dryRunRequest.current += 1
+    setPreflight(null)
+    setPreflightSelectionConfirmed(false)
+    setBusy('bulk-polish')
+    setNotice({ tone: 'info', text: `正在批量润色 ${selectedIds.length} 条 Cover Letter，完成后需重新运行投递预演。` })
+    setBulkPolishProgress({ completed: failed, total: selectedIds.length, succeeded, failed })
+
+    const updateProgress = () => {
+      if (bulkPolishRequest.current !== requestId) return
+      setBulkPolishProgress({
+        completed: succeeded + failed,
+        total: selectedIds.length,
+        succeeded,
+        failed,
+      })
+    }
+    const worker = async () => {
+      while (bulkPolishRequest.current === requestId && nextTarget < targets.length) {
+        const target = targets[nextTarget]
+        nextTarget += 1
+        const { item, noteId } = target
+        const applicationContext = item.outreach.applicationContext || defaultApplicationContext(item)
+        const outreach = applicationOutreachDraft(item)
+        try {
+          let draftVersion = item.draftVersion
+          if (!draftVersion) {
+            const saved = await api.saveDraft(jobId, noteId, outreach, undefined, applicationContext)
+            if (!saved.draftVersion) throw new Error('服务端未返回文案版本')
+            draftVersion = saved.draftVersion
+          }
+          if (bulkPolishRequest.current !== requestId) return
+          const response = await api.rewriteCoverLetter(jobId, {
+            noteId,
+            aiSessionId,
+            instructions: BULK_POLISH_INSTRUCTIONS,
+            outreach,
+            applicationContext,
+            draftId: draftVersion.draftId,
+            baseVersion: draftVersion.version,
+          })
+          if (bulkPolishRequest.current !== requestId) return
+          if (!response.outreach.cover_letter?.trim()) throw new Error('高级模型未返回 Cover Letter')
+          const nextItem: ApplicationResult = {
+            ...item,
+            emailSubjectPreview: response.outreach.email_subject?.trim() || item.emailSubjectPreview,
+            outreach: {
+              ...item.outreach,
+              ...response.outreach,
+              generation_mode: 'model_rewrite',
+              runtime_status: 'generated_pending_quality',
+              status: 'needs_review',
+              applicationContext,
+            },
+            draftVersion: response.draftVersion,
+            delivery: response.delivery,
+            cover_letter_evaluation: response.cover_letter_evaluation || item.cover_letter_evaluation,
+          }
+          candidateItemCache.current.set(noteId, nextItem)
+          setCandidateCorpus((current) => current && current.jobId === jobId
+            ? { ...current, items: current.items.map((candidate) => candidate.note_id === noteId ? nextItem : candidate) }
+            : current)
+          succeeded += 1
+        } catch (error) {
+          failed += 1
+          const message = (error as ApiError).message || (error as Error).message || '润色失败'
+          failures.push(`${item.job_card?.role_name || item.title || noteId}：${message}`)
+        }
+        updateProgress()
+      }
+    }
+
+    try {
+      const workerCount = Math.min(2, targets.length)
+      await Promise.all(Array.from({ length: workerCount }, () => worker()))
+      if (bulkPolishRequest.current !== requestId) return
+      const failureSummary = failures.slice(0, 2).join('；')
+      setNotice({
+        tone: failed ? 'info' : 'success',
+        text: failed
+          ? `批量润色完成：成功 ${succeeded} 条，失败 ${failed} 条${failureSummary ? `；${failureSummary}` : ''}。旧投递预演已失效。`
+          : `批量润色完成：成功 ${succeeded} 条。已生成新草稿版本，请重新质量检查并运行投递预演。`,
+      })
+    } finally {
+      if (bulkPolishRequest.current === requestId) {
+        refreshCandidateCorpus()
+        setBusy('')
+      }
+    }
+  }
+
   function requestCandidatePage(offset: number, cursor?: string) {
     if (offset > 0 && !cursor) return
     setCandidatePageRequest({
@@ -729,7 +945,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   }
 
   function showPreviousCandidatePage() {
-    const offset = Math.max(0, candidateOffset - CANDIDATE_PAGE_SIZE)
+    const offset = Math.max(0, candidateOffset - candidatePageSize)
     requestCandidatePage(offset, candidatePageCursors.current.get(candidateFilterSignature)?.get(offset))
   }
 
@@ -878,11 +1094,13 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
           <div className="batch-selection-actions">
             <span className="batch-selection-summary">已选 <strong>{selected.size}</strong> / {MAX_BATCH_SIZE}<small>{candidateLoading ? '选择校验中' : `筛选外 ${selectedOutsideFilterIds.length} · 无效 ${selectedInvalidIds.length}${selectedMissingRevisionIds.length ? ` · 修订缺失 ${selectedMissingRevisionIds.length}，请重新加载` : ''}`}</small></span>
             <button type="button" onClick={selectCurrentPage} disabled={candidateLoading || rows.length === 0}><CheckCircle2 size={15} />选择当前页</button>
-            <label className="batch-selection-limit"><span>首批数量</span><input aria-label="首批选择数量" type="number" min={1} max={MAX_BATCH_SIZE} step={1} value={selectionLimit} onChange={(event) => setSelectionLimit(clampSelectionLimit(event.target.value))} /></label>
+            <label className={`batch-selection-limit ${selectionLimitMode === 'custom' ? 'custom' : ''}`}><span>批量数量</span><select aria-label="批量数量预设" value={selectionLimitMode === 'custom' ? 'custom' : selectionLimit} onChange={(event) => { if (event.target.value === 'custom') { setSelectionLimitMode('custom') } else { setSelectionLimitMode('preset'); setSelectionLimit(clampSelectionLimit(event.target.value)) } }}><option value={10}>10</option><option value={20}>20</option><option value={50}>50</option><option value={100}>100</option><option value="custom">自定义</option></select>{selectionLimitMode === 'custom' && <input aria-label="自定义批量数量" type="number" min={1} max={MAX_BATCH_SIZE} step={1} value={selectionLimit} onChange={(event) => setSelectionLimit(clampSelectionLimit(event.target.value))} />}</label>
             <button type="button" onClick={selectFirstReady} disabled={candidateLoading || candidateTotal === 0}><CheckCircle2 size={15} />选择前 {selectionLimit} 条可投递</button>
+            <button type="button" className="batch-bulk-polish" title={aiSessionId ? '按岗位要求逐条重写已选 Cover Letter；完成后需要重新质量检查' : '请先启用高级模型'} disabled={!selected.size || !aiSessionId || Boolean(busy) || candidateLoading} onClick={() => void bulkPolishSelected()}>{busy === 'bulk-polish' ? <LoaderCircle className="spin" size={15} /> : <WandSparkles size={15} />}批量一键润色</button>
             <button type="button" onClick={keepOnlyReady} disabled={candidateLoading || selected.size === 0}>仅保留可投递</button>
             <button type="button" onClick={cleanupSelection} disabled={candidateLoading || selectedOutsideFilterIds.length + selectedInvalidIds.length === 0}>清理选择</button>
             <button type="button" onClick={clearSelection} disabled={selected.size === 0}><XCircle size={15} />清空</button>
+            {bulkPolishProgress.total > 0 && <span className={`batch-polish-progress ${bulkPolishProgress.failed ? 'partial' : ''}`} role="status" aria-live="polite">已处理 {bulkPolishProgress.completed}/{bulkPolishProgress.total}<small>成功 {bulkPolishProgress.succeeded} · 失败 {bulkPolishProgress.failed}</small></span>}
           </div>
           <details className="batch-settings">
             <summary><SlidersHorizontal size={15} />批次设置</summary>
@@ -892,6 +1110,25 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
             </div>
           </details>
         </div>
+
+        {shouldShowCommentCollection && <div className="batch-contact-discovery-bar" role="status" aria-live="polite">
+          <div className="batch-contact-discovery-summary">
+            <Mail size={16} />
+            <strong>岗位邮箱发现</strong>
+            <span>评论邮箱 {commentEmailCount} 条</span>
+            {commentsPending > 0 && <span className="batch-contact-pending">待采集 {commentsPending} 条</span>}
+            {commentsPartial > 0 && <span className="batch-contact-pending">采集未完成 {commentsPartial} 条</span>}
+          </div>
+          <button
+            type="button"
+            className="batch-contact-discovery-action"
+            disabled={commentCollectionBusy || candidateLoading || (commentsPending === 0 && commentsPartial === 0)}
+            onClick={() => void startCommentCollection()}
+          >
+            {commentCollectionBusy ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}
+            {commentCollectionBusy ? '评论采集中' : '采集评论邮箱'}
+          </button>
+        </div>}
 
         <div className="batch-filter-strip" aria-label="投递筛选">
           <span className="batch-filter-heading"><SlidersHorizontal size={14} />筛选</span>
@@ -918,7 +1155,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
 
         <div className="batch-table-wrap">
           <table className="batch-application-table">
-            <thead><tr><th aria-label="选择" /><th>岗位</th><th>收件邮箱</th><th>文案质量</th><th>投递正文</th><th>邮件标题与附件命名</th><th>状态 / 修复</th></tr></thead>
+            <thead><tr><th aria-label="选择" /><th>岗位</th><th>收件邮箱</th><th>文案质量</th><th>投递正文</th><th>岗位事实</th><th>邮件标题与附件命名</th><th>状态 / 修复</th></tr></thead>
             <tbody>{rows.map((item) => {
               const checked = preflightById.get(item.note_id)
               const savedBatchItem = batchItemByNoteId.get(item.note_id)
@@ -927,6 +1164,9 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
               const savedFilenames = Array.isArray(savedBatchItem?.payload.finalFilenames) ? savedBatchItem.payload.finalFilenames.map(String) : []
               const emailBody = applicationEmailBody(item, checked, savedBatchItem)
               const coverLetter = applicationCoverLetter(item, checked, savedBatchItem)
+              const responsibilities = applicationFactPoints(item, 'responsibilities')
+              const requirements = applicationFactPoints(item, 'requirements')
+              const originalBody = item.body?.trim() || ''
               const coverLetterExpanded = expandedCoverLetters.has(item.note_id)
               const contentVersion = checked?.preview?.draftVersion || savedBatchItem?.payload.coverLetterVersion || item.draftVersion?.version
               const contentHash = checked?.manifestHash || checked?.coverLetterHash || savedBatchItem?.payload.coverLetterHash || item.draftVersion?.contentHash || ''
@@ -977,11 +1217,32 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
                   <span className="batch-cover-letter-meta">{emailBody.length} / {coverLetter.length} 字 · {contentVersion ? `v${contentVersion}` : '版本待生成'} · {contentHash ? `Hash ${contentHash.slice(0, 10)}...` : 'Hash 待生成'}</span>
                   {(emailBody || coverLetter) && <button type="button" className="batch-cover-letter-toggle" aria-expanded={coverLetterExpanded} onClick={() => toggleCoverLetter(item.note_id)}><FileText size={12} />{coverLetterExpanded ? '收起全文' : '展开全文'}</button>}
                 </td>
+                <td data-label="岗位事实" className="batch-job-facts-cell">
+                  <div className="batch-job-fact-block">
+                    <small className="batch-field-label">岗位职责</small>
+                    {responsibilities.length > 0
+                      ? <ul data-testid={`batch-responsibilities-${item.note_id}`}>{responsibilities.slice(0, 3).map((point) => <li key={point}>{point}</li>)}</ul>
+                      : <span className="batch-muted">未提取</span>}
+                    {responsibilities.length > 3 && <details><summary>展开其余 {responsibilities.length - 3} 条</summary><ul>{responsibilities.slice(3).map((point) => <li key={point}>{point}</li>)}</ul></details>}
+                  </div>
+                  <div className="batch-job-fact-block">
+                    <small className="batch-field-label">岗位要求</small>
+                    {requirements.length > 0
+                      ? <ul data-testid={`batch-requirements-${item.note_id}`}>{requirements.slice(0, 3).map((point) => <li key={point}>{point}</li>)}</ul>
+                      : <span className="batch-muted">未提取</span>}
+                    {requirements.length > 3 && <details><summary>展开其余 {requirements.length - 3} 条</summary><ul>{requirements.slice(3).map((point) => <li key={point}>{point}</li>)}</ul></details>}
+                  </div>
+                  <details className="batch-original-body" data-testid={`batch-original-body-${item.note_id}`}>
+                    <summary><span>原始正文</span><small>{originalBody ? `${originalBody.length} 字` : '未采集'}</small></summary>
+                    {originalBody ? <div>{originalBody}</div> : <span className="batch-muted">原始正文未采集</span>}
+                  </details>
+                </td>
                 <td data-label="邮件标题与附件命名">
                   <small className="batch-field-label">实际发送标题</small>
                   <strong className={`batch-subject ${subjectNeedsReview ? 'needs-review' : ''}`}>{subjectNeedsReview ? subjectGuard?.suggestedSubject || '主题待重生成' : savedSubject || '主题待生成'}</strong>
+                  {savedSubject && !subjectNeedsReview && <small className="batch-subject-source">{applicationEmailSubjectSourceLabel(item)}</small>}
                   {subjectNeedsReview && <small className="batch-blocker">原帖标题不是岗位名，主题待按准确岗位名重生成</small>}
-                  {item.emailSubjectRequirement?.detected && <span className="batch-email-subject-rule" title={item.emailSubjectRequirement.evidence}><Mail size={12} /><span><small>正文邮件标题要求</small><b>{item.emailSubjectRequirement.template}</b><em>发送时自动按此规则校验</em></span></span>}
+                  {item.emailSubjectRequirement?.detected && <span className="batch-email-subject-rule" title={item.emailSubjectRequirement.evidence}><Mail size={12} /><span><small>{applicationEmailSubjectRuleLabel(item)}</small><b>{item.emailSubjectRequirement.template}</b><em>{applicationEmailSubjectRuleHint(item)}</em></span></span>}
                   {checked?.attachments?.length ? checked.attachments.map((attachment) => {
                     const plannedName = applicationAttachmentPlannedName(attachment)
                     const willRename = attachment.willRename ?? attachment.renameRequired ?? plannedName !== attachment.currentDisplayName
@@ -1002,13 +1263,14 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
                   {candidates.length > 0 && <div className="contact-review-list">{candidates.map((candidate) => <button type="button" className={approvals[item.note_id] === candidate.evidenceHash ? 'confirmed' : ''} key={candidate.evidenceHash} onClick={() => void confirmContact(item.note_id, candidate)} title={candidate.evidenceText}><span>{candidate.address}</span><small>{contactSourceLabel(candidate.source, candidate.verificationStatus, candidate.normalizationApplied)} · {candidate.evidenceText}</small>{approvals[item.note_id] === candidate.evidenceHash ? <Check size={13} /> : <ShieldCheck size={13} />}</button>)}</div>}
                 </td>
               </tr>
-            })}{rows.length === 0 && <tr className="batch-search-empty-row"><td colSpan={7} data-label="搜索">当前筛选没有匹配岗位{batch ? `；当前发送批次匹配 ${visibleBatchItems.length} 封` : ''}。</td></tr>}</tbody>
+            })}{rows.length === 0 && <tr className="batch-search-empty-row"><td colSpan={8} data-label="搜索">当前筛选没有匹配岗位{batch ? `；当前发送批次匹配 ${visibleBatchItems.length} 封` : ''}。</td></tr>}</tbody>
           </table>
         </div>
 
         <div className="batch-candidate-pagination" aria-busy={candidateLoading}>
           <span>{candidateLoading ? <><LoaderCircle className="spin" size={14} />正在读取当前页</> : candidateTotal > 0 && rows.length > 0 ? `${candidateOffset + 1}-${Math.min(candidateOffset + rows.length, candidateTotal)} / ${candidateTotal}` : `0 / ${candidateTotal}`}</span>
-          <div>
+          <div className="batch-candidate-pagination-controls">
+            <label className="batch-page-size"><span>每页</span><select aria-label="每页显示数量" value={candidatePageSize} onChange={(event) => setCandidatePageSize(clampCandidatePageSize(event.target.value))}>{CANDIDATE_PAGE_SIZE_OPTIONS.map((size) => <option key={size} value={size}>{size} 条</option>)}</select></label>
             <button type="button" title="上一页待投岗位" disabled={candidateLoading || candidateOffset === 0} onClick={showPreviousCandidatePage}><ChevronLeft size={16} /></button>
             <button type="button" title="下一页待投岗位" disabled={candidateLoading || !candidateCorpus?.nextCursor} onClick={showNextCandidatePage}><ChevronRight size={16} /></button>
           </div>
@@ -1133,6 +1395,29 @@ function applicationCoverLetter(
     || splitBatchCoverLetter(item.outreach?.cover_letter).body
 }
 
+function applicationOutreachDraft(item: ApplicationResult): OutreachDraft {
+  return {
+    greeting: item.outreach?.greeting || '',
+    email_subject: item.emailSubjectPreview?.trim()
+      || item.outreach?.email_subject?.trim()
+      || splitBatchCoverLetter(item.outreach?.cover_letter).subject
+      || '',
+    email_body: item.outreach?.email_body || '',
+    cover_letter: splitBatchCoverLetter(item.outreach?.cover_letter).body,
+  }
+}
+
+function defaultApplicationContext(item: ApplicationResult): ApplicationContext {
+  return {
+    channel: 'email',
+    contactStage: ['applied', 'messaged', 'email_sent', 'sent'].includes(item.delivery?.action || '') ? 'follow_up' : 'first_contact',
+    tone: 'natural',
+    resumeAttached: false,
+    coverLetterAttached: false,
+    recipientType: 'recruiter',
+  }
+}
+
 function applicationEmailSubject(
   item: ApplicationResult,
   checked: ApplicationBatchPreflight['items'][number] | undefined,
@@ -1146,6 +1431,34 @@ function applicationEmailSubject(
     || ''
 }
 
+function applicationEmailSubjectSourceLabel(item: ApplicationResult) {
+  switch (item.emailSubjectRequirement?.source) {
+    case 'attachment_requirement':
+      return '无独立邮件主题，已采用附件命名要求'
+    case 'shared_subject_attachment_requirement':
+      return '已采用邮件主题与附件共用要求'
+    case 'email_subject_requirement':
+      return '已采用正文中的邮件标题要求'
+    default:
+      return item.emailSubjectRequirement?.detected ? '已采用岗位中的邮件标题要求' : '发送标题已就绪'
+  }
+}
+
+function applicationEmailSubjectRuleLabel(item: ApplicationResult) {
+  if (item.emailSubjectRequirement?.source === 'attachment_requirement') return '附件命名要求兜底'
+  if (item.emailSubjectRequirement?.source === 'shared_subject_attachment_requirement') return '邮件主题与附件共用要求'
+  return '正文邮件标题要求'
+}
+
+function applicationEmailSubjectRuleHint(item: ApplicationResult) {
+  if (item.emailSubjectRequirement?.source === 'attachment_requirement') {
+    return item.emailSubjectRequirement.attachmentTemplate
+      ? `来源附件模板：${item.emailSubjectRequirement.attachmentTemplate}；发送时去掉文件扩展名并校验`
+      : '发送时按附件命名要求生成主题并校验'
+  }
+  return '发送时自动按此规则校验'
+}
+
 function applicationEmailBody(
   item: ApplicationResult,
   checked: ApplicationBatchPreflight['items'][number] | undefined,
@@ -1156,6 +1469,18 @@ function applicationEmailBody(
     || savedBatchItem?.payload.body?.trim()
     || item.outreach?.email_body?.trim()
     || ''
+}
+
+function applicationFactPoints(
+  item: ApplicationResult,
+  field: 'responsibilities' | 'requirements',
+): string[] {
+  const values = item.application_info?.[field]
+  if (!Array.isArray(values)) return []
+  return values
+    .map((value: ProvenanceText | string) => typeof value === 'string' ? value : value?.text)
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
 }
 
 function applicationAttachmentPlannedName(attachment: ApplicationBatchPreflight['items'][number]['attachments'][number]) {
@@ -1339,11 +1664,23 @@ function clampSelectionLimit(value: string | number) {
   return Math.max(1, Math.min(MAX_BATCH_SIZE, Math.floor(Number(value) || 1)))
 }
 
+function isBatchSelectionPreset(value: number) {
+  return BATCH_SELECTION_PRESETS.some((preset) => preset === value)
+}
+
+function clampCandidatePageSize(value: string | number) {
+  const parsed = Math.floor(Number(value))
+  return CANDIDATE_PAGE_SIZE_OPTIONS.some((option) => option === parsed)
+    ? parsed
+    : DEFAULT_CANDIDATE_PAGE_SIZE
+}
+
 function loadWorkbenchPreferences(jobId: string): BatchWorkbenchPreferences {
   const fallback: BatchWorkbenchPreferences = {
     query: '',
     filters: { ...DEFAULT_WORKBENCH_FILTERS },
-    selectionLimit: MAX_BATCH_SIZE,
+    selectionLimit: DEFAULT_SELECTION_LIMIT,
+    pageSize: DEFAULT_CANDIDATE_PAGE_SIZE,
   }
   if (typeof window === 'undefined') return fallback
   try {
@@ -1361,7 +1698,8 @@ function loadWorkbenchPreferences(jobId: string): BatchWorkbenchPreferences {
         subject: allowed(raw.subject, SUBJECT_FILTER_OPTIONS, 'all'),
         attachment: allowed(raw.attachment, ATTACHMENT_FILTER_OPTIONS, 'all'),
       },
-      selectionLimit: clampSelectionLimit(parsed.selectionLimit ?? MAX_BATCH_SIZE),
+      selectionLimit: clampSelectionLimit(parsed.selectionLimit ?? DEFAULT_SELECTION_LIMIT),
+      pageSize: clampCandidatePageSize(parsed.pageSize ?? DEFAULT_CANDIDATE_PAGE_SIZE),
     }
   } catch {
     return fallback

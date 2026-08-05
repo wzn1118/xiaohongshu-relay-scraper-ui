@@ -79,6 +79,8 @@ async function readyServiceFixture(t, {
   noteIds,
   sendEmail = async () => {},
   previewHook = async () => {},
+  maxBatchSize,
+  previewSubjectFromRequest = false,
 } = {}) {
   const outputDir = await temporaryOutputDir(t);
   const records = new Map(noteIds.map((noteId) => [noteId, readyRecord(noteId)]));
@@ -94,6 +96,7 @@ async function readyServiceFixture(t, {
     jobId: JOB_ID,
     outputDir,
     manager,
+    maxBatchSize,
     candidateProfile: { name: 'Candidate' },
     loadRecord: async (noteId) => structuredClone(records.get(noteId)),
     listAttachments: async (noteId) => ({ attachments: [structuredClone(attachments.get(noteId))] }),
@@ -109,7 +112,7 @@ async function readyServiceFixture(t, {
         recipient: value.to,
         from: 'sender@example.com',
         replyTo: 'candidate@example.com',
-        subject: `Subject ${value.noteId}`,
+        subject: previewSubjectFromRequest ? value.subject : `Subject ${value.noteId}`,
         text: `Body ${value.noteId}`,
         draftId: value.draftId,
         draftVersion: value.version,
@@ -137,6 +140,65 @@ async function readyServiceFixture(t, {
 
   return { outputDir, records, manager, previewCalls, service };
 }
+
+test('the default service can dry-run and freeze more than ten applications in one batch', async (t) => {
+  const noteIds = Array.from({ length: 25 }, (_, index) => `bulk-${String(index + 1).padStart(3, '0')}`);
+  const { service, previewCalls } = await readyServiceFixture(t, { noteIds });
+  const request = { noteIds, defaultAttachmentTemplate: 'resume', minIntervalMs: 0 };
+
+  const dryRun = await service.dryRun(request);
+  const created = await service.createBatch({
+    ...request,
+    preflightId: dryRun.preflightId,
+    manifestHash: dryRun.manifestHash,
+    confirmedNoteIds: dryRun.readyNoteIds,
+  });
+
+  assert.equal(dryRun.maxBatchSize, 100);
+  assert.deepEqual(dryRun.readyNoteIds, noteIds);
+  assert.equal(created.batch.items.length, 25);
+  assert.equal(created.batch.metadata.selectedCount, 25);
+  assert.equal(created.batch.settings.maxBatchSize, 100);
+  assert.equal(previewCalls.length, 50);
+});
+
+test('a configured lower batch limit is still enforced before preparing records', async (t) => {
+  const noteIds = Array.from({ length: 13 }, (_, index) => `limited-${String(index + 1).padStart(3, '0')}`);
+  const { service, previewCalls } = await readyServiceFixture(t, { noteIds, maxBatchSize: 12 });
+
+  await assert.rejects(
+    service.dryRun({ noteIds, defaultAttachmentTemplate: 'resume' }),
+    (error) => error.code === 'APPLICATION_BATCH_LIMIT_EXCEEDED' && error.status === 409,
+  );
+  assert.deepEqual(previewCalls, []);
+});
+
+test('Dry Run derives an empty email subject from the attachment filename requirement', async (t) => {
+  const noteId = 'attachment-subject-fallback';
+  const { service, records, previewCalls } = await readyServiceFixture(t, {
+    noteIds: [noteId],
+    previewSubjectFromRequest: true,
+  });
+  const record = records.get(noteId);
+  record.body = '简历命名：学校-姓名-到岗时间.pdf\n投递邮箱 attachment-subject-fallback@example.com';
+  record.candidate_profile = {
+    name: '王梓楠',
+    school: '示例大学',
+    arrivalDate: '9月1日',
+  };
+  record.outreach.email_subject = '';
+
+  const dryRun = await service.dryRun({ noteIds: [noteId], defaultAttachmentTemplate: 'resume' });
+  const item = dryRun.items[0];
+
+  assert.deepEqual(dryRun.readyNoteIds, [noteId]);
+  assert.equal(previewCalls[0].subject, '示例大学-王梓楠-9月1日');
+  assert.equal(item.payload.subject, '示例大学-王梓楠-9月1日');
+  assert.equal(item.payload.subjectRule.source, 'attachment_requirement');
+  assert.equal(item.payload.subjectRule.template, '学校-姓名-到岗时间');
+  assert.equal(item.payload.subjectRule.attachmentTemplate, '学校-姓名-到岗时间.pdf');
+  assert.match(item.payload.subjectRule.evidence, /简历命名/u);
+});
 
 async function freezeAndApprove(service, noteIds) {
   const request = {

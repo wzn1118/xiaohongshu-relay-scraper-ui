@@ -1,4 +1,10 @@
+import {
+  buildApplicationAttachmentRule,
+  detectApplicationAttachmentRule,
+} from './application-attachment-rule.mjs';
+
 const EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/iu;
+export const MAX_APPLICATION_EMAIL_SUBJECT_LENGTH = 120;
 const ROLE_CORE_SIGNAL = /(?:AI\s*产品|产品|运营|用户研究|研究|数据|分析|商业|增长|市场|品牌|商务|销售|财务|法务|人力|行政|助理|顾问|经理|专员|管培生|工程师|开发|研发|测试|算法|设计|编辑|剪辑|项目|咨询|内容|电商|社群|海外|视觉|软件|医学|医药|信息|沟通|product|operations?|marketing|design|engineer|developer|analyst|research|sales|finance|legal|human\s+resources?|consult)/iu;
 const ROLE_SHAPE_SIGNAL = /(?:实习生|实习岗|实习|intern(?:ship)?|trainee|产品经理|项目经理|经理|专员|助理|工程师|开发|研发|测试|算法|设计|编辑|剪辑|分析师|研究员|顾问|管培生|运营|产品|研究|分析|咨询|策划|市场|品牌|商务|销售|财务|法务|人力|行政|沟通员|信息员|product\s+manager|project\s+manager|manager|specialist|assistant|engineer|developer|analyst|researcher|designer|operator|operations?|marketing)$/iu;
 const ROLE_DISQUALIFIER_SIGNAL = /(?:继任|急{1,}|急招|急聘|招聘|招募|内推|直招|速来|投递|到岗|入职|优先|有[^\n]{0,12}实习|能来实习|实习的?吗|找[^\n]{0,12}实习|帮[^\n]{0,12}招|接受无经验|岗位职责|工作职责|职位描述|任职要求|岗位要求|薪资|待遇|工作地点|办公地点|公司\s*[:：]|负责|协助|参与|请将|简历|邮箱|联系方式|为什么|怎么|如何|面试|面经|总结|复盘|而不是|#|＃)/iu;
@@ -115,7 +121,7 @@ export function isNoisyApplicationTitle(value) {
 
 export function applicationSubjectGuard(record, subject = '', suppliedValues = {}) {
   const values = { ...applicationValues(record, {}), ...suppliedValues };
-  const rule = applicationSubjectRule(record);
+  const rule = applicationDeliverySubjectRule(record);
   const rawTitles = applicationRawRoleTitles(record);
   const noisyTitle = rawTitles.find((value) => isNoisyApplicationTitle(value)) || '';
   const requested = String(subject || '').trim();
@@ -164,7 +170,7 @@ export function applicationSubjectGuard(record, subject = '', suppliedValues = {
     rawTitle: noisyTitle,
     resolvedJobTitle,
     requiresReview: !rule.detected && !resolvedJobTitle,
-    suggestedSubject: defaultSubject(null, { ...values, jobTitle: resolvedJobTitle }),
+    suggestedSubject: generatedSubjectForRule(record, rule, { ...values, jobTitle: resolvedJobTitle }).subject,
   };
 }
 
@@ -196,12 +202,41 @@ export function applicationSubjectRule(record) {
   return { detected: false, template: '', evidence: '', fields: [] };
 }
 
+/** Resolve the effective outbound subject rule without changing raw rule detection. */
+export function applicationDeliverySubjectRule(record) {
+  const emailRule = applicationSubjectRule(record);
+  const attachmentRule = detectApplicationAttachmentRule(record);
+  const sharedAttachmentRule = attachmentRule.detected
+    && sharedSubjectAttachmentRule(attachmentRule.evidence)
+    && subjectTemplateIdentity(attachmentRule.template) === subjectTemplateIdentity(emailRule.template);
+  if (emailRule.detected && !sharedAttachmentRule) {
+    return {
+      ...emailRule,
+      source: 'email_subject_requirement',
+    };
+  }
+
+  if (attachmentRule.detected) {
+    return {
+      ...attachmentRule,
+      template: stripAttachmentTemplateExtension(attachmentRule.template),
+      attachmentTemplate: attachmentRule.template,
+      source: sharedSubjectAttachmentRule(attachmentRule.evidence)
+        ? 'shared_subject_attachment_requirement'
+        : 'attachment_requirement',
+    };
+  }
+
+  return {
+    ...emailRule,
+    source: 'generated_default',
+  };
+}
+
 export function resolveApplicationEmailSubject(record, suppliedSubject = '', input = {}) {
   const values = applicationValues(record, input);
-  const rule = applicationSubjectRule(record);
-  const generated = rule.detected
-    ? subjectFromRule(rule, values)
-    : { subject: defaultSubject(record, values), missingFields: [] };
+  const rule = applicationDeliverySubjectRule(record);
+  const generated = generatedSubjectForRule(record, rule, values);
   const requested = String(suppliedSubject || '').trim().slice(0, 300);
   const validation = validateApplicationEmailSubject(record, requested, values);
   const requestedGuard = applicationSubjectGuard(record, requested, values);
@@ -215,7 +250,7 @@ export function resolveApplicationEmailSubject(record, suppliedSubject = '', inp
       : generated.subject);
   const subjectGuard = applicationSubjectGuard(record, subject, values);
   return {
-    subject: String(subject || '').trim().slice(0, 300),
+    subject: boundedApplicationEmailSubject(subject),
     rule,
     generated,
     validation,
@@ -307,9 +342,26 @@ export function applicationPostPreview(record) {
 }
 
 export function validateApplicationEmailSubject(record, subject, suppliedValues = {}) {
-  const rule = applicationSubjectRule(record);
+  const rule = applicationDeliverySubjectRule(record);
   if (!rule.detected) return { status: 'not_applicable', missingFields: [], missingValues: [] };
-  const values = { ...applicationValues(record, {}), ...suppliedValues };
+  const values = { ...applicationValues(record, suppliedValues), ...suppliedValues };
+  if (isAttachmentSubjectRule(rule)) {
+    const generated = subjectFromAttachmentRule(record, rule, values);
+    if (generated.missingFields.length || generated.status !== 'ready') {
+      return {
+        status: 'missing_fields',
+        missingFields: generated.missingFields,
+        missingValues: [],
+      };
+    }
+    const actual = normalizeSubjectComparison(subject);
+    const expected = normalizeSubjectComparison(generated.subject);
+    return {
+      status: actual && actual === expected ? 'compliant' : 'non_compliant',
+      missingFields: [],
+      missingValues: actual && actual === expected ? [] : ['subject'],
+    };
+  }
   const missingFields = rule.fields.filter((key) => !String(values[key] || '').trim());
   if (!rule.fields.length) {
     const actual = normalizeSubjectComparison(subject);
@@ -336,39 +388,106 @@ export function validateApplicationEmailSubject(record, subject, suppliedValues 
 }
 
 function applicationValues(record, input) {
-  const candidate = record?.candidate_profile || record?.candidateProfile || {};
+  const supplied = input?.values && typeof input.values === 'object' ? input.values : {};
+  const persistedCandidate = record?.candidate_profile || record?.candidateProfile || {};
+  const suppliedCandidate = input?.candidateProfile && typeof input.candidateProfile === 'object' && !Array.isArray(input.candidateProfile)
+    ? input.candidateProfile
+    : input?.candidate_profile && typeof input.candidate_profile === 'object' && !Array.isArray(input.candidate_profile)
+      ? input.candidate_profile
+      : {};
+  const candidate = { ...persistedCandidate, ...suppliedCandidate };
   const application = candidate.candidate_application || candidate.candidateProfile || candidate;
-  const availability = splitInternshipAvailability(firstString(input.internshipDuration, application.internshipDuration));
+  const availability = splitInternshipAvailability(firstString(
+    input.internshipDuration,
+    supplied.internshipDuration,
+    application.internshipDuration,
+  ));
   return {
-    candidateName: firstString(input.candidateName, application.name, candidate.name),
-    jobTitle: applicationRoleTitle(record, input),
-    company: firstString(input.company, record?.job_card?.company_name, record?.company_name, record?.company),
-    school: firstString(input.school, application.school),
-    major: firstString(input.major, application.major),
+    candidateName: firstString(input.candidateName, supplied.candidateName, application.name, candidate.name),
+    jobTitle: applicationRoleTitle(record, { ...supplied, ...input }),
+    company: firstString(input.company, supplied.company, record?.job_card?.company_name, record?.company_name, record?.company),
+    school: firstString(input.school, supplied.school, application.school),
+    major: firstString(input.major, supplied.major, application.major),
     undergraduateEducation: firstString(
       input.undergraduateEducation,
+      supplied.undergraduateEducation,
       application.undergraduateEducation,
       educationSummary(application.education, /(?:本科|学士)/u),
     ),
     graduateEducation: firstString(
       input.graduateEducation,
+      supplied.graduateEducation,
       application.graduateEducation,
       educationSummary(application.education, /(?:硕士|研究生)/u),
     ),
-    degreeYear: firstString(input.degreeYear, application.degreeYear),
-    availabilityDays: firstString(input.availabilityDays, application.availabilityDays),
+    degreeYear: firstString(input.degreeYear, supplied.degreeYear, application.degreeYear),
+    availabilityDays: firstString(input.availabilityDays, supplied.availabilityDays, application.availabilityDays),
     internshipDuration: availability.duration,
-    arrivalDate: firstString(input.arrivalDate, application.arrivalDate, application.availableFrom, availability.arrivalDate),
-    aiProductExperience: firstString(input.aiProductExperience, application.aiProductExperience),
-    relevantExperience: firstString(input.relevantExperience, application.relevantExperience, application.experienceSummary),
-    phone: firstString(input.phone, input.phoneWeChat, application.phone, application.mobile, application.phoneWeChat, application.contact?.phone),
+    arrivalDate: firstString(input.arrivalDate, supplied.arrivalDate, application.arrivalDate, application.availableFrom, availability.arrivalDate),
+    aiProductExperience: firstString(input.aiProductExperience, supplied.aiProductExperience, application.aiProductExperience),
+    relevantExperience: firstString(input.relevantExperience, supplied.relevantExperience, application.relevantExperience, application.experienceSummary),
+    phone: firstString(input.phone, supplied.phone, input.phoneWeChat, supplied.phoneWeChat, application.phone, application.mobile, application.phoneWeChat, application.contact?.phone),
+    email: firstString(input.email, supplied.email, application.email, candidate.email),
   };
+}
+
+function generatedSubjectForRule(record, rule, values) {
+  if (!rule.detected) {
+    return { subject: defaultSubject(record, values), missingFields: [] };
+  }
+  return isAttachmentSubjectRule(rule)
+    ? subjectFromAttachmentRule(record, rule, values)
+    : subjectFromRule(rule, values);
+}
+
+function subjectFromAttachmentRule(record, rule, values) {
+  const attachmentTemplate = String(rule.attachmentTemplate || rule.template || '').trim();
+  const extension = attachmentTemplate.match(/(\.[A-Za-z0-9]{1,10})\s*$/u)?.[1] || '.pdf';
+  const rendered = buildApplicationAttachmentRule(record, {
+    originalName: `subject${extension}`,
+    allowedExtensions: [extension],
+    values,
+  });
+  if (rendered.status !== 'ready') {
+    return {
+      subject: '',
+      missingFields: [...new Set(rendered.missingFields || [])],
+      status: rendered.status,
+    };
+  }
+  const displayName = String(rendered.displayName || '');
+  return {
+    subject: displayName.toLowerCase().endsWith(extension.toLowerCase())
+      ? boundedApplicationEmailSubject(displayName.slice(0, -extension.length))
+      : boundedApplicationEmailSubject(displayName),
+    missingFields: [],
+    status: 'ready',
+  };
+}
+
+function isAttachmentSubjectRule(rule) {
+  return ['attachment_requirement', 'shared_subject_attachment_requirement'].includes(rule?.source);
+}
+
+function stripAttachmentTemplateExtension(template) {
+  return String(template || '').replace(/\.[A-Za-z0-9]{1,10}\s*$/u, '').trim();
+}
+
+function subjectTemplateIdentity(template) {
+  return normalizeSubjectComparison(
+    stripAttachmentTemplateExtension(template).replace(/^\s*[【\[]\s*|\s*[】\]]\s*$/gu, ''),
+  );
+}
+
+function sharedSubjectAttachmentRule(evidence) {
+  const value = String(evidence || '');
+  return /(?:邮件|投递)?(?:标题|主题)/iu.test(value) && /(?:简历|附件)/iu.test(value);
 }
 
 function subjectFromRule(rule, values) {
   const missingFields = rule.fields.filter((key) => !String(values[key] || '').trim());
   if (rule.fields.length === 0) {
-    return { subject: cleanRule(rule.template), missingFields };
+    return { subject: boundedApplicationEmailSubject(cleanRule(rule.template)), missingFields };
   }
   const looksLikeTemplate = /[{}【】\[\]<>《》+＋|｜/_-]/u.test(rule.template)
     || rule.fields.length >= 2;
@@ -397,7 +516,11 @@ function subjectFromRule(rule, values) {
     const separator = preferredSeparator(rule.template);
     subject = rule.fields.map((key) => subjectFieldValue(key, values)).filter(Boolean).join(separator);
   }
-  return { subject: subject || defaultSubject(null, values), missingFields };
+  return { subject: boundedApplicationEmailSubject(subject || defaultSubject(null, values)), missingFields };
+}
+
+function boundedApplicationEmailSubject(value) {
+  return String(value || '').trim().slice(0, MAX_APPLICATION_EMAIL_SUBJECT_LENGTH);
 }
 
 function defaultSubject(record, values) {
@@ -448,7 +571,7 @@ function isCredibleRoleTitle(value) {
 function isSafeDefaultApplicationSubject(subject, jobTitle) {
   const actual = String(subject || '').replace(/^主题\s*[:：]\s*/u, '').trim();
   const role = normalizeApplicationRoleTitle(jobTitle);
-  if (!actual || !role || Array.from(actual).length > 120) return false;
+  if (!actual || !role || Array.from(actual).length > MAX_APPLICATION_EMAIL_SUBJECT_LENGTH) return false;
   if (/[\n?？！!。；;]/u.test(actual) || RECRUITMENT_NOISE_SIGNAL.test(actual)) return false;
   return normalizeSubjectComparison(actual).includes(normalizeSubjectComparison(role));
 }

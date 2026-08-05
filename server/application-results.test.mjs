@@ -428,6 +428,7 @@ test('application results hydrate images and filter the full result set by publi
       template: '姓名-学校-应聘岗位',
       evidence: '邮件标题要求：姓名-学校-应聘岗位',
       fields: ['candidateName', 'school', 'jobTitle'],
+      source: 'email_subject_requirement',
     });
 
     const roleMatch = await fetch(`${origin}/api/jobs/${id}/results?query=${encodeURIComponent('结构化增长产品经理')}`).then((response) => response.json());
@@ -787,11 +788,12 @@ test('application results start contact OCR through the shared service instance'
     assert.equal(starts, 1);
     assert.equal(results.contactResolution.action, 'started');
     assert.equal(results.contactResolution.status, 'running');
-    assert.equal(results.items[0].application_info.application_routes[0].value, 'image@example.com');
-    assert.equal(results.items[0].media.analysis.contact_ocr.status, 'complete');
-    assert.equal(results.items[0].contactDiscovery.status, 'ready');
-    assert.equal(results.items[0].contactDiscovery.candidates[0].address, 'image@example.com');
-    assert.equal(results.items[0].contactDiscovery.candidates[0].noteId, 'image-contact-1');
+    const imageContact = results.items.find((item) => item.note_id === 'image-contact-1');
+    assert.equal(imageContact.application_info.application_routes[0].value, 'image@example.com');
+    assert.equal(imageContact.media.analysis.contact_ocr.status, 'complete');
+    assert.equal(imageContact.contactDiscovery.status, 'ready');
+    assert.equal(imageContact.contactDiscovery.candidates[0].address, 'image@example.com');
+    assert.equal(imageContact.contactDiscovery.candidates[0].noteId, 'image-contact-1');
     assert.equal(results.contactDiscovery.summary.imageEmailRecords, 1);
 
     const resolutionResponse = await fetch(`${origin}/api/jobs/${id}/contact-resolution?limit=5`);

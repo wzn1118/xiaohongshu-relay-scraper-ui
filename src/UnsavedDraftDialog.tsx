@@ -19,11 +19,11 @@ export function UnsavedDraftDialog({ reason, saveStatus, onSave, onDiscard, onCa
         if (event.key === 'Escape' && !saving) onCancel()
       }}>
         <header>
-          <div><span className="step-label">UNSAVED DRAFT</span><h3 id="draft-guard-title">当前文案尚未保存</h3></div>
+          <div><span className="step-label">AUTO-SAVE FAILED</span><h3 id="draft-guard-title">文案自动保存失败</h3></div>
           <button type="button" title="取消离开" aria-label="取消离开" disabled={saving} onClick={onCancel}><X size={18} /></button>
         </header>
-        <p id="draft-guard-description">{reason}会离开当前草稿。请选择如何处理本次修改。</p>
-        {saveStatus === 'error' && <p className="draft-guard-error" role="alert">保存失败，当前文本仍保留，请重试或取消离开。</p>}
+        <p id="draft-guard-description">{reason}会离开当前草稿。自动保存未成功，请选择如何处理本次修改。</p>
+        {saveStatus === 'error' && <p className="draft-guard-error" role="alert">自动保存失败，当前文本仍保留，请重试或取消离开。</p>}
         <footer>
           <button type="button" className="secondary-button" disabled={saving} onClick={onCancel}><X size={16} />取消操作</button>
           <button type="button" className="secondary-button danger" disabled={saving} onClick={onDiscard}><Trash2 size={16} />放弃修改</button>

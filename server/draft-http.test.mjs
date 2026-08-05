@@ -2669,6 +2669,7 @@ test('Cover Letter rewrite sends the exact role context and instructions to the 
   assert.equal(response.body.outreach.cover_letter, expectedCoverLetter);
   assert.doesNotMatch(response.body.outreach.cover_letter, /^Subject:/u);
   assert.equal(response.body.outreach.email_subject, customSubject);
+  assert.equal(response.body.outreach.email_body, initial.outreach.email_body);
   assert.equal(response.body.draftVersion.version, 2);
   assert.equal(response.body.generation.model, 'fixture-quality-model');
   assert.equal(response.body.generation.promptVersion, 'cover-letter-rewrite-v1');
@@ -2701,6 +2702,63 @@ test('Cover Letter rewrite sends the exact role context and instructions to the 
   assert.equal(refreshed.outreach.generation_mode, 'model_rewrite');
   assert.equal(refreshed.delivery.generation.provider, 'fixture');
   assert.equal(refreshed.delivery.generation.model, 'fixture-quality-model');
+});
+
+test('Cover Letter rewrite retains a required email subject and only rewrites the Cover Letter', async (t) => {
+  const requiredSubject = '示例用户-示例大学-内容运营实习-每周4天';
+  const record = applicationRecord();
+  record.body = [
+    `请发送至 ${RECIPIENT}`,
+    '邮件主题：姓名-学校-应聘岗位-每周实习天数',
+  ].join('\n');
+  record.candidate_profile = {
+    name: '示例用户',
+    school: '示例大学',
+    availabilityDays: '4',
+  };
+  const generated = validRewrittenCoverLetter();
+  const fixture = await startFixture(t, {
+    record,
+    profileSnapshot: {
+      profileSnapshotId: 'profile-snapshot-required-subject',
+      candidate: record.candidate_profile,
+      evidence: [
+        { id: 'resume-user-research', label: '基金会用户研究与直播活动', detail: '通过访谈和问卷收集 520 位用户反馈，归纳需求并策划活动。', source: 'resume:ops:p1' },
+        { id: 'resume-community', label: '垂类达人社群与 KOL 共创', detail: '从零搭建达人社群，挖掘 30 余位 KOL 合作并组织内容共创。', source: 'resume:mkt:p1' },
+      ],
+    },
+    coverLetterRewriter: async () => ({
+      email_subject: '模型自行生成的主题',
+      cover_letter: generated.coverLetter,
+      used_evidence_ids: ['resume-user-research', 'resume-community'],
+      evidence_coverage: [
+        { evidence_id: 'resume-user-research', evidence_sentence: generated.researchSentence },
+        { evidence_id: 'resume-community', evidence_sentence: generated.communitySentence },
+      ],
+      responsibility_coverage: [{
+        responsibility_id: 'responsibility-1',
+        responsibility: '内容策划',
+        response_sentence: generated.responseSentence,
+        evidence_ids: [],
+      }],
+      char_count: Array.from(generated.coverLetter.replace(/\s+/gu, '')).length,
+    }),
+  });
+  const initial = (await fixture.getResults()).body.items[0];
+
+  const response = await fixture.post('draft/rewrite', {
+    noteId: NOTE_ID,
+    aiSessionId: 'advanced-cover-session',
+    instructions: '只润色 Cover Letter。',
+    outreach: initial.outreach,
+    draftId: initial.draftVersion.draftId,
+    baseVersion: initial.draftVersion.version,
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.body.outreach.email_subject, requiredSubject);
+  assert.equal(response.body.outreach.email_body, initial.outreach.email_body);
+  assert.equal(response.body.outreach.cover_letter, generated.coverLetter);
 });
 
 test('Cover Letter rewrite rejects an under-800 response without overwriting the saved draft', async (t) => {

@@ -170,7 +170,9 @@ class AIProvider:
             else os.environ.get("XHS_AI_MAX_OUTPUT_TOKENS", "4096")
         )
         try:
-            self.max_output_tokens = max(256, min(int(configured_output_tokens), 16_384))
+            # Large structured batches (for example 300 application letters)
+            # need a larger response budget than the interactive default.
+            self.max_output_tokens = max(256, min(int(configured_output_tokens), 262_144))
         except (TypeError, ValueError):
             self.max_output_tokens = 4_096
         try:
@@ -557,6 +559,7 @@ class AIProvider:
         payload = {
             "model": self.model,
             "temperature": 0.2,
+            "max_tokens": self.max_output_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},

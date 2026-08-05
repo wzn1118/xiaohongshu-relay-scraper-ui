@@ -21,6 +21,8 @@ type JobJourneyPanelProps = {
   lastEventAt: string | null
   now: Date
   actionBusy?: boolean
+  onResume?: () => void
+  resumeDisabled?: boolean
   onProblemAction?: (problem: UserProblem, actionId: SupportedProblemActionId) => void
   isProblemActionDisabled?: (problem: UserProblem, actionId: SupportedProblemActionId) => boolean
 }
@@ -100,6 +102,8 @@ export function JobJourneyPanel({
   lastEventAt,
   now,
   actionBusy = false,
+  onResume,
+  resumeDisabled = false,
   onProblemAction,
   isProblemActionDisabled,
 }: JobJourneyPanelProps) {
@@ -116,6 +120,16 @@ export function JobJourneyPanel({
   const currentDetail = currentWorkNeedsReview
     ? `系统暂时没有返回可读的原因；已保存 ${savedResultCount} 条结果，稍后可从检查点继续。`
     : view.detail
+  const canResume = !active
+    && Boolean(job.resumeAvailable)
+    && ['incomplete', 'interrupted', 'cancelled', 'blocked', 'failed'].includes(job.status)
+    && Boolean(onResume)
+  const remainingStageLabels = view.stages
+    .filter((stage) => !['completed', 'cancelled'].includes(stage.state))
+    .map((stage) => stage.label)
+  const remainingStageSummary = remainingStageLabels.length > 0
+    ? `${view.counts.discovered > 0 && view.counts.fullText >= view.counts.discovered ? '正文采集已完成；' : ''}待恢复：${remainingStageLabels.slice(0, 3).join('、')}${remainingStageLabels.length > 3 ? `等 ${remainingStageLabels.length} 项` : ''}`
+    : ''
 
   return (
     <div className="job-journey-panel">
@@ -126,6 +140,17 @@ export function JobJourneyPanel({
             <span className="journey-eyebrow">当前工作</span>
             <h3 id="journey-current-heading">{currentHeadline}</h3>
             <p>{currentDetail}</p>
+            {canResume && remainingStageSummary && <p className="journey-recovery-note">{remainingStageSummary}</p>}
+            {canResume && <button
+              type="button"
+              className="journey-recovery-action"
+              onClick={onResume}
+              disabled={actionBusy || resumeDisabled}
+              title="从已保存检查点继续处理未完成步骤"
+            >
+              <RefreshCw className={actionBusy || resumeDisabled ? 'spin' : ''} size={15} />
+              {actionBusy || resumeDisabled ? '正在准备恢复' : '一键恢复未完成步骤'}
+            </button>}
           </div>
         </div>
         <div className={`journey-connection ${view.connection.state}`} role="status">
@@ -214,7 +239,7 @@ export function JobJourneyPanel({
                   {problem.automaticAction && <small>系统处理：{problem.automaticAction}</small>}
                   {problem.retryAt && <small>下次自动检查：{dateTime(problem.retryAt)}（北京时间）</small>}
                 </div>
-                {problem.action && actionId && onProblemAction && (
+                {problem.action && actionId && onProblemAction && !(canResume && actionId === 'resume') && (
                   <button type="button" onClick={() => onProblemAction(problem, actionId)} disabled={disabled}>
                     {actionId === 'open_login' ? <Wifi size={15} /> : <RefreshCw className={actionBusy ? 'spin' : ''} size={15} />}
                     {actionBusy ? '正在处理' : actionLabel}

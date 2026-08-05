@@ -5,6 +5,9 @@ import {
 } from './lib/application-email-draft.mjs';
 
 const EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+const INTERNAL_COVER_LETTER_TOKEN = /(?<![\w])(?:exp|resume|evidence)[_-][A-Za-z0-9][A-Za-z0-9_-]{3,}(?![\w])/i;
+export const DEFAULT_APPLICATION_DELIVERY_CANDIDATE_LIMIT = 50;
+export const MAX_APPLICATION_DELIVERY_CANDIDATE_LIMIT = 100;
 const FILTER_FIELDS = Object.freeze([
   'deliveryStatus',
   'recipientStatus',
@@ -29,7 +32,7 @@ export function buildApplicationDeliveryCandidates({
   records = [],
   batches = [],
   query = {},
-  limit = 20,
+  limit = DEFAULT_APPLICATION_DELIVERY_CANDIDATE_LIMIT,
 } = {}) {
   const normalizedQuery = normalizeQuery(query);
   const latestBatchItems = latestBatchItemsByNoteId(batches, normalizedQuery.batchId);
@@ -58,7 +61,7 @@ export function buildApplicationDeliveryCandidates({
   const snapshotState = sorted.map(selectionSnapshotState);
   const selectionSnapshotHash = hashJson({ jobId: String(jobId || ''), queryHash, snapshotState });
   const offset = decodeCursor(normalizedQuery.cursor, queryHash, selectionSnapshotHash);
-  const safeLimit = Math.min(100, Math.max(1, Number(limit) || 20));
+  const safeLimit = normalizeApplicationDeliveryCandidateLimit(limit);
   const page = sorted.slice(offset, offset + safeLimit);
   const nextOffset = offset + page.length;
   const selectableNoteIds = sorted
@@ -95,6 +98,15 @@ export function buildApplicationDeliveryCandidates({
   };
 }
 
+export function normalizeApplicationDeliveryCandidateLimit(value) {
+  if (value === null || value === undefined || value === '') {
+    return DEFAULT_APPLICATION_DELIVERY_CANDIDATE_LIMIT;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) return DEFAULT_APPLICATION_DELIVERY_CANDIDATE_LIMIT;
+  return Math.min(MAX_APPLICATION_DELIVERY_CANDIDATE_LIMIT, Math.max(1, parsed));
+}
+
 export function withResolvedApplicationSubject(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) return record;
   const resolution = resolveApplicationEmailSubject(record, record?.outreach?.email_subject);
@@ -112,6 +124,11 @@ export function withResolvedApplicationSubject(record) {
       template: resolution.rule.template,
       evidence: resolution.rule.evidence,
       fields: resolution.rule.fields,
+      source: resolution.rule.source,
+      ...(resolution.rule.attachmentTemplate
+        ? { attachmentTemplate: resolution.rule.attachmentTemplate }
+        : {}),
+      ...(resolution.rule.literal ? { literal: true } : {}),
     },
   };
 }
@@ -269,7 +286,14 @@ function classifyRecipient(record) {
 function classifyCopy(record) {
   if (!String(record?.outreach?.email_body || '').trim()) return 'missing_email_body';
   if (!String(record?.outreach?.cover_letter || '').trim()) return 'missing_cover_letter';
-  if (record?.outreach?.content_quality?.batch_ready === false || record?.draftVersion?.qualityStatus === 'failed') return 'quality_failed';
+  const coverLetter = String(record?.outreach?.cover_letter || '').trim();
+  const contentQuality = record?.outreach?.content_quality;
+  if (
+    contentQuality?.batch_ready === false
+    || record?.draftVersion?.qualityStatus === 'failed'
+    || INTERNAL_COVER_LETTER_TOKEN.test(coverLetter)
+    || typeof contentQuality?.cover_letter_chars === 'number' && contentQuality.cover_letter_chars < 800
+  ) return 'quality_failed';
   if (record?.draftVersion?.qualityStatus === 'passed') return 'passed';
   return 'pending';
 }
@@ -393,6 +417,8 @@ function candidateSearchText(entry) {
     record?.outreach?.email_subject,
     record?.outreach?.email_body,
     record?.outreach?.cover_letter,
+    ...(Array.isArray(record?.application_info?.responsibilities) ? record.application_info.responsibilities.flatMap((item) => [item?.text, item?.evidence]) : []),
+    ...(Array.isArray(record?.application_info?.requirements) ? record.application_info.requirements.flatMap((item) => [item?.text, item?.evidence]) : []),
     entry.summary.recipient?.address,
     record?.emailSubjectRequirement?.evidence,
     record?.attachmentRequirement?.evidence,

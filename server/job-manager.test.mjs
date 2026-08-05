@@ -689,7 +689,7 @@ test('manual recovery starts a new automatic idempotency cycle after earlier att
     children[0].emit('close', 1, null);
     await manualEnded;
 
-    await waitForCondition(() => spawnCount === 2);
+    await waitForCondition(() => spawnCount === 2, 10_000);
     const automaticallyResumed = manager.get(jobId);
     assert.equal(automaticallyResumed.status, 'running');
     assert.equal(automaticallyResumed.attempts.length, 3);

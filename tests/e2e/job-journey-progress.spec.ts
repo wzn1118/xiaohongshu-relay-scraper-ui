@@ -192,7 +192,11 @@ async function json(route: Route, body: unknown, status = 200) {
   await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
 }
 
-async function openJourney(page: Page, journeyJob = job) {
+async function openJourney(page: Page, journeyJob = job, options: { expireFirstResume?: boolean } = {}) {
+  const state = {
+    aiSessionRequests: 0,
+    resumeRequests: [] as Array<Record<string, unknown>>,
+  }
   await page.route('**/api/**', async (route) => {
     const request = route.request()
     const path = new URL(request.url()).pathname
@@ -204,7 +208,10 @@ async function openJourney(page: Page, journeyJob = job) {
     if (path === '/api/email/config') return json(route, { provider: 'custom', host: '', port: 465, secure: true, requireTls: false, auth: 'login', user: '', from: '', configured: false, verified: false, oauth: {} })
     if (path === '/api/ai/providers') return json(route, [{ id: 'codex', label: 'Codex', baseUrl: 'http://127.0.0.1', model: 'test', models: ['test'], requiresKey: false, configured: true, hasApiKey: true, wireApi: 'responses' }])
     if (path === '/api/ai/local-models') return json(route, { runtime: { ready: false }, catalog: [], installedModels: [], install: null })
-    if (path === '/api/ai/sessions' && method === 'POST') return json(route, { id: 'session-journey', provider: 'codex', model: 'test', baseUrl: 'http://127.0.0.1', wireApi: 'responses', configured: true, expiresAt: '2026-08-03T09:00:00.000Z' })
+    if (path === '/api/ai/sessions' && method === 'POST') {
+      state.aiSessionRequests += 1
+      return json(route, { id: `session-journey-${state.aiSessionRequests}`, provider: 'codex', model: 'test', baseUrl: 'http://127.0.0.1', wireApi: 'responses', configured: true, expiresAt: '2026-08-03T09:00:00.000Z' })
+    }
     if (path === '/api/profiles') return json(route, [])
     if (path === `/api/jobs/${jobId}/results`) return json(route, emptyResults)
     if (path === `/api/jobs/${jobId}/artifacts`) return json(route, [])
@@ -218,12 +225,23 @@ async function openJourney(page: Page, journeyJob = job) {
         snapshot: journeyJob.experienceSnapshot,
       }, 202)
     }
+    if (path === `/api/jobs/${jobId}/resume` && method === 'POST') {
+      state.resumeRequests.push(request.postDataJSON() as Record<string, unknown>)
+      if (options.expireFirstResume && state.resumeRequests.length === 1) {
+        return json(route, {
+          message: 'The selected AI session has expired.',
+          error: { code: 'AI_SESSION_EXPIRED', message: 'The selected AI session has expired.' },
+        }, 400)
+      }
+      return json(route, { ...journeyJob, status: 'resuming' })
+    }
     if (path === `/api/jobs/${jobId}`) return json(route, journeyJob)
     return json(route, {})
   })
   await page.clock.setFixedTime(new Date(now))
   await page.goto('/', { waitUntil: 'commit' })
   await expect(page.locator('.job-journey-panel')).toBeVisible({ timeout: 45_000 })
+  return state
 }
 
 test('旧版未识别错误会转换成可理解的复查提示', async ({ page }) => {
@@ -235,6 +253,34 @@ test('旧版未识别错误会转换成可理解的复查提示', async ({ page 
   await expect(journey.getByText('已保存 251 条结果').first()).toBeVisible()
   await expect(page.getByText('当前步骤遇到未识别问题', { exact: true })).toHaveCount(0)
   await expect(page.getByText(/unknown error/i)).toHaveCount(0)
+
+  const resumeButton = journey.getByRole('button', { name: '一键恢复未完成步骤' })
+  await expect(resumeButton).toBeVisible()
+  await expect(journey.getByText(/待恢复：获取完整岗位详情、区分招聘信息和经验分享、整理页面结果和下载文件/)).toBeVisible()
+  await expect(journey.getByRole('button', { name: '继续任务' })).toHaveCount(0)
+  const resumeRequest = page.waitForRequest((request) => (
+    request.method() === 'POST'
+    && new URL(request.url()).pathname === `/api/jobs/${jobId}/resume`
+  ))
+  await resumeButton.click()
+  expect((await resumeRequest).postDataJSON()).toMatchObject({
+    scope: 'full',
+    idempotencyKey: expect.any(String),
+  })
+})
+
+test('继续任务遇到 AI 会话过期会自动重连并再次恢复', async ({ page }) => {
+  const state = await openJourney(page, unknownJob, { expireFirstResume: true })
+
+  await page.locator('.job-journey-panel').getByRole('button', { name: '一键恢复未完成步骤' }).click()
+
+  await expect.poll(() => state.resumeRequests.length).toBe(2)
+  expect(state.aiSessionRequests).toBeGreaterThan(0)
+  expect(state.resumeRequests[1]).toMatchObject({
+    scope: 'full',
+    aiSessionId: `session-journey-${state.aiSessionRequests}`,
+  })
+  await expect(page.getByText('The selected AI session has expired.')).toHaveCount(0)
 })
 
 for (const viewport of [
@@ -243,6 +289,7 @@ for (const viewport of [
   { name: 'desktop-1440', width: 1440, height: 900 },
 ]) {
   test(`求职者进度在 ${viewport.name} 显示真实正文、限流恢复与折叠技术详情`, async ({ page }) => {
+    test.setTimeout(90_000)
     await page.setViewportSize(viewport)
     await openJourney(page)
 
