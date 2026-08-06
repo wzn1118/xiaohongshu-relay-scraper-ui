@@ -1,0 +1,12 @@
+# Local-managed tunnel reference configuration.
+# The production launcher uses a remotely managed token when
+# CLOUDFLARE_TUNNEL_TOKEN_FILE is set. This file is for validation and for
+# installations that use a named tunnel credential JSON instead.
+tunnel: df68d104-5c20-44a1-be7c-9b80ff57626a
+credentials-file: C:\Users\<user>\.cloudflared\df68d104-5c20-44a1-be7c-9b80ff57626a.json
+metrics: 127.0.0.1:20241
+no-autoupdate: true
+ingress:
+  - hostname: relay.hegelsalon.com
+    service: http://127.0.0.1:4327
+  - service: http_status:404

@@ -13,6 +13,7 @@ const audienceProfileSupplementPath = path.resolve(serverDir, '..', 'scripts', '
 const applicationContactOcrPath = path.resolve(serverDir, '..', 'scripts', 'resolve_application_contacts.py');
 const dataDir = path.resolve(process.env.XHS_SERVER_DATA_DIR || path.join(serverDir, '..', 'data', 'jobs'));
 const authRoot = path.resolve(process.env.XHS_AUTH_DATA_DIR || path.join(dataDir, '..', 'auth'));
+const authRequired = readBoolean(process.env.XHS_AUTH_REQUIRED, process.env.NODE_ENV === 'production');
 const smtpPort = readPort(process.env.SMTP_PORT, 587);
 const smtpUser = String(process.env.SMTP_USER || '').trim();
 const smtpPass = String(process.env.SMTP_PASS || '');
@@ -50,7 +51,7 @@ export const config = Object.freeze({
   windowsPrerequisiteScriptPath: path.resolve(serverDir, '..', 'scripts', 'ensure-windows-prerequisites.ps1'),
   dataDir,
   localModelEndpoint: normalizeLocalModelEndpoint(process.env.XHS_LOCAL_MODEL_ENDPOINT || 'http://127.0.0.1:11434'),
-  authRequired: readBoolean(process.env.XHS_AUTH_REQUIRED, process.env.NODE_ENV === 'production'),
+  authRequired,
   authUsersPath: path.resolve(process.env.XHS_AUTH_USERS_PATH || path.join(authRoot, 'users.json')),
   authSessionSecretPath: path.resolve(process.env.XHS_AUTH_SESSION_SECRET_PATH || path.join(authRoot, 'session-secret')),
   authBootstrapEmail: String(process.env.XHS_AUTH_EMAIL || '').trim(),
@@ -58,7 +59,7 @@ export const config = Object.freeze({
   authCookieName: String(process.env.XHS_AUTH_COOKIE_NAME || 'xhs_session').trim() || 'xhs_session',
   authSecureCookie: readBoolean(process.env.XHS_AUTH_SECURE_COOKIE, process.env.NODE_ENV === 'production'),
   authSessionTtlSeconds: readInt(process.env.XHS_AUTH_SESSION_TTL_SECONDS, 8 * 60 * 60, 300, 7 * 24 * 60 * 60),
-  authOrigin: String(process.env.XHS_AUTH_ORIGIN || '').trim(),
+  authOrigin: normalizeAuthOrigin(process.env.XHS_AUTH_ORIGIN, authRequired),
   managedBrowserDataDir: path.resolve(process.env.XHS_BROWSER_DATA_DIR || path.join(dataDir, '..', 'browser')),
   relayConfigPath: path.resolve(process.env.XHS_RELAY_CONFIG_PATH || path.join(dataDir, '..', 'relay-config.json')),
   aiConfigPath: path.resolve(process.env.XHS_AI_CONFIG_PATH || path.join(dataDir, '..', 'ai-config.json')),
@@ -130,6 +131,34 @@ function normalizeLocalModelEndpoint(value) {
   parsed.hash = '';
   parsed.pathname = parsed.pathname.replace(/\/v1\/?$/iu, '').replace(/\/+$/u, '');
   return parsed.toString().replace(/\/+$/u, '');
+}
+
+/**
+ * Normalize the single browser origin used for CORS and CSRF protection.
+ * Production authentication must have an explicit origin so a deployment
+ * cannot accidentally start with the development CORS fallback.
+ */
+export function normalizeAuthOrigin(value, required = false) {
+  const text = String(value || '').trim();
+  if (!text) {
+    if (required) throw new Error('XHS_AUTH_ORIGIN is required when XHS_AUTH_REQUIRED=true.');
+    return '';
+  }
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    throw new Error('XHS_AUTH_ORIGIN must be a valid HTTP(S) origin.');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || (parsed.pathname !== '/' && parsed.pathname !== '')) {
+    throw new Error('XHS_AUTH_ORIGIN must contain only an HTTP(S) origin without credentials or a path.');
+  }
+  if (parsed.search || parsed.hash) throw new Error('XHS_AUTH_ORIGIN must not contain a query or fragment.');
+  const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname);
+  if (required && parsed.protocol !== 'https:' && !loopback) {
+    throw new Error('XHS_AUTH_ORIGIN must use HTTPS outside loopback hosts.');
+  }
+  return parsed.origin;
 }
 
 function readLocalModelBaseUrls(value) {

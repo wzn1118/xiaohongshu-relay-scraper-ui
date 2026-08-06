@@ -1820,6 +1820,7 @@ function App() {
   const audienceRequestRef = useRef(0)
   const audienceForegroundRequestRef = useRef(0)
   const aiBootstrapStartedRef = useRef(false)
+  const appAccessReady = !authLoading && Boolean(authSession && (!authSession.required || authSession.authenticated))
 
   useEffect(() => {
     let cancelled = false
@@ -2935,6 +2936,7 @@ function App() {
   }, [audienceKind, audiencePageSize, audiencePostId, audienceQuery])
 
   useEffect(() => {
+    if (!appAccessReady) return
     let mounted = true
     const boot = async () => {
       const results = await Promise.allSettled([api.health(), api.jobs(), api.relayConfig(), api.smtpConfig()])
@@ -2987,7 +2989,7 @@ function App() {
     return () => {
       mounted = false
     }
-  }, [])
+  }, [appAccessReady])
 
   useEffect(() => {
     const clockTimer = window.setInterval(() => setClock(new Date()), 1000)
@@ -2995,6 +2997,7 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!appAccessReady) return
     const refresh = () => {
       if (document.visibilityState === 'visible') void loadJobs()
     }
@@ -3006,21 +3009,22 @@ function App() {
       window.removeEventListener('focus', refresh)
       document.removeEventListener('visibilitychange', refresh)
     }
-  }, [loadJobs])
+  }, [appAccessReady, loadJobs])
 
   useEffect(() => {
+    if (!appAccessReady) return
     const relayTimer = window.setInterval(() => void refreshRelay(), 15000)
     return () => window.clearInterval(relayTimer)
-  }, [refreshRelay])
+  }, [appAccessReady, refreshRelay])
 
   useEffect(() => () => cleanupStream.current?.(), [])
 
   useEffect(() => {
-    if (!relayGuideOpen) return
+    if (!appAccessReady || !relayGuideOpen) return
     void refreshRelay()
     const guideTimer = window.setInterval(() => void refreshRelay(), 3000)
     return () => window.clearInterval(guideTimer)
-  }, [relayGuideOpen, refreshRelay])
+  }, [appAccessReady, relayGuideOpen, refreshRelay])
 
   useEffect(() => {
     const tabs = Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)
@@ -3032,7 +3036,7 @@ function App() {
   }, [loading, relay])
 
   useEffect(() => {
-    if (aiBootstrapStartedRef.current) return
+    if (!appAccessReady || aiBootstrapStartedRef.current) return
     aiBootstrapStartedRef.current = true
     Promise.all([api.aiProviders(), api.profiles(), api.localModels().catch(() => null)]).then(([options, saved, localStatus]) => {
       const expandedOptions = localStatus ? options.map((item) => item.id === 'local_qwen'
@@ -3070,7 +3074,7 @@ function App() {
       }
       if (saved[0]) updateRequest('profileId', saved[0].id)
     }).catch((error) => setNotice((error as Error).message))
-  }, [])
+  }, [appAccessReady])
 
   useEffect(() => {
     if (!request.profileId) {
