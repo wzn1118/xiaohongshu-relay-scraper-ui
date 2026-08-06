@@ -8,6 +8,7 @@ output/
 test-results/
 tmp/
 deliverables/
+backups/
 artifacts/
 profiles/*.json
 !profiles/candidate_profile.example.json
@@ -15,6 +16,13 @@ docs/RESUME_EVIDENCE.md
 .env
 .env.*
 !.env.example
+!.env.production.example
+.cloudflared/
+*.token
+*.pem
+cert.pem
+tunnel-credentials/
+*-credentials.json
 __pycache__/
 *.py[cod]
 .pytest_cache/

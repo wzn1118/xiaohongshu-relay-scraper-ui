@@ -540,8 +540,16 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     const requestStartedAt = performance.now();
     const requestId = diagnostics?.requestId?.(req.headers['x-request-id']);
     if (requestId) res.setHeader('X-Request-Id', requestId);
-    setSecurityHeaders(res, config);
-    if (req.method === 'OPTIONS') return noContent(res);
+    const requestOrigin = String(req.headers.origin || '').trim();
+    setSecurityHeaders(res, config, requestOrigin);
+    const originError = validateRequestOrigin(req, config, { preflight: req.method === 'OPTIONS' });
+    if (req.method === 'OPTIONS') {
+      if (originError) return json(res, originError.status, errorBody(originError.code, originError.message));
+      return noContent(res);
+    }
+    if (originError && isStateChangingMethod(req.method)) {
+      return json(res, originError.status, errorBody(originError.code, originError.message));
+    }
     const url = new URL(req.url, 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean);
     const authUser = authStore?.authenticate(req) || null;
@@ -6154,15 +6162,55 @@ async function readJsonBody(req, maxBytes) {
   return text ? JSON.parse(text) : {};
 }
 
-function setSecurityHeaders(res, config = {}) {
+const CORS_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+const CORS_HEADERS = new Set(['content-type', 'x-request-id']);
+
+function isStateChangingMethod(method) {
+  return ['POST', 'PUT', 'PATCH', 'DELETE'].includes(String(method || '').toUpperCase());
+}
+
+function validateRequestOrigin(req, config = {}, { preflight = false } = {}) {
+  const expectedOrigin = String(config.authOrigin || '').trim();
+  if (!expectedOrigin) return null;
+  const origin = String(req.headers.origin || '').trim();
+  if (origin && origin !== expectedOrigin) {
+    return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
+  }
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+  if (!origin && fetchSite && !['same-origin', 'same-site', 'none'].includes(fetchSite)) {
+    return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
+  }
+  if (!preflight) return null;
+  const requestedMethod = String(req.headers['access-control-request-method'] || '').trim().toUpperCase();
+  if (requestedMethod && !CORS_METHODS.has(requestedMethod)) {
+    return { status: 405, code: 'CORS_METHOD_NOT_ALLOWED', message: 'Requested CORS method is not allowed.' };
+  }
+  const requestedHeaders = String(req.headers['access-control-request-headers'] || '')
+    .split(',')
+    .map((header) => header.trim().toLowerCase())
+    .filter(Boolean);
+  if (requestedHeaders.some((header) => !CORS_HEADERS.has(header))) {
+    return { status: 403, code: 'CORS_HEADER_NOT_ALLOWED', message: 'Requested CORS header is not allowed.' };
+  }
+  return null;
+}
+
+function setSecurityHeaders(res, config = {}, requestOrigin = '') {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Access-Control-Allow-Origin', config.authOrigin || 'http://127.0.0.1:5173');
+  const configuredOrigin = String(config.authOrigin || '').trim();
+  const defaultDevOrigin = 'http://127.0.0.1:5173';
+  const allowedOrigin = configuredOrigin || (config.authRequired === true ? '' : defaultDevOrigin);
+  if (allowedOrigin && (!requestOrigin || requestOrigin === allowedOrigin)) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  }
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Request-Id');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Max-Age', '600');
 }
 
 function json(res, status, body) {
