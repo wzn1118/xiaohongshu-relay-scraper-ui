@@ -73,7 +73,7 @@ try {
         Copy-Item -LiteralPath $entry.FullName -Destination $TargetRoot -Recurse -Force
     }
     Write-Host "Restored $($files.Count) verified files to $TargetRoot."
-    Write-Host 'Restart the origin and tunnel with start-hegelsalon.cmd after checking the restored state.'
+    Write-Host 'Restart the origin and tunnel with start-production-windows.cmd after checking the restored state.'
 } finally {
     Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
 }

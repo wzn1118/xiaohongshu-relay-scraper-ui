@@ -2,8 +2,8 @@
 # The production launcher uses a remotely managed token when
 # CLOUDFLARE_TUNNEL_TOKEN_FILE is set. This file is for validation and for
 # installations that use a named tunnel credential JSON instead.
-tunnel: df68d104-5c20-44a1-be7c-9b80ff57626a
-credentials-file: C:\Users\<user>\.cloudflared\df68d104-5c20-44a1-be7c-9b80ff57626a.json
+tunnel: TUNNEL_UUID
+credentials-file: C:\Users\<user>\.cloudflared\TUNNEL_UUID.json
 metrics: 127.0.0.1:20241
 no-autoupdate: true
 ingress:

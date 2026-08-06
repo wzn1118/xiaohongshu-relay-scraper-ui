@@ -52,6 +52,19 @@ Stop only the processes recorded by this release:
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop-production-windows.ps1
 ```
 
+For a browser smoke check, provide credentials only through the current
+process environment. The optional job and artifact variables add exact
+assertions for a populated private data set; when omitted, the check still
+validates the login gate and accepts an empty job list.
+
+```powershell
+$env:HEGELSALON_VERIFY_URL = 'https://relay.hegelsalon.com'
+$env:HEGELSALON_VERIFY_EMAIL = 'admin@example.invalid'
+$env:HEGELSALON_VERIFY_PASSWORD = (Read-Host 'Password' -AsSecureString | % { [System.Net.NetworkCredential]::new('', $_).Password })
+node .\scripts\verify-production-browser.mjs
+Remove-Item Env:HEGELSALON_VERIFY_URL,Env:HEGELSALON_VERIFY_EMAIL,Env:HEGELSALON_VERIFY_PASSWORD
+```
+
 ## Release and data handling
 
 Create a clean code release with dependencies included by default:

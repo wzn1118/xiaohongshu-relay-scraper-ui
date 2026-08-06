@@ -206,7 +206,7 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 try {
     Copy-ReleaseTree -Source $root -Destination $stage
     Copy-Item -LiteralPath (Join-Path $root 'dist') -Destination (Join-Path $stage 'dist') -Recurse -Force
-    foreach ($legacyLauncher in @('start-windows.cmd', 'start-hegelsalon.cmd')) {
+    foreach ($legacyLauncher in @('start-windows.cmd')) {
         $legacyLauncherPath = Join-Path $stage $legacyLauncher
         if (Test-Path -LiteralPath $legacyLauncherPath -PathType Leaf) { Remove-Item -LiteralPath $legacyLauncherPath -Force }
     }

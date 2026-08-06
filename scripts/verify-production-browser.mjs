@@ -7,6 +7,15 @@ const baseUrl = String(process.env.HEGELSALON_VERIFY_URL || 'https://relay.hegel
 const email = String(process.env.HEGELSALON_VERIFY_EMAIL || '').trim();
 const password = String(process.env.HEGELSALON_VERIFY_PASSWORD || '');
 const screenshotPath = path.resolve(process.env.HEGELSALON_VERIFY_SCREENSHOT || 'output/playwright/hegelsalon-production-current.png');
+const expectedJobIds = String(process.env.HEGELSALON_VERIFY_JOB_IDS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
+  .sort();
+const expectedArtifactJobId = String(process.env.HEGELSALON_VERIFY_ARTIFACT_JOB_ID || '').trim();
+const expectedArtifactCountText = String(process.env.HEGELSALON_VERIFY_ARTIFACT_COUNT || '').trim();
+const expectedArtifactCount = expectedArtifactCountText ? Number(expectedArtifactCountText) : null;
+if (expectedArtifactCountText) assert.ok(Number.isInteger(expectedArtifactCount) && expectedArtifactCount >= 0, 'HEGELSALON_VERIFY_ARTIFACT_COUNT must be a non-negative integer.');
 
 assert.ok(email, 'HEGELSALON_VERIFY_EMAIL is required.');
 assert.ok(password, 'HEGELSALON_VERIFY_PASSWORD is required.');
@@ -34,16 +43,21 @@ try {
   const jobsResponse = await jobsResponsePromise;
   const jobs = await jobsResponse.json();
   assert.ok(Array.isArray(jobs));
-  assert.deepEqual(jobs.map((job) => job.id).sort(), ['20260731005634-5c619106', '20260804081657-caf8f451']);
+  const jobIds = jobs.map((job) => String(job.id)).sort();
+  if (expectedJobIds.length) assert.deepEqual(jobIds, expectedJobIds);
 
   await page.waitForFunction(() => !document.querySelector('.auth-form'));
-  const artifacts = await page.evaluate(async () => {
-    const response = await fetch('/api/jobs/20260804081657-caf8f451/artifacts');
-    if (!response.ok) throw new Error(`Artifacts request failed with ${response.status}.`);
-    return response.json();
-  });
+  const artifactJob = jobs.find((job) => String(job.id) === expectedArtifactJobId) || jobs[0];
+  if (expectedArtifactJobId) assert.equal(String(artifactJob?.id || ''), expectedArtifactJobId);
+  const artifacts = artifactJob?.id
+    ? await page.evaluate(async (jobId) => {
+        const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/artifacts`);
+        if (!response.ok) throw new Error(`Artifacts request failed with ${response.status}.`);
+        return response.json();
+      }, String(artifactJob.id))
+    : [];
   assert.ok(Array.isArray(artifacts));
-  assert.equal(artifacts.length, 321);
+  if (expectedArtifactCount !== null) assert.equal(artifacts.length, expectedArtifactCount);
 
   await mkdir(path.dirname(screenshotPath), { recursive: true });
   await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -53,7 +67,8 @@ try {
   console.log(JSON.stringify({
     url: page.url(),
     loginGateRequests: [...new Set(initialApiRequests)],
-    jobs: jobs.map((job) => job.id),
+    jobs: jobIds,
+    artifactJob: artifactJob?.id ? String(artifactJob.id) : null,
     artifacts: artifacts.length,
     screenshot: screenshotPath,
   }));
