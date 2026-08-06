@@ -2634,3 +2634,99 @@ test('JobManager keeps every persisted task when new history is added', async ()
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
+test('JobManager restores the latest events without loading an oversized journal prefix', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-large-journal-'));
+  const jobId = '20260805090000-large-journal';
+  const outputDir = path.join(dataDir, 'jobs', jobId, 'artifacts');
+  const eventDir = path.join(dataDir, 'job-events');
+  await mkdir(outputDir, { recursive: true });
+  await mkdir(eventDir, { recursive: true });
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'succeeded',
+    outputDir,
+    params: { keyword: 'large journal', analysisMode: 'job' },
+    createdAt: '2026-08-05T09:00:00.000Z',
+    updatedAt: '2026-08-05T09:01:00.000Z',
+    finishedAt: '2026-08-05T09:01:00.000Z',
+    eventSequence: 41,
+    stages: emptyWorkflowStages(),
+  }]), 'utf8');
+  const latestEvent = {
+    schemaVersion: 1,
+    eventId: `${jobId}:42`,
+    sequence: 42,
+    jobId,
+    attemptId: `${jobId}:legacy`,
+    occurredAt: '2026-08-05T09:01:01.000Z',
+    type: 'log',
+    data: { stream: 'stdout', message: 'latest durable event' },
+  };
+  await writeFile(
+    path.join(eventDir, `${encodeURIComponent(jobId)}.jsonl`),
+    `${'x'.repeat(9 * 1024 * 1024)}\n${JSON.stringify(latestEvent)}\n`,
+    'utf8',
+  );
+
+  try {
+    const manager = new JobManager({ dataDir, pythonBin: 'python', runnerPath: path.join(dataDir, 'runner.py') });
+    await manager.initialize();
+    assert.equal(await manager.getEventHighWater(jobId), 42);
+    const page = await manager.listEventPage(jobId, 41, { throughSequence: 42 });
+    assert.deepEqual(page.events.map((event) => event.eventId), [`${jobId}:42`]);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager list omits stage ledgers while preserving full job details', () => {
+  const manager = new JobManager({
+    dataDir: path.join(os.tmpdir(), 'xhs-job-list-summary'),
+    pythonBin: 'python',
+    runnerPath: 'runner.py',
+  });
+  const id = 'large-ledger-job';
+  manager.jobs = [{
+    id,
+    schemaVersion: 2,
+    status: 'completed',
+    params: { keyword: 'summary test', analysisMode: 'job' },
+    createdAt: '2026-08-05T00:00:00.000Z',
+    updatedAt: '2026-08-05T00:01:00.000Z',
+    stages: {
+      discovery: {
+        status: 'completed',
+        discoveredCount: 2,
+        discoveredIds: ['note-1', 'note-2'],
+        lastCheckpointAt: '2026-08-05T00:00:20.000Z',
+      },
+      bodyCompletion: {
+        status: 'completed',
+        totalCount: 2,
+        completedCount: 2,
+        records: {
+          'note-1': { bodyStatus: 'succeeded', attemptCount: 1, body: 'x'.repeat(100_000) },
+          'note-2': { bodyStatus: 'succeeded', attemptCount: 1, body: 'y'.repeat(100_000) },
+        },
+        lastCheckpointAt: '2026-08-05T00:00:40.000Z',
+      },
+      analysis: { status: 'completed', records: { 'note-1': { score: 95 } }, completedCount: 2 },
+      audience: { status: 'not_started', posts: {}, replyThreads: {}, users: {} },
+      artifacts: { status: 'completed', generatedFiles: ['report.json'], failedFiles: [] },
+    },
+    attempts: [],
+  }];
+
+  const listed = manager.list()[0];
+  assert.equal(listed.stages.discovery.discoveredIds, undefined);
+  assert.equal(listed.stages.bodyCompletion.records, undefined);
+  assert.equal(listed.stages.analysis.records, undefined);
+  assert.equal(listed.stages.artifacts.completedCount, 1);
+  assert.equal(listed.experienceSnapshot.counts.discovered, 2);
+  assert.equal(listed.experienceSnapshot.counts.fullText, 2);
+
+  const detailed = manager.get(id);
+  assert.equal(detailed.stages.discovery.discoveredIds.length, 2);
+  assert.equal(detailed.stages.bodyCompletion.records['note-1'].body.length, 100_000);
+});

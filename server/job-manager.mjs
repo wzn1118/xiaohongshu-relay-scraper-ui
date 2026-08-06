@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createWriteStream } from 'node:fs';
-import { appendFile, mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { buildRunnerArgs } from './lib/contracts.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
@@ -30,6 +30,31 @@ const RESUME_SCOPES = new Set(['full', 'discovery', 'body_completion', 'analysis
 const RATE_LIMIT_RECOVERY_STATUSES = new Set(['waiting', 'stopped', 'scheduled', 'resuming']);
 const RATE_LIMIT_TERMINAL_STATUSES = new Set(['stopped', 'scheduled']);
 const BODY_RATE_LIMIT_STABLE_SUCCESSES = 3;
+const EVENT_JOURNAL_TAIL_BYTES = 8 * 1024 * 1024;
+const MAX_IN_MEMORY_JOB_EVENTS = 2_000;
+
+async function readEventJournalTail(filePath) {
+  const handle = await open(filePath, 'r');
+  try {
+    const { size } = await handle.stat();
+    const start = Math.max(0, size - EVENT_JOURNAL_TAIL_BYTES);
+    const buffer = Buffer.allocUnsafe(size - start);
+    let bytesRead = 0;
+    while (bytesRead < buffer.length) {
+      const chunk = await handle.read(buffer, bytesRead, buffer.length - bytesRead, start + bytesRead);
+      if (chunk.bytesRead === 0) break;
+      bytesRead += chunk.bytesRead;
+    }
+    let text = buffer.subarray(0, bytesRead).toString('utf8');
+    if (start > 0) {
+      const firstNewline = text.indexOf('\n');
+      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : '';
+    }
+    return text;
+  } finally {
+    await handle.close();
+  }
+}
 
 export class JobManager {
   constructor({
@@ -226,7 +251,7 @@ export class JobManager {
   }
 
   list() {
-    return this.jobs.map(publicJob);
+    return this.jobs.map((job) => publicJob(job, { compactStages: true }));
   }
 
   get(id) {
@@ -1279,7 +1304,7 @@ export class JobManager {
     const journalPath = this.#eventJournalPath(job.id);
     let text;
     try {
-      text = await readFile(journalPath, 'utf8');
+      text = await readEventJournalTail(journalPath);
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
       this.jobEventJournals.set(job.id, []);
@@ -1874,7 +1899,9 @@ export class JobManager {
     const occurredAt = new Date().toISOString();
     if (job) job.eventSequence = sequence;
 
-    let eventData = data;
+    let eventData = type === 'state' && job
+      ? publicJob(job, { compactStages: true })
+      : data;
     if (type === 'state' && data && typeof data === 'object' && job) {
       const legacySnapshot = adaptLegacyJobSnapshot(data, {
         throughSequence: sequence,
@@ -1931,6 +1958,9 @@ export class JobManager {
       workflowEvent,
     };
     journal.push(event);
+    if (journal.length > MAX_IN_MEMORY_JOB_EVENTS) {
+      journal.splice(0, journal.length - MAX_IN_MEMORY_JOB_EVENTS);
+    }
     const previousWrite = this.jobEventWriteQueues.get(id) || Promise.resolve();
     const write = previousWrite
       .catch(() => {})
@@ -2962,7 +2992,21 @@ function normalizeExperienceSnapshotBodyCoverage(snapshot, bodyMetrics = null) {
   return normalized;
 }
 
-export function publicJob(job) {
+function summarizeWorkflowStages(stages) {
+  return Object.fromEntries(Object.entries(stages).map(([stageId, stage]) => {
+    if (!stage || typeof stage !== 'object' || Array.isArray(stage)) return [stageId, {}];
+    const summary = {};
+    for (const [key, value] of Object.entries(stage)) {
+      if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) summary[key] = value;
+    }
+    if (stageId === 'artifacts' && !Number.isFinite(summary.completedCount)) {
+      summary.completedCount = Array.isArray(stage.generatedFiles) ? stage.generatedFiles.length : 0;
+    }
+    return [stageId, summary];
+  }));
+}
+
+export function publicJob(job, { compactStages = false } = {}) {
   const status = job.status === 'succeeded' ? 'completed' : job.status;
   const bodyMetrics = bodyMetricsForJob(job);
   const discoveredCount = bodyMetrics.discovered;
@@ -3055,7 +3099,9 @@ export function publicJob(job) {
     resumeCount: Number(job.resumeCount || 0),
     lastResumedAt: job.lastResumedAt || null,
     revision: Number(job.revision || 0),
-    stages: structuredClone(job.stages || emptyWorkflowStages()),
+    stages: compactStages
+      ? summarizeWorkflowStages(job.stages || emptyWorkflowStages())
+      : structuredClone(job.stages || emptyWorkflowStages()),
     attempts: structuredClone(job.attempts || []),
     legacyResumeLineage: job.legacyResumeLineage || null,
     artifactCount: job.artifactCount || 0,
@@ -3078,7 +3124,10 @@ export function publicJob(job) {
     rateLimit,
     resumeAvailable,
   };
-  const legacySnapshot = adaptLegacyJobSnapshot(exposed, {
+  const legacySnapshot = adaptLegacyJobSnapshot({
+    ...exposed,
+    stages: job.stages || emptyWorkflowStages(),
+  }, {
     throughSequence: exposed.throughSequence,
     lastEventAt: exposed.updatedAt || exposed.progressUpdatedAt || exposed.createdAt,
   });
