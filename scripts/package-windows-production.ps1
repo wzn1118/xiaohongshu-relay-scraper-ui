@@ -214,9 +214,8 @@ try {
         }
     }
     Copy-Item -LiteralPath (Join-Path $root 'dist') -Destination (Join-Path $stage 'dist') -Recurse -Force
-    foreach ($legacyLauncher in @('start-windows.cmd')) {
-        $legacyLauncherPath = Join-Path $stage $legacyLauncher
-        if (Test-Path -LiteralPath $legacyLauncherPath -PathType Leaf) { Remove-Item -LiteralPath $legacyLauncherPath -Force }
+    if (-not (Test-Path -LiteralPath (Join-Path $stage 'start-windows.cmd') -PathType Leaf)) {
+        throw 'Release staging is missing start-windows.cmd.'
     }
     if (-not (Test-Path -LiteralPath (Join-Path $stage 'start-production-windows.cmd') -PathType Leaf)) {
         throw 'Release staging is missing start-production-windows.cmd.'
