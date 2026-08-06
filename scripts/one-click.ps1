@@ -11,6 +11,19 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
 
+function Enable-BundledRuntime {
+    $runtimeRoot = Join-Path $root 'runtime'
+    $nodeDir = Join-Path $runtimeRoot 'node'
+    $pythonDir = Join-Path $runtimeRoot 'python'
+    $pathEntries = @()
+    if (Test-Path -LiteralPath (Join-Path $nodeDir 'node.exe') -PathType Leaf) { $pathEntries += $nodeDir }
+    if (Test-Path -LiteralPath (Join-Path $pythonDir 'python.exe') -PathType Leaf) {
+        $pathEntries += $pythonDir
+        $env:PYTHON_BIN = Join-Path $pythonDir 'python.exe'
+    }
+    if ($pathEntries.Count -gt 0) { $env:PATH = ([string]::Join(';', $pathEntries) + ';' + $env:PATH) }
+}
+
 function Import-DotEnv {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -173,7 +186,7 @@ function Refresh-ProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $currentPath = $env:Path
-    $pathEntries = @($machinePath, $userPath, $currentPath) |
+    $pathEntries = @($currentPath, $machinePath, $userPath) |
         Where-Object { $_ } |
         ForEach-Object { $_.Split(';') } |
         Where-Object { $_ } |
@@ -219,6 +232,7 @@ function Connect-Relay {
     }
 }
 
+Enable-BundledRuntime
 Import-DotEnv (Join-Path $root '.env')
 if ($Port -gt 0) { $env:PORT = [string]$Port }
 $url = Get-AppUrl
