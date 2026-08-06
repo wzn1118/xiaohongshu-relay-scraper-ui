@@ -111,7 +111,7 @@ function Test-ForbiddenReleasePath {
     if ($normalized -match '^scripts/data(?:/|$)') { return $true }
     if ($normalized -match '(?:^|/)\.(?:git|runtime)(?:/|$)') { return $true }
     if ($normalized -match '(?:^|/)(?:\.cloudflared|tunnel-credentials)(?:/|$)') { return $true }
-    if ($leaf -match '^\.env') { return $true }
+    if ($leaf -match '^\.env' -and $leaf -notin @('.env.example', '.env.production.example')) { return $true }
     if ($leaf -eq 'production.env.local') { return $true }
     if ($leaf -eq 'cert.pem' -or $leaf -like '*.token') { return $true }
     if ($normalized -match '^data/auth/(?:users\.json|session-secret)$') { return $true }
@@ -205,6 +205,14 @@ $stage = Join-Path ([IO.Path]::GetTempPath()) ("hegelsalon-release-" + [guid]::N
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 try {
     Copy-ReleaseTree -Source $root -Destination $stage
+    # Ship templates so a first run can create a local .env without embedding
+    # machine credentials or production secrets.
+    foreach ($template in @('.env.example', '.env.production.example')) {
+        $templatePath = Join-Path $root $template
+        if (Test-Path -LiteralPath $templatePath -PathType Leaf) {
+            Copy-Item -LiteralPath $templatePath -Destination (Join-Path $stage $template) -Force
+        }
+    }
     Copy-Item -LiteralPath (Join-Path $root 'dist') -Destination (Join-Path $stage 'dist') -Recurse -Force
     foreach ($legacyLauncher in @('start-windows.cmd')) {
         $legacyLauncherPath = Join-Path $stage $legacyLauncher
@@ -271,7 +279,7 @@ try {
         includesPortableRuntime = ($requiredRuntimeFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $stage "runtime\$_") -PathType Leaf) }).Count -eq 0
         includesRawData = [bool]$IncludeData
         dataSource = $dataSourceLabel
-        excluded = if ($IncludeData) { @('.git', '.runtime', 'data/auth/users.json', 'data/auth/session-secret', '.env*', '*.token', 'cert.pem', 'tunnel credentials') } else { @('.git', '.runtime', 'data', 'artifacts', 'output', 'profiles', '.env*', '*.token', 'cert.pem', 'tunnel credentials') }
+        excluded = if ($IncludeData) { @('.git', '.runtime', 'data/auth/users.json', 'data/auth/session-secret', '.env and .env.* except *.example', '*.token', 'cert.pem', 'tunnel credentials') } else { @('.git', '.runtime', 'data', 'artifacts', 'output', 'profiles', '.env and .env.* except *.example', '*.token', 'cert.pem', 'tunnel credentials') }
         files = @(Get-Manifest -Stage $stage)
     }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stage 'PORTABLE_MANIFEST.json') -Encoding UTF8
