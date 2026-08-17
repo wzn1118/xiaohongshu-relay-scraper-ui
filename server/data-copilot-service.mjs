@@ -2919,7 +2919,7 @@ function contextArtifactRecord(jobId, item) {
   };
 }
 
-async function listTaskArtifactFiles(outputDir, { excludedRoots = [] } = {}) {
+export async function listTaskArtifactFiles(outputDir, { excludedRoots = [] } = {}) {
   const root = path.resolve(String(outputDir || ''));
   let canonicalRoot;
   try {
@@ -2951,7 +2951,11 @@ async function listTaskArtifactFiles(outputDir, { excludedRoots = [] } = {}) {
       if (entry.isSymbolicLink()) continue;
       const relativePath = path.join(relativeDirectory, entry.name);
       const absolutePath = path.resolve(root, relativePath);
-      if (!pathIsWithin(canonicalRoot, absolutePath)) continue;
+      // Keep the lexical and canonical containment checks in their respective
+      // path spaces. Windows temp roots can be aliases (for example, a junction
+      // or an 8.3 path), so comparing an unresolved child with canonicalRoot
+      // incorrectly filters every legitimate artifact under that root.
+      if (!pathIsWithin(root, absolutePath)) continue;
       let canonicalPath;
       try {
         canonicalPath = await realpath(absolutePath);

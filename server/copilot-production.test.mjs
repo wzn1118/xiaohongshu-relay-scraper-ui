@@ -2,13 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 
 import { CopilotApprovalStore } from './copilot-approval-store.mjs';
 import { CopilotArtifactService } from './copilot-artifact-service.mjs';
 import { createCopilotProductionStore } from './copilot/production-store.mjs';
 import { runGoldenEvaluation } from './copilot/evaluation-suite.mjs';
-import { DataCopilotService } from './data-copilot-service.mjs';
+import { DataCopilotService, listTaskArtifactFiles } from './data-copilot-service.mjs';
 import { DataCopilotStore } from './data-copilot-store.mjs';
 import { DataPolicyEngine } from './data-policy-engine.mjs';
 
@@ -40,6 +40,33 @@ test('production store uses WAL and keeps immutable snapshot manifests with stru
   assert.equal(store.listTraces({ conversationId: 'conversation-1' })[0].payload.ok, true);
   assert.equal(store.acquireLease({ leaseKey: 'eval', ownerId: 'worker-a' }).acquired, true);
   assert.equal(store.acquireLease({ leaseKey: 'eval', ownerId: 'worker-b' }).acquired, false);
+});
+
+test('artifact discovery accepts an aliased output root without weakening containment', async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), 'copilot-artifact-alias-'));
+  const physicalOutputDir = path.join(rootDir, 'physical-output');
+  const aliasedOutputDir = path.join(rootDir, 'output-alias');
+  await mkdir(physicalOutputDir, { recursive: true });
+  await writeFile(path.join(physicalOutputDir, 'records.json'), '[{"id":1}]\n', 'utf8');
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+
+  try {
+    await symlink(
+      physicalOutputDir,
+      aliasedOutputDir,
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOSYS'].includes(error?.code)) {
+      t.skip(`Directory links are unavailable in this environment: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+
+  const files = await listTaskArtifactFiles(aliasedOutputDir);
+  assert.deepEqual(files.map((file) => file.relativePath), ['records.json']);
+  assert.match(files[0].sha256, /^[a-f0-9]{64}$/u);
 });
 
 test('service persists snapshots, migrates explicitly, creates verified artifacts, and stores golden evaluation', async (t) => {
