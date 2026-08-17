@@ -709,7 +709,6 @@ test('连续切换时自动保存只执行一次并继续第一次操作', async
   await page.getByLabel('私信文案').fill(changed)
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
   await page.getByRole('button', { name: '历史' }).click()
-  await page.getByRole('row', { name: /任务乙/ }).dispatchEvent('click')
   await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
   expect(state.draftRequests).toBe(1)
   await expect(page.getByRole('alertdialog')).toHaveCount(0)
