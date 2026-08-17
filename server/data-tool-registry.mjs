@@ -497,6 +497,45 @@ export class DataToolRegistry {
         };
       },
     });
+    this.register({
+      name: "audience.research_brief",
+      description:
+        "Build an evidence-backed audience research brief from bound posts, comments, and users. Use this first for deep audience, community, demand, sentiment, positioning, or content-strategy analysis. It keeps comment-record and unique-text denominators separate, reports profile and geography coverage, and returns source-addressable evidence samples. Signal buckets can overlap and are triage signals, not demographic estimates.",
+      tags: [
+        "audience",
+        "research",
+        "deep analysis",
+        "community",
+        "demand",
+        "sentiment",
+        "content strategy",
+        "用户洞察",
+        "深度分析",
+        "受众研究",
+        "内容策略",
+        "需求",
+        "情绪",
+        "争议",
+      ],
+      scopes: ["audience:read"],
+      inputSchema: objectSchema({
+        exampleLimit: integerSchema(1, 12),
+      }),
+      handler: async (input, context) => {
+        const [posts, comments, users] = await Promise.all([
+          this.#dataset("audience.posts", context, { allowUnavailable: true }),
+          this.#dataset("comments", context, { allowUnavailable: true }),
+          this.#dataset("users", context, { allowUnavailable: true }),
+        ]);
+        return audienceResearchBrief({
+          posts: posts?.rows || [],
+          comments: comments?.rows || [],
+          users: users?.rows || [],
+          sources: [posts?.source, comments?.source, users?.source].filter(Boolean),
+          exampleLimit: bounded(input.exampleLimit, 5, 1, 12),
+        });
+      },
+    });
     for (const [name, dataset] of [
       ["users.query", "users"],
       ["comments.query", "comments"],
@@ -1302,6 +1341,291 @@ function groupRows(rows, by, limit, source) {
     .sort((left, right) => right.count - left.count)
     .slice(0, limit);
   return tableResult(grouped, source, counts.size);
+}
+
+const AUDIENCE_SIGNAL_RULES = Object.freeze([
+  {
+    id: "replication_and_purchase",
+    label: "复刻、购买与来源获取",
+    interpretation: "用户希望获得可执行的单品、方法、价格或来源信息。",
+    terms: ["怎么", "如何", "教程", "求同款", "同款", "链接", "哪里买", "怎么买", "购买", "店铺", "品牌", "价格", "推荐"],
+  },
+  {
+    id: "contextual_fit",
+    label: "日常场景与适配约束",
+    interpretation: "用户在工作、学校、预算、身体或暴露度等现实约束下评估是否可采用。",
+    terms: ["上班", "上学", "通勤", "日常", "身材", "胖", "瘦", "胳膊", "遮住", "适合", "不适合", "预算"],
+  },
+  {
+    id: "identity_and_meaning",
+    label: "身份归属与文化理解",
+    interpretation: "用户在讨论定义、文化内核、圈层边界或新手进入门槛。",
+    terms: ["算不算", "定义", "内核", "文化", "亚文化", "商业化", "符号", "圈子", "新手", "入门"],
+  },
+  {
+    id: "service_and_collaboration",
+    label: "服务与协作线索",
+    interpretation: "用户可能从内容消费转向拍摄、妆造、合作或联系人等服务需求。",
+    terms: ["摄影师", "拍摄", "约拍", "妆造", "联系方式", "合作", "老师"],
+  },
+  {
+    id: "boundary_and_conflict",
+    label: "边界、冲突与排斥风险",
+    interpretation: "讨论包含争议、攻击、身份判断、身体评价或被排斥的风险信号。",
+    terms: ["争议", "攻击", "歧视", "冒犯", "性别", "恶心", "刻板", "排斥", "焦虑", "规训"],
+  },
+  {
+    id: "aesthetic_affirmation",
+    label: "审美认同与正向反馈",
+    interpretation: "用户在表达喜欢、认同或对视觉效果的正向评价。",
+    terms: ["好看", "漂亮", "喜欢", "爱了", "绝了", "氛围", "高级", "美"],
+  },
+]);
+
+function audienceResearchBrief({ posts = [], comments = [], users = [], sources = [], exampleLimit = 5 } = {}) {
+  const postTitles = new Map(
+    posts.map((post) => [
+      firstString(post?.post_id, post?.postId, post?.note_id, post?.noteId, post?.id),
+      firstString(post?.title, post?.name),
+    ]).filter(([postId]) => postId),
+  );
+  const commentFacts = comments.map((comment, index) => audienceCommentFact(comment, index, postTitles));
+  const commentsWithText = commentFacts.filter((comment) => comment.text);
+  const uniqueTextCounts = new Map();
+  for (const comment of commentsWithText) {
+    uniqueTextCounts.set(comment.normalizedText, (uniqueTextCounts.get(comment.normalizedText) || 0) + 1);
+  }
+  const profileCompletion = countAudienceValues(
+    users,
+    (user) => firstString(user?.enrichment_status, user?.profile_status, user?.status).toLowerCase() || "unknown",
+  );
+  const roleCounts = countAudienceValues(users, (user) => {
+    const roles = Array.isArray(user?.roles) ? user.roles : [];
+    return roles.length ? roles : ["unclassified"];
+  });
+  const locationFacts = commentFacts.filter((comment) => comment.location);
+  const locationCounts = countAudienceValues(locationFacts, (comment) => comment.location);
+  const knownLikes = commentFacts.filter((comment) => comment.likes !== null);
+  const topLevelCommentRecords = commentFacts.filter((comment) => !comment.parentCommentId).length;
+  const replyCommentRecords = commentFacts.length - topLevelCommentRecords;
+  const repeatedTextRecords = [...uniqueTextCounts.values()]
+    .reduce((total, count) => total + Math.max(0, count - 1), 0);
+  const questionComments = commentsWithText.filter((comment) => audienceQuestion(comment.text));
+
+  return {
+    type: "audience.research_brief",
+    methodology: {
+      analysisUnit: "comment record",
+      signalMethod: "Rule-based lexical triage over comment text. Signal buckets overlap; use them to prioritize evidence review and validation, not as mutually exclusive audience segments.",
+      populationGuardrail: "Do not infer demographic composition, independent-user share, or majority opinion from keyword mentions, repeated text, incomplete profiles, or engagement alone.",
+    },
+    coverage: {
+      postRecords: posts.length,
+      commentRecords: commentFacts.length,
+      commentsWithText: commentsWithText.length,
+      uniqueCommentTexts: uniqueTextCounts.size,
+      repeatedTextRecords,
+      topLevelCommentRecords,
+      replyCommentRecords,
+      uniqueCommentUsers: new Set(commentFacts.map((comment) => comment.userId).filter(Boolean)).size,
+      userRecords: users.length,
+    },
+    dataQuality: {
+      repeatedTextRate: audienceRatio(repeatedTextRecords, commentFacts.length),
+      profileCompletion: audienceCountRows(profileCompletion, 12),
+      geography: {
+        recordsWithLocation: locationFacts.length,
+        recordsWithoutLocation: commentFacts.length - locationFacts.length,
+        topLocations: audienceCountRows(locationCounts, 10),
+      },
+      warning: repeatedTextRecords
+        ? "Repeated comment text is present. Compare both comment-record and unique-text counts before estimating issue prevalence."
+        : "No repeated non-empty comment text was detected in the materialized snapshot.",
+    },
+    participation: {
+      questionOrInformationSeekingRecords: questionComments.length,
+      questionOrInformationSeekingUniqueTexts: new Set(questionComments.map((comment) => comment.normalizedText)).size,
+      commentTopology: {
+        topLevelCommentRecords,
+        replyCommentRecords,
+        replyShare: audienceRatio(replyCommentRecords, commentFacts.length),
+      },
+      userRoles: audienceCountRows(roleCounts, 12),
+    },
+    demandAndRiskSignals: AUDIENCE_SIGNAL_RULES.map((rule) =>
+      audienceSignalSummary(rule, commentsWithText, uniqueTextCounts, exampleLimit)),
+    engagement: {
+      likes: {
+        recordsWithLikeCount: knownLikes.length,
+        recordsWithoutLikeCount: commentFacts.length - knownLikes.length,
+        total: knownLikes.reduce((total, comment) => total + comment.likes, 0),
+        averagePerKnownRecord: knownLikes.length
+          ? audienceRound(knownLikes.reduce((total, comment) => total + comment.likes, 0) / knownLikes.length)
+          : null,
+      },
+      topComments: [...commentFacts]
+        .filter((comment) => comment.text)
+        .sort(compareAudienceAttention)
+        .slice(0, exampleLimit)
+        .map(audienceEvidence),
+      topPosts: audiencePostAttention(commentFacts, postTitles, exampleLimit),
+    },
+    sources: [...new Set(sources.map(String).filter(Boolean))],
+  };
+}
+
+function audienceCommentFact(comment, index, postTitles) {
+  const text = firstString(comment?.text, comment?.comment, comment?.content, comment?.body);
+  const postId = firstString(comment?.post_id, comment?.postId, comment?.note_id, comment?.noteId);
+  return {
+    commentId:
+      firstString(comment?.comment_id, comment?.commentId, comment?.id) ||
+      `comment-${index + 1}`,
+    postId,
+    postTitle: firstString(comment?.post_title, postTitles.get(postId)),
+    parentCommentId: firstString(comment?.parent_comment_id, comment?.parentCommentId, comment?.reply_to_comment_id),
+    userId: firstString(comment?.user?.user_id, comment?.user_id, comment?.user?.id),
+    text,
+    normalizedText: normalizeAudienceText(text),
+    likes: audienceNumber(comment?.likes, comment?.like_count, comment?.likeCount, comment?.liked_count),
+    location: normalizeAudienceLocation(firstString(
+      comment?.location,
+      comment?.ip_location,
+      comment?.ipLocation,
+      comment?.user?.location,
+      comment?.user?.ip_location,
+    )),
+    sourceUrl: firstString(comment?.source_url, comment?.note_url, comment?.url),
+  };
+}
+
+function audienceSignalSummary(rule, comments, uniqueTextCounts, exampleLimit) {
+  const matched = comments.filter((comment) => rule.terms.some((term) => comment.normalizedText.includes(term)));
+  const uniqueTexts = new Set(matched.map((comment) => comment.normalizedText));
+  const knownLikes = matched.filter((comment) => comment.likes !== null);
+  return {
+    id: rule.id,
+    label: rule.label,
+    interpretation: rule.interpretation,
+    matchedTerms: rule.terms,
+    evidence: {
+      commentRecords: matched.length,
+      uniqueCommentTexts: uniqueTexts.size,
+      repeatedTextRecords: [...uniqueTexts]
+        .reduce((total, text) => total + Math.max(0, (uniqueTextCounts.get(text) || 0) - 1), 0),
+      recordShare: audienceRatio(matched.length, comments.length),
+      likesOnKnownRecords: knownLikes.reduce((total, comment) => total + comment.likes, 0),
+      averageLikesOnKnownRecords: knownLikes.length
+        ? audienceRound(knownLikes.reduce((total, comment) => total + comment.likes, 0) / knownLikes.length)
+        : null,
+    },
+    examples: [...matched]
+      .sort(compareAudienceAttention)
+      .slice(0, exampleLimit)
+      .map(audienceEvidence),
+  };
+}
+
+function audiencePostAttention(comments, postTitles, limit) {
+  const byPost = new Map();
+  for (const comment of comments) {
+    const postId = comment.postId || "(unknown post)";
+    if (!byPost.has(postId)) {
+      byPost.set(postId, {
+        postId,
+        postTitle: comment.postTitle || postTitles.get(postId) || "",
+        commentRecords: 0,
+        likesOnKnownRecords: 0,
+        knownLikeRecords: 0,
+        users: new Set(),
+      });
+    }
+    const current = byPost.get(postId);
+    current.commentRecords += 1;
+    if (comment.userId) current.users.add(comment.userId);
+    if (comment.likes !== null) {
+      current.knownLikeRecords += 1;
+      current.likesOnKnownRecords += comment.likes;
+    }
+  }
+  return [...byPost.values()]
+    .map((post) => ({
+      postId: post.postId,
+      postTitle: post.postTitle,
+      commentRecords: post.commentRecords,
+      uniqueCommentUsers: post.users.size,
+      likesOnKnownRecords: post.likesOnKnownRecords,
+      knownLikeRecords: post.knownLikeRecords,
+    }))
+    .sort((left, right) => right.likesOnKnownRecords - left.likesOnKnownRecords
+      || right.commentRecords - left.commentRecords
+      || left.postId.localeCompare(right.postId))
+    .slice(0, limit);
+}
+
+function audienceEvidence(comment) {
+  return {
+    commentId: comment.commentId,
+    postId: comment.postId || null,
+    postTitle: comment.postTitle || null,
+    likes: comment.likes,
+    text: comment.text.length > 240 ? `${comment.text.slice(0, 237)}...` : comment.text,
+    sourceUrl: comment.sourceUrl || null,
+  };
+}
+
+function countAudienceValues(rows, valuesFor) {
+  const counts = new Map();
+  for (const row of rows) {
+    const values = valuesFor(row);
+    for (const value of Array.isArray(values) ? values : [values]) {
+      const key = String(value || "unknown").trim() || "unknown";
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+  return counts;
+}
+
+function audienceCountRows(counts, limit) {
+  return [...counts]
+    .map(([value, count]) => ({ value, count }))
+    .sort((left, right) => right.count - left.count || left.value.localeCompare(right.value))
+    .slice(0, limit);
+}
+
+function audienceQuestion(text) {
+  return /[?？]/u.test(text) || /(?:怎么|如何|哪里|能不能|可不可以|求)/u.test(text);
+}
+
+function normalizeAudienceText(value) {
+  return String(value || "").replace(/\s+/gu, "").toLocaleLowerCase("zh-CN");
+}
+
+function normalizeAudienceLocation(value) {
+  return String(value || "").replace(/^ip\s*(?:属地)?\s*[:：]?\s*/iu, "").trim().slice(0, 120);
+}
+
+function audienceNumber(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined || value === "") continue;
+    const parsed = Number(String(value).replaceAll(",", "").trim());
+    if (Number.isFinite(parsed)) return Math.max(0, parsed);
+  }
+  return null;
+}
+
+function compareAudienceAttention(left, right) {
+  return (right.likes ?? -1) - (left.likes ?? -1)
+    || left.commentId.localeCompare(right.commentId);
+}
+
+function audienceRatio(numerator, denominator) {
+  if (!denominator) return 0;
+  return audienceRound(numerator / denominator);
+}
+
+function audienceRound(value) {
+  return Math.round(Number(value || 0) * 10_000) / 10_000;
 }
 
 function joinRows(left, right, leftKey, rightKey) {

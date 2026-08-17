@@ -59,6 +59,23 @@ test('warning-only preflight remains ready when SMTP and optional profile are ab
   assert.equal(find(report, 'PROFILE').blocking, false);
 });
 
+test('raw collection does not require an AI session or model', async () => {
+  const report = await createService().run({
+    ...BASE_PARAMS,
+    analysisMode: 'general',
+    skipPostprocess: true,
+    useCodexRuntime: true,
+    aiSessionId: null,
+  });
+
+  assert.equal(report.ready, true);
+  assert.equal(find(report, 'AI_PROVIDER').status, 'passed');
+  assert.equal(find(report, 'AI_PROVIDER').details.enabled, false);
+  assert.equal(find(report, 'AI_PROVIDER').details.rawCollection, true);
+  assert.equal(find(report, 'AI_MODEL').status, 'passed');
+  assert.equal(find(report, 'AI_MODEL').details.enabled, false);
+});
+
 test('Relay timeout becomes a structured blocking result without rejecting the run', async () => {
   const service = createService({
     timeoutMs: 15,

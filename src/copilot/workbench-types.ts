@@ -7,17 +7,26 @@ export type WorkbenchPlanNode = {
   title: string
   kind: string
   status: WorkbenchNodeStatus
+  nodeType: 'tool' | 'subagent-run' | 'subagent-task'
+  depth?: number
+  parentId?: string
+  detail?: string
+  dependsOn?: string[]
+  toolCount?: number
+  completedChildren?: number
+  childCount?: number
   startedAt?: string
   finishedAt?: string
 }
 
 export type WorkbenchActivity = {
   id: string
-  type: 'message' | 'tool' | 'evidence' | 'error'
+  type: 'message' | 'agent' | 'tool' | 'evidence' | 'error'
   title: string
   detail: string
   status: WorkbenchNodeStatus | 'info'
   occurredAt: string
+  toolName?: string
 }
 
 export type WorkbenchClaim = {
@@ -42,6 +51,8 @@ export type WorkbenchProjection = {
   evidence: WorkbenchEvidence
   progress: number
   completedNodes: number
+  totalNodes: number
   elapsedMs: number
   toolCount: number
+  subagentRunCount: number
 }

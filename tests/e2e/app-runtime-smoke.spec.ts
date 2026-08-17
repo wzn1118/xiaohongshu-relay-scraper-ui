@@ -43,8 +43,8 @@ test('loads the workbench against the live API without runtime failures', async 
     await response.json()
   }
   await expect(page.locator('.app-shell')).toBeVisible()
-  await expect(page.locator('#product-hero-title')).toBeVisible()
-  await expect(page.getByText('本地服务正常', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 1, name: /今天你投了吗？/ })).toBeVisible()
+  await expect(page.getByText('应用服务正常', { exact: true })).toBeVisible()
 
   const horizontalOverflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,

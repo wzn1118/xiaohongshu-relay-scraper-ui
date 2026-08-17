@@ -45,9 +45,15 @@ export class McpDataAdapter {
         annotations: {
           readOnlyHint: tool.risk === 'read',
           destructiveHint: tool.risk === 'approval_required',
-          idempotentHint: tool.risk !== 'approval_required',
+          idempotentHint: tool.idempotent !== false,
         },
-        _meta: { scopes: tool.scopes, risk: tool.risk },
+        _meta: {
+          scopes: tool.scopes,
+          risk: tool.risk,
+          version: tool.version,
+          idempotent: tool.idempotent !== false,
+          parallelSafe: tool.parallelSafe !== false,
+        },
       }));
   }
 
@@ -76,17 +82,28 @@ export class McpDataAdapter {
     };
   }
 
-  async callTool(reference, conversation, name, input, { requestId = null } = {}) {
+  async callTool(reference, conversation, name, input, {
+    requestId = null,
+    approved = false,
+    idempotencyKey = '',
+  } = {}) {
     const tool = this.registry.get(name);
     if (!tool) throw adapterError('COPILOT_TOOL_UNKNOWN', `Unknown data tool: ${name}.`, 404);
-    if (tool.risk === 'approval_required') {
+    if (tool.risk === 'approval_required' && !approved) {
       throw adapterError(
         'COPILOT_APPROVAL_REQUIRED',
         'This tool requires confirmation in the Data Copilot conversation and cannot run directly over MCP.',
         409,
       );
     }
-    return this.registry.execute(name, input, this.#toolContext(reference, conversation, requestId, name, input));
+    return this.registry.execute(name, input, this.#toolContext(
+      reference,
+      conversation,
+      requestId,
+      name,
+      input,
+      { approved, idempotencyKey },
+    ));
   }
 
   async handleRequest(reference, conversation, request = {}) {
@@ -149,14 +166,14 @@ export class McpDataAdapter {
 
   async #readTaskResource(reference, conversation, name) {
     if (name === 'applications' || name === 'content') {
-      return this.registry.execute('records.query', { dataset: name, limit: 1000 }, this.#toolContext(reference, conversation, name, 'records.query', { dataset: name }));
+      return this.registry.execute('records.query', { dataset: name, limit: 200 }, this.#toolContext(reference, conversation, name, 'records.query', { dataset: name }));
     }
     if (name === 'audience') {
       const context = this.#toolContext(reference, conversation, name, 'records.query', { dataset: 'audience' });
       const [comments, users, posts] = await Promise.all([
-        this.registry.execute('records.query', { dataset: 'comments', limit: 1000 }, context),
-        this.registry.execute('records.query', { dataset: 'users', limit: 1000 }, context),
-        this.registry.execute('records.query', { dataset: 'audience.posts', limit: 1000 }, context),
+        this.registry.execute('records.query', { dataset: 'comments', limit: 200 }, context),
+        this.registry.execute('records.query', { dataset: 'users', limit: 200 }, context),
+        this.registry.execute('records.query', { dataset: 'audience.posts', limit: 200 }, context),
       ]);
       return { comments, users, posts };
     }
@@ -175,7 +192,7 @@ export class McpDataAdapter {
     throw adapterError('COPILOT_RESOURCE_DENIED', 'The MCP task resource is not available.', 403);
   }
 
-  #toolContext(reference, conversation, requestId, name, input) {
+  #toolContext(reference, conversation, requestId, name, input, { approved = false, idempotencyKey = '' } = {}) {
     const digest = crypto.createHash('sha256')
       .update(JSON.stringify({ conversationId: reference.conversationId, requestId, name, input }))
       .digest('hex');
@@ -183,8 +200,8 @@ export class McpDataAdapter {
       reference,
       conversation,
       state: {},
-      approved: false,
-      idempotencyKey: `mcp:${digest.slice(0, 48)}`,
+      approved,
+      idempotencyKey: idempotencyKey || `mcp:${digest.slice(0, 48)}`,
     };
   }
 }

@@ -18,12 +18,25 @@ function Refresh-ProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $currentPath = $env:Path
-    $pathEntries = @($machinePath, $userPath, $currentPath) |
+    $pathEntries = @($currentPath, $machinePath, $userPath) |
         Where-Object { $_ } |
         ForEach-Object { $_.Split(';') } |
         Where-Object { $_ } |
         Select-Object -Unique
     $env:Path = [string]::Join(';', [string[]]$pathEntries)
+}
+
+function Enable-BundledRuntime {
+    $runtimeRoot = Join-Path $projectRoot 'runtime'
+    $nodeDir = Join-Path $runtimeRoot 'node'
+    $pythonDir = Join-Path $runtimeRoot 'python'
+    $pathEntries = @()
+    if (Test-Path -LiteralPath (Join-Path $nodeDir 'node.exe') -PathType Leaf) { $pathEntries += $nodeDir }
+    if (Test-Path -LiteralPath (Join-Path $pythonDir 'python.exe') -PathType Leaf) {
+        $pathEntries += $pythonDir
+        $env:PYTHON_BIN = Join-Path $pythonDir 'python.exe'
+    }
+    if ($pathEntries.Count -gt 0) { $env:PATH = ([string]::Join(';', $pathEntries) + ';' + $env:PATH) }
 }
 
 function Find-CommandPath {
@@ -38,6 +51,8 @@ function Find-CommandPath {
 function Find-BrowserPath {
     $candidates = @(
         $env:XHS_BROWSER_PATH,
+        (Join-Path $projectRoot 'runtime\browser\chrome.exe'),
+        (Join-Path $projectRoot 'runtime\browser\msedge.exe'),
         (Join-Path ${env:ProgramFiles} 'Google\Chrome\Application\chrome.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
         (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe'),
@@ -150,6 +165,7 @@ function Install-NpmGlobalPackage {
     Refresh-ProcessPath
 }
 
+Enable-BundledRuntime
 Refresh-ProcessPath
 $status = Get-ToolStatus
 

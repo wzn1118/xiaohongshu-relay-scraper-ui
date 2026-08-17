@@ -71,6 +71,93 @@ def test_ai_provider_uses_the_task_timeout() -> None:
     assert provider.total_timeout == 47
 
 
+def test_raw_collection_summary_passes_when_all_bodies_are_complete() -> None:
+    summary = workflow.build_raw_collection_summary("general", {
+        "passed": True,
+        "bodyMetrics": {
+            "discovered": 3,
+            "attempted": 3,
+            "succeeded": 3,
+            "failed": 0,
+            "notAttempted": 0,
+            "blocked": 0,
+            "cancelled": 0,
+            "pending": 0,
+            "completionRatePercent": 100.0,
+            "statisticsSource": "bodyCompletionLedger",
+        },
+    })
+
+    assert summary["status"] == "succeeded"
+    assert summary["rawCollection"] is True
+    assert summary["analysisSkipped"] is True
+    assert summary["analysisSkipReason"] == "raw_collection_requested"
+    assert summary["bodyCoveragePercent"] == 100.0
+    assert summary["qualityPending"] is False
+    assert summary["checks"] == {
+        "bodyCollectionPassed": True,
+        "bodyCoverageComplete": True,
+        "analysisSkippedByRequest": True,
+    }
+    assert summary["issues"] == []
+
+
+def test_raw_collection_summary_remains_partial_when_bodies_are_missing() -> None:
+    summary = workflow.build_raw_collection_summary("general", {
+        "passed": False,
+        "bodyMetrics": {
+            "discovered": 3,
+            "attempted": 2,
+            "succeeded": 2,
+            "failed": 0,
+            "notAttempted": 1,
+            "blocked": 0,
+            "cancelled": 0,
+            "pending": 0,
+            "completionRatePercent": 66.67,
+            "statisticsSource": "bodyCompletionLedger",
+        },
+        "stopReason": "rate_limited",
+    })
+
+    assert summary["status"] == "completed_partial"
+    assert summary["qualityPending"] is True
+    assert summary["sourceCoverage"]["pendingCount"] == 1
+    assert summary["checks"]["analysisSkippedByRequest"] is True
+    assert summary["issues"][0]["code"] == "rate_limited"
+
+
+def test_restart_stage_replaces_a_stale_analysis_ledger(tmp_path: Path) -> None:
+    output_dir, state_path, state = state_fixture(tmp_path)
+    state["stages"]["analysis"] = {
+        "status": "partial",
+        "records": {
+            "note-1": {
+                "analysisStatus": "partial",
+                "attemptCount": 1,
+                "completedStages": [],
+            },
+        },
+        "totalCount": 1,
+        "completedCount": 0,
+        "remainingCount": 1,
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    session = open_session(output_dir, state_path)
+
+    session.restart_stage("analysis", {"skipReason": "raw_collection_requested"})
+    session.finish_stage("analysis", "completed")
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    stage = persisted["stages"]["analysis"]
+    assert stage["status"] == "completed"
+    assert stage["records"] == {}
+    assert stage["totalCount"] == 0
+    assert stage["completedCount"] == 0
+    assert stage["remainingCount"] == 0
+    assert stage["skipReason"] == "raw_collection_requested"
+
+
 def test_stage_update_is_revision_checked_and_preserves_unknown_fields(tmp_path: Path) -> None:
     output_dir, state_path, _ = state_fixture(tmp_path)
     session = open_session(output_dir, state_path)
@@ -395,6 +482,30 @@ def test_resume_scope_selects_only_the_declared_dependency_chain(tmp_path: Path)
     assert body.scope_selects("artifacts")
     assert not body.scope_selects("discovery")
     assert not body.scope_selects("audience")
+
+
+def test_complete_missing_forces_analysis_after_raw_collection_marked_it_completed(
+    tmp_path: Path,
+) -> None:
+    output_dir, state_path, state = state_fixture(tmp_path)
+    state["stages"]["analysis"] = {
+        "status": "completed",
+        "records": {},
+        "skipReason": "raw_collection_requested",
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    session = open_session(output_dir, state_path, scope="body_completion")
+
+    assert not workflow.should_run_analysis_stage(
+        session,
+        body_ran=False,
+        complete_missing_only=False,
+    )
+    assert workflow.should_run_analysis_stage(
+        session,
+        body_ran=False,
+        complete_missing_only=True,
+    )
 
 
 def test_wrapper_parser_keeps_upstream_resume_separate_from_resume_scope() -> None:

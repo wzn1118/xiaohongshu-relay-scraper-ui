@@ -50,6 +50,7 @@ import { createPreflightService } from './preflight-service.mjs';
 import { AudienceAiService } from './audience-ai-service.mjs';
 import { createAudienceAiProfileRunner } from './lib/audience-ai-profile-runner.mjs';
 import { handleDataCopilotRequest } from './data-copilot-http.mjs';
+import { handleMcpManagementRequest } from './mcp-management-http.mjs';
 import { writeCopilotJsonAtomically } from './data-copilot-store.mjs';
 import { ApplicationBatchManager } from './application-batch-manager.mjs';
 import { ApplicationBatchService, ApplicationBatchServiceError } from './application-batch-service.mjs';
@@ -72,6 +73,7 @@ import {
   normalizeApplicationRoleTitle,
   resolveApplicationEmailSubject,
 } from './lib/application-email-draft.mjs';
+import { classifyApplicationSource } from './lib/application-source-disposition.mjs';
 
 const INTERNAL_COVER_LETTER_TOKEN = /(?<![\w])(?:exp|resume|evidence)[_-][A-Za-z0-9][A-Za-z0-9_-]{3,}(?![\w])/i;
 import {
@@ -211,7 +213,7 @@ export function contactOcrDrainState(state) {
   };
 }
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, coverLetterRewriter, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService, applicationContactOcrService, applicationContactResolutionService, dataCopilotService, authStore }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, coverLetterRewriter, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService, applicationContactOcrService, applicationContactResolutionService, dataCopilotService, mcpAccessService, authStore }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const relayRuntime = relaySupervisor || createRelaySupervisor({
     getConfig: getRelayConfig,
@@ -419,6 +421,21 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         withLock: withSmtpOperationLock,
       })
     : null;
+  const resolveCandidateProfile = async (internal) => {
+    const basic = internal?.params?.candidateProfile
+      && typeof internal.params.candidateProfile === 'object'
+      && !Array.isArray(internal.params.candidateProfile)
+      ? internal.params.candidateProfile
+      : {};
+    const profileId = String(internal?.params?.profileId || '').trim();
+    if (!profileId || typeof profileStore?.get !== 'function') return { ...basic };
+    const stored = await profileStore.get(profileId);
+    return {
+      ...(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}),
+      ...basic,
+      profileId,
+    };
+  };
   const applicationBatchServices = new Map();
   const getApplicationBatchService = async (jobId, internal) => {
     const cacheKey = path.resolve(internal.outputDir);
@@ -426,6 +443,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       const pending = (async () => {
         const batchManager = new ApplicationBatchManager({ rootDir: internal.outputDir });
         await batchManager.initialize();
+        const candidateProfile = await resolveCandidateProfile(internal);
         const fallbackOutputDirs = audienceHistoryJobIds(
           manager,
           audienceContentSourceJobId(manager, jobId),
@@ -466,7 +484,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           jobId,
           outputDir: internal.outputDir,
           manager: batchManager,
-          candidateProfile: internal.params?.candidateProfile,
+          candidateProfile,
           fallbackOutputDirs,
           loadRecord,
           listAttachments: (noteId) => listApplicationAttachments(
@@ -497,7 +515,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
               },
               checkDraftQuality,
               ai,
-              internal.params?.candidateProfile,
+              candidateProfile,
               deliveryStateWriter,
               deliveryAttachmentLimits,
             );
@@ -540,11 +558,45 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     const requestStartedAt = performance.now();
     const requestId = diagnostics?.requestId?.(req.headers['x-request-id']);
     if (requestId) res.setHeader('X-Request-Id', requestId);
-    setSecurityHeaders(res, config);
-    if (req.method === 'OPTIONS') return noContent(res);
+    const requestOrigin = String(req.headers.origin || '').trim();
+    setSecurityHeaders(res, config, requestOrigin);
+    const secureRedirect = resolveSecurePublicRedirect(req, config);
+    if (secureRedirect) {
+      res.writeHead(301, { Location: secureRedirect, 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
+    const originError = validateRequestOrigin(req, config, { preflight: req.method === 'OPTIONS' });
+    if (req.method === 'OPTIONS') {
+      if (originError) return json(res, originError.status, errorBody(originError.code, originError.message));
+      return noContent(res);
+    }
+    if (originError && isStateChangingMethod(req.method)) {
+      return json(res, originError.status, errorBody(originError.code, originError.message));
+    }
     const url = new URL(req.url, 'http://localhost');
     const parts = url.pathname.split('/').filter(Boolean);
     const authUser = authStore?.authenticate(req) || null;
+    const trustedCopilotLocal = isLoopbackAddress(req.socket?.remoteAddress)
+      && isLoopbackHost(req.headers.host);
+    const localOwnerActor = !authStore?.required && trustedCopilotLocal
+      ? { id: 'local-owner', roles: ['owner'] }
+      : null;
+    // In no-auth desktop mode the auth store exposes a presentation user with
+    // an email but no stable actor id. Prefer the server-derived loopback
+    // owner for Copilot authority, and retain email as an identity fallback
+    // for authenticated stores that similarly omit an id field.
+    const copilotActor = localOwnerActor || authUser;
+    const copilotRoles = Array.isArray(copilotActor?.roles)
+      ? copilotActor.roles.map((role) => String(role).toLowerCase())
+      : [];
+    const copilotSecurityContext = {
+      actorId: String(copilotActor?.id || copilotActor?.email || '').trim(),
+      trustedLocal: trustedCopilotLocal,
+      ownerLocal: trustedCopilotLocal
+        && config.copilotApprovalMode === 'never'
+        && copilotRoles.includes('owner'),
+    };
     res.once('finish', () => diagnostics?.record?.('http_request_completed', {
       requestId,
       method: req.method,
@@ -599,7 +651,39 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             enabled: config.audienceAiEnabled === true,
             runnerAvailable: config.audienceAiRunnerAvailable === true,
           },
+          mcp: mcpAccessService ? {
+            enabled: config.mcpEnabled === true,
+            host: config.mcpHost,
+            port: config.mcpPort,
+            ...mcpAccessService.status(),
+          } : { enabled: false },
         });
+      }
+      if (await handleMcpManagementRequest({
+        req,
+        res,
+        url,
+        service: mcpAccessService,
+        actor: copilotActor || { id: 'anonymous', roles: [] },
+        maxBodyBytes: Math.min(config.maxBodyBytes, config.mcpMaxBodyBytes || config.maxBodyBytes),
+      })) return;
+      const requiresCopilotOwnerControl = isCopilotMcpControlPath(url.pathname)
+        || (
+          isStateChangingMethod(req.method)
+          && url.pathname.startsWith('/api/mcp')
+        )
+        || (
+          config.copilotApprovalMode === 'never'
+          && isStateChangingMethod(req.method)
+          && url.pathname.startsWith('/api/copilot/')
+        );
+      if (requiresCopilotOwnerControl) {
+        const controlError = validateCopilotOwnerRequest(req, config, copilotActor, {
+          authenticationRequired: Boolean(authStore?.required),
+        });
+        if (controlError) {
+          return json(res, controlError.status, errorBody(controlError.code, controlError.message));
+        }
       }
       if (await handleDataCopilotRequest({
         req,
@@ -607,6 +691,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         url,
         service: dataCopilotService,
         maxBodyBytes: config.maxBodyBytes,
+        securityContext: copilotSecurityContext,
       })) return;
       if (req.method === 'GET' && url.pathname === '/api/relay/config') {
         return json(res, 200, getRelayConfig());
@@ -741,6 +826,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       }
       if (req.method === 'POST' && url.pathname === '/api/ai/sessions') {
         return json(res, 201, await aiSessions.create(await readJsonBody(req, config.maxBodyBytes)));
+      }
+      if (req.method === 'POST' && parts[0] === 'api' && parts[1] === 'ai' && parts[2] === 'sessions' && parts[3] && parts[4] === 'probe') {
+        return json(res, 200, await aiSessions.probe(parts[3]));
       }
       if (req.method === 'DELETE' && parts[0] === 'api' && parts[1] === 'ai' && parts[2] === 'sessions' && parts[3]) {
         return json(res, aiSessions.delete(parts[3]) ? 200 : 404, { deleted: true });
@@ -1083,6 +1171,8 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             resumeFromJobId: id,
             completeMissingOnly: true,
             checkOnly: false,
+            skipPostprocess: false,
+            useCodexRuntime: true,
             aiSessionId: requestedAiSessionId,
           });
           const job = await manager.resume(id, {
@@ -1090,6 +1180,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             params,
             aiSessionId: requestedAiSessionId,
             idempotencyKey: body.idempotencyKey,
+            forceCompleted: true,
             requestedBy: 'complete_missing_api',
           });
           return json(res, 202, {
@@ -1701,24 +1792,26 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (req.method === 'POST' && parts[3] === 'draft' && parts[4] === 'rewrite' && parts.length === 5) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           const ai = resolveDraftAiRuntime(aiSessions, internal, body);
+          const candidateProfile = await resolveCandidateProfile(internal);
           return json(res, 200, await rewriteApplicationCoverLetter(
             internal.outputDir,
             body,
             runCoverLetterRewrite,
             ai,
-            internal.params?.candidateProfile,
+            candidateProfile,
             deliveryStateWriter,
           ));
         }
         if (req.method === 'POST' && parts[3] === 'draft' && parts[4] === 'quality' && parts.length === 5) {
           const body = await readJsonBody(req, config.maxBodyBytes);
           const ai = resolveDraftAiRuntime(aiSessions, internal, body);
+          const candidateProfile = await resolveCandidateProfile(internal);
           return json(res, 200, await recheckApplicationDraft(
             internal.outputDir,
             body,
             checkDraftQuality,
             ai,
-            internal.params?.candidateProfile,
+            candidateProfile,
             deliveryStateWriter,
             deliveryAttachmentLimits,
           ));
@@ -1908,7 +2001,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       }
       if (String(error.code || '').startsWith('AUTH_')) return json(res, Number(error.status || 500), errorBody(error.code, error.message));
       if (['AI_VALIDATION', 'AI_SESSION_EXPIRED', 'PROFILE_VALIDATION', 'PROFILE_AI_SESSION_REQUIRED', 'RELAY_CONFIG_VALIDATION', 'SMTP_CONFIG_VALIDATION'].includes(error.code)) return json(res, 400, errorBody(error.code, error.message));
-      if (error.code === 'AI_MODEL_DISCOVERY_FAILED') return json(res, 502, errorBody(error.code, error.message));
+      if (['AI_MODEL_DISCOVERY_FAILED', 'AI_PROBE_FAILED'].includes(error.code)) return json(res, 502, errorBody(error.code, error.message));
       if (error.code === 'LOCAL_MODEL_VALIDATION') return json(res, 400, errorBody(error.code, error.message));
       if (error.code === 'LOCAL_MODEL_BUSY') return json(res, 409, { ...errorBody(error.code, error.message), install: error.install });
       if (error.code === 'LOCAL_MODEL_RUNTIME_UNAVAILABLE') return json(res, 503, errorBody(error.code, error.message));
@@ -1963,7 +2056,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         return json(res, 500, errorBody(error.code, error.message));
       }
       if (error instanceof SyntaxError) return json(res, 400, errorBody('INVALID_JSON', 'Request body must contain valid JSON.'));
-      if (error.code === 'ENOENT' || /artifact/i.test(error.message) || /Path escapes/.test(error.message)) {
+      if (error.code === 'ENOENT' || /Path escapes/.test(error.message)) {
         return json(res, 404, errorBody('ARTIFACT_NOT_FOUND', 'Artifact not found.'));
       }
       console.error(error);
@@ -3499,6 +3592,21 @@ async function rewriteApplicationCoverLetter(
     .filter(Boolean))];
   const signatureEvidenceIds = requestedSignatureEvidenceIds
     .filter((evidenceId) => normalizedUsedEvidenceIds.includes(evidenceId));
+  const capabilityMatches = responsibilityCoverage
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => {
+      const responsibility = String(item.responsibility || '').trim();
+      const evidenceIdList = Array.isArray(item.evidence_ids)
+        ? item.evidence_ids.map((value) => String(value || '').trim()).filter(Boolean)
+        : [];
+      const responseSentence = String(item.response_sentence || '').trim();
+      return [
+        responsibility ? `岗位职责：${responsibility}` : '',
+        evidenceIdList.length ? `证据 ${evidenceIdList.join('、')}` : '',
+        responseSentence ? `可迁移价值：${responseSentence}` : '',
+      ].filter(Boolean).join('；');
+    })
+    .filter(Boolean);
   const roleResponsibilities = Array.isArray(record.application_info?.responsibilities)
     && record.application_info.responsibilities.length > 0
     ? record.application_info.responsibilities
@@ -3546,6 +3654,7 @@ async function rewriteApplicationCoverLetter(
       profileSnapshotId,
       inputHash,
       usedEvidenceIds,
+      capabilityMatches,
       resumeArtifactIds,
       status: 'saved',
       generatedAt,
@@ -3779,6 +3888,12 @@ async function updateApplicationDraft(outputDir, value, writeState = writeDelive
       : savedStore;
     const updated = currentDraftVersion(updatedStore);
     const generation = normalizeGenerationMetadata(value?.generation);
+    const boundGeneration = generation ? {
+      ...generation,
+      draftId: updatedStore.draftId,
+      draftVersion: updated.version,
+      contentHash: updated.contentHash,
+    } : null;
     state[noteId] = {
       ...existing,
       action: 'draft_saved',
@@ -3787,7 +3902,7 @@ async function updateApplicationDraft(outputDir, value, writeState = writeDelive
       draftStore: updatedStore,
       draftWriteProtocol: isVersionedWrite ? 'versioned' : (writeProtocol || 'legacy'),
       ...(hasApplicationContext ? { applicationContext, applicationContextHash } : {}),
-      ...(generation ? { generation } : {}),
+      ...(boundGeneration ? { generation: boundGeneration } : {}),
     };
     await writeState(outputDir, state);
     return {
@@ -3814,6 +3929,13 @@ function normalizeGenerationMetadata(value) {
   const signatureEvidenceIds = Array.isArray(value.signatureEvidenceIds)
     ? [...new Set(value.signatureEvidenceIds.map((item) => bounded(item, 120)).filter(Boolean))].slice(0, 4)
     : [];
+  const capabilityMatches = Array.isArray(value.capabilityMatches)
+    ? [...new Set(value.capabilityMatches.map((item) => bounded(item, 600)).filter(Boolean))].slice(0, 12)
+    : [];
+  const sourceHash = bounded(value.sourceHash, 64);
+  if (sourceHash && !/^[a-f0-9]{64}$/iu.test(sourceHash)) {
+    throw new ValidationError('Generation sourceHash must be a 64-character hexadecimal hash.');
+  }
   const metadata = {
     runId: bounded(value.runId, 160),
     promptVersion: bounded(value.promptVersion, 120),
@@ -3827,13 +3949,19 @@ function normalizeGenerationMetadata(value) {
     styleViolationCount: Math.max(0, Number(value.styleViolationCount) || 0),
     signatureEvidenceIds,
     profileSnapshotId: bounded(value.profileSnapshotId, 128),
+    targetRole: bounded(value.targetRole, 160),
     inputHash: bounded(value.inputHash, 128),
     usedEvidenceIds,
+    capabilityMatches,
+    sourceHash,
     resumeArtifactIds,
     recommendedResumeId: bounded(value.recommendedResumeId, 120),
     resumeReason: bounded(value.resumeReason, 600),
     status: bounded(value.status, 40) || 'validated',
     generatedAt: bounded(value.generatedAt, 40) || new Date().toISOString(),
+    draftId: bounded(value.draftId, 96),
+    draftVersion: Math.max(0, Number(value.draftVersion) || 0),
+    contentHash: bounded(value.contentHash, 64),
   };
   if (!metadata.runId || !metadata.profileSnapshotId) {
     throw new ValidationError('Generation metadata requires runId and profileSnapshotId.');
@@ -3959,11 +4087,33 @@ async function recheckApplicationDraft(
     if (blockingWarning) throw new AttachmentError(blockingWarning.code, blockingWarning.message);
     const peerDrafts = savedPeerDrafts(state, noteId);
     const applicationContext = resolveApplicationContext(record, existing, value);
+    const generation = existing.generation && typeof existing.generation === 'object'
+      ? existing.generation
+      : {};
+    const generationMatches = !generation.contentHash || generation.contentHash === current.contentHash;
+    const usedEvidenceIds = generationMatches && Array.isArray(generation.usedEvidenceIds)
+      ? generation.usedEvidenceIds.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const capabilityMatches = generationMatches && Array.isArray(generation.capabilityMatches)
+      ? generation.capabilityMatches.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const sourceHash = generationMatches && /^[a-f0-9]{64}$/iu.test(String(generation.sourceHash || ''))
+      ? String(generation.sourceHash)
+      : '';
+    const targetRole = generationMatches
+      ? String(generation.targetRole || '').trim()
+      : '';
     return {
       draftId: store.draftId,
       version: current.version,
       contentHash: current.contentHash,
-      content: { ...current.content },
+      content: {
+        ...current.content,
+        ...(usedEvidenceIds.length ? { used_evidence_ids: usedEvidenceIds } : {}),
+        ...(capabilityMatches.length ? { capability_matches: capabilityMatches } : {}),
+      },
+      sourceHash,
+      targetRole,
       attachmentBundleHash: attachmentBundle.attachmentBundleHash,
       peerCorpusHash: applicationPeerCorpusHash(peerDrafts),
       attachmentContext: normalizedAttachmentContext(
@@ -3979,12 +4129,48 @@ async function recheckApplicationDraft(
   const threshold = Math.max(90, Number(record?.cover_letter_evaluation?.threshold || 90));
   let report;
   try {
+    const qualityRecord = snapshot.targetRole
+      ? {
+          ...record,
+          job_card: {
+            ...(record?.job_card && typeof record.job_card === 'object' ? record.job_card : {}),
+            role_name: snapshot.targetRole,
+          },
+        }
+      : record;
+    const qualitySubjectResolution = resolveApplicationEmailSubject(
+      qualityRecord,
+      snapshot.content.email_subject,
+      candidateProfile,
+    );
+    const qualityRecordWithSubjectRule = {
+      ...qualityRecord,
+      qualitySubjectRule: {
+        detected: Boolean(qualitySubjectResolution.rule?.detected),
+        fields: Array.isArray(qualitySubjectResolution.rule?.fields)
+          ? qualitySubjectResolution.rule.fields
+          : [],
+      },
+      qualitySourceDisposition: (() => {
+        const disposition = classifyApplicationSource(record);
+        return {
+          status: disposition.status,
+          roleName: disposition.roleName,
+        };
+      })(),
+    };
     report = await checker({
-      record: { ...record, applicationContext: snapshot.applicationContext },
+      record: { ...qualityRecordWithSubjectRule, applicationContext: snapshot.applicationContext },
       draft: snapshot.content,
-      candidateProfile: candidateProfile || record?.candidate_profile || {},
+      candidateProfile: candidateProfile && Object.keys(candidateProfile).length
+        ? candidateProfile
+        : record?.candidate_profile || {},
       attachmentContext: snapshot.attachmentContext,
       applicationContext: snapshot.applicationContext,
+      ...(snapshot.sourceHash ? { sourceHash: snapshot.sourceHash } : {}),
+      ...(value?.evaluationMode === 'deterministic_strict'
+        ? { evaluationMode: 'deterministic_strict' }
+        : {}),
       threshold,
     }, ai);
   } catch (error) {
@@ -6154,15 +6340,166 @@ async function readJsonBody(req, maxBytes) {
   return text ? JSON.parse(text) : {};
 }
 
-function setSecurityHeaders(res, config = {}) {
+const CORS_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+const CORS_HEADERS = new Set(['content-type', 'x-request-id']);
+
+function isStateChangingMethod(method) {
+  return ['POST', 'PUT', 'PATCH', 'DELETE'].includes(String(method || '').toUpperCase());
+}
+
+function isCopilotMcpControlPath(pathname) {
+  return String(pathname || '').startsWith('/api/copilot/mcp/');
+}
+
+function validateCopilotOwnerRequest(req, config = {}, actor, { authenticationRequired = false } = {}) {
+  const roles = Array.isArray(actor?.roles) ? actor.roles.map((role) => String(role).toLowerCase()) : [];
+  if (!actor || !roles.includes('owner')) {
+    return { status: 403, code: 'COPILOT_MCP_OWNER_REQUIRED', message: 'Copilot autonomous execution requires an owner session.' };
+  }
+
+  const origin = String(req.headers.origin || '').trim();
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+  if (fetchSite && !['same-origin', 'same-site', 'none'].includes(fetchSite)) {
+    return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
+  }
+
+  if (authenticationRequired) {
+    const expectedOrigin = String(config.authOrigin || '').trim();
+    if (origin && expectedOrigin && origin !== expectedOrigin) {
+      return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
+    }
+    return null;
+  }
+
+  if (!isLoopbackAddress(req.socket?.remoteAddress) || !isLoopbackHost(req.headers.host)) {
+    return {
+      status: 403,
+      code: 'COPILOT_MCP_LOCAL_ONLY',
+      message: 'Copilot autonomous execution requires a local owner session outside the loopback interface.',
+    };
+  }
+  if (origin) {
+    let originUrl;
+    try {
+      originUrl = new URL(origin);
+    } catch {
+      return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
+    }
+    if (!isLoopbackHost(originUrl.host)) {
+      return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
+    }
+  }
+  return null;
+}
+
+function isLoopbackAddress(value) {
+  const address = String(value || '').trim().toLowerCase().split('%', 1)[0];
+  return address === '::1'
+    || address.startsWith('127.')
+    || address.startsWith('::ffff:127.');
+}
+
+function isLoopbackHost(value) {
+  const host = String(value || '').trim();
+  if (!host) return false;
+  try {
+    const hostname = new URL(`http://${host}`).hostname.toLowerCase();
+    return ['127.0.0.1', 'localhost', '[::1]'].includes(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function validateRequestOrigin(req, config = {}, { preflight = false } = {}) {
+  const expectedOrigin = String(config.authOrigin || '').trim();
+  if (!expectedOrigin) return null;
+  const origin = String(req.headers.origin || '').trim();
+  if (origin && origin !== expectedOrigin) {
+    return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
+  }
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+  if (!origin && fetchSite && !['same-origin', 'same-site', 'none'].includes(fetchSite)) {
+    return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
+  }
+  if (!preflight) return null;
+  const requestedMethod = String(req.headers['access-control-request-method'] || '').trim().toUpperCase();
+  if (requestedMethod && !CORS_METHODS.has(requestedMethod)) {
+    return { status: 405, code: 'CORS_METHOD_NOT_ALLOWED', message: 'Requested CORS method is not allowed.' };
+  }
+  const requestedHeaders = String(req.headers['access-control-request-headers'] || '')
+    .split(',')
+    .map((header) => header.trim().toLowerCase())
+    .filter(Boolean);
+  if (requestedHeaders.some((header) => !CORS_HEADERS.has(header))) {
+    return { status: 403, code: 'CORS_HEADER_NOT_ALLOWED', message: 'Requested CORS header is not allowed.' };
+  }
+  return null;
+}
+
+function resolveSecurePublicRedirect(req, config = {}) {
+  const configuredOrigin = String(config.authOrigin || '').trim();
+  if (!configuredOrigin.startsWith('https://')) return '';
+  let publicUrl;
+  try {
+    publicUrl = new URL(configuredOrigin);
+  } catch {
+    return '';
+  }
+  const requestHost = String(req.headers.host || '').trim().toLowerCase().replace(/:\d+$/, '');
+  if (!requestHost || requestHost !== publicUrl.host.toLowerCase()) return '';
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  let cfVisitorScheme = '';
+  try {
+    const cfVisitor = JSON.parse(String(req.headers['cf-visitor'] || '{}'));
+    cfVisitorScheme = String(cfVisitor?.scheme || '').trim().toLowerCase();
+  } catch {
+    cfVisitorScheme = '';
+  }
+  if (forwardedProto !== 'http' && cfVisitorScheme !== 'http') return '';
+  const requestUrl = String(req.url || '/');
+  if (!requestUrl.startsWith('/') || requestUrl.startsWith('//')) return '';
+  try {
+    return new URL(requestUrl, publicUrl).toString();
+  } catch {
+    return '';
+  }
+}
+
+function setSecurityHeaders(res, config = {}, requestOrigin = '') {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Access-Control-Allow-Origin', config.authOrigin || 'http://127.0.0.1:5173');
+  const configuredOrigin = String(config.authOrigin || '').trim();
+  if (configuredOrigin.startsWith('https://')) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "img-src 'self' data: blob: https:",
+    "font-src 'self' data:",
+    "style-src 'self' 'unsafe-inline'",
+    "script-src 'self' https://static.cloudflareinsights.com",
+    "connect-src 'self' https: wss:",
+  ].join('; '));
+  res.setHeader('Permissions-Policy', 'accelerometer=(), autoplay=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()');
+  const defaultDevOrigin = 'http://127.0.0.1:5173';
+  const allowedOrigin = configuredOrigin || (config.authRequired === true ? '' : defaultDevOrigin);
+  if (allowedOrigin && (!requestOrigin || requestOrigin === allowedOrigin)) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  }
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Request-Id');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Max-Age', '600');
 }
 
 function json(res, status, body) {

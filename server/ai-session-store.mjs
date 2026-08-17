@@ -2,8 +2,10 @@ import crypto from 'node:crypto';
 import { mkdir, readFile, rename, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
 import { LOCAL_MODEL_CATALOG } from './local-model-manager.mjs';
+import { createProxyAwareFetch } from './lib/proxy-aware-fetch.mjs';
 
 const DEFAULT_LOCAL_MODEL_ENDPOINT = 'http://127.0.0.1:11434';
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const PROVIDERS = Object.freeze({
   local_qwen: {
@@ -18,7 +20,7 @@ const PROVIDERS = Object.freeze({
     free: true,
   },
   relay: {
-    label: 'API 中转站（OpenAI 兼容）',
+    label: '自定义 AI 接口（OpenAI 兼容）',
     baseUrl: '',
     model: '',
     models: [],
@@ -75,11 +77,14 @@ const PROVIDERS = Object.freeze({
 });
 
 export class AiSessionStore {
-  constructor({ ttlMs = 8 * 60 * 60 * 1000, filePath = null, fetchImpl = globalThis.fetch, modelDiscoveryTimeoutMs = 10000, localModelEndpoint = DEFAULT_LOCAL_MODEL_ENDPOINT } = {}) {
+  constructor({ ttlMs = 8 * 60 * 60 * 1000, filePath = null, fetchImpl = null, modelDiscoveryTimeoutMs = 10000, probeTimeoutMs = 120000, probeTransportAttempts = 3, probeRetryDelayMs = 750, localModelEndpoint = DEFAULT_LOCAL_MODEL_ENDPOINT } = {}) {
     this.ttlMs = ttlMs;
     this.filePath = filePath;
-    this.fetchImpl = fetchImpl;
+    this.fetchImpl = fetchImpl || createProxyAwareFetch();
     this.modelDiscoveryTimeoutMs = modelDiscoveryTimeoutMs;
+    this.probeTimeoutMs = probeTimeoutMs;
+    this.probeTransportAttempts = Math.max(1, Math.min(5, Number(probeTransportAttempts) || 1));
+    this.probeRetryDelayMs = Math.max(0, Math.min(5000, Number(probeRetryDelayMs) || 0));
     this.definitions = Object.freeze({
       ...PROVIDERS,
       local_qwen: Object.freeze({
@@ -226,6 +231,75 @@ export class AiSessionStore {
     return { ...session };
   }
 
+  async probe(id) {
+    const session = this.resolve(id);
+    if (typeof this.fetchImpl !== 'function') throw probeFailure('AI inference is unavailable in this runtime.');
+    const startedAt = Date.now();
+    const headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
+    if (session.apiKey) headers.Authorization = `Bearer ${session.apiKey}`;
+    const responsesApi = session.wireApi === 'responses';
+    const endpoint = `${session.baseUrl}/${responsesApi ? 'responses' : 'chat/completions'}`;
+    const body = responsesApi
+      ? {
+          model: session.model,
+          input: 'Connectivity check. Reply with exactly READY.',
+          max_output_tokens: 256,
+        }
+      : {
+          model: session.model,
+          messages: [
+            { role: 'system', content: 'This is a connectivity check. Reply with exactly READY.' },
+            { role: 'user', content: 'Reply READY.' },
+          ],
+          stream: false,
+          temperature: 0,
+          max_tokens: 256,
+        };
+
+    let response;
+    let transportError;
+    for (let attempt = 1; attempt <= this.probeTransportAttempts; attempt += 1) {
+      try {
+        response = await this.fetchImpl(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(this.probeTimeoutMs),
+        });
+        break;
+      } catch (error) {
+        transportError = error;
+        if (attempt < this.probeTransportAttempts && this.probeRetryDelayMs > 0) {
+          await sleep(this.probeRetryDelayMs * attempt);
+        }
+      }
+    }
+    if (!response) {
+      const reason = transportError?.name === 'TimeoutError' ? '真实推理超时' : '无法访问推理服务';
+      throw probeFailure(`${reason}，请检查模型进程、Base URL 和网络连接。`);
+    }
+    if (!response.ok) throw probeFailure(probeStatusMessage(response.status));
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      throw probeFailure('推理服务已响应，但未返回有效 JSON。');
+    }
+    const responseText = extractProbeText(payload, session.wireApi);
+    if (!responseText) throw probeFailure('推理服务已响应，但没有返回可验证的模型文本。');
+    return {
+      ok: true,
+      sessionId: session.id,
+      provider: session.provider,
+      model: session.model,
+      wireApi: session.wireApi,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+      responseText: responseText.slice(0, 200),
+      testedAt: new Date().toISOString(),
+    };
+  }
+
   delete(id) {
     return this.sessions.delete(String(id || ''));
   }
@@ -339,6 +413,38 @@ function discoveryStatusMessage(status) {
   return `模型服务返回 HTTP ${status}，请检查 Base URL、API Key 和服务状态。`;
 }
 
+function probeStatusMessage(status) {
+  if (status === 401 || status === 403) return `真实推理返回 HTTP ${status}：API Key 无效或没有模型访问权限。`;
+  if (status === 404) return '真实推理接口不存在，请检查 Base URL 和所选协议。';
+  if (status === 429) return '真实推理返回 HTTP 429：请求过于频繁或账号额度不足。';
+  if (status >= 500) return `真实推理返回 HTTP ${status}：模型服务或其上游暂时不可用。`;
+  return `真实推理返回 HTTP ${status}，请检查模型、Base URL 和 API Key。`;
+}
+
+function extractProbeText(payload, wireApi) {
+  const values = wireApi === 'responses'
+    ? [
+        payload?.output_text,
+        ...(Array.isArray(payload?.output) ? payload.output.flatMap((item) => [
+          item?.text,
+          ...(Array.isArray(item?.content) ? item.content.map((content) => content?.text || content?.output_text) : []),
+        ]) : []),
+      ]
+    : [
+        payload?.choices?.[0]?.message?.content,
+        payload?.choices?.[0]?.message?.reasoning_content,
+        payload?.choices?.[0]?.message?.reasoning,
+        payload?.choices?.[0]?.text,
+      ];
+  for (const value of values) {
+    const text = Array.isArray(value)
+      ? value.map((item) => typeof item === 'string' ? item : item?.text || item?.content || '').join(' ')
+      : String(value || '');
+    if (text.trim()) return text.trim().replace(/\s+/gu, ' ');
+  }
+  return '';
+}
+
 function validation(message) {
   const error = new Error(message);
   error.code = 'AI_VALIDATION';
@@ -354,5 +460,11 @@ function sessionExpired(message) {
 function discoveryFailure(message) {
   const error = new Error(message);
   error.code = 'AI_MODEL_DISCOVERY_FAILED';
+  return error;
+}
+
+function probeFailure(message) {
+  const error = new Error(message);
+  error.code = 'AI_PROBE_FAILED';
   return error;
 }

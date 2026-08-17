@@ -51,9 +51,13 @@ class FakeRuntime {
     this.continued.push({ reference, approval, value });
     return { runId: approval.runId, conversation: await this.store.getConversation(reference) };
   }
+
+  setModelRunBroker(broker) {
+    this.modelRunBroker = broker;
+  }
 }
 
-async function fixture(t) {
+async function fixture(t, { runCoordinator = null, modelRunBroker = null, subagentRuntime = null } = {}) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'data-copilot-service-'));
   t.after(() => rm(rootDir, { recursive: true, force: true }));
   const job = { ...JOB };
@@ -68,17 +72,42 @@ async function fixture(t) {
   const runtime = new FakeRuntime(store);
   const aiSessions = {
     resolve(id) {
-      if (id !== 'ai-session-001') throw Object.assign(new Error('expired'), { code: 'AI_SESSION_EXPIRED', status: 401 });
-      return { id, provider: 'openai_compatible', model: 'model-a', wireApi: 'responses', apiKey: 'secret' };
+      if (id === 'ai-session-001') {
+        return { id, provider: 'openai_compatible', model: 'model-a', wireApi: 'responses', apiKey: 'secret' };
+      }
+      if (id === 'ai-session-chat-001') {
+        return { id, provider: 'openai_compatible', model: 'model-b', wireApi: 'chat_completions', apiKey: 'secret' };
+      }
+      throw Object.assign(new Error('expired'), { code: 'AI_SESSION_EXPIRED', status: 401 });
     },
   };
   const policy = new DataPolicyEngine({ manager });
   const service = new DataCopilotService({
-    rootDir, store, approvals, artifacts, runtime, policy, manager, aiSessions,
+    rootDir, store, approvals, artifacts, runtime, policy, manager, aiSessions, runCoordinator, modelRunBroker, subagentRuntime,
   });
   await service.initialize();
   return { rootDir, job, manager, store, approvals, artifacts, runtime, aiSessions, policy, service };
 }
+
+test('explicit ModelRunBroker is assembled into primary and subagent runtimes', async (t) => {
+  let subagentBroker = null;
+  const broker = {
+    runTurn: async () => ({}),
+    retrieve: async () => ({}),
+    cancel: async () => ({}),
+  };
+  const { runtime, service } = await fixture(t, {
+    modelRunBroker: broker,
+    subagentRuntime: { setModelRunBroker: (value) => { subagentBroker = value; } },
+  });
+
+  assert.equal(runtime.modelRunBroker, broker);
+  assert.equal(subagentBroker, broker);
+  const capabilities = service.getCapabilities().modelGateway;
+  assert.equal(capabilities.implementation, 'model-run-broker-v1');
+  assert.equal(capabilities.statefulResponses, true);
+  assert.equal(capabilities.backgroundLifecycle, true);
+});
 
 async function create(service, overrides = {}) {
   return service.createConversation({
@@ -98,7 +127,7 @@ test('conversation creation is idempotent, model-safe, and persisted under data/
   assert.equal(first.conversation.conversationId, second.conversation.conversationId);
   assert.equal(first.conversation.snapshotId, 'job-r7');
   assert.deepEqual(first.conversation.selectedModel, {
-    provider: 'openai_compatible', model: 'model-a', wireApi: 'responses',
+    aiSessionId: 'ai-session-001', provider: 'openai_compatible', model: 'model-a', wireApi: 'responses',
   });
   assert.equal(JSON.stringify(first).includes('secret'), false);
   const persisted = JSON.parse(await readFile(
@@ -111,6 +140,96 @@ test('conversation creation is idempotent, model-safe, and persisted under data/
   const listed = await service.listConversations({ jobId: JOB.id });
   assert.equal(listed.total, 1);
   assert.equal(listed.conversations[0].conversationId, first.conversation.conversationId);
+});
+
+test('reasoning effort is a persisted model setting reused by send and retry', async (t) => {
+  const { service, runtime } = await fixture(t);
+  const created = await create(service, {
+    idempotencyKey: 'conversation-reasoning-001',
+    selectedModel: { reasoningEffort: 'high' },
+  });
+  const conversationId = created.conversation.conversationId;
+
+  assert.equal(created.conversation.selectedModel.aiSessionId, 'ai-session-001');
+  assert.equal(created.conversation.selectedModel.reasoningEffort, 'high');
+
+  const updated = await service.updateConversation(conversationId, {
+    selectedModel: { reasoningEffort: 'max' },
+  });
+  assert.equal(updated.conversation.selectedModel.reasoningEffort, 'max');
+
+  await service.sendMessage(conversationId, {
+    content: 'Inspect the workspace and continue.',
+    workspaceMode: 'build',
+    idempotencyKey: 'reasoning-message-001',
+  });
+  assert.equal(runtime.starts.at(-1).value.aiSessionId, 'ai-session-001');
+  assert.equal(runtime.starts.at(-1).value.reasoningEffort, 'max');
+
+  await service.retry(conversationId, { idempotencyKey: 'reasoning-retry-001' });
+  assert.equal(runtime.retries.at(-1).value.aiSessionId, 'ai-session-001');
+  assert.equal(runtime.retries.at(-1).value.reasoningEffort, 'max');
+
+  const unsupported = await create(service, {
+    aiSessionId: 'ai-session-chat-001',
+    idempotencyKey: 'conversation-reasoning-chat-001',
+    selectedModel: { reasoningEffort: 'high' },
+  });
+  assert.equal(unsupported.conversation.selectedModel.wireApi, 'chat_completions');
+  assert.equal('reasoningEffort' in unsupported.conversation.selectedModel, false);
+});
+
+test('workbench run controls require an explicit owning conversation', async (t) => {
+  let ownerConversationId = '';
+  const runId = 'service-owned-run-001';
+  const coordinator = {
+    getState(id) {
+      return id === runId
+        ? { run: { runId, conversationId: ownerConversationId, status: 'paused' }, nodes: [], attempts: [] }
+        : { run: null, nodes: [], attempts: [] };
+    },
+    pause: () => true,
+    cancel: () => true,
+    resume: async () => ({ run: { runId, conversationId: ownerConversationId, status: 'completed' } }),
+    steer: async () => ({ run: { runId, conversationId: ownerConversationId, status: 'completed' } }),
+  };
+  const { service } = await fixture(t, { runCoordinator: coordinator });
+  const owner = await create(service);
+  ownerConversationId = owner.conversation.conversationId;
+  const other = await create(service, { idempotencyKey: 'conversation-service-create-002' });
+  const otherConversationId = other.conversation.conversationId;
+
+  for (const operation of [
+    () => service.getWorkbenchRun(runId),
+    () => service.pauseWorkbenchRun(runId),
+    () => service.cancelWorkbenchRun(runId),
+  ]) {
+    assert.throws(operation, (error) => error?.code === 'COPILOT_ID_INVALID');
+  }
+  await assert.rejects(
+    service.resumeWorkbenchRun(runId),
+    (error) => error?.code === 'COPILOT_ID_INVALID',
+  );
+  await assert.rejects(
+    service.steerWorkbenchRun(runId),
+    (error) => error?.code === 'COPILOT_ID_INVALID',
+  );
+
+  for (const operation of [
+    () => service.getWorkbenchRun(runId, otherConversationId),
+    () => service.pauseWorkbenchRun(runId, otherConversationId),
+    () => service.cancelWorkbenchRun(runId, otherConversationId),
+  ]) {
+    assert.throws(operation, (error) => error?.code === 'COPILOT_RUN_CONTEXT_MISMATCH' && error?.status === 409);
+  }
+  await assert.rejects(
+    service.resumeWorkbenchRun(runId, otherConversationId),
+    (error) => error?.code === 'COPILOT_RUN_CONTEXT_MISMATCH' && error?.status === 409,
+  );
+  await assert.rejects(
+    service.steerWorkbenchRun(runId, otherConversationId),
+    (error) => error?.code === 'COPILOT_RUN_CONTEXT_MISMATCH' && error?.status === 409,
+  );
 });
 
 test('historical post context normalizes legacy image schemas without stringifying objects', async (t) => {
@@ -325,6 +444,27 @@ test('durable event logs retain history beyond the memory window and report repl
   assert.deepEqual(received[0].payload, { from: 2, to: 11, recovery: 'GET ?format=json&afterSeq=<cursor>' });
   assert.equal(received.at(-1).eventId, 261);
 
+  const coldReplay = [];
+  const stopColdReplay = context.service.subscribe(
+    conversation.conversationId,
+    (event) => coldReplay.push(event),
+    { afterEventId: 0 },
+  );
+  stopColdReplay();
+  assert.equal(coldReplay[0].type, 'stream.gap');
+  assert.deepEqual(coldReplay[0].payload, { from: 1, to: 11, recovery: 'GET ?format=json&afterSeq=<cursor>' });
+
+  const firstPage = await context.service.listEvents(conversation.conversationId, { afterSeq: 0, limit: 200 });
+  const secondPage = await context.service.listEvents(conversation.conversationId, { afterSeq: firstPage.nextSeq, limit: 200 });
+  assert.deepEqual(
+    [firstPage.events.length, firstPage.nextSeq, firstPage.lastSeq, firstPage.hasMore],
+    [200, 200, 261, true],
+  );
+  assert.deepEqual(
+    [secondPage.events.length, secondPage.nextSeq, secondPage.lastSeq, secondPage.hasMore],
+    [61, 261, 261, false],
+  );
+
   const eventFile = path.join(context.rootDir, 'copilot', conversation.conversationId, 'events.jsonl');
   assert.equal((await readFile(eventFile, 'utf8')).trim().split(/\r?\n/u).length, 261);
   const restarted = new DataCopilotService({
@@ -339,6 +479,11 @@ test('durable event logs retain history beyond the memory window and report repl
   });
   await restarted.initialize();
   assert.equal((await readFile(eventFile, 'utf8')).trim().split(/\r?\n/u).length, 261);
+  const restartedPage = await restarted.listEvents(conversation.conversationId, { afterSeq: 200, limit: 200 });
+  assert.deepEqual(
+    [restartedPage.events.length, restartedPage.nextSeq, restartedPage.lastSeq, restartedPage.hasMore],
+    [61, 261, 261, false],
+  );
 });
 
 test('initialization marks an active persisted run interrupted without creating a new conversation', async (t) => {

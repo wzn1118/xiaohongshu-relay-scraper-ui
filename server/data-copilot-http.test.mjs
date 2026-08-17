@@ -3,19 +3,19 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 
 import { CopilotApprovalStore } from './copilot-approval-store.mjs';
 import { CopilotArtifactService } from './copilot-artifact-service.mjs';
 import { handleDataCopilotRequest } from './data-copilot-http.mjs';
-import { DataCopilotService } from './data-copilot-service.mjs';
+import { DataCopilotService, hashStableFile } from './data-copilot-service.mjs';
 import { DataCopilotStore } from './data-copilot-store.mjs';
 import { DataPolicyEngine } from './data-policy-engine.mjs';
 import { DataToolRegistry } from './data-tool-registry.mjs';
 import { McpDataAdapter } from './mcp-data-adapter.mjs';
 import { createCopilotProductionStore } from './copilot/production-store.mjs';
 
-async function fixture(t, { production = false } = {}) {
+async function fixture(t, { production = false, subagentRuntime = null } = {}) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'data-copilot-http-'));
   let productionStore = null;
   t.after(async () => { productionStore?.close(); await rm(rootDir, { recursive: true, force: true }); });
@@ -68,9 +68,34 @@ async function fixture(t, { production = false } = {}) {
   const policy = new DataPolicyEngine({ manager });
   const registry = new DataToolRegistry({ manager, policy, artifactService: artifacts });
   const mcpAdapter = new McpDataAdapter({ policy, registry, artifacts });
+  const mcpClientManager = createOutboundMcpFixture();
+  const workspaceAdapter = {
+    workspaceRoot: rootDir,
+    get: (name) => ['workspace.read', 'exec.run', 'http.request'].includes(name) ? { name } : null,
+  };
+  const capabilityRegistry = {
+    describeCapabilities: () => ({
+      schemaVersion: 1,
+      total: registry.list().length + 6 + mcpClientManager.listTools().length,
+      sources: { data: registry.list().length, workspace: 6, mcp: mcpClientManager.listTools().length },
+    }),
+  };
   productionStore = production ? createCopilotProductionStore({ rootDir }) : null;
   const service = new DataCopilotService({
-    rootDir, store, approvals, artifacts, runtime, policy, mcpAdapter, manager, aiSessions, productionStore,
+    rootDir,
+    store,
+    approvals,
+    artifacts,
+    runtime,
+    policy,
+    mcpAdapter,
+    capabilityRegistry,
+    workspaceAdapter,
+    mcpClientManager,
+    manager,
+    aiSessions,
+    productionStore,
+    subagentRuntime,
   });
   await service.initialize();
 
@@ -89,10 +114,58 @@ async function fixture(t, { production = false } = {}) {
     server.close(resolve);
   }));
   const address = server.address();
-  return { baseUrl: `http://127.0.0.1:${address.port}`, job, service, artifacts, productionStore };
+  return { baseUrl: `http://127.0.0.1:${address.port}`, job, service, artifacts, productionStore, mcpClientManager };
 }
 
-async function createConversation(baseUrl, jobId) {
+function createOutboundMcpFixture() {
+  const servers = new Map();
+  const listServers = () => [...servers.values()].map((server) => structuredClone(server));
+  const listTools = () => listServers()
+    .filter((server) => server.enabled && server.status === 'connected')
+    .map((server) => ({
+      name: `mcp.${server.id}.ping-test`,
+      serverId: server.id,
+      remoteName: 'ping',
+      risk: 'read',
+    }));
+  return {
+    listServers,
+    listTools,
+    describe: () => ({ schemaVersion: 1, initialized: true, servers: listServers(), toolCount: listTools().length }),
+    async upsertServer(value = {}, { connect = false } = {}) {
+      const id = String(value.id || value.name || value.label || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/gu, '-');
+      const previous = servers.get(id) || {};
+      const server = {
+        ...previous,
+        id,
+        label: String(value.label || value.name || previous.label || id),
+        enabled: value.enabled !== false,
+        transport: value.transport || previous.transport || 'streamable_http',
+        command: value.command || previous.command,
+        args: value.args || previous.args || [],
+        url: value.url || previous.url,
+        envKeys: value.envKeys || value.env || previous.envKeys || [],
+        headerEnv: value.headerEnv || previous.headerEnv || {},
+        status: connect && value.enabled !== false ? 'connected' : 'disconnected',
+        lastError: null,
+        toolCount: connect && value.enabled !== false ? 1 : 0,
+      };
+      servers.set(id, server);
+      return structuredClone(server);
+    },
+    async removeServer(id) { return servers.delete(String(id || '')); },
+    async refresh(id = null) {
+      const selected = id ? [servers.get(String(id))].filter(Boolean) : [...servers.values()];
+      for (const server of selected) {
+        server.status = server.enabled ? 'connected' : 'disconnected';
+        server.toolCount = server.enabled ? 1 : 0;
+      }
+      return selected.map((server) => structuredClone(server));
+    },
+  };
+}
+
+async function createConversation(baseUrl, jobId, overrides = {}) {
   const response = await fetch(`${baseUrl}/api/copilot/conversations`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -101,6 +174,7 @@ async function createConversation(baseUrl, jobId) {
       mode: 'application',
       aiSessionId: 'ai-http-001',
       idempotencyKey: 'conversation-http-create-001',
+      ...overrides,
     }),
   });
   assert.equal(response.status, 201);
@@ -148,6 +222,169 @@ test('HTTP capability and tool catalog endpoints expose runtime-safe manifests',
   assert.ok(capabilities.toolCatalog.total >= 25);
   assert.ok(tools.tools.some((tool) => tool.name === 'comments.query'));
   assert.ok(tools.tools.every((tool) => !Object.hasOwn(tool, 'handler')));
+});
+
+test('HTTP subagent delegation binds the selected session and parent execution identity', async (t) => {
+  const calls = [];
+  const subagentRuntime = {
+    describe: () => ({ enabled: true, toolCount: 4 }),
+    async delegate(value, context) {
+      calls.push({ value: structuredClone(value), context });
+      context.emit({
+        type: 'subagent.run.planned',
+        runId: 'subagent-http-001',
+        parentRunId: context.runId,
+        parentToolRunId: context.toolRunId,
+      });
+      return {
+        schemaVersion: 1,
+        type: 'subagent.run.receipt',
+        receipt: {
+          runId: 'subagent-http-001',
+          parentRunId: context.runId,
+          parentToolRunId: context.toolRunId,
+          conversationId: context.reference.conversationId,
+          status: 'completed',
+        },
+        results: [],
+      };
+    },
+  };
+  const { baseUrl, job } = await fixture(t, { subagentRuntime });
+  const created = await createConversation(baseUrl, job.id);
+  const conversationId = created.conversation.conversationId;
+  const response = await fetch(`${baseUrl}/api/copilot/conversations/${conversationId}/subagent-runs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      objective: 'Delegate a focused evidence task.',
+      aiSessionId: 'ai-http-001',
+      parentRunId: 'parent-http-run-001',
+      parentToolRunId: 'parent-http-tool-001',
+    }),
+  });
+  assert.equal(response.status, 200);
+  const delegated = await response.json();
+  assert.equal(delegated.receipt.status, 'completed');
+  assert.equal(delegated.receipt.conversationId, conversationId);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].value.objective, 'Delegate a focused evidence task.');
+  assert.equal(calls[0].context.reference.conversationId, conversationId);
+  assert.equal(calls[0].context.conversation.conversationId, conversationId);
+  assert.equal(calls[0].context.aiSessionId, 'ai-http-001');
+  assert.equal(calls[0].context.runId, 'parent-http-run-001');
+  assert.equal(calls[0].context.toolRunId, 'parent-http-tool-001');
+  assert.equal(calls[0].context.agentDepth, 0);
+
+  const events = await (await fetch(`${baseUrl}/api/copilot/conversations/${conversationId}/events?format=json`)).json();
+  const planned = events.events.find((event) => event.type === 'subagent.run.planned');
+  assert.equal(planned.runId, 'subagent-http-001');
+  assert.equal(planned.parentRunId, 'parent-http-run-001');
+  assert.equal(planned.parentToolRunId, 'parent-http-tool-001');
+  assert.equal(planned.conversationId, conversationId);
+});
+
+test('HTTP outbound MCP management supports create, list, refresh, update, and delete', async (t) => {
+  const { baseUrl } = await fixture(t);
+  const rejectedResponse = await fetch(`${baseUrl}/api/copilot/mcp/servers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify({ name: 'cross-site-compatible-body' }),
+  });
+  assert.equal(rejectedResponse.status, 415);
+  assert.equal((await rejectedResponse.json()).error.code, 'COPILOT_CONTENT_TYPE_UNSUPPORTED');
+
+  const createdResponse = await fetch(`${baseUrl}/api/copilot/mcp/servers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'remote-tools',
+      label: 'Remote Tools',
+      connect: true,
+      transport: 'streamable_http',
+      url: 'https://mcp.example.test/mcp',
+      headerEnv: { Authorization: 'MCP_AUTH_HEADER' },
+    }),
+  });
+  assert.equal(createdResponse.status, 201);
+  const created = await createdResponse.json();
+  assert.equal(created.server.id, 'remote-tools');
+  assert.equal(created.server.status, 'disconnected');
+  assert.equal(created.tools.length, 0);
+
+  const listed = await (await fetch(`${baseUrl}/api/copilot/mcp/servers`)).json();
+  assert.equal(listed.servers.length, 1);
+  assert.deepEqual(listed.servers[0].headerEnv, { Authorization: 'MCP_AUTH_HEADER' });
+
+  const refreshedResponse = await fetch(`${baseUrl}/api/copilot/mcp/servers/remote-tools/refresh`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(refreshedResponse.status, 200);
+  assert.equal((await refreshedResponse.json()).tools.length, 1);
+
+  const updatedResponse = await fetch(`${baseUrl}/api/copilot/mcp/servers/remote-tools`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      label: 'Remote Tools Disabled',
+      enabled: false,
+      transport: 'streamable_http',
+      url: 'https://mcp.example.test/mcp',
+    }),
+  });
+  assert.equal(updatedResponse.status, 200);
+  assert.equal((await updatedResponse.json()).server.status, 'disconnected');
+
+  const capabilities = await (await fetch(`${baseUrl}/api/copilot/capabilities`)).json();
+  assert.equal(capabilities.localRuntime.exec, true);
+  assert.equal(capabilities.localRuntime.filesystem, true);
+  assert.equal(capabilities.localRuntime.http, true);
+  assert.equal(capabilities.outboundMcp.initialized, true);
+
+  const removedResponse = await fetch(`${baseUrl}/api/copilot/mcp/servers/remote-tools`, { method: 'DELETE' });
+  assert.equal(removedResponse.status, 200);
+  assert.equal((await removedResponse.json()).removed, true);
+  assert.equal((await (await fetch(`${baseUrl}/api/copilot/mcp/servers`)).json()).servers.length, 0);
+});
+
+test('production snapshot excludes symbolic-link directories outside the task output root', async (t) => {
+  const { baseUrl, job, productionStore } = await fixture(t, { production: true });
+  const externalDir = await mkdtemp(path.join(os.tmpdir(), 'data-copilot-external-'));
+  t.after(() => rm(externalDir, { recursive: true, force: true }));
+  await writeFile(path.join(externalDir, 'escaped.json'), '{"outside":true}', 'utf8');
+  try {
+    await symlink(externalDir, path.join(job.outputDir, 'linked-output'), 'junction');
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOSYS'].includes(error?.code)) {
+      t.skip(`Directory links are unavailable in this environment: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+
+  await createConversation(baseUrl, job.id);
+  const snapshot = productionStore.getSnapshot(job.id, `job-r${job.revision}`);
+  assert.ok(snapshot);
+  assert.equal(
+    snapshot.manifest.artifacts.some((artifact) => artifact.relativePath.startsWith('linked-output/')),
+    false,
+  );
+});
+
+test('stable artifact hashing rejects a deterministic replacement after the file handle opens', async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'data-copilot-toctou-'));
+  const filePath = path.join(root, 'mutable.json');
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(filePath, '{"version":1}', 'utf8');
+
+  await assert.rejects(
+    hashStableFile(filePath, {
+      beforeRead: async () => writeFile(filePath, '{"version":2,"replaced":true}', 'utf8'),
+    }),
+    (error) => error?.code === 'COPILOT_ARTIFACT_CHANGED' && error?.status === 409,
+  );
 });
 
 test('HTTP workbench executes read-only tools and dependency graphs with usage accounting', async (t) => {
@@ -279,6 +516,56 @@ test('HTTP schema v2 persists agent runs and manages idempotent context pins', a
   const removed = await fetch(`${pinEndpoint}/${firstPin.pinId}`, { method: 'DELETE' });
   assert.equal(removed.status, 200);
   assert.equal((await removed.json()).removed, true);
+});
+
+test('global agent-run controls are unavailable and conversation routes enforce run ownership', async (t) => {
+  const { baseUrl, job } = await fixture(t, { production: true });
+  const first = await createConversation(baseUrl, job.id);
+  const firstConversationId = first.conversation.conversationId;
+  const second = await createConversation(baseUrl, job.id, {
+    idempotencyKey: 'conversation-http-create-002',
+  });
+  const secondConversationId = second.conversation.conversationId;
+  const runResponse = await fetch(`${baseUrl}/api/copilot/workbench/runs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      runId: 'agent-run-owner-001',
+      turnId: 'agent-turn-owner-001',
+      conversationId: firstConversationId,
+      goal: 'Create an ownership-bound run.',
+      tasks: [{ id: 'profile', toolName: 'dataset.profile', input: { rows: [{ score: 1 }] } }],
+    }),
+  });
+  assert.equal(runResponse.status, 200);
+
+  const unscoped = await fetch(`${baseUrl}/api/copilot/agent-runs/agent-run-owner-001`);
+  assert.equal(unscoped.status, 404);
+  assert.equal((await unscoped.json()).error.code, 'COPILOT_ROUTE_NOT_FOUND');
+  for (const action of ['pause', 'resume', 'cancel', 'steer']) {
+    const response = await fetch(`${baseUrl}/api/copilot/agent-runs/agent-run-owner-001/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(response.status, 404, action);
+    assert.equal((await response.json()).error.code, 'COPILOT_ROUTE_NOT_FOUND', action);
+  }
+
+  const wrongRunPath = `${baseUrl}/api/copilot/conversations/${secondConversationId}/runs/agent-run-owner-001`;
+  const wrongState = await fetch(wrongRunPath);
+  assert.equal(wrongState.status, 409);
+  assert.equal((await wrongState.json()).error.code, 'COPILOT_RUN_CONTEXT_MISMATCH');
+
+  for (const action of ['pause', 'resume', 'cancel', 'steer']) {
+    const response = await fetch(`${wrongRunPath}/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(action === 'steer' ? { tasks: [{ id: 'replacement', toolName: 'dataset.profile', input: { rows: [] } }] } : {}),
+    });
+    assert.equal(response.status, 409, action);
+    assert.equal((await response.json()).error.code, 'COPILOT_RUN_CONTEXT_MISMATCH', action);
+  }
 });
 
 test('HTTP production routes expose snapshot migration, verified artifacts, traces, and golden evaluations', async (t) => {

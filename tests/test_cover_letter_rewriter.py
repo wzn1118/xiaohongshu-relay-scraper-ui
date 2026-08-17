@@ -199,6 +199,17 @@ class CoverLetterRewriterTests(unittest.TestCase):
         self.assertEqual(payload["quality_contract"]["minimum_non_whitespace_characters"], 800)
         self.assertEqual(payload["candidate"]["evidence"][0]["id"], "content-project")
 
+    def test_input_recovers_role_from_leading_body_phrase_when_social_title_is_noisy(self) -> None:
+        record = fixture_record()
+        record.pop("application_info")
+        record["job_card"] = {"title": "上海继任-小红书短视频内容运营实习生"}
+        record["title"] = "上海继任-小红书短视频内容运营实习生"
+        record["body"] = "短视频内容运营实习生 负责AI运动类产品内容矩阵分发，参与内容策划与数据复盘。"
+
+        payload = build_cover_letter_rewrite_input(record, {}, "结合真实经历")
+
+        self.assertEqual(payload["role"]["role_name"], "短视频内容运营实习生")
+
     def test_input_preserves_uploaded_resume_evidence_and_provenance(self) -> None:
         payload = build_cover_letter_rewrite_input(
             fixture_record(),

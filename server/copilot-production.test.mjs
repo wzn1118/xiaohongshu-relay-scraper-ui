@@ -19,7 +19,11 @@ test('production store uses WAL and keeps immutable snapshot manifests with stru
 
   assert.equal(store.describe().journalMode, 'wal');
   const first = store.upsertSnapshot({ jobId: 'job-1', snapshotId: 'job-r1', revision: 1, manifest: { counts: { posts: 2 }, status: 'running' } });
-  const duplicate = store.upsertSnapshot({ jobId: 'job-1', snapshotId: 'job-r1', revision: 1, manifest: { counts: { posts: 99 } } });
+  const duplicate = store.upsertSnapshot({ jobId: 'job-1', snapshotId: 'job-r1', revision: 1, manifest: { status: 'running', counts: { posts: 2 } } });
+  assert.throws(
+    () => store.upsertSnapshot({ jobId: 'job-1', snapshotId: 'job-r1', revision: 1, manifest: { counts: { posts: 99 } } }),
+    (error) => error.code === 'COPILOT_SNAPSHOT_COLLISION' && error.status === 409,
+  );
   store.upsertSnapshot({ jobId: 'job-1', snapshotId: 'job-r2', revision: 2, manifest: { counts: { posts: 5 }, status: 'done' } });
 
   assert.equal(first.manifest.counts.posts, 2);
@@ -60,6 +64,7 @@ test('service persists snapshots, migrates explicitly, creates verified artifact
   const created = await service.createConversation({ jobId: job.id, mode: 'research', idempotencyKey: 'create-production-conversation' });
   assert.equal(created.snapshot.snapshotId, 'job-r1');
   assert.equal(created.snapshot.manifest.artifacts[0].relativePath, 'records.json');
+  assert.match(created.snapshot.manifest.artifacts[0].sha256, /^[a-f0-9]{64}$/u);
 
   job.revision = 2;
   job.status = 'completed';

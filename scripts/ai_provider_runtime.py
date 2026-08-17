@@ -190,6 +190,19 @@ class AIProvider:
     def requires_api_key(self) -> bool:
         return self.provider != "local_qwen"
 
+    def _external_json_headers(self) -> dict[str, str]:
+        default_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PowerShell/7.5.0"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Connection": "close",
+            "User-Agent": os.environ.get("XHS_AI_USER_AGENT", default_user_agent).strip()
+            or default_user_agent,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
     def _remaining_timeout(self) -> int:
         if not self.total_timeout:
             return self.timeout
@@ -270,16 +283,41 @@ class AIProvider:
             # Retry without image parts so the record still receives text/alt-text analysis.
             return self._openai_compatible(system + schema_instruction, user, self.wire_api)
 
-    def generate_text(self, system: str, user: str) -> str:
-        """Generate long-form local text without forcing it into a JSON string."""
+    def generate_json_from_text(self, system: str, user: str) -> dict[str, Any]:
+        """Parse JSON from ordinary provider text without structured-output controls.
+
+        Some OpenAI-compatible relays accept normal chat completions but reject
+        larger requests that combine response_format with a full JSON Schema.
+        Callers still validate the parsed object against their local contract.
+        """
         if self._terminal_error:
             raise AIProviderTimeoutError(self._terminal_error)
         self._remaining_timeout()
         self.last_request_used_images = False
         self.last_request_model = ""
-        if self.provider != "local_qwen":
-            raise AIProviderError("Plain-text generation is only configured for the local AI provider")
-        return self._local_text(system, user)
+        if self.provider == "local_qwen":
+            return self._local_chat(system, user, {"type": "object"}, model=self.model)
+        if self.provider == "codex" and not (self.api_key and self.base_url and self.model):
+            return self._codex(system, user, {"type": "object"})
+        return self._openai_compatible(
+            system,
+            user,
+            self.wire_api,
+            enforce_json_mode=False,
+        )
+
+    def generate_text(self, system: str, user: str) -> str:
+        """Generate long-form text without forcing it into a JSON string."""
+        if self._terminal_error:
+            raise AIProviderTimeoutError(self._terminal_error)
+        self._remaining_timeout()
+        self.last_request_used_images = False
+        self.last_request_model = ""
+        if self.provider == "local_qwen":
+            return self._local_text(system, user)
+        if self.provider == "codex" and not (self.api_key and self.base_url and self.model):
+            raise AIProviderError("Plain-text generation requires a configured API endpoint")
+        return self._openai_text(system, user, self.wire_api)
 
     def _read_local_images(self, image_files: list[str]) -> list[str]:
         encoded_images: list[str] = []
@@ -540,11 +578,12 @@ class AIProvider:
         user: str,
         wire_api: str = "chat_completions",
         image_urls: list[str] | None = None,
+        enforce_json_mode: bool = True,
     ) -> dict[str, Any]:
         if not self.base_url or not self.model or (self.requires_api_key and not self.api_key):
             raise AIProviderError("AI provider configuration is incomplete")
         if wire_api == "responses":
-            return self._responses(system, user, image_urls)
+            return self._responses(system, user, image_urls, enforce_json_mode)
         if wire_api != "chat_completions":
             raise AIProviderError("Unsupported AI wire API")
         user_content: str | list[dict[str, Any]] = user
@@ -556,7 +595,7 @@ class AIProvider:
                     for image_url in image_urls
                 ],
             ]
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "temperature": 0.2,
             "max_tokens": self.max_output_tokens,
@@ -564,11 +603,10 @@ class AIProvider:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
-            "response_format": {"type": "json_object"},
         }
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        if enforce_json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        headers = self._external_json_headers()
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -592,7 +630,89 @@ class AIProvider:
         except (KeyError, IndexError, TypeError) as error:
             raise AIProviderError("AI provider response did not contain a message") from error
 
-    def _responses(self, system: str, user: str, image_urls: list[str] | None = None) -> dict[str, Any]:
+    def _openai_text(self, system: str, user: str, wire_api: str = "chat_completions") -> str:
+        if not self.base_url or not self.model or (self.requires_api_key and not self.api_key):
+            raise AIProviderError("AI provider configuration is incomplete")
+        if wire_api not in {"chat_completions", "responses"}:
+            raise AIProviderError("Unsupported AI wire API")
+        if wire_api == "responses":
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "instructions": system,
+                "input": user,
+                "max_output_tokens": self.max_output_tokens,
+            }
+            endpoint = f"{self.base_url}/responses"
+        else:
+            payload = {
+                "model": self.model,
+                "temperature": 0.2,
+                "max_tokens": self.max_output_tokens,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+            endpoint = f"{self.base_url}/chat/completions"
+        headers = self._external_json_headers()
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+        result: dict[str, Any] = {}
+        for attempt in range(self.http_max_retries + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self._request_timeout()) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                self.last_request_model = str(result.get("model") or self.model)
+                break
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                if error.code not in retryable_statuses or attempt >= self.http_max_retries:
+                    raise AIProviderError(f"AI provider returned HTTP {error.code}: {detail}") from error
+            except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as error:
+                if attempt >= self.http_max_retries:
+                    raise AIProviderError(f"AI provider request failed: {error}") from error
+            delay = min(2 ** attempt, 8)
+            if self.total_timeout and self._remaining_timeout() <= delay:
+                raise AIProviderTimeoutError(
+                    f"AI runtime budget exhausted after {self.total_timeout} seconds; "
+                    "remaining records were preserved for a later resume"
+                )
+            time.sleep(delay)
+        if wire_api == "responses":
+            content = result.get("output_text")
+            if not isinstance(content, str):
+                parts: list[str] = []
+                for item in result.get("output", []):
+                    for block in item.get("content", []) if isinstance(item, dict) else []:
+                        if isinstance(block, dict) and isinstance(block.get("text"), str):
+                            parts.append(block["text"])
+                content = "".join(parts)
+        else:
+            try:
+                content = result["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    content = "".join(
+                        str(item.get("text", "")) for item in content if isinstance(item, dict)
+                    )
+            except (KeyError, IndexError, TypeError) as error:
+                raise AIProviderError("AI provider response did not contain a message") from error
+        text = str(content or "").strip()
+        if not text:
+            raise AIProviderError("AI provider returned empty text")
+        return text
+
+    def _responses(
+        self,
+        system: str,
+        user: str,
+        image_urls: list[str] | None = None,
+        enforce_json_mode: bool = True,
+    ) -> dict[str, Any]:
         input_value: str | list[dict[str, Any]] = user
         if image_urls:
             input_value = [{
@@ -605,17 +725,18 @@ class AIProvider:
                     ],
                 ],
             }]
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "instructions": system,
             "input": input_value,
             "max_output_tokens": self.max_output_tokens,
-            "text": {"format": {"type": "json_object"}},
         }
+        if enforce_json_mode:
+            payload["text"] = {"format": {"type": "json_object"}}
         request = urllib.request.Request(
             f"{self.base_url}/responses",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            headers=self._external_json_headers(),
             method="POST",
         )
         retryable_statuses = {408, 425, 429, 500, 502, 503, 504}

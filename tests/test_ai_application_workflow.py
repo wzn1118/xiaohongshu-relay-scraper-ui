@@ -463,9 +463,17 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertEqual(provider.calls, ["presentation"])
         self.assertFalse(payload["quality_gate"]["passed"])
 
-    def test_general_mode_rejects_evidence_not_found_in_source(self) -> None:
+    def test_general_mode_discards_fabricated_evidence_and_keeps_a_conservative_source_excerpt(self) -> None:
         class UngroundedProvider(GeneralContentProvider):
             def generate_json(self, system, user, schema, image_urls=None):
+                if set(schema.get("required", [])) == {"modules"}:
+                    self.calls.append("grounding-repair")
+                    return {
+                        "modules": [{
+                            "id": "schedule",
+                            "evidence": ["修复请求仍然返回原文中不存在的句子"],
+                        }],
+                    }
                 result = super().generate_json(system, user, schema, image_urls)
                 if "overview" in set(schema.get("required", [])):
                     result["modules"] = [{
@@ -491,11 +499,99 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         report = enrich_general_payload(payload, "城市展览", provider=UngroundedProvider(), content_preset="place")
 
         analysis = payload["records"][0]["content_analysis"]
-        self.assertEqual(report.passed, 0)
-        self.assertEqual(analysis["status"], "ungrounded")
-        self.assertEqual(analysis["grounded_evidence_count"], 0)
+        self.assertEqual(report.passed, 1)
+        self.assertEqual(analysis["status"], "completed")
+        self.assertGreater(analysis["grounded_evidence_count"], 0)
         self.assertEqual(analysis["relevance_score"], 0)
-        self.assertTrue(record_needs_content_completion(payload["records"][0]))
+        self.assertEqual(analysis["grounding_repair_mode"], "deterministic_source_excerpt")
+        self.assertNotIn("修复请求仍然返回原文中不存在的句子", analysis["modules"][0]["evidence"])
+        self.assertFalse(record_needs_content_completion(payload["records"][0]))
+
+    def test_general_mode_repairs_ungrounded_evidence_with_exact_source_quotes(self) -> None:
+        class RepairingProvider(GeneralContentProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.analysis_calls = 0
+
+            def generate_json(self, system, user, schema, image_urls=None):
+                required = set(schema.get("required", []))
+                if required == {"modules"}:
+                    self.calls.append("grounding-repair")
+                    return {
+                        "modules": [{
+                            "id": "schedule",
+                            "evidence": ["本周城市摄影展将展出多位创作者的作品"],
+                        }],
+                    }
+                result = super().generate_json(system, user, schema, image_urls)
+                if "overview" in required:
+                    self.analysis_calls += 1
+                    result["modules"] = [{
+                        "id": "schedule",
+                        "title": "时间与地点",
+                        "summary": "本周有一场城市摄影展。",
+                        "items": [],
+                        "evidence": ["改写后无法逐字匹配的证据"],
+                    }]
+                return result
+
+        payload = {
+            "quality_gate": {"passed": True, "discovered_count": 1, "record_count": 1, "checks": {}, "issues": []},
+            "records": [{
+                "note_id": "repair-1",
+                "title": "城市摄影展",
+                "body": "本周城市摄影展将展出多位创作者的作品，并介绍现场策展思路。",
+                "source_card_text": "城市摄影展览推荐",
+                "media": {"images": []},
+            }],
+        }
+        provider = RepairingProvider()
+
+        report = enrich_general_payload(payload, "城市展览", provider=provider, content_preset="place")
+
+        analysis = payload["records"][0]["content_analysis"]
+        self.assertEqual(report.passed, 1)
+        self.assertEqual(analysis["status"], "completed")
+        self.assertTrue(analysis["grounding_repair_attempted"])
+        self.assertTrue(analysis["grounding_repair_succeeded"])
+        self.assertEqual(analysis["modules"][0]["evidence"], ["本周城市摄影展将展出多位创作者的作品"])
+        self.assertFalse(record_needs_content_completion(payload["records"][0]))
+        self.assertEqual(provider.calls, ["presentation", "analysis", "grounding-repair"])
+
+    def test_general_mode_repairs_ungrounded_evidence_by_selecting_source_segment_ids(self) -> None:
+        class SegmentSelectingProvider(GeneralContentProvider):
+            def generate_json(self, system, user, schema, image_urls=None):
+                if set(schema.get("required", [])) == {"modules"}:
+                    self.calls.append("grounding-repair")
+                    return {
+                        "modules": [{
+                            "id": "schedule",
+                            "evidence_segment_ids": [1],
+                        }],
+                    }
+                return super().generate_json(system, user, schema, image_urls)
+
+        source = "The public relay exposes a grounded local AI analysis workflow for operators."
+        payload = {
+            "quality_gate": {"passed": True, "discovered_count": 1, "record_count": 1, "checks": {}, "issues": []},
+            "records": [{
+                "note_id": "segment-repair-1",
+                "title": "Public relay acceptance",
+                "body": source,
+                "source_card_text": "",
+                "media": {"images": []},
+            }],
+        }
+        provider = SegmentSelectingProvider()
+
+        report = enrich_general_payload(payload, "relay", provider=provider, content_preset="place")
+
+        analysis = payload["records"][0]["content_analysis"]
+        self.assertEqual(report.passed, 1)
+        self.assertEqual(analysis["status"], "completed")
+        self.assertTrue(analysis["grounding_repair_succeeded"])
+        self.assertEqual(analysis["modules"][0]["evidence"], [source])
+        self.assertEqual(provider.calls, ["presentation", "analysis", "grounding-repair"])
 
     def test_poster_first_line_replaces_noisy_search_title_with_formal_role_name(self) -> None:
         role = _deterministic_ocr_role(
@@ -730,6 +826,7 @@ class AiApplicationWorkflowTests(unittest.TestCase):
             for problem in problems
             if any(marker in problem for marker in alignment_markers)
         ])
+        self.assertNotIn("Cover Letter 缺少首行主题", problems)
 
     def test_quality_gate_requires_capability_match_to_bind_used_evidence_id(self) -> None:
         role = {
@@ -915,6 +1012,50 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         self.assertNotEqual(legacy_hash, formal_hash)
         self.assertNotEqual(formal_hash, concise_hash)
 
+    def test_application_copy_source_hash_ignores_public_media_proxy_rewrites(self) -> None:
+        original_cover = "https://sns-img.example.com/original-cover.jpg"
+        original_image = "https://sns-img.example.com/original-image.jpg"
+        raw = {
+            "note_id": "note-media",
+            "title": "Media-backed role",
+            "body": "Role description",
+            "media": {
+                "cover_url": original_cover,
+                "images": [{"url": original_image}],
+                "analysis": {"status": "pending"},
+            },
+        }
+        public = {
+            **raw,
+            "media": {
+                "cover_url": "http://127.0.0.1:4327/api/media/cache/cover",
+                "cover_original_url": original_cover,
+                "images": [{
+                    "url": "http://127.0.0.1:4327/api/media/cache/image",
+                    "original_url": original_image,
+                }],
+                "analysis": {"status": "ready", "derived": True},
+            },
+        }
+        profile = {"id": "profile-1", "name": "Candidate"}
+
+        self.assertEqual(
+            _application_copy_source_hash(raw, profile),
+            _application_copy_source_hash(public, profile),
+        )
+
+        changed = {
+            **public,
+            "media": {
+                **public["media"],
+                "cover_original_url": "https://sns-img.example.com/new-cover.jpg",
+            },
+        }
+        self.assertNotEqual(
+            _application_copy_source_hash(raw, profile),
+            _application_copy_source_hash(changed, profile),
+        )
+
     def test_enrichment_does_not_regenerate_unchanged_or_changed_existing_copy(self) -> None:
         copy_fields = {
             "greeting": "您好，我是候选人。",
@@ -1093,6 +1234,26 @@ class AiApplicationWorkflowTests(unittest.TestCase):
         )
 
         self.assertTrue(any("缺少可验证的招聘或投递信号" in problem for problem in problems))
+
+    def test_quality_gate_ignores_non_job_words_inside_recruitment_hashtags(self) -> None:
+        problems = _deterministic_problems(
+            {
+                "greeting": "您好，我希望申请AI产品经理实习生岗位，期待进一步沟通。",
+                "email_subject": "应聘AI产品经理实习生｜测试用户",
+                "email_body": "您好，我希望申请AI产品经理实习生岗位，并进一步沟通工作安排。",
+                "cover_letter": "主题：应聘AI产品经理实习生｜测试用户\n尊敬的招聘负责人：\n您好！我是测试用户。期待进一步沟通。\n\n此致\n敬礼！\n姓名：测试用户",
+                "used_evidence_ids": [],
+            },
+            {"role_name": "AI产品经理实习生", "responsibilities": [], "requirements": []},
+            [],
+            {"name": "测试用户"},
+            {
+                "title": "小米紧急招聘AI产品经理实习生，请投递简历 #令人心动的实习日记 #找实习",
+                "body": "岗位职责：参与产品需求分析。请投递 jobs@example.com。",
+            },
+        )
+
+        self.assertFalse(any("缺少可验证的招聘或投递信号" in problem for problem in problems))
 
     def test_external_link_normalization_rejects_unsafe_targets(self) -> None:
         self.assertEqual(_normalize_external_url("www.example.com/apply/42"), "https://www.example.com/apply/42")

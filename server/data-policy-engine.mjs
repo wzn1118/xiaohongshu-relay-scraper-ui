@@ -23,6 +23,7 @@ const TOOL_SCOPES = Object.freeze({
   'applications.compose_email': 'email:draft',
   'audience.segment': 'audience:read',
   'audience.coverage': 'audience:read',
+  'audience.research_brief': 'audience:read',
   'users.query': 'audience:read',
   'comments.query': 'audience:read',
   'expansion.trace': 'expansion:read',
@@ -118,19 +119,27 @@ export class DataPolicyEngine {
   authorizeTool(reference, toolName, conversation = null, declaredScopes = []) {
     const { job } = this.validateSnapshot(reference, conversation);
     const declared = normalizeDeclaredScopes(declaredScopes);
-    const required = TOOL_SCOPES[toolName] || declared[0];
-    if (!required) throw policyError('COPILOT_TOOL_NOT_ALLOWED', 'The requested tool is not registered.', 403);
-    if (declared.length && !declared.includes(required)) {
+    const registered = TOOL_SCOPES[toolName];
+    if (!registered && declared.length === 0) {
+      throw policyError('COPILOT_TOOL_NOT_ALLOWED', 'The requested tool is not registered.', 403);
+    }
+    if (registered && declared.length && !declared.includes(registered)) {
       throw policyError('COPILOT_TOOL_SCOPE_INVALID', 'The tool scope does not match its registered policy.', 403);
     }
-    if (!MODE_SCOPES[reference.mode].has(required)) {
-      throw policyError('COPILOT_SCOPE_DENIED', 'The tool is outside the conversation mode.', 403);
-    }
+    const requiredScopes = normalizeDeclaredScopes([
+      ...(registered ? [registered] : []),
+      ...declared,
+    ]);
     const configured = allowedScopes(reference.scope);
-    if (configured && !configured.has(required) && !configured.has('*')) {
-      throw policyError('COPILOT_SCOPE_DENIED', 'The conversation did not grant this tool scope.', 403);
+    for (const required of requiredScopes) {
+      if (!MODE_SCOPES[reference.mode].has(required)) {
+        throw policyError('COPILOT_SCOPE_DENIED', 'The tool is outside the conversation mode.', 403);
+      }
+      if (configured && !configured.has(required) && !configured.has('*')) {
+        throw policyError('COPILOT_SCOPE_DENIED', 'The conversation did not grant every scope required by this tool.', 403);
+      }
     }
-    return { job, requiredScope: required };
+    return { job, requiredScope: registered || requiredScopes[0], requiredScopes };
   }
 
   resourceUri(reference, resource) {

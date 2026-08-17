@@ -31,6 +31,7 @@ test('SMTP credentials survive a real API process restart without plaintext expo
     XHS_DIAGNOSTICS_PATH: path.join(fixture, 'diagnostics.jsonl'),
     OPENCLAW_CONFIG_PATH: path.join(fixture, 'openclaw.json'),
     XHS_RELAY_MONITOR_INTERVAL_MS: '300000',
+    XHS_MCP_ENABLED: 'false',
   };
   let child = null;
 
@@ -102,6 +103,7 @@ test('the API remains available and can reset SMTP after its credential key is m
     XHS_DIAGNOSTICS_PATH: path.join(fixture, 'diagnostics.jsonl'),
     OPENCLAW_CONFIG_PATH: path.join(fixture, 'openclaw.json'),
     XHS_RELAY_MONITOR_INTERVAL_MS: '300000',
+    XHS_MCP_ENABLED: 'false',
   };
   const cases = [
     {

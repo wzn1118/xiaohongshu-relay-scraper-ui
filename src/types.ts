@@ -450,6 +450,17 @@ export type AiSession = {
   expiresAt: string
 }
 
+export type AiSessionProbe = {
+  ok: true
+  sessionId: string
+  provider: string
+  model: string
+  wireApi: 'responses' | 'chat_completions'
+  latencyMs: number
+  responseText: string
+  testedAt: string
+}
+
 export type AiModelDiscovery = {
   provider: string
   baseUrl: string

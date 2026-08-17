@@ -30,8 +30,17 @@ CONTEXT_ENTITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("company", re.compile(r"(?:任职于|就职于|加入)([^，。；;！？!?\n]{2,36}?(?:公司|集团|科技|咨询|银行|实验室|团队))")),
     ("company", re.compile(r"(?:曾在|在)([^，。；;！？!?\n]{2,36}?(?:公司|集团|银行|实验室))(?:工作|任职|实习|期间|负责|参与|[，。])")),
     ("job", re.compile(r"(?:应聘|申请|担任)([^，。；;！？!?\n]{2,36}?(?:实习生|分析师|工程师|顾问|经理|岗位|实习))")),
-    ("project", re.compile(r"(?:参与|负责|推进|完成)([^，。；;！？!?\n]{2,36}?(?:项目|计划|平台))")),
+    ("project", re.compile(r"(?:参与|负责|推进|完成)([^，。；;！？!?\n]{2,36}?(?:项目|计划))")),
 )
+
+# Generic work descriptions are not project names. Treating them as named
+# projects makes a factual-claim checker reject otherwise grounded copy.
+GENERIC_PROJECT_DESCRIPTORS = frozenset({
+    "\u76f8\u5173", "\u8be5", "\u8fd9\u4e2a", "\u4e00\u4e2a", "\u591a\u4e2a", "\u5177\u4f53", "\u5b9e\u9645",
+    "\u5b8c\u6574", "\u6e05\u6670", "\u6709\u5e8f", "\u590d\u6742", "\u8de8\u90e8\u95e8", "\u5168\u6d41\u7a0b", "\u4e0d\u540c",
+    "\u82e5\u5e72", "\u4e00\u9879", "\u5404\u7c7b", "\u9879\u76ee\u7ba1\u7406",
+})
+
 
 NUMERIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("money", re.compile(
@@ -310,6 +319,9 @@ def _entity_lexicon(
     for item in record.get("fit_evidence", []):
         if not isinstance(item, dict):
             continue
+        evidence_label = item.get("label") or item.get("title") or item.get("name")
+        if re.search(r"(?:项目|计划)$", str(evidence_label or "").strip()):
+            add("project", evidence_label)
         skills = item.get("skills")
         skill_values = skills if isinstance(skills, list) else ([skills] if skills is not None else [])
         for skill in skill_values:
@@ -325,9 +337,51 @@ def _overlaps(span: tuple[int, int], occupied: list[tuple[int, int]]) -> bool:
     return any(span[0] < end and start < span[1] for start, end in occupied)
 
 
+def _is_generic_project_reference(value: str) -> bool:
+    normalized = str(value or "").strip()
+    if not normalized.endswith(("\u9879\u76ee", "\u8ba1\u5212")):
+        return False
+    descriptor_text = normalized[:-2].rstrip("\u7684").strip()
+    if not descriptor_text:
+        return True
+    descriptors = [
+        item.strip()
+        for item in re.split(r"[\s\u3001\uff0c,/\u548c\u4e0e\u53ca\u7684]+", descriptor_text)
+        if item.strip()
+    ]
+    return bool(descriptors) and all(item in GENERIC_PROJECT_DESCRIPTORS for item in descriptors)
+
+
+def _is_verified_target_role_reference(
+    raw_claim: dict[str, Any],
+    draft: dict[str, Any],
+    record: dict[str, Any],
+) -> bool:
+    """Allow a verified job-posting target in application-intent wording only."""
+    if raw_claim.get("claimType") != "job":
+        return False
+    disposition = record.get("qualitySourceDisposition")
+    if not isinstance(disposition, dict) or disposition.get("status") != "sendable":
+        return False
+    target_role = str(disposition.get("roleName") or "").strip()
+    claim_text = str(raw_claim.get("text") or "").strip()
+    normalized_target = re.sub(r"\s*[/\uff0f]\s*", "/", target_role)
+    normalized_claim = re.sub(r"\s*[/\uff0f]\s*", "/", claim_text)
+    if not target_role or not claim_text or normalized_claim != normalized_target:
+        return False
+    field = str(raw_claim.get("field") or "")
+    text = str(draft.get(field) or "")
+    start = raw_claim.get("outputStart")
+    if field not in OUTREACH_TEXT_FIELDS or not isinstance(start, int) or start < 0:
+        return False
+    prefix = text[max(0, start - 32):start]
+    return bool(re.search(r"(?:\u7533\u8bf7|\u5e94\u8058|\u6295\u9012|\u7ade\u8058|\u62a5\u7533)\s*$", prefix))
+
+
 def _extract_claims(
     draft: dict[str, Any],
     lexicon: dict[str, set[str]],
+    sources: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     claims: list[dict[str, Any]] = []
     seen: set[tuple[str, str, int]] = set()
@@ -357,7 +411,11 @@ def _extract_claims(
             append("other_hard_fact", match.group(0), match.start(), review=True)
 
         for match in QUANTIFIED_PATTERN.finditer(text):
-            append("quantified_achievement", match.group(0), match.start())
+            # Individual numbers are validated below. Keep this richer claim only
+            # when its complete wording is present in the evidence, otherwise a
+            # harmless action-verb paraphrase would fail a second, stricter check.
+            if _find_evidence(match.group(0).strip(), sources or []) is not None:
+                append("quantified_achievement", match.group(0), match.start())
 
         for kind, pattern in NUMERIC_PATTERNS:
             for match in pattern.finditer(text):
@@ -381,7 +439,24 @@ def _extract_claims(
 
         for kind, pattern in CONTEXT_ENTITY_PATTERNS:
             for match in pattern.finditer(text):
-                append(kind, match.group(1), match.start(1))
+                raw = match.group(1)
+                cleaned = raw.strip(" \t\r\n\"'“”‘’「」『』【】（）()[]<>《》：:，,。.;；!?！？")
+                if kind == "project":
+                    cleaned = re.sub(r"^(?:了|过)(?=.{2,})", "", cleaned)
+                if not cleaned:
+                    continue
+                if kind == "project" and _is_generic_project_reference(cleaned):
+                    continue
+                known_entities = [
+                    value
+                    for value in sorted(lexicon.get(kind, set()), key=len, reverse=True)
+                    if value in cleaned
+                ]
+                if known_entities:
+                    for value in known_entities:
+                        append(kind, value, match.start(1) + raw.find(value))
+                else:
+                    append(kind, cleaned, match.start(1) + raw.find(cleaned))
     return claims
 
 
@@ -440,10 +515,12 @@ def validate_generated_claims(
     sources = build_evidence_sources(record, resolved_profile, resolved_candidate)
     source_set_hash = _source_set_hash(sources)
     lexicon = _entity_lexicon(record, resolved_profile, resolved_candidate, sources)
-    raw_claims = _extract_claims(draft or record.get("outreach") or {}, lexicon)
+    raw_claims = _extract_claims(draft or record.get("outreach") or {}, lexicon, sources)
     claims: list[dict[str, Any]] = []
     failed = review = 0
     for raw in raw_claims:
+        if _is_verified_target_role_reference(raw, draft or record.get("outreach") or {}, record):
+            continue
         claim_seed = f"{raw['field']}:{raw['claimType']}:{raw['outputStart']}:{raw['text']}"
         match = _find_evidence(raw["text"], sources)
         if raw["requiresHumanReview"]:

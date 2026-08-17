@@ -38,6 +38,8 @@ import {
   Cpu,
   Pause,
   Paperclip,
+  PanelLeftClose,
+  PanelLeftOpen,
   Play,
   RefreshCw,
   RotateCcw,
@@ -70,7 +72,11 @@ import { BatchApplicationPanel } from './BatchApplicationPanel'
 import type { BodyImportRecord } from './body-import'
 import { DataCopilotPanel, type DataCopilotModelConnectionInput } from './DataCopilotPanel'
 import { createDataCopilotTransport } from './data-copilot-transport'
-import type { DataCopilotContextSource, DataCopilotModel } from './DataCopilotContext'
+import {
+  dataCopilotReasoningEffortsForModel,
+  type DataCopilotContextSource,
+  type DataCopilotModel,
+} from './DataCopilotContext'
 import { ExpansionWorkspace } from './ExpansionWorkspace'
 import { JobJourneyPanel } from './JobJourneyPanel'
 import { experienceSnapshotForJob, jobExperienceView } from './job-experience'
@@ -401,6 +407,12 @@ const statusText: Record<JobStatus, string> = {
   interrupted: '未完成 · 已中断',
 }
 
+function jobStatusText(status?: string) {
+  if (!status) return '状态待更新'
+  if (status === 'succeeded') return '已完成'
+  return statusText[status as JobStatus] || status
+}
+
 const humanQualityLabels: Record<string, string> = {
   factual_grounding: '事实依据',
   specificity: '具体程度',
@@ -656,7 +668,7 @@ function EmailSendPreview({ preview, sending, onClose, onConfirm }: { preview: E
     <div className="email-preview-backdrop" role="presentation" onMouseDown={() => { if (!sending) onClose() }}>
       <section className="email-preview-dialog" role="dialog" aria-modal="true" aria-label="邮件发送预览" onMouseDown={(event) => event.stopPropagation()}>
         <header>
-          <div><span className="step-label">FINAL SEND PREVIEW</span><h3>确认本次邮件投递</h3></div>
+          <div><span className="step-label">最后发送确认</span><h3>确认本次邮件投递</h3></div>
           <button type="button" disabled={sending} onClick={onClose} title="关闭发送预览" aria-label="关闭发送预览"><X size={19} /></button>
         </header>
         <div className="email-preview-content">
@@ -1044,12 +1056,12 @@ function GeneralResultsWorkspace({
     <>
       {results.research ? <section className="content-research-context" aria-label="本次非岗位研究设定">
         <span className="content-research-context-icon"><BrainCircuit size={20} /></span>
-        <span className="content-research-context-copy"><small>NON-JOB RESEARCH BRIEF</small><strong>{results.research.label}</strong><p>{results.research.goal || 'AI 将结合关键词、正文、图片和 OCR，动态决定本次研究栏目。'}</p></span>
+        <span className="content-research-context-copy"><small>本次研究目标</small><strong>{results.research.label}</strong><p>{results.research.goal || 'AI 将结合关键词、正文、图片和 OCR，动态决定本次研究栏目。'}</p></span>
         <span className="content-research-context-keyword"><small>搜索关键词</small><strong>{results.keyword || '未记录'}</strong></span>
       </section> : null}
       {results.insights ? <section className="content-evidence-insights" aria-label="跨样本证据洞察">
         <header>
-          <div><small>CROSS-SAMPLE EVIDENCE</small><h3>跨样本证据洞察</h3><p>{results.insights.methodNote}</p></div>
+          <div><small>跨样本证据</small><h3>跨样本证据洞察</h3><p>{results.insights.methodNote}</p></div>
           <div className="content-insight-metrics"><span><strong>{results.insights.groundedRecords}</strong>可回溯样本</span><span><strong>{results.insights.sourceReady}</strong>原文充足</span><span><strong>{results.insights.coverageRate}%</strong>证据覆盖</span><span><strong>{results.insights.sampleSize}</strong>采集样本</span></div>
         </header>
         {results.insights.topTopics.length > 0 && <div className="content-topic-frequency"><strong>高频主题</strong><div>{results.insights.topTopics.map((topic) => <span key={topic.label}>{topic.label}<b>{topic.count}</b></span>)}</div></div>}
@@ -1106,7 +1118,7 @@ function GeneralResultsWorkspace({
           </section>}
           <AiSectionBoundary resetSignal={analysis} fallback={<AiSectionUnavailable label="AI 内容结构" />}>
             {!analysisReady && <section className="content-evidence-warning"><WandSparkles size={17} /><span><strong>当前结论未通过证据门禁</strong><small>{analysis?.status === 'insufficient_source' ? '正文和图片可读信息过少，需要继续采集后再分析。' : analysis?.status === 'ungrounded' ? '模型引用无法在原始图文中复核，已撤销相关度分数。' : '分析尚未完成，可从检查点继续补全。'}</small></span></section>}
-            <section className="general-overview"><div><span>AI CONTENT BRIEF</span><h4>内容概览</h4></div><p>{analysisReady ? (analysis?.overview || '等待 AI 根据关键词、正文与图片生成概览。') : '等待 AI 根据可回溯的原文与图片证据重新生成。'}</p>{analysisReady && analysis?.relevance_reason && <small>{analysis.relevance_reason}</small>}</section>
+            <section className="general-overview"><div><span>AI 内容概览</span><h4>内容概览</h4></div><p>{analysisReady ? (analysis?.overview || '等待 AI 根据关键词、正文与图片生成概览。') : '等待 AI 根据可回溯的原文与图片证据重新生成。'}</p>{analysisReady && analysis?.relevance_reason && <small>{analysis.relevance_reason}</small>}</section>
             {analysisReady && (analysis?.topics?.length || analysis?.entities?.length) ? <div className="content-taxonomy">{analysis?.topics?.length ? <section><h4>主题</h4><div>{analysis.topics.map((topic) => <span key={topic}>{topic}</span>)}</div></section> : null}{analysis?.entities?.length ? <section><h4>实体与对象</h4><div>{analysis.entities.map((entity) => <span key={entity}>{entity}</span>)}</div></section> : null}</div> : null}
             <div className="content-module-grid">{analysisReady && analysis?.modules?.length ? analysis.modules.map((module) => <section className="content-module" key={module.id}><div><BookOpenCheck size={16} /><h4>{module.title}</h4></div><p>{module.summary}</p>{module.items.length > 0 && <ul>{module.items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul>}{module.evidence.length > 0 && <details><summary>查看原文依据</summary>{module.evidence.map((item, index) => <blockquote key={`${item}-${index}`}>{item}</blockquote>)}</details>}</section>) : <section className="content-module pending"><LoaderCircle size={18} /><h4>等待动态栏目分析</h4><p>AI 会根据本次关键词决定栏目，而不是套用岗位模板。</p></section>}</div>
             {analysisReady && analysis?.image_insights?.length ? <section className="image-insight-list"><h4>图片线索</h4><ul>{analysis.image_insights.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section> : null}
@@ -1458,7 +1470,7 @@ function AudienceWorkspace({
 }
 
 function StatusPill({ status, label }: { status: JobStatus; label?: string }) {
-  return <span className={`status-pill status-${status}`}><i />{label || statusText[status]}</span>
+  return <span className={`status-pill status-${status}`}><i />{label || jobStatusText(status)}</span>
 }
 
 function MissingCompletionFlowPanel({ flow, job, noun, onDismiss }: {
@@ -1595,6 +1607,9 @@ function audienceSnapshotRegressed(current: AudienceResultsResponse, next: Audie
 }
 
 type ApplicationView = 'jobs' | 'batch'
+type WorkflowScreen = 'start' | 'setup' | 'task' | 'workspace' | 'history' | 'artifacts'
+
+const workflowScreenValues: WorkflowScreen[] = ['start', 'setup', 'task', 'workspace', 'history', 'artifacts']
 
 function workspaceModeFromLocation(): AnalysisMode {
   if (typeof window === 'undefined') return 'job'
@@ -1615,6 +1630,22 @@ function generalResultModuleFromLocation(): GeneralResultModule {
   if (typeof window === 'undefined') return 'insights'
   const module = new URLSearchParams(window.location.search).get('module')
   return module === 'audience' || module === 'expansion' ? module : 'insights'
+}
+
+function workflowScreenFromLocation(): WorkflowScreen {
+  if (typeof window === 'undefined') return 'start'
+  const params = new URLSearchParams(window.location.search)
+  const screen = params.get('screen') as WorkflowScreen | null
+  if (screen && workflowScreenValues.includes(screen)) return screen
+
+  const pathname = window.location.pathname.replace(/\/+$/, '') || '/'
+  if (pathname === '/batch') return 'workspace'
+  if (params.has('job')) return 'workspace'
+  if (pathname === '/content') {
+    const module = params.get('module')
+    if (module === 'audience' || module === 'expansion') return 'workspace'
+  }
+  return 'start'
 }
 
 function audienceDataJobIdFromLocation() {
@@ -1697,6 +1728,15 @@ function App() {
   const [workspaceMode, setWorkspaceMode] = useState<AnalysisMode>(() => workspaceModeFromLocation())
   const [applicationView, setApplicationView] = useState<ApplicationView>(() => applicationViewFromLocation())
   const [generalResultModule, setGeneralResultModule] = useState<GeneralResultModule>(() => generalResultModuleFromLocation())
+  const [workflowScreen, setWorkflowScreen] = useState<WorkflowScreen>(() => workflowScreenFromLocation())
+  const [railCollapsed, setRailCollapsed] = useState(() => {
+    if (typeof window === 'undefined') return false
+    try {
+      return window.localStorage.getItem('xhs-workflow-rail-collapsed') === '1'
+    } catch {
+      return false
+    }
+  })
   const requestCache = useRef<Record<AnalysisMode, JobRequest>>({
     job: { ...defaultRequest, analysisMode: 'job', candidateProfile: loadCandidateProfile() },
     general: { ...defaultRequest, analysisMode: 'general', keyword: '', useCodexRuntime: true, collectAudience: true, candidateProfile: loadCandidateProfile() },
@@ -1820,6 +1860,7 @@ function App() {
   const audienceRequestRef = useRef(0)
   const audienceForegroundRequestRef = useRef(0)
   const aiBootstrapStartedRef = useRef(false)
+  const appAccessReady = !authLoading && Boolean(authSession && (!authSession.required || authSession.authenticated))
 
   useEffect(() => {
     let cancelled = false
@@ -1933,7 +1974,10 @@ function App() {
   }, [])
 
   const performSwitchWorkspace = useCallback((mode: AnalysisMode, updateHistory = true, targetApplicationView: ApplicationView = 'jobs') => {
-    if (mode === workspaceMode) return
+    if (mode === workspaceMode) {
+      if (!updateHistory) setWorkflowScreen(workflowScreenFromLocation())
+      return
+    }
     draftViewRevisionRef.current += 1
     disconnectJobStream()
     resultsRequestRef.current += 1
@@ -1961,9 +2005,14 @@ function App() {
       aiSessionId: request.aiSessionId,
     }
     const nextApplicationView: ApplicationView = mode === 'job' ? targetApplicationView : 'jobs'
+    const nextWorkflowScreen: WorkflowScreen = updateHistory ? 'start' : workflowScreenFromLocation()
     if (updateHistory && window.location.pathname !== workspacePath(mode, nextApplicationView)) {
-      window.history.pushState({ workspaceMode: mode, applicationView: nextApplicationView }, '', workspacePath(mode, nextApplicationView))
+      const url = new URL(window.location.href)
+      url.pathname = workspacePath(mode, nextApplicationView)
+      url.search = ''
+      window.history.pushState({ workspaceMode: mode, applicationView: nextApplicationView, workflowScreen: nextWorkflowScreen }, '', `${url.pathname}${url.search}${url.hash}`)
     }
+    setWorkflowScreen(nextWorkflowScreen)
     setApplicationView(nextApplicationView)
     if (mode === 'general') setGeneralResultModule(updateHistory ? 'insights' : generalResultModuleFromLocation())
     setWorkspaceMode(mode)
@@ -2008,11 +2057,20 @@ function App() {
   ), [draftGuard.requestTransition, performSwitchWorkspace])
 
   const performSwitchApplicationView = useCallback((view: ApplicationView, updateHistory = true) => {
-    if (workspaceMode !== 'job' || view === applicationView) return
-    const nextPath = workspacePath('job', view)
-    if (updateHistory && window.location.pathname !== nextPath) {
-      window.history.pushState({ workspaceMode: 'job', applicationView: view }, '', nextPath)
+    if (workspaceMode !== 'job' || view === applicationView) {
+      if (!updateHistory) setWorkflowScreen(workflowScreenFromLocation())
+      return
     }
+    const nextPath = workspacePath('job', view)
+    const nextWorkflowScreen: WorkflowScreen = updateHistory ? (view === 'batch' ? 'workspace' : 'start') : workflowScreenFromLocation()
+    if (updateHistory && window.location.pathname !== nextPath) {
+      const url = new URL(window.location.href)
+      url.pathname = nextPath
+      url.search = ''
+      if (nextWorkflowScreen !== 'start') url.searchParams.set('screen', nextWorkflowScreen)
+      window.history.pushState({ workspaceMode: 'job', applicationView: view, workflowScreen: nextWorkflowScreen }, '', `${url.pathname}${url.search}${url.hash}`)
+    }
+    setWorkflowScreen(nextWorkflowScreen)
     setApplicationView(view)
     setNotice(null)
     window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -2021,6 +2079,36 @@ function App() {
   const switchApplicationView = useCallback((view: ApplicationView, updateHistory = true) => {
     performSwitchApplicationView(view, updateHistory)
   }, [performSwitchApplicationView])
+
+  const performSwitchWorkflowScreen = useCallback((screen: WorkflowScreen, updateHistory = true) => {
+    setWorkflowScreen(screen)
+    if (updateHistory) {
+      const url = new URL(window.location.href)
+      if (screen === 'start') url.searchParams.delete('screen')
+      else url.searchParams.set('screen', screen)
+      window.history.pushState({ ...(window.history.state || {}), workflowScreen: screen }, '', `${url.pathname}${url.search}${url.hash}`)
+    }
+    setNotice(null)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }, [])
+
+  const switchWorkflowScreen = useCallback((screen: WorkflowScreen, updateHistory = true) => {
+    if (workspaceMode === 'job' && applicationView === 'batch') {
+      setApplicationView('jobs')
+      setWorkflowScreen(screen)
+      if (updateHistory) {
+        const url = new URL(window.location.href)
+        url.pathname = workspacePath('job', 'jobs')
+        url.search = ''
+        if (screen !== 'start') url.searchParams.set('screen', screen)
+        window.history.pushState({ workspaceMode: 'job', applicationView: 'jobs', workflowScreen: screen }, '', `${url.pathname}${url.search}${url.hash}`)
+      }
+      setNotice(null)
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+      return
+    }
+    performSwitchWorkflowScreen(screen, updateHistory)
+  }, [applicationView, performSwitchWorkflowScreen, workspaceMode])
 
   const performSwitchGeneralResultModule = useCallback((module: GeneralResultModule, preferredJobId = '') => {
     const currentScroll = window.scrollY
@@ -2082,8 +2170,10 @@ function App() {
       const targetMode = workspaceModeFromLocation()
       const targetApplicationView = applicationViewFromLocation()
       const targetModule = generalResultModuleFromLocation()
+      const targetWorkflowScreen = workflowScreenFromLocation()
       const applyTarget = () => {
         setGeneralResultModule(targetModule)
+        setWorkflowScreen(targetWorkflowScreen)
         if (targetModule === 'audience') {
           const preferredJobId = audienceDataJobIdFromLocation()
           void findBestAudienceDataJob(jobs, preferredJobId, audienceSourceJobIdFor(activeJob, jobs)).then((job) => {
@@ -2104,6 +2194,12 @@ function App() {
         applyTarget()
         return
       }
+      // Workflow screen changes keep the task form mounted, so browser
+      // navigation can restore them without invoking the draft save guard.
+      if (targetMode === workspaceMode && targetApplicationView === applicationView && targetWorkflowScreen !== workflowScreen) {
+        applyTarget()
+        return
+      }
       if (!draftDirtyRef.current) {
         applyTarget()
         return
@@ -2120,15 +2216,17 @@ function App() {
         currentUrl.searchParams.set('module', 'expansion')
         currentUrl.searchParams.delete('job')
       }
-      window.history.pushState({ workspaceMode, generalResultModule }, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
+      if (workflowScreen === 'start') currentUrl.searchParams.delete('screen')
+      else currentUrl.searchParams.set('screen', workflowScreen)
+      window.history.pushState({ workspaceMode, generalResultModule, workflowScreen }, '', `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`)
       void draftGuard.requestTransition('浏览器返回', () => {
-        window.history.pushState({ workspaceMode: targetMode, applicationView: targetApplicationView, generalResultModule: targetModule }, '', targetUrl)
+        window.history.pushState({ workspaceMode: targetMode, applicationView: targetApplicationView, generalResultModule: targetModule, workflowScreen: targetWorkflowScreen }, '', targetUrl)
         applyTarget()
       })
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [activeJob, applicationView, audienceDataJobId, draftGuard.requestTransition, generalResultModule, jobs, performSwitchApplicationView, performSwitchWorkspace, workspaceMode])
+  }, [activeJob, applicationView, audienceDataJobId, draftGuard.requestTransition, generalResultModule, jobs, performSwitchApplicationView, performSwitchWorkspace, workflowScreen, workspaceMode])
 
   useEffect(() => {
     document.title = workspaceMode === 'general'
@@ -2162,13 +2260,13 @@ function App() {
     const connection = api.connectRelay(port, profile)
       .then((status) => {
         setRelay(status)
-        if (notify) setNotice(status.message || (status.ready ? 'Relay 已连接' : 'Relay 尚未连接'))
+        if (notify) setNotice(status.message || (status.ready ? '采集浏览器已连接' : '采集浏览器尚未连接'))
         return status
       })
       .catch((error) => {
         const status: RelayStatus = { running: false, cdpReady: false, port, profile, message: (error as Error).message }
         setRelay(status)
-        if (notify) setNotice(status.message || 'Relay 尚未连接')
+        if (notify) setNotice(status.message || '采集浏览器尚未连接')
         return status
       })
       .finally(() => {
@@ -2191,7 +2289,7 @@ function App() {
       const saved = await api.updateRelayConfig(relayConfig)
       setRelayConfig(saved)
       updateRequest('relayPort', saved.port)
-      setNotice('Relay 配置已保存')
+      setNotice('采集浏览器设置已保存')
       await connectRelay(true, saved)
     } catch (error) {
       setNotice((error as Error).message)
@@ -2209,7 +2307,7 @@ function App() {
       updateRequest('relayPort', saved.port)
       const status = await api.setupRelay(saved.port, saved.profile)
       setRelay(status)
-      setNotice(status.message || (status.ready ? 'Relay 已安装并连接' : 'Relay 已准备，等待连接'))
+      setNotice(status.message || (status.ready ? '采集浏览器已安装并连接' : '采集浏览器已准备，等待连接'))
     } catch (error) {
       setNotice((error as Error).message)
     } finally {
@@ -2381,10 +2479,10 @@ function App() {
         recoveryRecommended: result.after.recoveryRecommended,
       })
       setNotice(result.ok
-        ? `${result.hardRestarted ? 'Relay 浏览器已自动重建，' : 'Relay 已修复，'}并完成 Playwright 验证，共关闭 ${result.closedTargets} 个旧页面。`
-        : result.message || 'Relay 已完成清理，但连接验证仍未通过。')
+        ? `${result.hardRestarted ? '采集浏览器已自动重建，' : '浏览器连接已修复，'}并完成可用性检查，共关闭 ${result.closedTargets} 个旧页面。`
+        : result.message || '采集浏览器已完成清理，但连接检查仍未通过。')
     } catch (error) {
-      setNotice(`Relay 一键修复失败：${(error as Error).message}`)
+      setNotice(`采集浏览器修复失败：${(error as Error).message}`)
       await connectRelay(false, relayConfig)
     } finally {
       setRelayRecovering(false)
@@ -2695,6 +2793,7 @@ function App() {
   const configureAi = async () => {
     setConfiguringAi(true)
     setNotice(null)
+    setAiConnectionCheck({ status: 'checking', message: '正在读取模型并执行一次最小真实推理…' })
     try {
       const currentProvider = providers.find((item) => item.id === providerId)
       let resolvedBaseUrl = aiBaseUrl
@@ -2704,19 +2803,18 @@ function App() {
         const result = await api.discoverAiModels({ provider: providerId, apiKey, baseUrl: aiBaseUrl })
         resolvedBaseUrl = result.baseUrl
         resolvedModel = applyDiscoveredModels(result)
-        setAiConnectionCheck({ status: 'verified', message: `连接可用 · ${result.models.length} 个模型 · ${result.baseUrl}` })
       }
       if (!resolvedModel) throw new Error('未找到可用模型，请先检测模型或填写模型 ID。')
       const session = await api.createAiSession({ provider: providerId, apiKey, model: resolvedModel, baseUrl: resolvedBaseUrl, wireApi: aiWireApi })
+      const probe = await api.probeAiSession(session.id)
       rememberAiSession(session)
+      setAiConnectionCheck({ status: 'verified', message: `真实推理已通过 · ${probe.model} · ${probe.latencyMs} ms` })
       setApiKey('')
       setNotice(currentProvider?.local
-        ? `${currentProvider.label} 已连接，文本仅在本机处理。`
-        : `${currentProvider?.label || providerId} 已验证并连接，密钥仅保存在当前设备。`)
+        ? `${currentProvider.label} 已完成真实推理，公网请求可接入本机模型。`
+        : `${currentProvider?.label || providerId} 已完成真实推理并连接。`)
     } catch (error) {
-      if (providers.find((item) => item.id === providerId)?.relay) {
-        setAiConnectionCheck({ status: 'error', message: (error as Error).message })
-      }
+      setAiConnectionCheck({ status: 'error', message: (error as Error).message })
       setNotice((error as Error).message)
     } finally {
       setConfiguringAi(false)
@@ -2762,6 +2860,7 @@ function App() {
     setCustomModelMode(false)
     setApiKey('')
     setAiSession(null)
+    setAiConnectionCheck({ status: 'checking', message: '正在调用本机模型执行真实推理…' })
     updateRequest('aiSessionId', null)
     try {
       const discovered = await api.discoverAiModels({
@@ -2787,10 +2886,13 @@ function App() {
         baseUrl: localProvider.baseUrl,
         wireApi: localProvider.wireApi,
       })
+      const probe = await api.probeAiSession(session.id)
       rememberAiSession(session)
-      setNotice(`本地免费模型 ${model} 已就绪，文本整理不产生 API 费用。`)
+      setAiConnectionCheck({ status: 'verified', message: `本机真实推理已通过 · ${model} · ${probe.latencyMs} ms` })
+      setNotice(`本地免费模型 ${model} 已完成真实推理，公网请求可直接使用。`)
       return session
     } catch (error) {
+      setAiConnectionCheck({ status: 'error', message: (error as Error).message })
       setNotice(`${(error as Error).message} 可使用上方入口一键安装。`)
       return null
     } finally {
@@ -2935,6 +3037,7 @@ function App() {
   }, [audienceKind, audiencePageSize, audiencePostId, audienceQuery])
 
   useEffect(() => {
+    if (!appAccessReady) return
     let mounted = true
     const boot = async () => {
       const results = await Promise.allSettled([api.health(), api.jobs(), api.relayConfig(), api.smtpConfig()])
@@ -2946,7 +3049,8 @@ function App() {
         const initialMode = workspaceModeFromLocation()
         setJobs(nextJobs)
         const scopedJobs = nextJobs.filter((job) => jobAnalysisMode(job) === initialMode)
-        const initialCandidate = scopedJobs.find((job) => !isAudienceOnlyJob(job)) || scopedJobs[0] || null
+        const featuredCandidate = scopedJobs.find((job) => job.id === FEATURED_JOB_ID && !isAudienceOnlyJob(job))
+        const initialCandidate = featuredCandidate || scopedJobs.find((job) => !isAudienceOnlyJob(job)) || scopedJobs[0] || null
         let initialJob = audienceSourceJobFor(scopedJobs, initialCandidate)
         if (initialMode === 'general' && generalResultModuleFromLocation() === 'audience') {
           const audienceDataJob = await findBestAudienceDataJob(nextJobs, audienceDataJobIdFromLocation())
@@ -2987,7 +3091,7 @@ function App() {
     return () => {
       mounted = false
     }
-  }, [])
+  }, [appAccessReady])
 
   useEffect(() => {
     const clockTimer = window.setInterval(() => setClock(new Date()), 1000)
@@ -2995,6 +3099,7 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!appAccessReady) return
     const refresh = () => {
       if (document.visibilityState === 'visible') void loadJobs()
     }
@@ -3006,21 +3111,22 @@ function App() {
       window.removeEventListener('focus', refresh)
       document.removeEventListener('visibilitychange', refresh)
     }
-  }, [loadJobs])
+  }, [appAccessReady, loadJobs])
 
   useEffect(() => {
+    if (!appAccessReady) return
     const relayTimer = window.setInterval(() => void refreshRelay(), 15000)
     return () => window.clearInterval(relayTimer)
-  }, [refreshRelay])
+  }, [appAccessReady, refreshRelay])
 
   useEffect(() => () => cleanupStream.current?.(), [])
 
   useEffect(() => {
-    if (!relayGuideOpen) return
+    if (!appAccessReady || !relayGuideOpen) return
     void refreshRelay()
     const guideTimer = window.setInterval(() => void refreshRelay(), 3000)
     return () => window.clearInterval(guideTimer)
-  }, [relayGuideOpen, refreshRelay])
+  }, [appAccessReady, relayGuideOpen, refreshRelay])
 
   useEffect(() => {
     const tabs = Array.isArray(relay?.tabs) ? relay.tabs.length : Number(relay?.tabs || 0)
@@ -3032,12 +3138,15 @@ function App() {
   }, [loading, relay])
 
   useEffect(() => {
-    if (aiBootstrapStartedRef.current) return
+    if (!appAccessReady || aiBootstrapStartedRef.current) return
     aiBootstrapStartedRef.current = true
     Promise.all([api.aiProviders(), api.profiles(), api.localModels().catch(() => null)]).then(([options, saved, localStatus]) => {
-      const expandedOptions = localStatus ? options.map((item) => item.id === 'local_qwen'
+      const runtimeExpandedOptions = localStatus ? options.map((item) => item.id === 'local_qwen'
         ? { ...item, models: [...new Set([...item.models, ...localStatus.installedModels.map((model) => model.name)])] }
         : item) : options
+      const expandedOptions = runtimeExpandedOptions.map((item) => item.id === 'relay'
+        ? { ...item, label: '自定义 AI 接口（OpenAI 兼容）' }
+        : item)
       setProviders(expandedOptions)
       setProfiles(saved)
       if (localStatus) {
@@ -3070,7 +3179,7 @@ function App() {
       }
       if (saved[0]) updateRequest('profileId', saved[0].id)
     }).catch((error) => setNotice((error as Error).message))
-  }, [])
+  }, [appAccessReady])
 
   useEffect(() => {
     if (!request.profileId) {
@@ -3480,7 +3589,7 @@ function App() {
     }
     if (payload.analysisMode === 'general' && !payload.checkOnly && !sessionHint) {
       setNotice('内容模式需要先连接 AI 模型，正文、图片和动态栏目才会进入同一次分析。')
-      document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      switchWorkflowScreen('setup')
       return null
     }
     setSubmitting(true)
@@ -3769,7 +3878,7 @@ function App() {
         session = await restoreAiSession()
       } catch (error) {
         setNotice((error as Error).message)
-        document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth' })
+        switchWorkflowScreen('setup')
         return null
       } finally {
         setRestoringAi(false)
@@ -3850,7 +3959,7 @@ function App() {
       const tabCount = Array.isArray(status.tabs) ? status.tabs.length : Number(status.tabs || 0)
       const siteReady = Boolean(status.running && status.cdpReady && tabCount > 0 && Number(status.xiaohongshuTabs || 0) > 0)
       if (!siteReady) {
-        setNotice('刷新后仍未检测到可用的小红书页面，请保留验证完成后的页面并确认 Relay 已连接。')
+        setNotice('刷新后仍未检测到可用的小红书页面，请保留验证完成后的页面并确认采集浏览器已连接。')
         return
       }
 
@@ -4057,7 +4166,7 @@ function App() {
       }))
       setNotice(message)
       if (apiError.code === 'AI_SESSION_EXPIRED') {
-        document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        switchWorkflowScreen('setup')
       }
     } finally {
       setCompletingMissing(false)
@@ -4102,17 +4211,20 @@ function App() {
 
   const openHistoryJob = (job: Job) => {
     const targetMode = jobAnalysisMode(job)
-    if (targetMode !== workspaceMode) {
-      activeJobIdCache.current[targetMode] = job.id
-      switchWorkspace(targetMode)
-      return
-    }
-    void selectJob(job)
+    void draftGuard.requestTransition('切换任务', () => {
+      if (targetMode !== workspaceMode) {
+        activeJobIdCache.current[targetMode] = job.id
+        performSwitchWorkspace(targetMode)
+      } else {
+        performSelectJob(job)
+      }
+      performSwitchWorkflowScreen('workspace')
+    })
   }
 
   const openFeaturedJob = () => {
     if (!featuredJob) {
-      setNotice('竞赛演示任务尚未迁移到当前数据目录。')
+      setNotice('默认展示任务尚未迁移到当前数据目录。')
       return
     }
     openHistoryJob(featuredJob)
@@ -4129,29 +4241,29 @@ function App() {
   const relayAutomaticRecovery = Boolean(relay?.supervisor?.inProgress)
   const relayRecoveryBusy = relayRecovering || relayAutomaticRecovery
   const relayGuideTitle = relaySiteReady
-    ? 'Relay 已连通，目标页已打开'
+    ? '采集浏览器已连接，小红书页面已打开'
     : relayServiceReady
-      ? 'Relay 服务已启动，继续打开目标页'
-      : '从这里完成 Relay 手动连接'
+      ? '采集浏览器已启动，请继续打开小红书'
+      : '从这里完成采集浏览器连接'
   const relayGuideDescription = relaySiteReady
     ? `端口 ${relayConfig.port} 正常，已发现 ${xiaohongshuTabCount} 个小红书标签页。`
     : relayServiceReady
       ? `端口 ${relayConfig.port} 已响应；下一步在托管浏览器中打开小红书并完成登录。`
-      : `已有 Relay 可填写实际端口；首次使用可保留 ${defaultRelayConfig.port} / ${defaultRelayConfig.profile}。`
+      : `如果已有采集浏览器，请填写实际端口；首次使用可保留默认设置 ${defaultRelayConfig.port} / ${defaultRelayConfig.profile}。`
   const relayGuideSteps = [
     {
       label: '连接参数',
-      detail: relayConfigValid ? `${relayConfig.port} · ${relayConfig.profile}` : '检查端口和 Profile',
+      detail: relayConfigValid ? `${relayConfig.port} · ${relayConfig.profile}` : '检查连接端口和登录环境',
       state: relayConfigValid ? 'done' : 'current',
     },
     {
-      label: 'Relay 服务',
-      detail: relayServiceReady ? 'CDP 端口响应正常' : '等待启动或接入',
+      label: '浏览器服务',
+      detail: relayServiceReady ? '连接端口响应正常' : '等待启动或接入',
       state: relayServiceReady ? 'done' : relayConfigValid ? 'current' : 'waiting',
     },
     {
-      label: '浏览器标签页',
-      detail: relayReady ? `已接入 ${tabCount} 个标签页` : '等待浏览器连接',
+      label: '浏览器页面',
+      detail: relayReady ? `已接入 ${tabCount} 个页面` : '等待浏览器连接',
       state: relayReady ? 'done' : relayServiceReady ? 'current' : 'waiting',
     },
     {
@@ -4191,7 +4303,7 @@ function App() {
     || (featuredCollectionComplete
       ? featuredQualityNeedsReview ? '采集完成 · 材料待检查' : '采集完成'
       : null)
-    || (featuredJob ? statusText[featuredJob.status] : '待迁移')
+    || (featuredJob ? jobStatusText(featuredJob.status) : '待迁移')
   const effectiveHistoryPageSize = historyPageSize === 0 ? Math.max(historyJobs.length, 1) : historyPageSize
   const historyPageCount = Math.max(1, Math.ceil(historyJobs.length / effectiveHistoryPageSize))
   const currentHistoryPage = Math.min(historyPage, historyPageCount)
@@ -4219,6 +4331,7 @@ function App() {
   const activeBodyImport = activeJob?.config?.bodyOnly === true
   const activeAnalysisMode = workspaceMode
   const batchSurfaceActive = activeAnalysisMode === 'job' && applicationView === 'batch'
+  const currentWorkflowScreen: WorkflowScreen = batchSurfaceActive ? 'workspace' : workflowScreen
   const audienceModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'audience'
   const expansionModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'expansion'
   const displayJobConnectionState: WorkflowConnectionState = jobConnectionState === 'live'
@@ -4268,6 +4381,17 @@ function App() {
   const securityTimeoutSeconds = Number(activeJob?.securityRestriction?.timeoutSeconds || securityVerification.timeoutSeconds || activeJob?.config?.securityVerificationTimeoutSeconds || 600)
   const securityTimeoutLabel = securityTimeoutSeconds % 60 === 0 ? `${securityTimeoutSeconds / 60} 分钟` : `${securityTimeoutSeconds} 秒`
   const codexRuntime = results?.codexRuntime || (workflowSummary.codexRuntime as Record<string, unknown> | undefined)
+  const aiRunStatus = String(codexRuntime?.status || 'pending')
+  const aiRunStatusText: Record<string, string> = {
+    completed: '已完成',
+    running: '分析中',
+    pending: '等待分析',
+    queued: '等待分析',
+    disabled: '未启用',
+    failed: '需要处理',
+    error: '需要处理',
+    skipped: '本次未运行',
+  }
   const selectedProvider = providers.find((item) => item.id === providerId)
   const selectedLocalModel = localModelStatus?.catalog.find((item) => item.id === localModelChoice)
   const installedLocalModelNames = localModelStatus?.installedModels.map((item) => item.name).filter(Boolean) || []
@@ -4431,7 +4555,10 @@ function App() {
 
   const chooseResult = (next: ApplicationResult) => {
     if (selectedResult?.note_id === next.note_id) return
-    void draftGuard.requestTransition('切换岗位', () => performChooseResult(next))
+    void draftGuard.requestTransition('切换岗位', () => {
+      performChooseResult(next)
+      if (workflowScreenFromLocation() !== 'workspace') performSwitchWorkflowScreen('workspace')
+    })
   }
 
   const updateDraft = (field: keyof OutreachDraft, value: string) => {
@@ -4859,6 +4986,9 @@ function App() {
     provider: aiSession.provider,
     supportsTools: true,
     supportsAttachments: true,
+    wireApi: aiSession.wireApi,
+    supportsReasoningEffort: aiSession.wireApi === 'responses',
+    reasoningEfforts: dataCopilotReasoningEffortsForModel(aiSession.model, aiSession.wireApi),
   }] : [], [aiSession])
   const discoverDataCopilotModels = async (
     input: Pick<DataCopilotModelConnectionInput, 'provider' | 'apiKey' | 'baseUrl'>,
@@ -4873,6 +5003,9 @@ function App() {
       provider: session.provider,
       supportsTools: true,
       supportsAttachments: true,
+      wireApi: session.wireApi,
+      supportsReasoningEffort: session.wireApi === 'responses',
+      reasoningEfforts: dataCopilotReasoningEffortsForModel(session.model, session.wireApi),
     }
   }
   const dataCopilotSources = useMemo<DataCopilotContextSource[]>(() => {
@@ -4937,14 +5070,69 @@ function App() {
     { label: '质量通过', value: coverage?.qualityPassed, icon: ShieldCheck },
   ]
 
+  const setupReadiness = activeAnalysisMode === 'job'
+    ? [relaySiteReady, Boolean(aiSession), smtpConfig.verified]
+    : [relaySiteReady, Boolean(aiSession)]
+  const setupReadyCount = setupReadiness.filter(Boolean).length
+  const setupStepCount = setupReadiness.length
+  const workflowStepCount = activeAnalysisMode === 'job' ? 7 : 6
+  const workflowStepNumber = batchSurfaceActive
+    ? 5
+    : ({ start: 1, setup: 2, task: 3, workspace: 4, history: activeAnalysisMode === 'job' ? 6 : 5, artifacts: activeAnalysisMode === 'job' ? 7 : 6 } as Record<WorkflowScreen, number>)[currentWorkflowScreen]
+  const currentModule = batchSurfaceActive
+    ? {
+        eyebrow: '步骤 05',
+        title: '批量投递',
+        description: activeJob ? `当前任务：${activeJob.keyword || activeJob.id}` : '尚未选择岗位任务',
+        state: smtpConfig.verified ? '发送通道已验证' : '发送通道待验证',
+      }
+    : ({
+        start: {
+          eyebrow: '步骤 01',
+          title: '工作总览',
+          description: activeJob ? `当前任务：${activeJob.keyword || activeJob.id}` : '当前没有选中的任务',
+          state: health?.ok ? '服务正常' : loading ? '正在检查服务' : '服务待检查',
+        },
+        setup: {
+          eyebrow: '步骤 02',
+          title: '运行环境',
+          description: activeAnalysisMode === 'job' ? '采集浏览器、智能分析和发件邮箱' : '采集浏览器与智能分析服务',
+          state: `${setupReadyCount} / ${setupStepCount} 已就绪`,
+        },
+        task: {
+          eyebrow: '步骤 03',
+          title: activeAnalysisMode === 'general' ? '创建研究任务' : '创建采集任务',
+          description: request.keyword.trim() ? `当前关键词：${request.keyword.trim()}` : '尚未填写关键词',
+          state: activeJob ? '已有选中任务' : '等待创建',
+        },
+        workspace: {
+          eyebrow: '步骤 04',
+          title: activeAnalysisMode === 'general' ? '研究结果' : '运行与结果',
+          description: activeJob ? `${activeJob.keyword || activeJob.id} · ${jobStatusText(activeJob.status)}` : '尚未选择任务',
+          state: activeJob ? jobStatusText(activeJob.status) : '无任务',
+        },
+        history: {
+          eyebrow: `步骤 ${String(activeAnalysisMode === 'job' ? 6 : 5).padStart(2, '0')}`,
+          title: '任务历史',
+          description: activeJob ? `当前选中：${activeJob.keyword || activeJob.id}` : '浏览并恢复已保存任务',
+          state: `${workspaceJobs.length} 个任务`,
+        },
+        artifacts: {
+          eyebrow: `步骤 ${String(activeAnalysisMode === 'job' ? 7 : 6).padStart(2, '0')}`,
+          title: '文件交付',
+          description: activeJob ? `当前任务：${activeJob.keyword || activeJob.id}` : '选择任务后查看文件',
+          state: `${currentArtifacts.length} 个当前文件`,
+        },
+      } satisfies Record<WorkflowScreen, { eyebrow: string; title: string; description: string; state: string }>)[currentWorkflowScreen]
+
   if (authLoading) {
     return <main className="auth-shell"><section className="auth-card"><LoaderCircle className="spin" size={24} /><span>正在检查登录状态…</span></section></main>
   }
   if (authSession?.required && !authSession.authenticated) {
     return <main className="auth-shell"><section className="auth-card">
-      <div className="auth-brand"><ShieldCheck size={22} /><span><strong>Relay 招聘情报工作台</strong><small>竞赛演示入口</small></span></div>
+      <div className="auth-brand"><ShieldCheck size={22} /><span><strong>招聘情报工作台</strong><small>在线工作入口</small></span></div>
       <h1>登录后查看历史数据</h1>
-      <p className="auth-description">登录后可查看已保存的 AI 产品经理招聘任务、Relay 抓取结果、分析和导出文件。</p>
+      <p className="auth-description">登录后可查看已保存的招聘任务、浏览器采集结果、智能分析和导出文件。</p>
       <form onSubmit={submitAuth} className="auth-form">
         <label className="field"><span>账号邮箱</span><input type="email" autoComplete="username" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} required /></label>
         <label className="field"><span>密码</span><input type="password" autoComplete="current-password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} required /></label>
@@ -4955,31 +5143,57 @@ function App() {
   }
 
   return (
-    <div className={`app-shell ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
+    <div className={`app-shell ${railCollapsed ? 'rail-collapsed' : ''} ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
       <aside className="side-rail">
-        <div className="brand-mark" aria-label="今天你投了吗？">投</div>
-        <nav aria-label="主导航">
-          <button className={`nav-button ${workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''}`} type="button" title="岗位投递工作台" aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={20} /><span>岗位台</span></button>
-          <button className={`nav-button ${workspaceMode === 'job' && applicationView === 'batch' ? 'active' : ''}`} type="button" title="批量投递工作台" aria-current={workspaceMode === 'job' && applicationView === 'batch' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><Layers3 size={20} /><span>批量投递</span></button>
-          <button className={`nav-button ${workspaceMode === 'general' ? 'active' : ''}`} type="button" title="非岗位信息研究工作台" aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={20} /><span>研究台</span></button>
-          {!batchSurfaceActive && <button className="nav-button" title="任务历史" onClick={() => document.getElementById('history')?.scrollIntoView({ behavior: 'smooth' })}><Clock3 size={20} /><span>历史</span></button>}
-          {!batchSurfaceActive && <button className="nav-button" title="导出文件" onClick={() => document.getElementById('artifacts')?.scrollIntoView({ behavior: 'smooth' })}><Table2 size={20} /><span>产物</span></button>}
+        <div className="rail-brand">
+          <div className="brand-mark" aria-label="今天你投了吗？">投</div>
+          <span><strong>今天你投了吗？</strong><small>{activeAnalysisMode === 'general' ? '内容研究' : '岗位与投递'}</small></span>
+        </div>
+        <div className="rail-progress" aria-label={`当前第 ${workflowStepNumber} 步，共 ${workflowStepCount} 步`}>
+          <span>操作流程</span><strong>{workflowStepNumber} / {workflowStepCount}</strong>
+        </div>
+        <nav className="workflow-nav" aria-label="任务流程">
+          <button aria-label="总览" className={`nav-button ${currentWorkflowScreen === 'start' ? 'active' : ''}`} type="button" title="查看当前任务和整体状态" aria-current={currentWorkflowScreen === 'start' ? 'page' : undefined} onClick={() => switchWorkflowScreen('start')}><span className="nav-step-index">01</span><span className="nav-step-icon"><Activity size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">总览</strong><small>当前任务</small></span><span className="nav-button-state">{health?.ok ? '正常' : '检查'}</span><ChevronRight className="nav-chevron" size={15} /></button>
+          <button aria-label="环境" className={`nav-button ${currentWorkflowScreen === 'setup' ? 'active' : ''}`} type="button" title="配置采集浏览器、智能分析和发件邮箱" aria-current={currentWorkflowScreen === 'setup' ? 'page' : undefined} onClick={() => switchWorkflowScreen('setup')}><span className="nav-step-index">02</span><span className="nav-step-icon"><ShieldCheck size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">环境</strong><small>采集、分析、邮箱</small></span><span className="nav-button-state">{setupReadyCount}/{setupStepCount}</span><ChevronRight className="nav-chevron" size={15} /></button>
+          <button aria-label="新建" className={`nav-button ${currentWorkflowScreen === 'task' ? 'active' : ''}`} type="button" title="新建采集或研究任务" aria-current={currentWorkflowScreen === 'task' ? 'page' : undefined} onClick={() => switchWorkflowScreen('task')}><span className="nav-step-index">03</span><span className="nav-step-icon"><Target size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">新建</strong><small>{activeAnalysisMode === 'general' ? '研究任务' : '采集任务'}</small></span><span className="nav-button-state">{activeJob ? '已有' : '待建'}</span><ChevronRight className="nav-chevron" size={15} /></button>
+          <button aria-label="结果" className={`nav-button ${currentWorkflowScreen === 'workspace' && !batchSurfaceActive ? 'active' : ''}`} type="button" title="查看运行进度和任务结果" aria-current={currentWorkflowScreen === 'workspace' && !batchSurfaceActive ? 'page' : undefined} onClick={() => switchWorkflowScreen('workspace')}><span className="nav-step-index">04</span><span className="nav-step-icon"><Play size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">结果</strong><small>进度与内容</small></span><span className="nav-button-state">{activeJob ? jobStatusText(activeJob.status) : '无任务'}</span><ChevronRight className="nav-chevron" size={15} /></button>
+          {workspaceMode === 'job' && <button aria-label="投递" className={`nav-button ${batchSurfaceActive ? 'active' : ''}`} type="button" title="预检并批量发送投递邮件" aria-current={batchSurfaceActive ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><span className="nav-step-index">05</span><span className="nav-step-icon"><Layers3 size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">投递</strong><small>预检与发送</small></span><span className="nav-button-state">{smtpConfig.verified ? '可发送' : '待验证'}</span><ChevronRight className="nav-chevron" size={15} /></button>}
+          <button aria-label="历史" className={`nav-button ${currentWorkflowScreen === 'history' ? 'active' : ''}`} type="button" title="任务历史" aria-current={currentWorkflowScreen === 'history' ? 'page' : undefined} onClick={() => switchWorkflowScreen('history')}><span className="nav-step-index">{activeAnalysisMode === 'job' ? '06' : '05'}</span><span className="nav-step-icon"><Clock3 size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">历史</strong><small>任务记录</small></span><span className="nav-button-state">{workspaceJobs.length} 项</span><ChevronRight className="nav-chevron" size={15} /></button>
+          <button aria-label="文件" className={`nav-button ${currentWorkflowScreen === 'artifacts' ? 'active' : ''}`} type="button" title="下载结果和交付文件" aria-current={currentWorkflowScreen === 'artifacts' ? 'page' : undefined} onClick={() => switchWorkflowScreen('artifacts')}><span className="nav-step-index">{activeAnalysisMode === 'job' ? '07' : '06'}</span><span className="nav-step-icon"><Table2 size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">文件</strong><small>下载与交付</small></span><span className="nav-button-state">{exportCount} 个</span><ChevronRight className="nav-chevron" size={15} /></button>
         </nav>
-        {workspaceMode === 'job' && !batchSurfaceActive && <button className="nav-button rail-settings" title="发件邮箱设置" onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={20} /><span>设置</span></button>}
+        <button
+          type="button"
+          className="rail-collapse-button"
+          aria-label={railCollapsed ? '展开左侧导航' : '收起左侧导航'}
+          aria-expanded={!railCollapsed}
+          title={railCollapsed ? '展开左侧导航' : '收起左侧导航，为主屏留出更多空间'}
+          onClick={() => setRailCollapsed((current) => {
+            const next = !current
+            try {
+              window.localStorage.setItem('xhs-workflow-rail-collapsed', next ? '1' : '0')
+            } catch {
+              // The layout still works when storage is unavailable.
+            }
+            return next
+          })}
+        >
+          {railCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          <span>{railCollapsed ? '展开导航' : '收起导航'}</span>
+        </button>
       </aside>
 
       <div className="workspace">
         <header className="topbar">
           <div className="topbar-leading">
             <div className="product-title">
-              <span className="eyebrow">{workspaceMode === 'general' ? 'CONTENT INTELLIGENCE' : applicationView === 'batch' ? 'BATCH APPLICATION WORKBENCH' : 'APPLICATION INTELLIGENCE'}</span>
-              <h1>{workspaceMode === 'general' ? '今天你投了吗？｜内容研究工作台' : applicationView === 'batch' ? '今天你投了吗？｜批量投递工作台' : '今天你投了吗？｜岗位与投递'}</h1>
+              <span className="eyebrow">{workspaceMode === 'general' ? '内容研究工作台' : applicationView === 'batch' ? '批量投递工作台' : '岗位信息与投递管理'}</span>
+              <h1><span>今天你投了吗？</span><span className="product-title-context">{workspaceMode === 'general' ? '｜内容研究工作台' : applicationView === 'batch' ? '｜批量投递工作台' : '｜岗位与投递'}</span></h1>
               <span className="version">v3.0</span>
             </div>
             <nav className="workspace-switcher" aria-label="切换工作台">
-              <button type="button" className={workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={15} /><span>岗位投递</span></button>
-              <button type="button" className={workspaceMode === 'job' && applicationView === 'batch' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'batch' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><Layers3 size={15} /><span>批量投递</span></button>
-              <button type="button" className={workspaceMode === 'general' ? 'active' : ''} aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={15} /><span>非岗位研究</span></button>
+              <button type="button" aria-label="岗位投递" className={workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={15} /><span className="workspace-label-long">岗位投递</span><span className="workspace-label-short" aria-hidden="true">岗位</span></button>
+              <button type="button" aria-label="批量投递" className={workspaceMode === 'job' && applicationView === 'batch' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'batch' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><Layers3 size={15} /><span className="workspace-label-long">批量投递</span><span className="workspace-label-short" aria-hidden="true">批量</span></button>
+              <button type="button" aria-label="非岗位研究" className={workspaceMode === 'general' ? 'active' : ''} aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={15} /><span className="workspace-label-long">非岗位研究</span><span className="workspace-label-short" aria-hidden="true">研究</span></button>
             </nav>
           </div>
           <div className="topbar-status">
@@ -4995,9 +5209,9 @@ function App() {
             </button>
             <div className={`relay-indicator ${relayReady ? 'ready' : relayConnecting ? 'connecting' : 'offline'}`}>
               {relayReady ? <Wifi size={17} /> : relayConnecting ? <LoaderCircle className="spin" size={17} /> : <WifiOff size={17} />}
-              <span><strong>{relaySiteReady ? 'Relay 已连接' : relayReady ? 'Relay 已启动，待登录' : relayConnecting ? 'Relay 连接中' : 'Relay 待配置'}</strong><small>CDP {request.relayPort} · {tabCount} 个标签页</small></span>
+              <span><strong>{relaySiteReady ? '采集浏览器已连接' : relayReady ? '采集浏览器已启动，待登录' : relayConnecting ? '正在连接采集浏览器' : '采集浏览器未连接'}</strong><small>连接端口 {request.relayPort} · {tabCount} 个页面</small></span>
             </div>
-            <button className="icon-button" onClick={() => void connectRelay(true)} disabled={relayConnecting} title="通过代码启动 Relay"><RefreshCw className={relayConnecting ? 'spin' : ''} size={17} /></button>
+            <button className="icon-button" onClick={() => void connectRelay(true)} disabled={relayConnecting} title="启动或重新连接采集浏览器" aria-label="启动或重新连接采集浏览器"><RefreshCw className={relayConnecting ? 'spin' : ''} size={17} /></button>
             <time title="北京时间（Asia/Shanghai）">{formatTime(clock.toISOString())}</time>
           </div>
         </header>
@@ -5010,50 +5224,52 @@ function App() {
           </div>
         )}
 
-        <main>
-          <section className={`product-hero ${activeAnalysisMode === 'general' ? 'content-ai-hero' : ''}`} aria-labelledby="product-hero-title">
-            <div className="product-hero-copy">
-              <span className="marketing-kicker">{activeAnalysisMode === 'general' ? 'FROM DISCOVERY TO STRUCTURE' : 'FROM DISCOVERY TO DELIVERY'}</span>
-              <h2 id="product-hero-title">{activeAnalysisMode === 'general' ? '研究经验、人群、趋势、产品或地点，不再被岗位模板限制。' : '别再在碎片信息里找机会，把每次发现都变成更有把握的投递。🚀'}</h2>
-              <p className="product-hero-lede">{activeAnalysisMode === 'general' ? '选择研究场景和目标后，全量保存正文与原图；AI 会结合关键词、OCR 与逐条证据，动态生成本次专属栏目和结构化结论。' : '今天你投了吗？把“发现岗位 🔎、读懂正文 🧠、匹配经历、写好求职信 ✍️、完成投递 📮”放在同一条求职流程里。'}</p>
-              <div className="product-hero-actions">
-                <button type="button" className="primary-button" onClick={() => document.getElementById('task-config')?.scrollIntoView({ behavior: 'smooth' })}><Play size={16} />{activeAnalysisMode === 'general' ? '创建非岗位研究' : '马上开始采集 🚀'}</button>
-              </div>
-              <div className="product-proof-list" aria-label="产品能力">
-                {activeAnalysisMode === 'general' ? <>
-                  <span><BrainCircuit size={14} />AI 动态生成内容栏目</span>
-                  <span><Images size={14} />正文、图片与 OCR 联合理解</span>
-                  <span><ShieldCheck size={14} />结论保留原文证据</span>
-                </> : <>
-                  <span><Check size={14} />🧩 多 Agent 分工推进</span>
-                  <span><Check size={14} />🛡️ 保留正文与失败原因</span>
-                  <span><Check size={14} />📦 JSON / CSV / XLSX / MD 导出</span>
-                </>}
-              </div>
+        <main className={`workflow-main screen-${currentWorkflowScreen}`}>
+          <header className="workflow-module-bar">
+            <div className="workflow-module-copy">
+              <span>{currentModule.eyebrow} / 共 {String(workflowStepCount).padStart(2, '0')} 步</span>
+              <h2>{currentModule.title}</h2>
+              <p>{currentModule.description}</p>
             </div>
-            {activeAnalysisMode === 'general' && (
-              <aside className={`content-ai-runtime ${aiSession ? 'ready' : ''}`} aria-label="内容 AI 运行状态">
-                <div className="content-ai-runtime-heading">
-                  <span className="content-ai-runtime-icon"><BrainCircuit size={20} /></span>
-                  <span><small>CONTENT AI RUNTIME</small><strong>{aiSession ? `${selectedProvider?.label || providerId} 已接入` : 'AI 等待连接'}</strong></span>
-                  <b>{aiSession ? '已就绪' : '未连接'}</b>
-                </div>
-                <dl>
-                  <div><dt>当前模型</dt><dd>{aiSession?.model || '尚未选择'}</dd></div>
-                  <div><dt>分析输入</dt><dd>搜索关键词 · 正文 · 图片文字</dd></div>
-                  <div><dt>生成结果</dt><dd>摘要 · 实体 · 洞察 · 动态栏目</dd></div>
-                </dl>
-                <button type="button" onClick={() => document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>
-                  {aiSession ? <Settings2 size={15} /> : <KeyRound size={15} />}{aiSession ? '查看 AI 配置' : '连接 AI 模型'}
-                </button>
-              </aside>
-            )}
+            <div className="workflow-module-actions">
+              <span className="workflow-module-state"><small>当前状态</small><strong>{currentModule.state}</strong></span>
+              {batchSurfaceActive ? (
+                <button type="button" className="secondary-button" onClick={() => switchApplicationView('jobs')}><ChevronLeft size={16} />返回运行结果</button>
+              ) : currentWorkflowScreen === 'start' ? (
+                <button type="button" className="primary-button" onClick={() => switchWorkflowScreen(activeJob ? 'workspace' : 'task')}>{activeJob ? <Eye size={16} /> : <Target size={16} />}{activeJob ? '查看当前任务' : '创建任务'}</button>
+              ) : currentWorkflowScreen === 'setup' ? (
+                <button type="button" className="primary-button" onClick={() => switchWorkflowScreen('task')}><ChevronRight size={16} />进入创建任务</button>
+              ) : currentWorkflowScreen === 'workspace' ? (
+                activeAnalysisMode === 'job'
+                  ? <button type="button" className="primary-button" onClick={() => switchApplicationView('batch')}><Layers3 size={16} />进入批量投递</button>
+                  : <button type="button" className="secondary-button" onClick={() => switchWorkflowScreen('history')}><Clock3 size={16} />查看任务历史</button>
+              ) : currentWorkflowScreen === 'history' ? (
+                <button type="button" className="primary-button" onClick={() => switchWorkflowScreen('artifacts')}><Table2 size={16} />查看文件</button>
+              ) : currentWorkflowScreen === 'artifacts' ? (
+                <button type="button" className="secondary-button" onClick={() => switchWorkflowScreen('task')}><Target size={16} />创建新任务</button>
+              ) : null}
+            </div>
+          </header>
+
+          <section className="current-task-band workflow-screen workflow-screen-start" aria-label="当前任务摘要">
+            <span className={`current-task-icon ${activeJob ? 'active' : ''}`}>{activeJob ? <Activity size={20} /> : <Target size={20} />}</span>
+            <div className="current-task-copy">
+              <span>当前任务</span>
+              <h2>{activeJob ? activeJob.keyword || activeJob.id : '暂无选中的任务'}</h2>
+              <p>{activeJob ? readableJobView?.headline || jobStatusText(activeJob.status) : '创建任务后，运行状态和结果会在这里持续更新。'}</p>
+            </div>
+            <dl className="current-task-facts">
+              <div><dt>任务状态</dt><dd>{activeJob ? jobStatusText(activeJob.status) : '未开始'}</dd></div>
+              <div><dt>已发现</dt><dd>{activeJob ? discoveredCount : 0}</dd></div>
+              <div><dt>已保存</dt><dd>{activeJob ? readableSavedCount : 0}</dd></div>
+              <div><dt>当前文件</dt><dd>{activeJob ? currentArtifacts.length : 0}</dd></div>
+            </dl>
           </section>
 
-          <section className="overview-band" id="product-overview" aria-label="运行概览">
+          <section className="overview-band workflow-screen workflow-screen-start" id="product-overview" aria-label="运行概览">
             <div className="overview-copy">
-              <p>多 Agent 工作流</p>
-              <strong>{runningCount ? `${runningCount} 个任务正在推进` : '工作台已待命'}</strong>
+              <p>任务概况</p>
+              <strong>{runningCount ? `${runningCount} 个任务运行中` : '当前没有运行中的任务'}</strong>
             </div>
             <div className="metric"><span>成功任务</span><strong>{completedCount}</strong><small>当前历史</small></div>
             <div className="metric"><span>未完成任务</span><strong className={incompleteCount ? 'warning-text' : ''}>{incompleteCount}</strong><small>中断或主动取消</small></div>
@@ -5061,55 +5277,55 @@ function App() {
             <div className="metric"><span>导出文件</span><strong>{exportCount}</strong><small>JSON / CSV / XLSX / MD</small></div>
             <div className="health-stamp">
               <Activity size={18} />
-              <span><strong>{health?.ok ? '本地服务正常' : loading ? '正在检查服务' : '服务未响应'}</strong><small>{health?.runnerAvailable === false ? 'Runner 路径待配置' : 'Runner 已纳入受控执行'}</small></span>
+              <span><strong>{health?.ok ? '应用服务正常' : loading ? '正在检查服务' : '服务未响应'}</strong><small>{health?.runnerAvailable === false ? '任务执行程序尚未配置' : '任务执行程序运行正常'}</small></span>
             </div>
           </section>
 
-          <section className="panel relay-config-panel" id="relay-config" aria-label="Relay 配置">
+          <section className="panel relay-config-panel workflow-screen workflow-screen-setup" id="relay-config" aria-label="采集浏览器连接">
             <div className="panel-heading compact">
-              <div><span className="step-label">RELAY CONFIGURATION</span><h2>Relay 配置</h2></div>
+              <div><span className="step-label">采集浏览器连接</span><h2>采集浏览器</h2></div>
               <div className="relay-heading-actions">
                 <span className={`runtime-badge ${relaySiteReady ? 'passed' : ''}`}>{relaySiteReady ? '目标页已打开' : relayServiceReady ? '服务已启动' : '待连接'}</span>
                 <button type="button" className="relay-guide-toggle" aria-expanded={relayGuideOpen} aria-controls="relay-manual-guide" onClick={() => setRelayGuideOpen((open) => !open)}>
-                  <BookOpenCheck size={15} />{relayGuideOpen ? '收起向导' : '手动连接向导'}<ChevronDown className={relayGuideOpen ? 'expanded' : ''} size={14} />
+                  <BookOpenCheck size={15} />{relayGuideOpen ? '收起连接步骤' : '查看连接步骤'}<ChevronDown className={relayGuideOpen ? 'expanded' : ''} size={14} />
                 </button>
               </div>
             </div>
             <div className="relay-config-body">
               <div className={`relay-guide-summary ${relayPressureHigh ? 'pressure' : relaySiteReady ? 'ready' : relayServiceReady ? 'active' : ''}`}>
                 <span className="relay-guide-icon">{relayRecoveryBusy ? <LoaderCircle className="spin" size={18} /> : relayPressureHigh ? <ShieldAlert size={18} /> : relaySiteReady ? <Check size={18} /> : relayConnecting || relaySettingUp || relayLoginOpening ? <LoaderCircle className="spin" size={18} /> : <Wifi size={18} />}</span>
-                <span><small>MANUAL CONNECTION</small><strong>{relayGuideTitle}</strong><p>{relayGuideDescription}</p></span>
+                <span><small>连接状态</small><strong>{relayGuideTitle}</strong><p>{relayGuideDescription}</p></span>
                 <b>{relaySiteReady ? '4 / 4' : relayReady ? '3 / 4' : relayServiceReady ? '2 / 4' : relayConfigValid ? '1 / 4' : '0 / 4'}</b>
               </div>
               <div className="form-row relay-config-fields">
-                <label className="field"><span>Relay 端口</span><input type="number" min="1024" max="65535" value={relayConfig.port} onChange={(event) => updateRelayConfig('port', Number(event.target.value))} /></label>
-                <label className="field"><span>浏览器 Profile</span><input value={relayConfig.profile} onChange={(event) => updateRelayConfig('profile', event.target.value)} placeholder="chrome" /></label>
-                <Toggle checked={relayConfig.autoConnect} onChange={(value) => updateRelayConfig('autoConnect', value)} label="开机自动连接" description="启动脚本读取此配置并通过代码连接" />
+                <label className="field"><span>连接端口</span><input type="number" min="1024" max="65535" value={relayConfig.port} onChange={(event) => updateRelayConfig('port', Number(event.target.value))} /></label>
+                <label className="field"><span>浏览器登录环境</span><input value={relayConfig.profile} onChange={(event) => updateRelayConfig('profile', event.target.value)} placeholder="chrome" /></label>
+                <Toggle checked={relayConfig.autoConnect} onChange={(value) => updateRelayConfig('autoConnect', value)} label="开机自动连接" description="打开软件时自动连接采集浏览器" />
               </div>
               <div className={`relay-recovery-strip ${relayPressureHigh ? 'warning' : relayRecovery?.ok ? 'success' : ''}`} aria-live="polite">
                 <span className="relay-recovery-copy">
                   {relayPressureHigh ? <ShieldAlert size={18} /> : <ShieldCheck size={18} />}
                   <span>
-                    <strong>{relayAutomaticRecovery ? 'Relay 正在自动恢复' : relayPressureHigh ? '检测到 Relay 目标过载' : relayRecovery?.ok ? 'Relay 已修复并通过真实连接验证' : 'Relay 连接保护已启用'}</strong>
+                    <strong>{relayAutomaticRecovery ? '正在自动恢复浏览器连接' : relayPressureHigh ? '打开的页面过多' : relayRecovery?.ok ? '浏览器连接已修复并通过检查' : '浏览器连接自动修复已启用'}</strong>
                     <small>{relayAutomaticRecovery
                       ? '后端已检测到连续断线或目标页缺失，正在重建浏览器并执行 Playwright 验证。'
                       : relayPressureHigh
                       ? '页面或后台目标过多会让 Playwright 初始化超时；可直接收敛旧页面并保留登录态。'
-                      : '后端持续巡检并在连续异常后自动恢复；不会清除 Cookie 或浏览器 Profile。'}</small>
+                      : '系统会持续检查浏览器连接；异常时自动重连，并保留当前登录状态。'}</small>
                   </span>
                 </span>
-                <dl aria-label="Relay 目标诊断">
+                <dl aria-label="浏览器连接情况">
                   <div><dt>全部目标</dt><dd>{tabCount}</dd></div>
                   <div><dt>页面</dt><dd>{Number(relay?.pageCount || 0)}</dd></div>
                   <div><dt>后台</dt><dd>{Number(relay?.workerCount || 0) + Number(relay?.iframeCount || 0)}</dd></div>
                 </dl>
                 <button type="button" className={relayPressureHigh ? 'primary-button' : 'secondary-button'} disabled={relayRecoveryBusy || relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void repairRelay()}>
                   {relayRecoveryBusy ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}
-                  {relayRecoveryBusy ? '正在重建并验证' : '一键修复 Relay'}
+                  {relayRecoveryBusy ? '正在修复并检查' : '一键修复浏览器连接'}
                 </button>
               </div>
               {relayGuideOpen && <div className="relay-manual-guide" id="relay-manual-guide">
-                <ol className="relay-guide-steps" aria-label="Relay 手动连接进度">
+                <ol className="relay-guide-steps" aria-label="采集浏览器连接进度">
                   {relayGuideSteps.map((step, index) => <li className={step.state} key={step.label}>
                     <i>{step.state === 'done' ? <Check size={14} /> : index + 1}</i>
                     <span><strong>{step.label}</strong><small>{step.detail}</small></span>
@@ -5118,31 +5334,31 @@ function App() {
                 <div className="relay-guide-actionbar">
                   <span className="relay-guide-diagnostic">
                     <Wifi size={17} />
-                    <span><strong>{relaySiteReady ? '连接链路正常' : relayServiceReady ? 'Relay 已响应，等待目标页' : `端口 ${relayConfig.port} 暂未连通`}</strong><small>{relay?.checkedAt ? `最近检测 ${formatTime(relay.checkedAt)}` : '正在等待首次检测'}{relay?.message && !relayServiceReady ? ` · ${relay.message}` : ''}</small></span>
+                    <span><strong>{relaySiteReady ? '浏览器连接正常' : relayServiceReady ? '浏览器已响应，等待小红书页面' : `端口 ${relayConfig.port} 暂未连通`}</strong><small>{relay?.checkedAt ? `最近检测 ${formatTime(relay.checkedAt)}` : '正在等待首次检测'}{relay?.message && !relayServiceReady ? ` · ${relay.message}` : ''}</small></span>
                   </span>
                   <div className="relay-guide-actions">
                     <button type="button" className="secondary-button" disabled={relayConnecting || relaySettingUp || relayRecovering || relayLoginOpening || !relayConfigValid} onClick={() => void connectRelay(true, relayConfig)}>{relayConnecting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}检测连接</button>
-                    {!relayServiceReady && <button type="button" className="primary-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并启动 Relay</button>}
+                    {!relayServiceReady && <button type="button" className="primary-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并启动采集浏览器</button>}
                     {relayServiceReady && <button type="button" className="primary-button" disabled={relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void openRelayLogin()}>{relayLoginOpening ? <LoaderCircle className="spin" size={16} /> : <ExternalLink size={16} />}{relaySiteReady ? '再开一个目标页' : '打开小红书登录页'}</button>}
                     <button type="button" className="secondary-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening || !relayConfigValid} onClick={() => void setupAndConnectRelay()}>{relaySettingUp ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{relaySettingUp ? '正在准备环境' : '自动准备本机环境'}</button>
                   </div>
                 </div>
-                <p className="relay-login-note"><CircleAlert size={14} />Relay 只能确认目标页面已经打开；账号是否登录，请以托管浏览器中的页面为准。登录完成后本页会自动检测连接，无需刷新。</p>
+                <p className="relay-login-note"><CircleAlert size={14} />系统只能确认小红书页面已经打开；账号是否登录，请以采集浏览器中的页面为准。登录完成后本页会自动检查连接，无需刷新。</p>
               </div>}
               {!relayGuideOpen && <div className="relay-config-footer">
                 <span className="field-help">端口和 Profile 会同时用于状态探测、连接按钮和新任务。</span>
                 <div className="relay-config-actions">
                   <button type="button" className="secondary-button" disabled={relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void openRelayLogin()}>{relayLoginOpening ? <LoaderCircle className="spin" size={16} /> : <ExternalLink size={16} />}打开登录页</button>
                   <button type="button" className="secondary-button setup-action" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void saveRelayConfig()}>{relayConfigSaving ? <LoaderCircle className="spin" size={16} /> : <Save size={16} />}保存并连接</button>
-                  <button type="button" className="primary-button relay-install-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void setupAndConnectRelay()}>{relaySettingUp ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{relaySettingUp ? '正在安装并接入' : '一键安装并接入'}</button>
+                  <button type="button" className="primary-button relay-install-button" disabled={relayConfigSaving || relayConnecting || relaySettingUp || relayLoginOpening} onClick={() => void setupAndConnectRelay()}>{relaySettingUp ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}{relaySettingUp ? '正在安装并连接' : '自动安装并连接'}</button>
                 </div>
               </div>}
             </div>
           </section>
 
-          {workspaceMode === 'job' && <section className="panel email-config-panel" id="email-config" aria-label="发件邮箱配置">
+          {workspaceMode === 'job' && <section className="panel email-config-panel workflow-screen workflow-screen-setup" id="email-config" aria-label="发件邮箱配置">
             <div className="panel-heading compact">
-              <div><span className="step-label">DELIVERY EMAIL</span><h2>发件邮箱</h2></div>
+              <div><span className="step-label">发件邮箱设置</span><h2>发件邮箱</h2></div>
               <span className={`runtime-badge ${smtpConfig.verified ? 'passed' : ''}`}>{smtpConfig.verified ? '连接已验证' : smtpConfig.configured ? '配置已保存' : '等待配置'}</span>
             </div>
             <div className="email-config-body">
@@ -5213,19 +5429,19 @@ function App() {
             </div>
           </section>}
 
-          <section id="ai-memory" className="panel ai-setup-panel" aria-label={request.analysisMode === 'general' ? 'AI 与内容分析' : 'AI 与背景记忆'}>
+          <section id="ai-memory" className="panel ai-setup-panel workflow-screen workflow-screen-setup" aria-label={request.analysisMode === 'general' ? 'AI 与内容分析' : 'AI 与背景记忆'}>
             <div className="panel-heading compact">
-              <div><span className="step-label">{request.analysisMode === 'general' ? 'AI & CONTENT' : 'AI & MEMORY'}</span><h2>{request.analysisMode === 'general' ? '模型连接与内容分析' : '模型连接与个人背景记忆'}</h2></div>
+              <div><span className="step-label">{request.analysisMode === 'general' ? '智能内容分析' : '智能分析与个人资料'}</span><h2>{request.analysisMode === 'general' ? '模型连接与内容分析' : '模型连接与个人背景记忆'}</h2></div>
               <span className={`runtime-badge ${aiSession && (request.analysisMode === 'general' || activeProfile) ? 'passed' : ''}`}>{aiSession && (request.analysisMode === 'general' || activeProfile) ? '执行条件已就绪' : '等待配置'}</span>
             </div>
             <div className={`ai-setup-grid ${request.analysisMode === 'general' ? 'general-mode' : ''}`}>
               <section>
-                <div className="setup-title"><KeyRound size={17} /><span><strong>AI Runtime</strong><small>{aiSession ? `${selectedProvider?.label || providerId} · 会话内存` : '选择提供方并连接'}</small></span></div>
+                <div className="setup-title"><KeyRound size={17} /><span><strong>智能分析服务</strong><small>{aiSession ? `${selectedProvider?.label || providerId} · 当前会话已连接` : '选择 AI 服务并连接'}</small></span></div>
                 <div className={`local-model-offer ${selectedProvider?.local ? 'active' : ''}`}>
                   <div className="local-model-copy">
                     <Cpu size={18} />
                     <span><strong>本地免费模型库</strong><small>{localModelStatus?.runtime.ready ? `${localModelStatus.catalog.length} 款可选 · 运行器${localModelStatus.runtime.version ? ` v${localModelStatus.runtime.version}` : ''} · 文本不离开电脑` : '覆盖中文、双语与推理模型，安装后不产生 API 费用'}</small></span>
-                    <span className={`local-runtime-state ${localModelStatus?.runtime.ready ? 'ready' : ''}`}>{localModelStatus?.runtime.ready ? '运行器在线' : '等待运行器'}</span>
+                    <span className={`local-runtime-state ${localModelStatus?.runtime.ready ? 'ready' : ''}`}>{localModelStatus?.runtime.ready ? '本地模型服务可用' : '等待本地模型服务'}</span>
                   </div>
                   <div className="local-model-actions">
                     <label><span className="sr-only">本地模型版本</span><select value={localModelChoice} disabled={localInstallActive} onChange={(event) => setLocalModelChoice(event.target.value)}>{localModelGroups.map((group) => <optgroup key={group.family} label={`${group.family} · ${group.models.length} 款`}>{group.models.map((item) => <option key={item.id} value={item.id}>{item.label} · {item.tier}{item.recommended ? ' · 推荐' : ''}{item.installed ? ' · 已安装' : ''} · 约 {formatBytes(item.downloadBytes)}</option>)}</optgroup>)}</select></label>
@@ -5237,25 +5453,25 @@ function App() {
                   {selectedLocalModel && !localInstallActive && <div className="local-model-detail"><p className="local-model-description">{selectedLocalModel.description}{selectedLocalModel.installed ? ' · 已安装' : ''}</p><div className="local-model-meta"><span>{selectedLocalModel.family}</span><span>{selectedLocalModel.tier}</span>{selectedLocalModel.downloadBytes > 0 && <span>约 {formatBytes(selectedLocalModel.downloadBytes)}</span>}</div></div>}
                   {localModelStatus?.install && localInstallActive && <div className="local-install-progress" role="status" aria-live="polite"><div><span>{localModelStatus.install.message}</span><strong>{localModelStatus.install.progress}%</strong></div><progress max="100" value={localModelStatus.install.progress} /></div>}
                 </div>
-                {selectedProvider?.relay && <div className={`ai-relay-status ${aiConnectionCheck?.status || 'idle'}`}>
-                  <div className="ai-relay-status-heading"><Shuffle size={17} /><span><strong>OpenAI 兼容中转</strong><small>自动校正接口路径并读取账号可用模型</small></span><b>{aiConnectionCheck?.status === 'checking' ? '检测中' : aiConnectionCheck?.status === 'verified' ? '连接可用' : aiConnectionCheck?.status === 'error' ? '需要修正' : '待检测'}</b></div>
-                  <div className="ai-relay-progress" aria-label="中转配置进度"><span className={aiBaseUrl.trim() ? 'done' : ''}>01 地址</span><span className={apiKey || selectedProvider.hasApiKey ? 'done' : ''}>02 密钥</span><span className={aiConnectionCheck?.status === 'verified' ? 'done' : ''}>03 模型</span></div>
+                {selectedProvider && <div className={`ai-relay-status ${aiConnectionCheck?.status || 'idle'}`}>
+                  <div className="ai-relay-status-heading">{selectedProvider.local ? <BrainCircuit size={17} /> : <Shuffle size={17} />}<span><strong>{selectedProvider.local ? '本机 AI 服务' : selectedProvider.relay ? '自定义 AI 接口' : 'AI 分析服务'}</strong><small>连接时会实际生成一小段内容，确认模型能够正常回答</small></span><b>{aiConnectionCheck?.status === 'checking' ? '正在测试' : aiConnectionCheck?.status === 'verified' ? '可以使用' : aiConnectionCheck?.status === 'error' ? '需要修正' : '等待测试'}</b></div>
+                  <div className="ai-relay-progress" aria-label="AI 配置进度"><span className={aiBaseUrl.trim() ? 'done' : ''}>01 服务地址</span><span className={!selectedProvider.requiresKey || apiKey || selectedProvider.hasApiKey ? 'done' : ''}>02 访问密钥</span><span className={aiConnectionCheck?.status === 'verified' ? 'done' : ''}>03 可用性测试</span></div>
                 </div>}
                 {selectedProvider?.relay ? <>
                   <div className="form-row ai-relay-address-row">
-                    <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-                    <label className="field relay-base-url-field"><span>API Base URL</span><div className="relay-url-control"><input value={aiBaseUrl} onChange={(event) => updateAiBaseUrl(event.target.value)} placeholder="https://gateway.example/v1" inputMode="url" spellCheck={false} /><button type="button" className="secondary-button relay-model-test" disabled={refreshingModels || !aiBaseUrl.trim() || (!apiKey && !selectedProvider.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}检测模型</button></div><small className={`relay-check-message ${aiConnectionCheck?.status || 'idle'}`} aria-live="polite">{aiConnectionCheck?.message || '支持粘贴 API 根地址或完整的 /chat/completions 接口地址'}</small></label>
+                    <label className="field"><span>AI 服务</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+                    <label className="field relay-base-url-field"><span>服务地址</span><div className="relay-url-control"><input value={aiBaseUrl} onChange={(event) => updateAiBaseUrl(event.target.value)} placeholder="https://gateway.example/v1" inputMode="url" spellCheck={false} /><button type="button" className="secondary-button relay-model-test" disabled={refreshingModels || !aiBaseUrl.trim() || (!apiKey && !selectedProvider.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={15} /> : <Wifi size={15} />}读取可用模型</button></div><small className={`relay-check-message ${aiConnectionCheck?.status || 'idle'}`} aria-live="polite">{aiConnectionCheck?.message || '可以粘贴服务根地址，也可以粘贴完整的接口地址'}</small></label>
                   </div>
                   <div className="form-row ai-provider-row ai-relay-credentials-row">
-                    <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { invalidateAiSession(); setApiKey(event.target.value); setAiConnectionCheck(null) }} placeholder={selectedProvider.hasApiKey ? '已保存，留空即可复用' : '粘贴中转服务 API Key'} /></label>
+                    <label className="field"><span>访问密钥</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { invalidateAiSession(); setApiKey(event.target.value); setAiConnectionCheck(null) }} placeholder={selectedProvider.hasApiKey ? '已保存，留空即可复用' : '粘贴服务访问密钥'} /></label>
                     <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => { invalidateAiSession(); setAiWireApi(event.target.value as 'responses' | 'chat_completions') }}><option value="chat_completions">Chat Completions</option><option value="responses">Responses API</option></select></label>
                     <div className="field model-field"><span id="relay-ai-model-label">模型</span><div className="model-picker single"><select aria-labelledby="relay-ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>检测后选择模型</option>{(selectedProvider.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select></div><small>{selectedProvider.models.length || 0} 个可选模型</small></div>
                   </div>
                 </> : <>
                   <div className="form-row ai-provider-row">
-                    <label className="field"><span>提供方</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+                    <label className="field"><span>AI 服务</span><select value={providerId} onChange={(event) => selectProvider(event.target.value as AiProviderOption['id'])}>{providers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
                     {selectedProvider?.requiresKey
-                      ? <label className="field"><span>API Key</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { invalidateAiSession(); setApiKey(event.target.value) }} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务 API Key'} /></label>
+                      ? <label className="field"><span>访问密钥</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { invalidateAiSession(); setApiKey(event.target.value) }} placeholder={selectedProvider?.hasApiKey ? '已保存，留空即可复用' : '粘贴模型服务访问密钥'} /></label>
                       : <div className="field local-access-field"><span>运行方式</span><strong><Cpu size={14} />本机免密 · 零 API 费用</strong></div>}
                     <div className="field model-field"><span id="ai-model-label">模型</span><div className="model-picker"><select aria-labelledby="ai-model-label" value={selectedModelValue} onChange={(event) => selectAiModel(event.target.value)}><option value="" disabled>选择模型</option>{(selectedProvider?.models || []).map((model) => <option key={model} value={model}>{model}</option>)}<option value={CUSTOM_MODEL_OPTION}>自定义模型 ID…</option></select><button type="button" className="model-refresh-button" title={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} aria-label={selectedProvider?.local ? '读取本机已安装模型' : '读取当前账号可用模型'} disabled={refreshingModels || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void refreshAiModels()}>{refreshingModels ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}</button></div><small>{selectedProvider?.models.length || 0} 个可选模型</small></div>
                   </div>
@@ -5264,9 +5480,9 @@ function App() {
                     <label className="field"><span>协议</span><select value={aiWireApi} onChange={(event) => { invalidateAiSession(); setAiWireApi(event.target.value as 'responses' | 'chat_completions') }}><option value="responses">Responses API</option><option value="chat_completions">Chat Completions</option></select></label>
                   </div>
                 </>}
-                {customModelMode && <label className="field custom-model-field"><span>自定义模型 ID</span><input value={aiModel} onChange={(event) => { invalidateAiSession(); setAiModel(event.target.value) }} placeholder="例如 provider/model-name" /></label>}
+                {customModelMode && <label className="field custom-model-field"><span>自定义模型名称或 ID</span><input value={aiModel} onChange={(event) => { invalidateAiSession(); setAiModel(event.target.value) }} placeholder="例如 provider/model-name" /></label>}
                 <small className="form-hint">{selectedProvider?.local ? request.analysisMode === 'general' ? '用于正文归纳、图片文字理解和动态栏目生成；速度取决于本机硬件。' : '适合职位信息提炼、简历事实整理和初稿生成；速度取决于本机硬件。' : selectedProvider?.relay ? '密钥仅保存在当前设备；连接时会再次验证地址和模型，不写入任务历史或 GitHub。' : providerId === 'codex' ? '内置 Codex Runtime，用户电脑无需安装 Codex CLI；填写模型服务 Base URL 后直接调用。' : '配置保存在本机，API Key 不进入任务历史或 GitHub。'}</small>
-                <button type="button" className="secondary-button setup-action" disabled={configuringAi || (!selectedProvider?.relay && !aiModel.trim()) || (selectedProvider?.relay && customModelMode && !aiModel.trim()) || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : selectedProvider?.relay ? <Wifi size={16} /> : <BrainCircuit size={16} />}{selectedProvider?.relay ? (aiSession ? '重新验证并连接' : '验证并连接') : aiSession ? '重新连接' : '连接 AI'}</button>
+                <button type="button" className="secondary-button setup-action" disabled={configuringAi || (!selectedProvider?.relay && !aiModel.trim()) || (selectedProvider?.relay && customModelMode && !aiModel.trim()) || !aiBaseUrl.trim() || (selectedProvider?.requiresKey && !apiKey && !selectedProvider?.hasApiKey)} onClick={() => void configureAi()}>{configuringAi ? <LoaderCircle className="spin" size={16} /> : selectedProvider?.relay ? <Wifi size={16} /> : <BrainCircuit size={16} />}{aiSession ? '重新测试 AI 连接' : '验证推理并连接'}</button>
               </section>
               {request.analysisMode === 'job' && <section>
                 <div className="setup-title"><Upload size={17} /><span><strong>背景资料</strong><small>{activeProfile ? `${activeProfile.display_name || '个人档案'} · ${activeProfile.sourceFiles?.length || 0} 个来源` : 'PDF / DOCX / TXT / MD / JSON / CSV / RTF'}</small></span></div>
@@ -5286,7 +5502,7 @@ function App() {
                 </div>
                 {activeProfile && <div className="memory-preview">
                   <div className="memory-preview-meta"><span>{activeProfile.analysis_runtime ? `${activeProfile.analysis_runtime.provider} / ${activeProfile.analysis_runtime.model}` : '旧版档案'}</span><b>{activeProfile.evidence_items?.length || 0} 条可核验证据</b></div>
-                  {activeProfile.analysis_runtime?.base_url && <small className="memory-preview-endpoint">解析端点：{activeProfile.analysis_runtime.base_url}</small>}
+                  {activeProfile.analysis_runtime?.base_url && <small className="memory-preview-endpoint">使用的服务地址：{activeProfile.analysis_runtime.base_url}</small>}
                   <strong>{activeProfile.first_person_profile?.narrative || activeProfile.summary}</strong>
                   {!!activeProfile.first_person_profile?.core_strengths?.length && <ul>{activeProfile.first_person_profile.core_strengths.slice(0, 3).map((item) => <li key={item}>{item}</li>)}</ul>}
                   {!!activeProfile.writing_constraints?.missing_information?.length && <p>待补充：{activeProfile.writing_constraints.missing_information.join('、')}</p>}
@@ -5311,10 +5527,10 @@ function App() {
             </section>}
           </section>
 
-          <div className="primary-grid">
+          <div className="primary-grid workflow-screen workflow-screen-task">
             <section className="panel config-panel" id="task-config">
               <div className="panel-heading">
-                <div><span className="step-label">01 / CONFIGURE</span><h2>{collectionEntryMode === 'import' ? '批量采集指定正文' : request.analysisMode === 'general' ? '新建非岗位信息研究任务' : '新建采集与投递分析任务'}</h2></div>
+                <div><span className="step-label">步骤 1 / 设置采集任务</span><h2>{collectionEntryMode === 'import' ? '批量采集指定正文' : request.analysisMode === 'general' ? '新建非岗位信息研究任务' : '新建采集与投递分析任务'}</h2></div>
                 <span className="local-badge">本地执行</span>
               </div>
               <div className="collection-entry-switch" role="tablist" aria-label="采集入口">
@@ -5325,7 +5541,7 @@ function App() {
               <form onSubmit={submit} hidden={collectionEntryMode !== 'search'}>
                 <div className={`workspace-mode-summary ${workspaceMode === 'general' ? 'content' : 'job'}`}>
                   <span className="workspace-mode-icon">{workspaceMode === 'general' ? <BookOpenCheck size={19} /> : <Target size={19} />}</span>
-                  <span><small>{workspaceMode === 'general' ? 'NON-JOB RESEARCH INTERFACE' : 'JOB APPLICATION INTERFACE'}</small><strong>{workspaceMode === 'general' ? '非岗位信息采集与 AI 研究' : '岗位采集与投递'}</strong><p>{workspaceMode === 'general' ? '可选择经验、人群、趋势、产品、地点或自定义目标；AI 按内容证据动态生成结构，而不是套岗位模板。' : '采集岗位正文与图片，整理岗位卡、投递方式和通过质量门禁的可编辑投递文案。'}</p></span>
+                  <span><small>{workspaceMode === 'general' ? '内容研究任务' : '岗位采集和投递准备'}</small><strong>{workspaceMode === 'general' ? '非岗位信息采集与 AI 研究' : '岗位采集与投递'}</strong><p>{workspaceMode === 'general' ? '可选择经验、人群、趋势、产品、地点或自定义目标；AI 按内容证据动态生成结构，而不是套岗位模板。' : '采集岗位正文与图片，整理岗位卡、投递方式和通过质量门禁的可编辑投递文案。'}</p></span>
                 </div>
                 {workspaceMode === 'general' ? <section className="content-research-builder" aria-labelledby="content-research-type-label">
                   <div className="content-research-builder-heading"><span><BrainCircuit size={17} /><strong id="content-research-type-label">选择信息类型</strong></span><small>场景约束分析方向，AI 仍会根据每条正文和图片动态生成栏目</small></div>
@@ -5352,8 +5568,8 @@ function App() {
                 </div>
 
                 <div className="form-row connection">
-                  <label className="field"><span>浏览器 Profile</span><select value={request.browserProfile} onChange={(event) => updateRequest('browserProfile', event.target.value)}><option value="openclaw">openclaw（独立）</option><option value="chrome">chrome（当前浏览器）</option></select></label>
-                  <label className="field"><span>Relay 端口</span><input type="number" min="1024" max="65535" value={request.relayPort} onChange={(event) => updateRequest('relayPort', Number(event.target.value))} /></label>
+                  <label className="field"><span>浏览器登录环境</span><select value={request.browserProfile} onChange={(event) => updateRequest('browserProfile', event.target.value)}><option value="openclaw">独立登录环境</option><option value="chrome">当前浏览器登录环境</option></select></label>
+                  <label className="field"><span>连接端口</span><input type="number" min="1024" max="65535" value={request.relayPort} onChange={(event) => updateRequest('relayPort', Number(event.target.value))} /></label>
                 </div>
 
                 <div className="field sort-policy-field">
@@ -5414,7 +5630,7 @@ function App() {
                 <div className="readiness-strip" aria-live="polite">
                   <div className="readiness-header">
                     <span className="readiness-title"><ShieldCheck size={15} />启动前检查</span>
-                    <span className={`readiness-relay ${relayReady ? 'ready' : ''}`}><Wifi size={13} />{relayReady ? `Relay 已连接 · ${tabCount} 个标签页` : 'Relay 等待连接'}</span>
+                    <span className={`readiness-relay ${relayReady ? 'ready' : ''}`}><Wifi size={13} />{relayReady ? `采集浏览器已连接 · ${tabCount} 个页面` : '采集浏览器等待连接'}</span>
                     <strong className={missingReadiness.length ? 'pending' : 'ready'}>{missingReadiness.length ? `还差 ${missingReadiness.length} 项` : '可以启动'}</strong>
                   </div>
                   <div className="readiness-items">
@@ -5430,15 +5646,15 @@ function App() {
                 </div>
 
                 <div className="form-actions">
-                  <button className="primary-button" type="submit" disabled={submitting || !request.keyword.trim() || !aiSession || (request.analysisMode === 'job' && (!backgroundReady || !candidateReady))}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Play size={18} fill="currentColor" />}启动全流程</button>
-                  <button className="secondary-button" type="button" disabled={submitting} onClick={() => void runJob({ ...request, checkOnly: true })}><Activity size={18} />仅检查链路</button>
+                  <button className="primary-button" type="submit" disabled={submitting || !request.keyword.trim() || !aiSession || (request.analysisMode === 'job' && (!backgroundReady || !candidateReady))}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Play size={18} fill="currentColor" />}开始采集并分析</button>
+                  <button className="secondary-button" type="button" disabled={submitting} onClick={() => void runJob({ ...request, checkOnly: true })}><Activity size={18} />只检查连接</button>
                 </div>
               </form>
             </section>
 
             <section className="panel mission-panel">
               <div className="panel-heading">
-                <div><span className="step-label">02 / AGENT TEAM</span><h2>当前任务</h2></div>
+                <div><span className="step-label">步骤 2 / 当前任务进度</span><h2>当前任务</h2></div>
                 {activeJob ? <StatusPill status={activeJob.status} /> : <span className="muted-badge">尚未创建</span>}
               </div>
               {activeJob ? (
@@ -5483,7 +5699,7 @@ function App() {
 
             <details className="panel log-panel technical-details-panel" open>
               <summary className="panel-heading dark-heading">
-                <div><span className="step-label">STATUS EXPLAINED</span><h2>系统状态说明</h2><small>先看日常说明；原始记录只在需要排查时展开</small></div>
+                <div><span className="step-label">任务状态说明</span><h2>系统状态说明</h2><small>先看日常说明；原始记录只在需要排查时展开</small></div>
                 <span className="technical-details-toggle"><Info size={15} />{logs.length ? `还有 ${logs.length} 条系统记录` : '暂无系统记录'}<ChevronDown size={17} /></span>
               </summary>
               {activeJob && (
@@ -5492,7 +5708,7 @@ function App() {
                     <span className="readable-job-icon">{activeJob.status === 'completed' ? <Check size={18} /> : readableIssue ? <CircleAlert size={18} /> : activeJob.status === 'queued' ? <Clock3 size={18} /> : <Activity size={18} />}</span>
                     <div>
                       <span className="readable-job-eyebrow">现在发生了什么</span>
-                      <strong>{readableJobView?.headline || statusText[activeJob.status]}</strong>
+                      <strong>{readableJobView?.headline || jobStatusText(activeJob.status)}</strong>
                       <p>{readableJobView?.detail || '系统正在整理已保存的任务信息。'}</p>
                     </div>
                   </div>
@@ -5526,9 +5742,9 @@ function App() {
             </details>
           </div>
 
-          <section className="panel coverage-panel" aria-label="结果覆盖">
+          {!batchSurfaceActive && <section className="panel coverage-panel workflow-screen workflow-screen-workspace" aria-label="结果覆盖">
             <div className="panel-heading compact">
-                <div><span className="step-label">COVERAGE & QUALITY</span><h2>{activeAnalysisMode === 'general' ? '内容覆盖与事实边界' : '结果覆盖与事实边界'}</h2></div>
+                <div><span className="step-label">数据完整度与质量</span><h2>{activeAnalysisMode === 'general' ? '内容覆盖与事实边界' : '结果覆盖与事实边界'}</h2></div>
               <span className={`coverage-state ${coverage?.gatePassed === false ? 'failed' : coverage?.gatePassed ? 'passed' : ''}`}>{coverage?.gatePassed === true ? '质量门禁通过' : coverage?.gatePassed === false ? `质量门禁未通过 · ${coverage.issueCount ?? '-'} 项` : activeJob?.status === 'completed' ? '等待覆盖摘要' : '随任务更新'}</span>
             </div>
             <div className="coverage-content">
@@ -5546,16 +5762,16 @@ function App() {
                       ? '图片邮箱识别队列启动失败，已保留原图和检查点，可在修复本地模型后继续。'
                       : '图片邮箱识别队列等待启动；正文没有邮箱时，评论采集状态仍会保留为待确认。'}</p>}
             </div>
-          </section>
+          </section>}
 
-          <section className="panel results-panel" id="results" aria-label={batchSurfaceActive ? '批量投递界面' : expansionModuleActive ? '关系扩散工作台' : audienceModuleActive ? '受众及用户界面结果' : activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
-            <div className="panel-heading compact">
-              <div><span className="step-label">{batchSurfaceActive ? 'BATCH APPLICATION DELIVERY' : expansionModuleActive ? 'RELATIONSHIP EXPANSION WORKSPACE' : audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{batchSurfaceActive ? '批量投递工作台' : expansionModuleActive ? '关系扩散' : audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{batchSurfaceActive ? <p className="result-heading-description">从已保存正文中选择岗位，预检收件人、文案和附件后再分批发送。</p> : expansionModuleActive ? <p className="result-heading-description">从当前任务已保存的帖子出发，多轮采集公开用户、帖子、评论与关系，并持续写回同一任务。</p> : audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
+          <section className="panel results-panel workflow-screen workflow-screen-workspace" id="results" aria-label={batchSurfaceActive ? '批量投递界面' : expansionModuleActive ? '关系扩散工作台' : audienceModuleActive ? '受众及用户界面结果' : activeAnalysisMode === 'general' ? '逐链接内容分析结果' : '逐链接投递结果'}>
+            {!batchSurfaceActive && <div className="panel-heading compact">
+              <div><span className="step-label">{batchSurfaceActive ? '批量投递准备' : expansionModuleActive ? '关系数据扩展' : audienceModuleActive ? '受众与用户分析' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || '关键词内容分析' : '逐条岗位分析'}</span><h2>{batchSurfaceActive ? '批量投递工作台' : expansionModuleActive ? '关系扩散' : audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{batchSurfaceActive ? <p className="result-heading-description">从已保存正文中选择岗位，预检收件人、文案和附件后再分批发送。</p> : expansionModuleActive ? <p className="result-heading-description">从当前任务已保存的帖子出发，多轮采集公开用户、帖子、评论与关系，并持续写回同一任务。</p> : audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
               <div className="result-heading-meta">
-                <span className={`runtime-badge ${batchSurfaceActive || expansionStatus === 'completed' || audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{batchSurfaceActive ? '投递批次 · 发送前预检' : expansionModuleActive ? `多轮扩散 · ${expansionStatusText}` : audienceModuleActive ? `全量评论流 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · ${String(codexRuntime?.status || '等待结果')}`}</span>
+                <span className={`runtime-badge ${batchSurfaceActive || expansionStatus === 'completed' || audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{batchSurfaceActive ? '投递批次 · 发送前预检' : expansionModuleActive ? `多轮扩散 · ${expansionStatusText}` : audienceModuleActive ? `评论与用户信息 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容分析' : 'AI 质量检查'} · ${aiRunStatusText[aiRunStatus] || '等待结果'}`}</span>
                 <span className="count-badge">{expansionModuleActive ? Number((expansionSummary?.counters as Record<string, unknown> | undefined)?.users || 0) : audienceModuleActive ? audienceResults?.total ?? 0 : results?.total ?? activeJob?.applicationCount ?? 0}</span>
               </div>
-            </div>
+            </div>}
             {activeAnalysisMode === 'general' && <nav className="general-result-tabs" role="tablist" aria-label="非岗位研究结果模块" onKeyDown={(event) => {
               if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
               const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
@@ -5599,7 +5815,7 @@ function App() {
               onResume={() => void resumeAudienceCollection()}
               onGrowthScrolls={setAudienceGrowthScrolls}
               onGrow={() => void growAudienceCollection()}
-              onConfigureAi={() => document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+              onConfigureAi={() => switchWorkflowScreen('setup')}
               onNavigateEvidence={(target) => {
                 const targetPostId = target.anchor.postId || audiencePostId
                 setAudienceKind(target.kind)
@@ -5621,12 +5837,12 @@ function App() {
             />}
             {batchSurfaceActive && <div className="batch-workspace-screen">
               <div className="batch-screen-toolbar">
-                <div><span className="step-label">独立投递界面</span><h3>选择、预检、审批、发送</h3><p>岗位正文和已生成文案继续使用当前任务的已保存版本，不会重新采集或覆盖。</p></div>
+                <div><span className="step-label">当前投递任务</span><h3>{activeJob?.keyword || '尚未选择岗位任务'}</h3></div>
                 <div className="batch-screen-actions">
                   <label><span>岗位任务</span><select aria-label="批量投递使用的岗位任务" value={activeJob?.id || ''} onChange={(event) => {
                     const nextJob = workspaceJobs.find((job) => job.id === event.target.value)
                     if (nextJob) void selectJob(nextJob)
-                  }}><option value="" disabled>选择岗位任务</option>{workspaceJobs.map((job) => <option key={job.id} value={job.id}>{job.keyword || '未命名任务'} · {statusText[job.status]}</option>)}</select></label>
+                  }}><option value="" disabled>选择岗位任务</option>{workspaceJobs.map((job) => <option key={job.id} value={job.id}>{job.keyword || '未命名任务'} · {jobStatusText(job.status)}</option>)}</select></label>
                   <button type="button" onClick={() => switchApplicationView('jobs')}><Target size={15} />返回岗位投递</button>
                 </div>
               </div>
@@ -5638,6 +5854,7 @@ function App() {
                 onOpenItem={(item) => {
                   performChooseResult(item)
                   performSwitchApplicationView('jobs')
+                  performSwitchWorkflowScreen('workspace')
                   window.requestAnimationFrame(() => document.querySelector('.result-detail')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
                 }}
               /> : <div className="result-empty"><Send size={28} /><strong>请先在岗位投递界面选择一个任务</strong></div>}
@@ -5780,7 +5997,7 @@ function App() {
                     </div>
                     <div className="draft-stack">
                       <div className="draft-toolbar">
-                        <div><span className="step-label">EDITABLE APPLICATION COPY</span><h4>投递文案编辑器</h4><p>每个岗位均生成可编辑初稿；90 分以上方可发送，发送时使用当前内容。</p></div>
+                        <div><span className="step-label">可编辑投递文案</span><h4>投递文案编辑器</h4><p>每个岗位均生成可编辑初稿；90 分以上方可发送，发送时使用当前内容。</p></div>
                         <button className={draftDirty ? 'dirty' : ''} disabled={draftOperationPending || (!draftDirty && !selectedDraftQualityRetryable)} onClick={() => void draftGuard.saveNow()}>{draftSaving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{draftSaveLabel}</button>
                       </div>
                       <div className="draft-context-row" aria-label="投递上下文">
@@ -5828,7 +6045,7 @@ function App() {
                     <section className="attachment-workspace" aria-label="投递附件">
                       <input ref={attachmentInputRef} className="attachment-file-input" type="file" multiple accept=".pdf,.doc,.docx,.txt,.png,.jpg,.jpeg" onInput={(event) => void uploadAttachmentFiles(event)} />
                       <header>
-                        <div><span className="step-label">APPLICATION ATTACHMENTS</span><h4><Paperclip size={15} />随信附件</h4><p>附件保存在当前任务与岗位下，发送前仍会重新校验文件内容和哈希。</p></div>
+                        <div><span className="step-label">投递附件</span><h4><Paperclip size={15} />随信附件</h4><p>附件保存在当前任务与岗位下，发送前仍会重新校验文件内容和哈希。</p></div>
                         <strong>{selectedAttachments.length} / {applicationAttachments?.limits.maxFiles ?? 5} 个 · {formatBytes(selectedAttachmentBytes)}</strong>
                       </header>
                       <div className="attachment-source-actions">
@@ -5873,7 +6090,7 @@ function App() {
                       </div>
                       <div className="delivery-actions">
                         <button className="send-email-action" disabled={draftDirty || !selectedDraftQualityVerified || selectedSubjectNeedsReview || !selectedEmailRoute || !health?.emailDelivery?.configured || !smtpConfig?.verified || draftOperationPending || attachmentUploading || attachmentsLoading} onClick={() => void sendEmail()} title={selectedSubjectNeedsReview ? '邮件主题正在等待准确岗位名复核' : !selectedEmailRoute ? '岗位正文中没有可验证邮箱' : !health?.emailDelivery?.configured ? '请先配置 SMTP' : !smtpConfig?.verified ? '请先测试 SMTP' : attachmentsLoading ? '正在读取当前岗位附件' : '预览收件人、完整正文与附件后发送'}>{emailSending ? <LoaderCircle className="spin" size={16} /> : <Eye size={16} />}{emailSending ? '生成预览' : '预览并发送'}</button>
-                        <button onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={16} />发件邮箱</button>
+                        <button onClick={() => switchWorkflowScreen('setup')}><Settings2 size={16} />发件邮箱</button>
                         <button disabled={draftDirty || !selectedDraftQualityVerified || !selectedMessageRoute || draftOperationPending} onClick={() => void prepareMessage()}><MessageSquare size={16} />复制私信</button>
                         {selectedResult.note_url && <a href={selectedResult.note_url} target="_blank" rel="noreferrer"><ExternalLink size={16} />打开岗位</a>}
                       </div>
@@ -5886,10 +6103,10 @@ function App() {
             ))}</>)}
           </section>
 
-          <div className="secondary-grid">
+          <div className="secondary-grid workflow-secondary-grid">
             <section className="panel history-panel" id="history">
               <div className="panel-heading compact">
-                <div><span className="step-label">RUN HISTORY</span><h2>全部历史任务 <small>{historyJobs.length}</small></h2></div>
+                <div><span className="step-label">任务历史</span><h2>全部历史任务 <small>{historyJobs.length}</small></h2></div>
                 <div className="history-heading-actions">
                   <span>已保存 {jobs.length} 条任务</span>
                   <button className="icon-text-button" disabled={dataManaging} onClick={() => void draftGuard.requestTransition('删除当前任务或本地数据', manageLocalData)}>{dataManaging ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}本地数据</button>
@@ -5898,8 +6115,8 @@ function App() {
               </div>
               <div className={`featured-job-banner ${featuredJob ? '' : 'missing'}`}>
                 <div className="featured-job-copy">
-                  <span className="featured-job-label"><Target size={14} />竞赛演示任务</span>
-                  <strong>AI 产品经理招聘 · 最新 Relay 抓取</strong>
+                  <span className="featured-job-label"><Target size={14} />默认展示任务</span>
+                  <strong>AI 产品经理招聘 · 最新采集结果</strong>
                   <small>{featuredJob ? `关键词：${featuredJob.keyword} · ${featuredStateLabel} · 任务 ${featuredJob.id}` : '迁移数据后将自动显示指定历史任务'}</small>
                 </div>
                 {featuredJob && <div className="featured-job-stats">
@@ -5910,7 +6127,7 @@ function App() {
                 </div>}
                 <div className="featured-job-action">
                   {featuredJob && <StatusPill status={featuredJob.status} label={featuredStateLabel} />}
-                  <button type="button" className="secondary-button" onClick={openFeaturedJob} disabled={!featuredJob}><Target size={15} />打开演示任务</button>
+                  <button type="button" className="secondary-button" onClick={openFeaturedJob} disabled={!featuredJob}><Target size={15} />打开默认任务</button>
                 </div>
               </div>
               <div className="history-scope-control" aria-label="历史任务类型筛选">
@@ -5951,7 +6168,7 @@ function App() {
 
             <section className="panel artifacts-panel" id="artifacts">
               <div className="panel-heading compact">
-                <div><span className="step-label">DELIVERABLES</span><h2>交付产物</h2></div>
+                <div><span className="step-label">结果文件</span><h2>交付产物</h2></div>
                 <span className="count-badge">{currentArtifacts.length}</span>
               </div>
               <div className="artifact-list">

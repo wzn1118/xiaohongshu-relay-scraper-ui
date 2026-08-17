@@ -182,14 +182,15 @@ test('model gateway persists Responses state and supports background retrieval a
         baseUrl: 'https://models.example/v1',
         apiKey: 'token',
         wireApi: 'responses',
-        capabilities: { background: true, statefulResponses: true, conversationState: true, reasoningSummary: true },
+        capabilities: { background: true, statefulResponses: true, conversationState: true, reasoningSummary: true, reasoningEffort: true },
       },
     },
   });
-  const completed = await gateway.complete({ provider: 'responses', model: 'model-2', input: 'continue', previousResponseId: 'resp-1', conversationId: 'conv-1', background: true, reasoningSummary: 'auto' });
+  const completed = await gateway.complete({ provider: 'responses', model: 'gpt-5.6-sol', input: 'continue', previousResponseId: 'resp-1', conversationId: 'conv-1', background: true, reasoningSummary: 'auto', reasoningEffort: 'max' });
   assert.equal(completed.responseId, 'resp-2');
   assert.equal(requests[0].body.previous_response_id, 'resp-1');
   assert.equal(requests[0].body.conversation, 'conv-1');
+  assert.deepEqual(requests[0].body.reasoning, { summary: 'auto', effort: 'max' });
   await gateway.retrieve({ provider: 'responses', responseId: 'resp-2' });
   await gateway.cancel({ provider: 'responses', responseId: 'resp-2' });
   assert.deepEqual(requests.slice(1).map((request) => [request.method, request.url]), [
