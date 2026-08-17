@@ -11,7 +11,7 @@ const PARENT_RUN_ID = 'parent-run-security-001';
 const PARENT_TOOL_RUN_ID = 'parent-tool-run-security-001';
 const CONVERSATION_ID = 'conversation-subagent-security';
 const AI_SESSION_ID = 'session-reference-001';
-const API_KEY = 'sk-subagent-security-must-not-persist';
+const API_KEY = 'test-api-key-subagent-security-must-not-persist';
 const SESSION_TOKEN = 'session-token-must-not-persist';
 
 const REFERENCE = Object.freeze({

@@ -103,9 +103,12 @@ export function CopilotProjectWorkspacePanel({
   const [selectedGitBranch, setSelectedGitBranch] = useState('')
   const [receipt, setReceipt] = useState<CopilotCapabilityReceipt | null>(null)
   const [receiptEvents, setReceiptEvents] = useState<CopilotToolExecutionEvent[]>([])
+  const [receiptRefreshing, setReceiptRefreshing] = useState(false)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const workspaceLoadRevision = useRef(0)
+  const receiptLoadRevision = useRef(0)
+  const receiptExecutionIdRef = useRef<string | null>(null)
   const selectionRef = useRef<DataCopilotWorkspaceBinding | null>(selection ?? null)
 
   useEffect(() => {
@@ -208,14 +211,21 @@ export function CopilotProjectWorkspacePanel({
 
   const refreshReceipt = useCallback(async () => {
     if (!selectedProject || !selectedWorkspace || !receipt?.toolExecutionId) return
-    setBusy((current) => current ?? 'refresh-receipt')
+    const toolExecutionId = receipt.toolExecutionId
+    if (toolExecutionId !== receiptExecutionIdRef.current) return
+    const revision = ++receiptLoadRevision.current
+    setReceiptRefreshing(true)
     try {
       const response = await api.getToolExecution(
         selectedProject.projectId,
         selectedWorkspace.workspaceId,
-        receipt.toolExecutionId,
+        toolExecutionId,
       )
-      setReceipt(response.receipt)
+      if (revision !== receiptLoadRevision.current || toolExecutionId !== receiptExecutionIdRef.current) return
+      receiptExecutionIdRef.current = response.receipt.toolExecutionId ?? toolExecutionId
+      setReceipt((current) => (
+        toolExecutionId === receiptExecutionIdRef.current ? response.receipt : current
+      ))
       setReceiptEvents((current) => mergeToolExecutionEvents(current, response.events))
       setError(receiptNeedsAttention(response.receipt) ? receiptError(response.receipt) : null)
       if (!isPendingReceipt(response.receipt)) {
@@ -224,7 +234,7 @@ export function CopilotProjectWorkspacePanel({
     } catch (value) {
       setError(toError(value).message)
     } finally {
-      setBusy((current) => current === 'refresh-receipt' ? null : current)
+      if (revision === receiptLoadRevision.current) setReceiptRefreshing(false)
     }
   }, [api, receipt?.toolExecutionId, refreshWorkspace, selectedProject, selectedWorkspace])
 
@@ -238,6 +248,7 @@ export function CopilotProjectWorkspacePanel({
         receipt.toolExecutionId,
         { reason: 'user_cancelled' },
       )
+      receiptExecutionIdRef.current = response.receipt.toolExecutionId ?? receipt.toolExecutionId
       setReceipt(response.receipt)
       setError(receiptNeedsAttention(response.receipt) ? receiptError(response.receipt) : null)
       void refreshReceipt()
@@ -318,9 +329,9 @@ export function CopilotProjectWorkspacePanel({
   }, [open, refreshWorkspace, selectedProjectId, selectedWorkspaceId])
 
   useEffect(() => {
-    if (!open || !receipt?.toolExecutionId) return
+    if (!open || !receipt?.toolExecutionId || !isPendingReceipt(receipt)) return
     void refreshReceipt()
-  }, [open, receipt?.toolExecutionId, refreshReceipt])
+  }, [open, receipt?.status, receipt?.toolExecutionId, refreshReceipt])
 
   useEffect(() => {
     if (!open || !isPendingReceipt(receipt)) return
@@ -425,6 +436,8 @@ export function CopilotProjectWorkspacePanel({
       return
     }
     setBusy('execute-tool')
+    receiptLoadRevision.current += 1
+    receiptExecutionIdRef.current = null
     setReceipt(null)
     setReceiptEvents([])
     try {
@@ -434,6 +447,7 @@ export function CopilotProjectWorkspacePanel({
         toolName,
         input,
       )
+      receiptExecutionIdRef.current = response.receipt.toolExecutionId ?? null
       setReceipt(response.receipt)
       setWorkspaces((current) => current.map((workspace) => (
         workspace.workspaceId === response.workspace.workspaceId
@@ -457,6 +471,8 @@ export function CopilotProjectWorkspacePanel({
   const executeGitTool = async (name: GitToolName, input: Record<string, unknown>) => {
     if (!selectedProject || !selectedWorkspace || !isGitToolGranted(capabilities, name)) return
     setBusy(name)
+    receiptLoadRevision.current += 1
+    receiptExecutionIdRef.current = null
     setReceipt(null)
     setReceiptEvents([])
     try {
@@ -466,6 +482,7 @@ export function CopilotProjectWorkspacePanel({
         name,
         input,
       )
+      receiptExecutionIdRef.current = response.receipt.toolExecutionId ?? null
       setReceipt(response.receipt)
       applyGitReceipt(response.receipt)
       setWorkspaces((current) => current.map((workspace) => (
@@ -718,7 +735,7 @@ export function CopilotProjectWorkspacePanel({
             receipt={receipt}
             events={receiptEvents}
             onRefresh={() => void refreshReceipt()}
-            refreshing={busy === 'refresh-receipt'}
+            refreshing={receiptRefreshing}
             onCancel={() => void cancelReceipt()}
             cancelling={busy === 'cancel-receipt'}
           />

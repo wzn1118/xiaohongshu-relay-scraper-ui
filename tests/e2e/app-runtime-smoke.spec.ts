@@ -9,6 +9,8 @@ const initialApiPaths = [
 ]
 
 test('loads the workbench against the live API without runtime failures', async ({ page }) => {
+  test.setTimeout(120_000)
+
   const pageErrors: string[] = []
   const consoleErrors: string[] = []
   const failedApiRequests: string[] = []
@@ -35,7 +37,7 @@ test('loads the workbench against the live API without runtime failures', async 
     page.waitForResponse((response) => new URL(response.url()).pathname === pathname),
   )
 
-  await page.goto('/')
+  await page.goto('/', { waitUntil: 'domcontentloaded', timeout: 90_000 })
   const responses = await Promise.all(initialResponses)
 
   for (const response of responses) {

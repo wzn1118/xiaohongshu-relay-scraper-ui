@@ -30,6 +30,7 @@ type MockState = {
   projectRequests: { method: string; path: string; body: Record<string, unknown>; contentType: string | null; idempotencyKey?: string | null }[]
   workspaceToolStatus: 'completed' | 'running' | 'cancelled'
   workspaceBranch: string
+  workspaceToolExecutions: Record<string, { toolName: string; input: Record<string, unknown> }>
 }
 
 function job(revision: number) {
@@ -280,6 +281,10 @@ async function installApi(page: Page, state: MockState) {
     if (workspaceTool && method === 'POST') {
       const body = request.postDataJSON() as Record<string, unknown>
       const toolName = workspaceTool[3]
+      const toolExecutionId = toolName === 'exec.run'
+        ? 'workspace-tool-e2e'
+        : `workspace-tool-e2e-${toolName.replaceAll('.', '-')}`
+      state.workspaceToolExecutions[toolExecutionId] = { toolName, input: body }
       state.projectRequests.push({
         method,
         path,
@@ -307,8 +312,8 @@ async function installApi(page: Page, state: MockState) {
           type: 'capability.receipt',
           status: state.workspaceToolStatus,
           tool: { name: toolName, source: toolName.startsWith('git.') ? 'git' : 'workspace', risk: 'approval_required' },
-          toolRunId: 'workspace-tool-e2e',
-          toolExecutionId: 'workspace-tool-e2e',
+          toolRunId: toolExecutionId,
+          toolExecutionId,
           result: state.workspaceToolStatus === 'completed'
             ? projectWorkspaceToolResult(toolName, body, state.workspaceBranch)
             : undefined,
@@ -342,6 +347,11 @@ async function installApi(page: Page, state: MockState) {
     }
     const workspaceToolExecution = path.match(/^\/api\/copilot\/projects\/([^/]+)\/workspaces\/([^/]+)\/tool-executions\/([^/]+)$/)
     if (workspaceToolExecution && method === 'GET') {
+      const toolExecutionId = workspaceToolExecution[3]
+      const execution = state.workspaceToolExecutions[toolExecutionId] || {
+        toolName: 'exec.run',
+        input: { command: 'node' },
+      }
       state.projectRequests.push({
         method,
         path,
@@ -356,10 +366,12 @@ async function installApi(page: Page, state: MockState) {
         receipt: {
           type: 'capability.receipt',
           status: state.workspaceToolStatus,
-          tool: 'exec.run',
-          toolRunId: 'workspace-tool-e2e',
-          toolExecutionId: workspaceToolExecution[3],
-          result: state.workspaceToolStatus === 'completed' ? { stdout: 'executed node', stderr: '' } : undefined,
+          tool: execution.toolName,
+          toolRunId: toolExecutionId,
+          toolExecutionId,
+          result: state.workspaceToolStatus === 'completed'
+            ? projectWorkspaceToolResult(execution.toolName, execution.input, state.workspaceBranch)
+            : undefined,
           error: state.workspaceToolStatus === 'cancelled'
             ? { code: 'TOOL_EXECUTION_CANCELLED', message: 'user_cancelled' }
             : undefined,
@@ -522,6 +534,7 @@ function baseState(overrides: Partial<MockState> = {}): MockState {
     projectRequests: [],
     workspaceToolStatus: 'completed',
     workspaceBranch: 'main',
+    workspaceToolExecutions: {},
     ...overrides,
   }
 }
@@ -871,6 +884,7 @@ test('creates a project workspace and runs a capability-gated local command', as
   await workspace.getByRole('button', { name: '运行命令' }).click()
 
   await expect(workspace.getByLabel('命令标准输出')).toHaveText('executed node')
+  await workspace.getByRole('button', { name: 'Refresh execution receipt' }).click()
   await expect(workspace.getByRole('list', { name: '执行轨迹' })).toContainText('已完成')
   const toolRequest = state.projectRequests.find((request) => request.path.endsWith('/tools/exec.run'))
   expect(toolRequest?.body).toEqual({
@@ -882,7 +896,6 @@ test('creates a project workspace and runs a capability-gated local command', as
   expect(toolRequest?.contentType).toContain('application/json')
   expect(toolRequest?.idempotencyKey).toMatch(/^workspace-tool:/u)
 
-  await workspace.getByRole('button', { name: 'Refresh execution receipt' }).click()
   await expect.poll(() => state.projectRequests.filter((request) => request.path.endsWith('/tool-executions/workspace-tool-e2e')).length).toBeGreaterThanOrEqual(1)
 
   await workspace.locator('.copilot-project-workspace-actions button').last().click()
