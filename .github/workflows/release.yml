@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  one-click-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install build prerequisites
+        shell: pwsh
+        run: |
+          npm ci --no-audit --no-fund
+          python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Build repository checkout
+        run: npm run build
+      - name: Create sanitized one-click archive
+        id: package
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-one-click-windows.zip'
+          ./scripts/package-github-release.ps1 -OutputPath $archive -SourceRef HEAD
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+          "checksum=$archive.sha256" >> $env:GITHUB_OUTPUT
+      - name: Verify clean archive installation and health
+        shell: pwsh
+        run: ./scripts/verify-github-release.ps1 -ArchivePath '${{ steps.package.outputs.archive }}' -Port 65431
+      - name: Upload verified one-click package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaohongshu-relay-scraper-ui-one-click-windows-${{ github.sha }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish tag as GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $archive = '${{ steps.package.outputs.archive }}'
+          $checksum = '${{ steps.package.outputs.checksum }}'
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $archive $checksum --clobber
+          } else {
+            gh release create $tag $archive $checksum --verify-tag --generate-notes --title $tag
+          }

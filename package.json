@@ -19,6 +19,7 @@
     "register:production": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/register-startup.ps1",
     "provision:hegelsalon:relay": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/provision-hegelsalon-relay-tunnel.ps1 -Apply",
     "package:production": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-production.ps1",
+    "package:github-release": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/package-github-release.ps1",
     "backup:production": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/backup-hegelsalon.ps1",
     "restore:production": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/restore-hegelsalon.ps1",
     "provision:auth": "node scripts/provision-auth.mjs",

@@ -25,6 +25,10 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   const bundledRuntime = await readFile(path.join(repositoryRoot, 'vendor', 'xiaohongshu-relay-scrape', 'scripts', 'run_xiaohongshu_relay_scrape.py'), 'utf8');
   const prerequisites = await readFile(path.join(repositoryRoot, 'scripts', 'ensure-windows-prerequisites.ps1'), 'utf8');
   const releasePackager = await readFile(path.join(repositoryRoot, 'scripts', 'package-windows-production.ps1'), 'utf8');
+  const githubReleasePackager = await readFile(path.join(repositoryRoot, 'scripts', 'package-github-release.ps1'), 'utf8');
+  const githubReleaseVerifier = await readFile(path.join(repositoryRoot, 'scripts', 'verify-github-release.ps1'), 'utf8');
+  const githubReleaseWorkflow = await readFile(path.join(repositoryRoot, '.github', 'workflows', 'release.yml'), 'utf8');
+  const oneClickGuide = await readFile(path.join(repositoryRoot, 'ONE_CLICK_START.md'), 'utf8');
   const nativeBrowser = await readFile(path.join(repositoryRoot, 'scripts', 'start-managed-browser.mjs'), 'utf8');
   assert.match(windows, /scripts\\one-click\.ps1/);
   assert.match(windows, /%\*/);
@@ -52,6 +56,17 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   assert.match(prerequisites, /bundled AI runtime/);
   assert.match(releasePackager, /\$entry\.Open\(\)/);
   assert.match(releasePackager, /WriteAllText\(\$checksumPath/);
+  assert.match(githubReleasePackager, /git.*archive/is);
+  assert.match(githubReleasePackager, /Get-FileHash -Algorithm SHA256/);
+  assert.match(githubReleasePackager, /node_modules\|dist\|data\|runtime/);
+  assert.match(githubReleaseVerifier, /Expand-Archive/);
+  assert.match(githubReleaseVerifier, /npm.*ci/is);
+  assert.match(githubReleaseVerifier, /api\/health/);
+  assert.match(githubReleaseWorkflow, /push:\s*[\s\S]*branches: \[main\]/);
+  assert.match(githubReleaseWorkflow, /Verify clean archive installation and health/);
+  assert.match(githubReleaseWorkflow, /gh release create/);
+  assert.match(oneClickGuide, /start-windows\.cmd/);
+  assert.match(oneClickGuide, /SHA-256/);
   assert.match(prerequisites, /builtInAiReady/);
   assert.match(prerequisites, /(?:openclaw|start-managed-browser\.mjs)/);
   assert.match(prerequisites, /(?:Google\.Chrome|start-managed-browser\.mjs)/);
