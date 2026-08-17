@@ -508,6 +508,24 @@ def test_complete_missing_forces_analysis_after_raw_collection_marked_it_complet
     )
 
 
+def test_analysis_resume_rewrites_completed_analysis_for_quality_gate_repair(
+    tmp_path: Path,
+) -> None:
+    output_dir, state_path, state = state_fixture(tmp_path)
+    state["stages"]["analysis"] = {
+        "status": "completed",
+        "records": {},
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    session = open_session(output_dir, state_path, scope="analysis")
+
+    assert workflow.should_run_analysis_stage(
+        session,
+        body_ran=False,
+        complete_missing_only=False,
+    )
+
+
 def test_wrapper_parser_keeps_upstream_resume_separate_from_resume_scope() -> None:
     options, upstream = workflow.parse_wrapper_args([
         "--resume",

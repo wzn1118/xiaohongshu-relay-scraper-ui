@@ -431,25 +431,9 @@ export class JobManager {
       if (this.deletingJobs.has(jobId)) {
         throw jobError('JOB_DELETION_IN_PROGRESS', 'The task is being deleted and cannot be resumed.');
       }
-      const scope = normalizeResumeScope(options.scope);
+      const requestedScope = normalizeResumeScope(options.scope);
       const idempotencyKey = normalizeIdempotencyKey(options.idempotencyKey);
-      const duplicate = idempotencyKey
-        ? job.attempts?.find((attempt) => (
-            attempt.kind !== 'initial'
-            && attempt.resumeScope === scope
-            && attempt.idempotencyKey === idempotencyKey
-          ))
-        : null;
-      if (duplicate) return { ...publicJob(job), attemptId: duplicate.attemptId };
-
       const activeAttempt = currentActiveAttempt(job);
-      if (
-        activeAttempt
-        && activeAttempt.kind !== 'initial'
-        && activeAttempt.resumeScope === scope
-      ) {
-        return { ...publicJob(job), attemptId: activeAttempt.attemptId };
-      }
 
       if (this.recoveryBlockers.length > 0) {
         const error = jobError(
@@ -460,14 +444,38 @@ export class JobManager {
         throw error;
       }
       if (this.active || this.relaySubtask) {
-        if (this.active?.id === job.id) {
-          const error = jobError('JOB_ALREADY_RUNNING', 'The task already has an active attempt.');
-          error.activeJob = publicJob(job);
+        if (this.active?.id !== job.id) {
+          const error = jobError('JOB_BUSY', 'Another scrape task is already running.');
+          if (this.active) error.activeJob = publicJob(this.active);
+          if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
           throw error;
         }
-        const error = jobError('JOB_BUSY', 'Another scrape task is already running.');
-        if (this.active) error.activeJob = publicJob(this.active);
-        if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
+      }
+
+      const state = await readWorkflowState(job.statePath);
+      applyWorkflowStateToJob(job, state);
+      await reconcileJobCheckpoint(job);
+      // A failed quality gate needs a fresh analysis pass. A full resume would
+      // otherwise skip completed analysis and immediately fail again.
+      const scope = resumeScopeForQualityGate(state, requestedScope);
+      const duplicate = idempotencyKey
+        ? job.attempts?.find((attempt) => (
+            attempt.kind !== 'initial'
+            && attempt.resumeScope === scope
+            && attempt.idempotencyKey === idempotencyKey
+        ))
+        : null;
+      if (duplicate) return { ...publicJob(job), attemptId: duplicate.attemptId };
+      if (
+        activeAttempt
+        && activeAttempt.kind !== 'initial'
+        && activeAttempt.resumeScope === scope
+      ) {
+        return { ...publicJob(job), attemptId: activeAttempt.attemptId };
+      }
+      if (this.active?.id === job.id) {
+        const error = jobError('JOB_ALREADY_RUNNING', 'The task already has an active attempt.');
+        error.activeJob = publicJob(job);
         throw error;
       }
       if (activeAttempt) {
@@ -476,25 +484,6 @@ export class JobManager {
         error.activeJob = publicJob(job);
         throw error;
       }
-
-      try {
-        const cleanup = await this.#isolatePersistedProcesses(job, 'before_resume');
-        if (cleanup.matched > 0 || cleanup.staleTempsRemoved > 0) await this.persist();
-      } catch (error) {
-        job.cleanupError = String(error?.message || error);
-        job.updatedAt = new Date().toISOString();
-        await this.persist();
-        const isolationError = jobError(
-          'JOB_PROCESS_ISOLATION_FAILED',
-          `The previous collection process could not be isolated before resume: ${job.cleanupError}`,
-        );
-        isolationError.cause = error;
-        throw isolationError;
-      }
-
-      const state = await readWorkflowState(job.statePath);
-      applyWorkflowStateToJob(job, state);
-      await reconcileJobCheckpoint(job);
       if (options.expectedRevision !== undefined && Number(options.expectedRevision) !== state.revision) {
         const error = jobError(
           'WORKFLOW_REVISION_CONFLICT',
@@ -519,6 +508,20 @@ export class JobManager {
       } catch (error) {
         if (error?.code !== 'ENOENT') throw error;
         throw jobError('RESUME_OUTPUT_MISSING', 'The original task output directory is missing.');
+      }
+      try {
+        const cleanup = await this.#isolatePersistedProcesses(job, 'before_resume');
+        if (cleanup.matched > 0 || cleanup.staleTempsRemoved > 0) await this.persist();
+      } catch (error) {
+        job.cleanupError = String(error?.message || error);
+        job.updatedAt = new Date().toISOString();
+        await this.persist();
+        const isolationError = jobError(
+          'JOB_PROCESS_ISOLATION_FAILED',
+          `The previous collection process could not be isolated before resume: ${job.cleanupError}`,
+        );
+        isolationError.cause = error;
+        throw isolationError;
       }
 
       const runnerParams = resumeRunnerParams(job.params, options.params, scope);
@@ -2034,6 +2037,28 @@ function normalizeResumeScope(value) {
   return scope;
 }
 
+function resumeScopeForQualityGate(state, requestedScope) {
+  if (requestedScope !== 'full' || state?.status !== 'incomplete') return requestedScope;
+  const summary = state.workflowSummary && typeof state.workflowSummary === 'object'
+    ? state.workflowSummary
+    : {};
+  const checks = summary.checks && typeof summary.checks === 'object' ? summary.checks : {};
+  const issueCodes = Array.isArray(summary.issues)
+    ? summary.issues.map((issue) => String(issue?.code || ''))
+    : [];
+  const failedDraftChecks = [
+    checks.all_outreach_drafts_ready,
+    checks.all_cover_letters_score_at_least_threshold,
+    checks.all_generated_claims_evidence_valid,
+  ].some((value) => value === false);
+  const failedDraftIssue = issueCodes.some((code) => (
+    code === 'COVER_LETTER_SCORE_BELOW_90'
+    || code === 'GENERATED_CLAIM_EVIDENCE_INVALID'
+    || code === 'OUTREACH_DRAFTS_INCOMPLETE'
+  ));
+  return failedDraftChecks || failedDraftIssue ? 'analysis' : requestedScope;
+}
+
 function inferResumeScope(params) {
   if (params?.audienceOnly) return 'audience';
   if (params?.completeMissingOnly) return 'body_completion';
@@ -2115,7 +2140,9 @@ function resumeRunnerParams(original, override, scope) {
   delete params.resumeFromJobId;
   params.completeMissingOnly = false;
   params.audienceOnly = false;
+  params.analysisOnly = false;
   if (scope === 'body_completion') params.completeMissingOnly = true;
+  if (scope === 'analysis') params.analysisOnly = true;
   if (scope === 'audience') {
     params.audienceOnly = true;
     params.collectAudience = true;

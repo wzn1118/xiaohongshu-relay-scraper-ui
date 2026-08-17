@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import {
   Activity,
   Check,
@@ -21,7 +22,7 @@ type JobJourneyPanelProps = {
   lastEventAt: string | null
   now: Date
   actionBusy?: boolean
-  onResume?: () => void
+  onResume?: () => Promise<Job | null | void> | Job | null | void
   resumeDisabled?: boolean
   onProblemAction?: (problem: UserProblem, actionId: SupportedProblemActionId) => void
   isProblemActionDisabled?: (problem: UserProblem, actionId: SupportedProblemActionId) => boolean
@@ -107,6 +108,7 @@ export function JobJourneyPanel({
   onProblemAction,
   isProblemActionDisabled,
 }: JobJourneyPanelProps) {
+  const [resumeFeedback, setResumeFeedback] = useState<{ tone: 'progress' | 'success' | 'error'; text: string } | null>(null)
   const view = jobExperienceView(job, mode, connectionState, lastEventAt)
   const active = ['queued', 'resuming', 'running'].includes(job.status)
   const connection = connectionCopy(view.connection.state, active)
@@ -130,6 +132,34 @@ export function JobJourneyPanel({
   const remainingStageSummary = remainingStageLabels.length > 0
     ? `${view.counts.discovered > 0 && view.counts.fullText >= view.counts.discovered ? '正文采集已完成；' : ''}待恢复：${remainingStageLabels.slice(0, 3).join('、')}${remainingStageLabels.length > 3 ? `等 ${remainingStageLabels.length} 项` : ''}`
     : ''
+  const qualityChecks = job.workflowSummary?.checks as Record<string, unknown> | undefined
+  const qualityRepair = qualityChecks?.all_outreach_drafts_ready === false
+    || qualityChecks?.all_cover_letters_score_at_least_threshold === false
+    || qualityChecks?.all_generated_claims_evidence_valid === false
+  const resumeLabel = qualityRepair ? '重新生成未达标草稿' : '一键恢复未完成步骤'
+  const handleResume = async () => {
+    if (!onResume || actionBusy || resumeDisabled) return
+    setResumeFeedback({
+      tone: 'progress',
+      text: qualityRepair ? '正在提交草稿重写与质量复核…' : '正在提交恢复请求…',
+    })
+    try {
+      const resumed = await onResume()
+      if (!resumed) {
+        setResumeFeedback({ tone: 'error', text: '恢复未能启动。请查看页面顶部的错误信息后重试。' })
+        return
+      }
+      const running = ['queued', 'resuming', 'running'].includes(resumed.status)
+      setResumeFeedback({
+        tone: running ? 'success' : 'progress',
+        text: running
+          ? qualityRepair ? '已开始重写未达标草稿，完成后会自动复核。' : '恢复已启动，正在从保存的进度继续。'
+          : '恢复请求已处理，正在同步任务状态。',
+      })
+    } catch (error) {
+      setResumeFeedback({ tone: 'error', text: (error as Error).message || '恢复请求失败，请重试。' })
+    }
+  }
 
   return (
     <div className="job-journey-panel">
@@ -144,13 +174,17 @@ export function JobJourneyPanel({
             {canResume && <button
               type="button"
               className="journey-recovery-action"
-              onClick={onResume}
+              onClick={() => void handleResume()}
               disabled={actionBusy || resumeDisabled}
               title="从已保存检查点继续处理未完成步骤"
             >
               <RefreshCw className={actionBusy || resumeDisabled ? 'spin' : ''} size={15} />
-              {actionBusy || resumeDisabled ? '正在准备恢复' : '一键恢复未完成步骤'}
+              {actionBusy || resumeDisabled ? '正在准备恢复' : resumeLabel}
             </button>}
+            {resumeFeedback && <p className={`journey-recovery-feedback ${resumeFeedback.tone}`} role={resumeFeedback.tone === 'error' ? 'alert' : 'status'}>
+              {resumeFeedback.tone === 'error' ? <CircleAlert size={14} /> : <RefreshCw className={resumeFeedback.tone === 'progress' ? 'spin' : ''} size={14} />}
+              {resumeFeedback.text}
+            </p>}
           </div>
         </div>
         <div className={`journey-connection ${view.connection.state}`} role="status">

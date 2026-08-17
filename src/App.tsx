@@ -3869,7 +3869,16 @@ function App() {
   }
 
   const performResumeJob = async (job: Job, scope: ResumeScope = 'full', sessionHint: AiSession | null = aiSession) => {
-    const needsAi = !['audience', 'artifacts', 'discovery'].includes(scope)
+    const qualityChecks = job.workflowSummary?.checks as Record<string, unknown> | undefined
+    const qualityIssues = Array.isArray(job.workflowSummary?.issues) ? job.workflowSummary.issues : []
+    const repairQualityGate = scope === 'full' && (
+      qualityChecks?.all_outreach_drafts_ready === false
+      || qualityChecks?.all_cover_letters_score_at_least_threshold === false
+      || qualityChecks?.all_generated_claims_evidence_valid === false
+      || qualityIssues.some((issue) => ['COVER_LETTER_SCORE_BELOW_90', 'GENERATED_CLAIM_EVIDENCE_INVALID', 'OUTREACH_DRAFTS_INCOMPLETE'].includes(String((issue as { code?: unknown })?.code || '')))
+    )
+    const effectiveScope: ResumeScope = repairQualityGate ? 'analysis' : scope
+    const needsAi = !['audience', 'artifacts', 'discovery'].includes(effectiveScope)
     let session = sessionHint
     if (needsAi && !session) {
       setRestoringAi(true)
@@ -3884,15 +3893,15 @@ function App() {
         setRestoringAi(false)
       }
     }
-    const operationId = `${job.id}:${scope}`
+    const operationId = `${job.id}:${effectiveScope}`
     const idempotencyKey = resumeIdempotencyKeys.current.get(operationId)
-      || newResumeIdempotencyKey(job.id, scope)
+      || newResumeIdempotencyKey(job.id, effectiveScope)
     resumeIdempotencyKeys.current.set(operationId, idempotencyKey)
     setSubmitting(true)
-    setNotice('正在恢复原任务…')
+    setNotice(repairQualityGate ? '正在重新生成未达标草稿并复核质量…' : '正在恢复原任务…')
     try {
       const requestResume = () => api.resumeJob(job.id, {
-        scope,
+        scope: effectiveScope,
         idempotencyKey,
         ...(session ? { aiSessionId: session.id } : {}),
       })
@@ -3922,10 +3931,10 @@ function App() {
       }
       setActiveJob((current) => current?.id === job.id ? resumedJob : current)
       setJobs((current) => replaceJobInPlace(current, resumedJob))
-      if (scope === 'audience') setAudienceTask(resumedJob)
+      if (effectiveScope === 'audience') setAudienceTask(resumedJob)
       if (['queued', 'resuming', 'running'].includes(resumedJob.status)) connectJob(resumedJob)
       setNotice(['queued', 'resuming', 'running'].includes(resumedJob.status)
-        ? '任务已恢复，正在从已保存进度继续处理。'
+        ? repairQualityGate ? '已开始重新生成未达标草稿，完成后会自动重新复核质量。' : '任务已恢复，正在从已保存进度继续处理。'
         : '恢复请求已处理，已同步最新任务状态。')
       return resumedJob
     } catch (error) {
@@ -5668,7 +5677,7 @@ function App() {
                     lastEventAt={jobLastEventAt}
                     now={clock}
                     actionBusy={submitting || audienceResuming || relayLoginOpening || securityRecovering || journeyActionBusy}
-                    onResume={() => void resumeJob(activeJob)}
+                    onResume={() => resumeJob(activeJob)}
                     resumeDisabled={submitting || restoringAi || journeyActionBusy}
                     isProblemActionDisabled={(_problem, actionId) => actionId === 'open_login'
                       ? relayLoginOpening || journeyActionBusy

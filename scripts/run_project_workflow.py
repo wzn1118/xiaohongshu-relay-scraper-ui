@@ -512,7 +512,10 @@ def should_run_analysis_stage(
 ) -> bool:
     return state.should_run(
         "analysis",
-        force=body_ran or complete_missing_only,
+        # A quality-gate retry deliberately revisits analysis even when the
+        # previous analysis checkpoint is complete, so it can regenerate the
+        # blocked drafts and revalidate their evidence.
+        force=body_ran or complete_missing_only or state.resume_scope == "analysis",
     )
 
 

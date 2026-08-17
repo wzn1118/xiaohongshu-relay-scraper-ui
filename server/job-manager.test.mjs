@@ -2469,7 +2469,8 @@ test('resume is revision-guarded and idempotent for concurrent retries', async (
     child.emit('close', 0, null);
     await ended;
   } finally {
-    await rm(dataDir, { recursive: true, force: true });
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
