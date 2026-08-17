@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "bundled": true,
+  "sdk": "@modelcontextprotocol/sdk",
+  "sdkVersion": "1.30.0",
+  "transports": [
+    "streamable-http",
+    "stdio-bridge"
+  ],
+  "localEndpoint": "http://127.0.0.1:4328/mcp",
+  "healthEndpoint": "http://127.0.0.1:4328/health",
+  "entrypoints": {
+    "startApplicationAndMcp": "start-mcp.cmd",
+    "stdioBridge": "mcp-stdio.cmd",
+    "verify": "verify-mcp.cmd",
+    "publicShowcaseVerify": "scripts/verify-mcp-public-showcase.mjs",
+    "isolatedPackageVerify": "scripts/verify-public-package-mcp.ps1",
+    "clientTemplate": "config/mcp-client.example.json",
+    "guide": "docs/PUBLIC_RELEASE_MCP_GUIDE.md"
+  },
+  "credentialsIncluded": false,
+  "tokenPolicy": "Create a scoped Grant in the Web MCP management panel and store its one-time token outside the release directory."
+}

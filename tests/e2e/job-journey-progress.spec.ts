@@ -239,7 +239,7 @@ async function openJourney(page: Page, journeyJob = job, options: { expireFirstR
     return json(route, {})
   })
   await page.clock.setFixedTime(new Date(now))
-  await page.goto('/', { waitUntil: 'commit' })
+  await page.goto('/?screen=task', { waitUntil: 'commit' })
   await expect(page.locator('.job-journey-panel')).toBeVisible({ timeout: 45_000 })
   return state
 }

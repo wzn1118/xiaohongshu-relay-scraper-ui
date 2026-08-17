@@ -583,10 +583,14 @@ export class ApplicationBatchService {
       };
     }
 
+    const subjectResolutionInput = {
+      ...this.candidateProfile,
+      includeAttachmentOnly: true,
+    };
     let subjectResolution = resolveApplicationEmailSubject(
       record,
       record?.outreach?.email_subject,
-      this.candidateProfile,
+      subjectResolutionInput,
     );
     const subjectGuard = subjectResolution.subjectGuard;
     if (subjectGuard.requiresReview || ['rejected_noisy_title', 'rejected_bare_title', 'rejected_unverified_subject'].includes(subjectGuard.sourceStatus)) {
@@ -689,7 +693,7 @@ export class ApplicationBatchService {
         subjectResolution = resolveApplicationEmailSubject(
           record,
           record?.outreach?.email_subject,
-          this.candidateProfile,
+          subjectResolutionInput,
         );
       } catch (error) {
         return {

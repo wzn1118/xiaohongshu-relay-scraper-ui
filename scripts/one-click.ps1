@@ -3,13 +3,17 @@ param(
     [switch]$NoBrowser,
     [switch]$CheckOnly,
     [switch]$SkipBrowserRelayCheck,
+    [switch]$EnableMcp,
     [ValidateRange(0, 65535)]
-    [int]$Port = 0
+    [int]$Port = 0,
+    [ValidateRange(0, 65535)]
+    [int]$McpPort = 0
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
+. (Join-Path $PSScriptRoot 'hegelsalon-common.ps1')
 
 function Enable-BundledRuntime {
     $runtimeRoot = Join-Path $root 'runtime'
@@ -23,6 +27,8 @@ function Enable-BundledRuntime {
     }
     if ($pathEntries.Count -gt 0) { $env:PATH = ([string]::Join(';', $pathEntries) + ';' + $env:PATH) }
 }
+
+Initialize-HegelSalonProxyEnvironment
 
 function Import-DotEnv {
     param([string]$Path)
@@ -67,6 +73,63 @@ function Test-PortOpen {
     } finally {
         $client.Dispose()
     }
+}
+
+function Enable-McpRuntime {
+    if (-not $EnableMcp) { return }
+    $env:XHS_MCP_ENABLED = 'true'
+    if (-not $env:XHS_MCP_HOST) { $env:XHS_MCP_HOST = '127.0.0.1' }
+    if ($McpPort -gt 0) {
+        $env:XHS_MCP_PORT = [string]$McpPort
+    } elseif (-not $env:XHS_MCP_PORT) {
+        $env:XHS_MCP_PORT = '4328'
+    }
+}
+
+function Get-RelayLaunchOptions {
+    $configPath = if ($env:XHS_RELAY_CONFIG_PATH) {
+        $env:XHS_RELAY_CONFIG_PATH
+    } else {
+        Join-Path $root 'data\relay-config.json'
+    }
+    $port = 18800
+    $profile = 'openclaw'
+    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+        try {
+            $config = Get-Content -LiteralPath $configPath -Raw -Encoding utf8 | ConvertFrom-Json
+            if ($null -ne $config.port) {
+                $candidate = [int]$config.port
+                if ($candidate -lt 1 -or $candidate -gt 65535) { throw 'port must be between 1 and 65535' }
+                $port = $candidate
+            }
+            if ($config.profile) { $profile = ([string]$config.profile).Trim() }
+            if (-not $profile) { throw 'profile must not be empty' }
+        } catch {
+            throw "Relay configuration is invalid: $configPath. $($_.Exception.Message)"
+        }
+    }
+    return [pscustomobject]@{ Port = $port; Profile = $profile; ConfigPath = $configPath }
+}
+
+function Get-AvailableAppPort {
+    param([ValidateRange(1, 65535)][int]$PreferredPort)
+    for ($candidate = $PreferredPort; $candidate -lt [Math]::Min(65536, $PreferredPort + 100); $candidate++) {
+        if ($candidate -in @(4318, 4327)) { continue }
+        if (-not (Test-PortOpen -HostName '127.0.0.1' -PortNumber $candidate)) { return $candidate }
+    }
+    throw "No available local application port was found near $PreferredPort."
+}
+
+function Resolve-AppUrlPort {
+    param([Parameter(Mandatory = $true)][string]$Url)
+    if (Test-AppHealth $Url) { return $Url }
+    $uri = [Uri]$Url
+    if (-not (Test-PortOpen -HostName $uri.Host -PortNumber $uri.Port)) { return $Url }
+    $replacement = Get-AvailableAppPort -PreferredPort $uri.Port
+    if ($replacement -eq $uri.Port) { return $Url }
+    Write-Warning "Port $($uri.Port) is occupied by another service; starting this package on local port $replacement instead."
+    $env:PORT = [string]$replacement
+    return Get-AppUrl
 }
 
 function Test-OllamaEndpoint {
@@ -234,12 +297,15 @@ function Connect-Relay {
 
 Enable-BundledRuntime
 Import-DotEnv (Join-Path $root '.env')
+Enable-McpRuntime
 if ($Port -gt 0) { $env:PORT = [string]$Port }
+$relayLaunch = Get-RelayLaunchOptions
 $url = Get-AppUrl
+$url = Resolve-AppUrlPort -Url $url
 
 if (-not $CheckOnly) {
     Write-Host 'Preparing Windows runtime and bundled AI/browser tools...'
-    & (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -InstallRuntime -InstallTools -EnsureBrowserRelay
+    & (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -InstallRuntime -InstallTools -EnsureBrowserRelay -RelayPort $relayLaunch.Port -RelayProfile $relayLaunch.Profile
     if ($LASTEXITCODE -ne 0) { throw 'Windows prerequisites are not ready.' }
     Refresh-ProcessPath
     Ensure-DedicatedOcrRuntime
@@ -289,7 +355,7 @@ if ($CheckOnly) {
     if (-not $SkipBrowserRelayCheck) {
         $relayPreflightExit = 2
         try {
-            $relayOutput = @(& (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -CheckOnly -EnsureBrowserRelay 2>$null)
+            $relayOutput = @(& (Join-Path $PSScriptRoot 'ensure-windows-prerequisites.ps1') -CheckOnly -EnsureBrowserRelay -RelayPort $relayLaunch.Port -RelayProfile $relayLaunch.Profile 2>$null)
             $relayPreflightExit = $LASTEXITCODE
             if ($relayOutput) {
                 $relayPreflight = (($relayOutput | Out-String).Trim() | ConvertFrom-Json)
@@ -307,11 +373,15 @@ if ($CheckOnly) {
         python = if ($pythonCommand) { $pythonCommand.Source } else { '' }
         browser = if ($relayPreflight) { $relayPreflight.browser } else { '' }
         relayCommandReady = if ($relayPreflight) { $relayPreflight.relayCommandReady } else { $false }
-        relayProfile = if ($relayPreflight) { $relayPreflight.relayProfile } else { 'openclaw' }
-        relayPort = if ($relayPreflight) { $relayPreflight.relayPort } else { 18800 }
+        relayProfile = if ($relayPreflight) { $relayPreflight.relayProfile } else { $relayLaunch.Profile }
+        relayPort = if ($relayPreflight) { $relayPreflight.relayPort } else { $relayLaunch.Port }
         relayServiceReady = if ($relayPreflight) { $relayPreflight.relayServiceReady } else { $false }
         relayCheckSkipped = [bool]$SkipBrowserRelayCheck
         url = $url
+        mcpEnabled = @('1', 'true', 'yes', 'on') -contains ([string]$env:XHS_MCP_ENABLED).Trim().ToLowerInvariant()
+        mcpHost = if ($env:XHS_MCP_HOST) { $env:XHS_MCP_HOST } else { '127.0.0.1' }
+        mcpPort = if ($env:XHS_MCP_PORT) { [int]$env:XHS_MCP_PORT } else { 4328 }
+        mcpEndpoint = "http://$(if ($env:XHS_MCP_HOST) { $env:XHS_MCP_HOST } else { '127.0.0.1' }):$(if ($env:XHS_MCP_PORT) { [int]$env:XHS_MCP_PORT } else { 4328 })/mcp"
     } | ConvertTo-Json
     if (-not $prerequisitesReady -or -not $relayCheckPassed) { exit 2 }
     exit 0
@@ -333,8 +403,10 @@ if (-not (Test-Path -LiteralPath '.env')) {
     Copy-Item -LiteralPath '.env.example' -Destination '.env'
 }
 Import-DotEnv (Join-Path $root '.env')
+Enable-McpRuntime
 if ($Port -gt 0) { $env:PORT = [string]$Port }
 $url = Get-AppUrl
+$url = Resolve-AppUrlPort -Url $url
 
 if (Test-AppHealth $url) {
     Write-Host "Application is already running at $url"

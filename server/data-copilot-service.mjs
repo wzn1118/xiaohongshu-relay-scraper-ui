@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { closeSync, fsyncSync, openSync, writeSync } from 'node:fs';
 import path from 'node:path';
-import { readFile, readdir, rm, stat } from 'node:fs/promises';
+import { open, readFile, readdir, realpath, rm } from 'node:fs/promises';
 
 import {
   normalizeCopilotIdempotencyKey,
@@ -15,6 +15,7 @@ import {
   normalizeCopilotContextSourceIds as normalizeBoundContextSourceIds,
 } from './copilot-context-source.mjs';
 import { createContextManager } from './copilot/context-manager.mjs';
+import { createCapabilityRuntime } from './copilot/capability-runtime.mjs';
 import { createConversationRepository } from './copilot/conversation-repository.mjs';
 import { runGoldenEvaluation as executeGoldenEvaluation } from './copilot/evaluation-suite.mjs';
 import { createModelGateway } from './copilot/model-gateway.mjs';
@@ -23,6 +24,11 @@ import { createReadOnlySandbox } from './copilot/sandbox.mjs';
 import { createRunCoordinator } from './copilot/run-coordinator.mjs';
 import { createSkillRegistry } from './copilot/skills.mjs';
 import { createSpecialistRouter } from './copilot/specialists.mjs';
+import { createTerminalSessionManager } from './copilot/terminal-session-manager.mjs';
+import {
+  describeToolExecutionLedger,
+  synchronizeToolExecutionLedger,
+} from './copilot/tool-execution-ledger.mjs';
 import { createUsageTracker } from './copilot/usage-tracker.mjs';
 import { verifyAnswer } from './copilot/verifier.mjs';
 
@@ -33,6 +39,16 @@ const ACTIVE_STATUSES = new Set([
 const DEFAULT_ALLOWED_SCOPES = Object.freeze(['*']);
 const MAX_ATTACHMENTS_PER_MESSAGE = 20;
 const EVENT_BUFFER_LIMIT = 250;
+const STREAM_EVENT_TYPES = new Set([
+  'assistant.delta',
+  'assistant.reasoning.delta',
+  'message.delta',
+  'reasoning.delta',
+  'subagent.output.delta',
+  'subagent.reasoning.delta',
+  'subagent.tool.call.delta',
+  'tool.progress',
+]);
 
 export class DataCopilotServiceError extends Error {
   constructor(code, message, status = 400, cause = undefined) {
@@ -57,11 +73,22 @@ export class DataCopilotService {
     runtime,
     policy,
     mcpAdapter = null,
+    capabilityRegistry = null,
+    workspaceAdapter = null,
+    gitAdapter = null,
+    projectWorkspaceService = null,
+    capabilityRuntimeFactory = createCapabilityRuntime,
+    terminalSessionManager = null,
+    runtimeV3Repository = null,
+    mcpClientManager = null,
     manager,
     aiSessions = runtime?.aiSessions,
     contextManager = null,
     repository = null,
     modelGateway = null,
+    modelRunBroker = null,
+    toolExecutionBroker = null,
+    executionWorkerSupervisor = null,
     orchestrator = null,
     sandbox = null,
     skillRegistry = null,
@@ -69,6 +96,7 @@ export class DataCopilotService {
     usageTracker = null,
     productionStore = null,
     runCoordinator = null,
+    subagentRuntime = null,
     now = () => new Date(),
   } = {}) {
     if (!store || !approvals || !artifacts || !runtime || !policy) {
@@ -85,11 +113,33 @@ export class DataCopilotService {
     this.runtime = runtime;
     this.policy = policy;
     this.mcpAdapter = mcpAdapter;
+    this.capabilityRegistry = capabilityRegistry || runtime.registry || null;
+    this.workspaceAdapter = workspaceAdapter;
+    this.gitAdapter = gitAdapter;
+    this.projectWorkspaceService = projectWorkspaceService;
+    this.capabilityRuntimeFactory = capabilityRuntimeFactory;
+    this.terminalSessionManager = terminalSessionManager || createTerminalSessionManager({
+      now,
+      repository: runtimeV3Repository,
+    });
+    this.terminalLeases = new Map();
+    this.mcpClientManager = mcpClientManager;
     this.manager = manager || policy.manager;
     this.aiSessions = aiSessions;
     this.contextManager = contextManager || createContextManager({ now });
     this.repository = repository || createConversationRepository({ store });
     this.modelGateway = modelGateway || createModelGateway({ now });
+    this.modelRunBroker = modelRunBroker && typeof modelRunBroker.runTurn === 'function'
+      ? modelRunBroker
+      : null;
+    this.toolExecutionBroker = toolExecutionBroker && typeof toolExecutionBroker.submit === 'function'
+      ? toolExecutionBroker
+      : null;
+    this.runtimeV3Repository = runtimeV3Repository || this.toolExecutionBroker?.repository || null;
+    this.executionWorkerSupervisor = executionWorkerSupervisor
+      && typeof executionWorkerSupervisor.describe === 'function'
+      ? executionWorkerSupervisor
+      : null;
     this.orchestrator = orchestrator || createOrchestrator({ now });
     this.sandbox = sandbox || createReadOnlySandbox();
     this.skillRegistry = skillRegistry || createSkillRegistry();
@@ -99,6 +149,7 @@ export class DataCopilotService {
     this.runCoordinator = runCoordinator || (productionStore
       ? createRunCoordinator({ store: productionStore, orchestrator: this.orchestrator, now })
       : null);
+    this.subagentRuntime = subagentRuntime;
     this.now = now;
     this.references = new Map();
     this.listeners = new Map();
@@ -107,6 +158,7 @@ export class DataCopilotService {
     this.modelSessions = new Map();
     this.operations = new Map();
     this.discoveryErrors = [];
+    this.terminalSessionsRecovered = 0;
     this.initialized = false;
 
     const previousEmit = typeof runtime.emit === 'function' ? runtime.emit.bind(runtime) : null;
@@ -114,6 +166,15 @@ export class DataCopilotService {
       previousEmit?.(reference, event);
       this.emit(reference, event);
     };
+    if (typeof runtime.setWorkspaceBindingResolver === 'function') {
+      runtime.setWorkspaceBindingResolver((binding, execution) => (
+        this.#resolveRuntimeWorkspaceBinding(binding, execution)
+      ));
+    }
+    if (this.modelRunBroker) {
+      runtime.setModelRunBroker?.(this.modelRunBroker);
+      this.subagentRuntime?.setModelRunBroker?.(this.modelRunBroker);
+    }
   }
 
   async initialize() {
@@ -121,11 +182,26 @@ export class DataCopilotService {
       return {
         conversations: this.references.size,
         interrupted: 0,
+        terminalSessionsRecovered: this.terminalSessionsRecovered,
         errors: structuredClone(this.discoveryErrors),
       };
     }
+    if (this.projectWorkspaceService?.initialize) await this.projectWorkspaceService.initialize();
     this.references.clear();
     this.discoveryErrors = [];
+    try {
+      const recovery = await this.terminalSessionManager?.recover?.();
+      this.terminalSessionsRecovered = Number.isSafeInteger(recovery?.recovered) && recovery.recovered >= 0
+        ? recovery.recovered
+        : 0;
+    } catch (error) {
+      this.terminalSessionsRecovered = 0;
+      this.discoveryErrors.push({
+        conversationId: 'terminal-sessions',
+        code: String(error?.code || 'COPILOT_TERMINAL_RECOVERY_FAILED'),
+        message: String(error?.message || error).slice(0, 500),
+      });
+    }
     const directory = path.join(this.rootDir, 'copilot');
     let entries = [];
     try {
@@ -176,8 +252,14 @@ export class DataCopilotService {
     return {
       conversations: this.references.size,
       interrupted,
+      terminalSessionsRecovered: this.terminalSessionsRecovered,
       errors: structuredClone(this.discoveryErrors),
     };
+  }
+
+  async close() {
+    await this.terminalSessionManager?.close?.();
+    this.terminalLeases.clear();
   }
 
   async createConversation(value = {}) {
@@ -201,7 +283,10 @@ export class DataCopilotService {
       value.idempotencyKey || `conversation:${crypto.randomUUID()}`,
       'conversation idempotency key',
     );
-    const selectedModel = this.#resolveSelectedModel(value.aiSessionId, value.selectedModel);
+    const selectedModel = this.#resolveSelectedModel(
+      value.aiSessionId || objectValue(value.selectedModel).aiSessionId,
+      value.selectedModel,
+    );
     const snapshot = await this.#captureSnapshot(job);
     const conversation = await this.store.createConversation({
       ...(value.conversationId ? { conversationId: requiredCopilotId(value.conversationId, 'conversation ID') } : {}),
@@ -217,8 +302,8 @@ export class DataCopilotService {
     const reference = normalizeCopilotReference(conversation);
     this.policy.validateReference(reference, conversation);
     this.references.set(reference.conversationId, reference);
-    if (String(value.aiSessionId || '').trim()) {
-      this.modelSessions.set(reference.conversationId, String(value.aiSessionId).trim());
+    if (selectedModel.aiSessionId) {
+      this.modelSessions.set(reference.conversationId, selectedModel.aiSessionId);
     }
     this.emit(reference, { type: 'conversation.created', conversation: publicConversation(conversation) });
     return { conversation: publicConversation(conversation), ...(snapshot ? { snapshot } : {}) };
@@ -277,6 +362,21 @@ export class DataCopilotService {
     };
   }
 
+  async getMcpContext(conversationId) {
+    const { reference, conversation } = await this.#conversation(conversationId);
+    this.policy.validateSnapshot(reference, conversation);
+    this.#requireProductionStore();
+    const snapshot = this.productionStore.getSnapshot(reference.jobId, reference.snapshotId);
+    if (!snapshot) {
+      throw serviceError('COPILOT_SNAPSHOT_NOT_FOUND', 'The MCP-bound snapshot was not found.', 404);
+    }
+    return {
+      reference: structuredClone(reference),
+      conversation: structuredClone(conversation),
+      snapshot: structuredClone(snapshot),
+    };
+  }
+
   async listRuns(conversationId, options = {}) {
     const { reference } = await this.#conversation(conversationId);
     const runs = await this.store.listRuns(reference, {
@@ -292,8 +392,19 @@ export class DataCopilotService {
   async updateConversation(conversationId, value = {}) {
     const { reference, conversation } = await this.#conversation(conversationId);
     const patch = {};
-    for (const key of ['title', 'filters', 'selectedModel', 'lastContextSourceIds']) {
+    for (const key of ['title', 'filters', 'lastContextSourceIds']) {
       if (Object.hasOwn(value, key)) patch[key] = value[key];
+    }
+    if (Object.hasOwn(value, 'selectedModel')) {
+      const existing = normalizeSelectedModel(conversation.selectedModel);
+      const requested = objectValue(value.selectedModel);
+      const aiSessionId = String(
+        requested.aiSessionId || existing.aiSessionId || this.modelSessions.get(reference.conversationId) || '',
+      ).trim();
+      patch.selectedModel = this.#resolveSelectedModel(aiSessionId, { ...existing, ...requested });
+      if (patch.selectedModel.aiSessionId) {
+        this.modelSessions.set(reference.conversationId, patch.selectedModel.aiSessionId);
+      }
     }
     const updated = await this.store.updateConversation(reference, patch, { expectedRevision: value.expectedRevision });
     this.emit(reference, { type: 'conversation.updated', conversation: publicConversation(updated) });
@@ -321,11 +432,21 @@ export class DataCopilotService {
     const lastSeq = Number(this.eventSequences.get(reference.conversationId) || events.at(-1)?.seq || events.at(-1)?.eventId || 0);
     const firstSeq = Number(events[0]?.seq || events[0]?.eventId || 0);
     const gap = after > 0 && firstSeq > after + 1 ? { from: after + 1, to: firstSeq - 1 } : null;
-    const selected = events
+    const matching = events
       .filter((event) => Number(event.seq || event.eventId || 0) > after)
-      .filter((event) => !runId || event.runId === runId || event.payload?.runId === runId)
-      .slice(0, maximum);
-    return { schemaVersion: 1, conversationId: reference.conversationId, events: selected, nextSeq: Number(selected.at(-1)?.seq || after), lastSeq, gap };
+      .filter((event) => !runId || event.runId === runId || event.payload?.runId === runId);
+    const selected = matching.slice(0, maximum);
+    const nextSeq = Number(selected.at(-1)?.seq || after);
+    const replayLastSeq = Number(matching.at(-1)?.seq || after);
+    return {
+      schemaVersion: 1,
+      conversationId: reference.conversationId,
+      events: selected,
+      nextSeq,
+      lastSeq,
+      hasMore: nextSeq < replayLastSeq,
+      gap,
+    };
   }
 
   async listRunEvents(runId, options = {}) {
@@ -403,11 +524,50 @@ export class DataCopilotService {
     return verifyAnswer(value);
   }
 
-  async executeWorkbenchTool(toolName, input = {}) {
+  async delegateSubagents(conversationId, value = {}) {
+    this.#requireSubagentRuntime();
+    const { reference, conversation } = await this.#conversation(conversationId);
+    this.policy.validateSnapshot(reference, conversation);
+    const aiSessionId = String(value.aiSessionId || this.modelSessions.get(reference.conversationId) || '').trim();
+    if (!aiSessionId) throw serviceError('COPILOT_AI_SESSION_REQUIRED', 'A selected model session is required to delegate subagent work.', 409);
+    this.#resolveSelectedModel(aiSessionId, conversation.selectedModel);
+    if (aiSessionId) this.modelSessions.set(reference.conversationId, aiSessionId);
+    const parentRunId = String(value.parentRunId || `api-run-${crypto.randomUUID()}`);
+    const parentToolRunId = String(value.parentToolRunId || `api-tool-${crypto.randomUUID()}`);
+    return this.subagentRuntime.delegate(value, {
+      reference,
+      conversation,
+      contextSourceIds: value.contextSourceIds || conversation.lastContextSourceIds || reference.scope?.contextSourceIds || [],
+      aiSessionId,
+      runId: parentRunId,
+      toolRunId: parentToolRunId,
+      agentDepth: 0,
+      signal: isAbortSignal(value.signal) ? value.signal : undefined,
+      emit: (event) => this.emit(reference, event),
+    });
+  }
+
+  async executeWorkbenchTool(toolName, input = {}, securityContext = {}, executionOptions = {}) {
     const startedAt = Date.now();
-    const conversationId = String(input.conversationId || '');
+    const body = objectValue(input);
+    const conversationId = String(body.conversationId || '');
     try {
-      const output = await this.sandbox.execute(toolName, input);
+      // A workbench task becomes a real workspace capability only when both
+      // identifiers are present. This keeps existing data-only workbench
+      // calls on the legacy sandbox while giving project tasks a scoped root,
+      // lease, authority, and replayable receipt.
+      if (body.projectId && body.workspaceId) {
+        const { projectId, workspaceId, conversationId: ignoredConversationId, ...workspaceInput } = body;
+        return await this.executeProjectWorkspaceTool(
+          projectId,
+          workspaceId,
+          toolName,
+          workspaceInput,
+          securityContext,
+          executionOptions,
+        );
+      }
+      const output = await this.sandbox.execute(toolName, body);
       const durationMs = Date.now() - startedAt;
       this.#recordUsage({ conversationId, toolCalls: 1, latencyMs: durationMs });
       this.#recordTrace({ conversationId, operation: `workbench.tool:${String(toolName)}`, status: 'completed', durationMs, payload: { outputType: output?.kind || typeof output } });
@@ -418,13 +578,21 @@ export class DataCopilotService {
     }
   }
 
-  async executeWorkbenchGraph(value = {}) {
+  async executeWorkbenchGraph(value = {}, securityContext = {}) {
     const tasks = (Array.isArray(value.tasks) ? value.tasks : []).map((task) => ({
       ...task,
       kind: String(task.toolName || task.kind || ''),
     }));
     if (!tasks.length) throw serviceError('COPILOT_TASK_GRAPH_EMPTY', 'At least one workbench task is required.');
     const conversationId = String(value.conversationId || '');
+    const executeTask = async (task) => {
+      const taskInput = objectValue(task.input);
+      if (taskInput.projectId && taskInput.workspaceId) {
+        const { projectId, workspaceId, conversationId: ignoredConversationId, ...workspaceInput } = taskInput;
+        return this.executeProjectWorkspaceTool(projectId, workspaceId, task.kind, workspaceInput, securityContext);
+      }
+      return this.sandbox.execute(task.kind, taskInput);
+    };
     if (this.runCoordinator && conversationId) {
       const { reference } = await this.#conversation(conversationId);
       const events = [];
@@ -434,7 +602,7 @@ export class DataCopilotService {
           ...value,
           conversationId: reference.conversationId,
           tasks,
-          executeTask: (task) => this.sandbox.execute(task.kind, task.input || {}),
+          executeTask,
           onEvent: (event) => {
             events.push(event);
             this.emit(reference, event);
@@ -454,7 +622,7 @@ export class DataCopilotService {
     const startedAt = Date.now();
     const result = await this.orchestrator.run(
       graph,
-      (task) => this.sandbox.execute(task.kind, task.input || {}),
+      executeTask,
       {
         budget: objectValue(value.budget),
         onEvent: (event) => events.push(event),
@@ -472,49 +640,779 @@ export class DataCopilotService {
     return { schemaVersion: 1, ...result, events };
   }
 
-  getWorkbenchRun(runId, conversationId = '') {
+  getWorkbenchRun(runId, conversationId) {
     this.#requireRunCoordinator();
-    const state = this.runCoordinator.getState(requiredCopilotId(runId, 'run ID'));
+    const id = requiredCopilotId(runId, 'run ID');
+    const ownerId = requiredCopilotId(conversationId, 'conversation ID');
+    const state = this.runCoordinator.getState(id);
     if (!state.run) throw serviceError('COPILOT_RUN_NOT_FOUND', 'Data Copilot run was not found.', 404);
-    if (conversationId && state.run.conversationId !== requiredCopilotId(conversationId, 'conversation ID')) {
+    if (state.run.conversationId !== ownerId) {
       throw serviceError('COPILOT_RUN_CONTEXT_MISMATCH', 'The run does not belong to this conversation.', 409);
     }
     return state;
   }
 
-  pauseWorkbenchRun(runId) {
+  pauseWorkbenchRun(runId, conversationId) {
     this.#requireRunCoordinator();
     const id = requiredCopilotId(runId, 'run ID');
+    this.getWorkbenchRun(id, conversationId);
     const accepted = this.runCoordinator.pause(id);
     if (!accepted && !this.runCoordinator.getState(id).run) throw serviceError('COPILOT_RUN_NOT_FOUND', 'Data Copilot run was not found.', 404);
     return { schemaVersion: 2, accepted, action: 'pause', runId: id };
   }
 
-  cancelWorkbenchRun(runId) {
+  cancelWorkbenchRun(runId, conversationId) {
     this.#requireRunCoordinator();
     const id = requiredCopilotId(runId, 'run ID');
+    const state = this.getWorkbenchRun(id, conversationId);
+    if (isSubagentRunState(state)) {
+      this.#requireSubagentRuntime();
+      const parent = subagentParentIds(state);
+      return this.subagentRuntime.cancel(id, {
+        conversationId: state.run.conversationId,
+        runId: parent.parentRunId,
+        toolRunId: parent.parentToolRunId,
+        agentDepth: 0,
+        emit: (event) => this.emit(state.run.conversationId, event),
+      });
+    }
     const accepted = this.runCoordinator.cancel(id);
-    if (!accepted && !this.runCoordinator.getState(id).run) throw serviceError('COPILOT_RUN_NOT_FOUND', 'Data Copilot run was not found.', 404);
+    if (!accepted && !state.run) throw serviceError('COPILOT_RUN_NOT_FOUND', 'Data Copilot run was not found.', 404);
     return { schemaVersion: 2, accepted, action: 'cancel', runId: id };
   }
 
-  async resumeWorkbenchRun(runId, value = {}) {
+  async resumeWorkbenchRun(runId, conversationId, value = {}) {
     this.#requireRunCoordinator();
-    return this.runCoordinator.resume(requiredCopilotId(runId, 'run ID'), {
+    const id = requiredCopilotId(runId, 'run ID');
+    const state = this.getWorkbenchRun(id, conversationId);
+    if (isSubagentRunState(state)) {
+      this.#requireSubagentRuntime();
+      const { reference, conversation } = await this.#conversation(state.run.conversationId);
+      const aiSessionId = resolveSubagentSessionId(value, state, this.modelSessions.get(reference.conversationId));
+      if (!aiSessionId) throw serviceError('COPILOT_AI_SESSION_REQUIRED', 'A selected model session is required to resume the subagent run.', 409);
+      this.#resolveSelectedModel(aiSessionId, conversation.selectedModel);
+      this.modelSessions.set(reference.conversationId, aiSessionId);
+      const parent = subagentParentIds(state);
+      return this.subagentRuntime.resume(id, {
+        reference,
+        conversation,
+        contextSourceIds: value.contextSourceIds || firstSubagentInput(state).contextSourceIds || [],
+        aiSessionId,
+        runId: parent.parentRunId,
+        toolRunId: parent.parentToolRunId,
+        agentDepth: 0,
+        signal: isAbortSignal(value.signal) ? value.signal : undefined,
+        emit: (event) => this.emit(reference, event),
+      });
+    }
+    return this.runCoordinator.resume(id, {
       ...value,
       executeTask: (task) => this.sandbox.execute(task.kind, task.input || {}),
     });
   }
 
-  async steerWorkbenchRun(runId, value = {}) {
+  async steerWorkbenchRun(runId, conversationId, value = {}) {
     this.#requireRunCoordinator();
+    const id = requiredCopilotId(runId, 'run ID');
+    const state = this.getWorkbenchRun(id, conversationId);
+    if (isSubagentRunState(state)) {
+      this.#requireSubagentRuntime();
+      const { reference, conversation } = await this.#conversation(state.run.conversationId);
+      const aiSessionId = resolveSubagentSessionId(value, state, this.modelSessions.get(reference.conversationId));
+      if (!aiSessionId) throw serviceError('COPILOT_AI_SESSION_REQUIRED', 'A selected model session is required to steer the subagent run.', 409);
+      this.#resolveSelectedModel(aiSessionId, conversation.selectedModel);
+      this.modelSessions.set(reference.conversationId, aiSessionId);
+      const parent = subagentParentIds(state);
+      return this.subagentRuntime.steer(id, value, {
+        reference,
+        conversation,
+        contextSourceIds: value.contextSourceIds || firstSubagentInput(state).contextSourceIds || [],
+        aiSessionId,
+        runId: parent.parentRunId,
+        toolRunId: parent.parentToolRunId,
+        agentDepth: 0,
+        signal: isAbortSignal(value.signal) ? value.signal : undefined,
+        emit: (event) => this.emit(reference, event),
+      });
+    }
     const tasks = (Array.isArray(value.tasks) ? value.tasks : []).map((task) => ({ ...task, kind: String(task.toolName || task.kind || '') }));
     if (!tasks.length) throw serviceError('COPILOT_TASK_GRAPH_EMPTY', 'At least one revised workbench task is required.');
-    return this.runCoordinator.steer(requiredCopilotId(runId, 'run ID'), {
+    return this.runCoordinator.steer(id, {
       ...value,
       tasks,
       executeTask: (task) => this.sandbox.execute(task.kind, task.input || {}),
     });
+  }
+
+  listProjects(value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    return {
+      schemaVersion: 1,
+      projects: this.projectWorkspaceService.listProjects({
+        includeArchived: value.includeArchived === true,
+      }),
+    };
+  }
+
+  getProject(projectId, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    return {
+      schemaVersion: 1,
+      project: this.projectWorkspaceService.getProject(projectId),
+    };
+  }
+
+  async createProject(value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    return {
+      schemaVersion: 1,
+      project: await this.projectWorkspaceService.createProject(value),
+    };
+  }
+
+  async updateProject(projectId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    return {
+      schemaVersion: 1,
+      project: await this.projectWorkspaceService.updateProject(projectId, value),
+    };
+  }
+
+  listProjectWorkspaces(projectId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    return {
+      schemaVersion: 1,
+      project: this.projectWorkspaceService.getProject(projectId),
+      workspaces: this.projectWorkspaceService.listWorkspaces(projectId, {
+        includeArchived: value.includeArchived === true,
+      }),
+    };
+  }
+
+  async createProjectWorkspace(projectId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    return {
+      schemaVersion: 1,
+      workspace: await this.projectWorkspaceService.createWorkspace(projectId, value),
+    };
+  }
+
+  async getProjectWorkspace(projectId, workspaceId, { includeStatus = false } = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    return {
+      schemaVersion: 1,
+      project,
+      workspace,
+      status: includeStatus ? await this.projectWorkspaceService.worktreeStatus(workspace.id) : undefined,
+    };
+  }
+
+  async archiveProjectWorkspace(projectId, workspaceId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    return {
+      schemaVersion: 1,
+      workspace: await this.projectWorkspaceService.archiveWorkspace(workspace.id, {
+        removeWorktree: value.removeWorktree === true,
+        force: value.force === true,
+      }),
+    };
+  }
+
+  async acquireProjectWorkspaceLease(projectId, workspaceId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    return {
+      schemaVersion: 1,
+      workspaceId: workspace.id,
+      lease: await this.projectWorkspaceService.acquireLease(workspace.id, { ...objectValue(value), actorId }),
+    };
+  }
+
+  async releaseProjectWorkspaceLease(projectId, workspaceId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    return {
+      schemaVersion: 1,
+      ...await this.projectWorkspaceService.releaseLease(workspace.id, { ...objectValue(value), actorId }),
+    };
+  }
+
+  /**
+   * Executes a local capability in a project-bound workspace.  The client can
+   * choose a tool input only; authority comes exclusively from the HTTP
+   * security context derived by the server.
+   */
+  async executeProjectWorkspaceTool(projectId, workspaceId, toolName, input = {}, securityContext = {}, executionOptions = {}) {
+    this.#requireProjectWorkspaceService();
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    if (!this.workspaceAdapter?.forWorkspace) {
+      throw serviceError('COPILOT_WORKSPACE_RUNTIME_UNAVAILABLE', 'The local workspace runtime is unavailable.', 503);
+    }
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    const adapter = this.workspaceAdapter.forWorkspace(workspace.rootPath);
+    const gitAdapter = this.gitAdapter?.forWorkspace?.(workspace.rootPath) || null;
+    const requestedTool = String(toolName || '').trim();
+    const registry = createScopedWorkspaceRegistry(adapter, { gitAdapter });
+    const descriptor = registry.get(requestedTool);
+    if (!descriptor) {
+      throw serviceError('COPILOT_WORKSPACE_TOOL_UNKNOWN', `Unknown project workspace tool: ${requestedTool || 'unknown'}.`, 404);
+    }
+    const runtime = this.capabilityRuntimeFactory({ registry, now: this.now });
+    const body = objectValue(input);
+    const timeoutMs = body.timeoutMs;
+    const toolInput = body;
+    const awaitCompletion = executionOptions?.awaitCompletion !== false;
+    const operation = projectWorkspaceToolOperation({
+      projectId: project.id,
+      workspaceId: workspace.id,
+      idempotencyKey: executionOptions?.idempotencyKey,
+    });
+    const runId = operation.runId;
+    const authority = workspaceAuthority(securityContext);
+    const execution = runtime.createExecution({
+      ...this.projectWorkspaceService.executionContext(workspace.id, authority),
+      runId,
+      toolRunId: operation.toolExecutionId,
+      timeoutMs,
+      authority,
+    });
+    const lease = await this.projectWorkspaceService.acquireLease(workspace.id, {
+      runId,
+      actorId,
+      mode: String(descriptor.risk || 'read') === 'read' ? 'read' : 'write',
+      ttlMs: Number(timeoutMs) > 0 ? Number(timeoutMs) + 30_000 : undefined,
+    });
+    const leaseOwner = lease.reused !== true;
+    let releaseLeaseOnReturn = leaseOwner;
+    let receipt;
+    let completion = null;
+    try {
+      const durableExecution = this.toolExecutionBroker
+        ? await this.#executeProjectWorkspaceToolDurably({
+          broker: this.toolExecutionBroker,
+          registry,
+          runtime,
+          descriptor,
+          toolInput,
+          execution,
+          authority,
+          project,
+          workspace,
+          timeoutMs,
+          idempotencyKey: operation.idempotencyKey,
+          awaitCompletion,
+        })
+        : {
+          receipt: await runtime.execute(descriptor.name, toolInput, execution),
+          completion: null,
+          started: leaseOwner,
+          duplicate: false,
+        };
+      receipt = durableExecution.receipt;
+      completion = durableExecution.completion;
+      const pendingDuplicate = durableExecution.duplicate === true && isPendingCapabilityReceipt(receipt);
+      const ownsLeaseLifecycle = durableExecution.started === true || (leaseOwner && !pendingDuplicate);
+      const ownsExecutionLifecycle = durableExecution.started === true
+        || (leaseOwner && durableExecution.duplicate !== true);
+      releaseLeaseOnReturn = ownsLeaseLifecycle;
+      if (!awaitCompletion && ownsExecutionLifecycle && isPendingCapabilityReceipt(receipt) && completion) {
+        releaseLeaseOnReturn = false;
+        void this.#completeProjectWorkspaceToolExecution({
+          completion,
+          project,
+          workspace,
+          descriptor,
+          runId,
+          lease,
+          actorId,
+        });
+      } else if (ownsExecutionLifecycle) {
+        this.#recordProjectWorkspaceToolOutcome({ runId, descriptor, project, workspace, receipt });
+      }
+    } finally {
+      if (releaseLeaseOnReturn) {
+        await this.projectWorkspaceService.releaseLease(workspace.id, { leaseId: lease.id, runId, actorId });
+      }
+    }
+    return {
+      schemaVersion: 1,
+      project: { id: project.id, name: project.name },
+      workspace: { id: workspace.id, name: workspace.name, kind: workspace.kind },
+      receipt,
+    };
+  }
+
+  getProjectWorkspaceToolExecution(projectId, workspaceId, toolExecutionId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    if (!this.toolExecutionBroker?.get) {
+      throw serviceError('COPILOT_TOOL_EXECUTION_UNAVAILABLE', 'Durable tool execution receipts are unavailable.', 503);
+    }
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    const executionId = String(toolExecutionId || '').trim();
+    if (!executionId) {
+      throw serviceError('COPILOT_TOOL_EXECUTION_ID_REQUIRED', 'A tool execution ID is required.', 400);
+    }
+    const durableReceipt = this.toolExecutionBroker.get(executionId);
+    if (!durableReceipt) {
+      throw serviceError('COPILOT_TOOL_EXECUTION_NOT_FOUND', 'The tool execution was not found.', 404);
+    }
+    const environment = objectValue(durableReceipt.context?.environment);
+    if (
+      environment.kind !== 'project_workspace'
+      || String(environment.projectId || '') !== project.id
+      || String(environment.workspaceId || '') !== workspace.id
+    ) {
+      throw serviceError('COPILOT_TOOL_EXECUTION_NOT_FOUND', 'The tool execution was not found.', 404);
+    }
+    this.#requireProjectWorkspaceToolExecutionActor(durableReceipt, actorId);
+    const authority = workspaceAuthority(securityContext);
+    const events = this.toolExecutionBroker.repository?.listEvents
+      ? this.toolExecutionBroker.repository.listEvents({
+        streamId: `execution:${String(durableReceipt.context?.runId || '')}:tool:${durableReceipt.toolExecutionId}`,
+        afterSequence: nonNegativeInteger(value.afterSequence, 0),
+        limit: boundedInteger(value.limit, 200, 1, 1_000),
+      })
+      : [];
+    return {
+      schemaVersion: 1,
+      project: { id: project.id, name: project.name },
+      workspace: { id: workspace.id, name: workspace.name, kind: workspace.kind },
+      receipt: projectWorkspaceCapabilityReceipt(durableReceipt, {
+        project,
+        workspace,
+        authority,
+        executionLedger: describeToolExecutionLedger({
+          repository: this.runtimeV3Repository || this.toolExecutionBroker?.repository,
+          durableReceipt,
+        }),
+      }),
+      events,
+    };
+  }
+
+  async cancelProjectWorkspaceToolExecution(projectId, workspaceId, toolExecutionId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    if (!this.toolExecutionBroker?.get || !this.toolExecutionBroker?.cancel) {
+      throw serviceError('COPILOT_TOOL_EXECUTION_UNAVAILABLE', 'Durable tool execution cancellation is unavailable.', 503);
+    }
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    const executionId = String(toolExecutionId || '').trim();
+    if (!executionId) {
+      throw serviceError('COPILOT_TOOL_EXECUTION_ID_REQUIRED', 'A tool execution ID is required.', 400);
+    }
+    const existing = this.toolExecutionBroker.get(executionId);
+    if (!existing) {
+      throw serviceError('COPILOT_TOOL_EXECUTION_NOT_FOUND', 'The tool execution was not found.', 404);
+    }
+    const environment = objectValue(existing.context?.environment);
+    if (
+      environment.kind !== 'project_workspace'
+      || String(environment.projectId || '') !== project.id
+      || String(environment.workspaceId || '') !== workspace.id
+    ) {
+      throw serviceError('COPILOT_TOOL_EXECUTION_NOT_FOUND', 'The tool execution was not found.', 404);
+    }
+    this.#requireProjectWorkspaceToolExecutionActor(existing, actorId);
+    const cancellation = objectValue(value);
+    const durableReceipt = await this.toolExecutionBroker.cancel(executionId, {
+      reason: boundedToolCancellationReason(cancellation.reason),
+    });
+    const authority = workspaceAuthority(securityContext);
+    return {
+      schemaVersion: 1,
+      project: { id: project.id, name: project.name },
+      workspace: { id: workspace.id, name: workspace.name, kind: workspace.kind },
+      receipt: projectWorkspaceCapabilityReceipt(durableReceipt, {
+        project,
+        workspace,
+        authority,
+        executionLedger: synchronizeToolExecutionLedger({
+          repository: this.runtimeV3Repository || this.toolExecutionBroker?.repository,
+          durableReceipt,
+          descriptor: { name: durableReceipt.toolName, source: 'workspace' },
+          project,
+          workspace,
+          authority,
+        }),
+      }),
+    };
+  }
+
+  listExecutions(value = {}, securityContext = {}) {
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    const repository = this.#requireRuntimeV3Repository();
+    const query = objectValue(value);
+    const limit = boundedInteger(query.limit, 100, 1, 500);
+    const records = repository.listExecutions({
+      taskId: String(query.taskId || '').trim(),
+      runId: String(query.runId || '').trim(),
+      actorId,
+      status: String(query.status || '').trim(),
+      limit: Math.min(limit + 1, 1_000),
+      order: 'desc',
+    }).filter((record) => executionActorId(record) === actorId);
+    return {
+      schemaVersion: 1,
+      executions: records.slice(0, limit).map(executionProjection),
+      hasMore: records.length > limit,
+    };
+  }
+
+  getExecution(executionId, securityContext = {}) {
+    const execution = this.#executionForActor(executionId, securityContext);
+    return {
+      schemaVersion: 1,
+      execution: executionProjection(execution),
+    };
+  }
+
+  listExecutionSteps(executionId, value = {}, securityContext = {}) {
+    const execution = this.#executionForActor(executionId, securityContext);
+    const repository = this.#requireRuntimeV3Repository();
+    const query = objectValue(value);
+    return {
+      schemaVersion: 1,
+      execution: executionProjection(execution),
+      steps: repository.listExecutionSteps({
+        executionId: execution.executionId,
+        status: String(query.status || '').trim(),
+        limit: boundedInteger(query.limit, 200, 1, 1_000),
+      }).map(executionStepProjection),
+    };
+  }
+
+  listExecutionArtifacts(executionId, value = {}, securityContext = {}) {
+    const execution = this.#executionForActor(executionId, securityContext);
+    const repository = this.#requireRuntimeV3Repository();
+    const query = objectValue(value);
+    return {
+      schemaVersion: 1,
+      execution: executionProjection(execution),
+      artifacts: repository.listExecutionArtifacts({
+        executionId: execution.executionId,
+        stepId: String(query.stepId || '').trim(),
+        kind: String(query.kind || '').trim(),
+        limit: boundedInteger(query.limit, 200, 1, 1_000),
+      }).map(executionArtifactProjection),
+    };
+  }
+
+  listExecutionEvents(executionId, value = {}, securityContext = {}) {
+    const execution = this.#executionForActor(executionId, securityContext);
+    const repository = this.#requireRuntimeV3Repository();
+    const query = objectValue(value);
+    const streams = executionEventStreams(execution);
+    const requestedScope = String(query.scope || (execution.kind === 'tool' ? 'execution' : 'run')).trim();
+    const selected = streams.find((stream) => stream.scope === requestedScope);
+    if (!selected) {
+      throw serviceError(
+        'COPILOT_EXECUTION_EVENT_SCOPE_INVALID',
+        `Execution event scope must be one of: ${streams.map((stream) => stream.scope).join(', ')}.`,
+        400,
+      );
+    }
+    const afterSequence = nonNegativeInteger(query.afterSequence, 0);
+    const limit = boundedInteger(query.limit, 200, 1, 1_000);
+    const events = repository.listEvents({
+      streamId: selected.streamId,
+      afterSequence,
+      limit,
+    }).map(executionEventProjection);
+    const latestSequence = repository.latestSequence(selected.streamId);
+    return {
+      schemaVersion: 1,
+      executionId: execution.executionId,
+      scope: selected.scope,
+      streamId: selected.streamId,
+      availableStreams: streams,
+      afterSequence,
+      latestSequence,
+      hasMore: events.length > 0 && events.at(-1).sequence < latestSequence,
+      events,
+    };
+  }
+
+  async cancelExecution(executionId, value = {}, securityContext = {}) {
+    const execution = this.#executionForActor(executionId, securityContext);
+    if (execution.kind !== 'tool' || !this.toolExecutionBroker?.cancel) {
+      throw serviceError(
+        'COPILOT_EXECUTION_CANCEL_UNSUPPORTED',
+        `Cancellation is not available for execution kind ${execution.kind || 'unknown'}.`,
+        409,
+      );
+    }
+    const cancellation = objectValue(value);
+    await this.toolExecutionBroker.cancel(execution.executionId, {
+      reason: boundedToolCancellationReason(cancellation.reason),
+    });
+    const current = this.#executionForActor(execution.executionId, securityContext);
+    return {
+      schemaVersion: 1,
+      execution: executionProjection(current),
+    };
+  }
+
+  async #executeProjectWorkspaceToolDurably({
+    broker,
+    registry,
+    runtime,
+    descriptor,
+    toolInput,
+    execution,
+    authority,
+    project,
+    workspace,
+    timeoutMs,
+    idempotencyKey,
+    awaitCompletion = true,
+  }) {
+    const authorization = runtime.authorize(descriptor, execution);
+    const toolExecutionId = execution.toolRunId;
+    const executionContext = projectWorkspaceToolExecutionContext({
+      project,
+      workspace,
+      execution,
+      authority,
+      timeoutMs,
+      idempotencyKey,
+      now: this.now,
+    });
+    const submission = await broker.submit({
+      registry,
+      toolName: descriptor.name,
+      input: toolInput,
+      toolExecutionId,
+      idempotencyKey,
+      context: {
+        runId: execution.runId,
+        toolRunId: execution.toolRunId,
+        projectId: project.id,
+        workspaceId: workspace.id,
+        worktreeId: workspace.kind === 'worktree' ? workspace.id : undefined,
+        authority,
+        approved: authorization.automatic,
+        authorizationMode: authorization.mode === 'owner_local_full' ? 'automatic_owner' : 'automatic_local',
+        timeoutMs,
+      },
+      executionContext,
+    });
+    this.#requireProjectWorkspaceToolExecutionActor(submission.receipt, authority.actorId);
+    const toReceipt = (durableReceipt) => projectWorkspaceCapabilityReceipt(durableReceipt, {
+      project,
+      workspace,
+      descriptor,
+      authority,
+      authorization,
+      runId: execution.runId,
+      toolRunId: execution.toolRunId,
+      executionLedger: synchronizeToolExecutionLedger({
+        repository: this.runtimeV3Repository || broker.repository,
+        durableReceipt,
+        descriptor,
+        project,
+        workspace,
+        authority,
+      }),
+    });
+    const completion = submission.promise ? submission.promise.then(toReceipt) : null;
+    return {
+      receipt: awaitCompletion && completion ? await completion : toReceipt(submission.receipt),
+      completion,
+      started: submission.started === true,
+      duplicate: submission.duplicate === true,
+    };
+  }
+
+  async #completeProjectWorkspaceToolExecution({ completion, project, workspace, descriptor, runId, lease, actorId }) {
+    try {
+      const receipt = await completion;
+      this.#recordProjectWorkspaceToolOutcome({ runId, descriptor, project, workspace, receipt });
+    } catch (error) {
+      this.#recordTrace({
+        runId,
+        operation: `workspace.tool:${descriptor.name}`,
+        status: 'failed',
+        durationMs: 0,
+        payload: {
+          projectId: project.id,
+          workspaceId: workspace.id,
+          receiptId: String(lease.runId || ''),
+          error: String(error?.code || error?.message || 'execution_completion_failed').slice(0, 400),
+        },
+      });
+    } finally {
+      await this.projectWorkspaceService.releaseLease(workspace.id, {
+        leaseId: lease.id,
+        runId,
+        actorId,
+      }).catch(() => {});
+    }
+  }
+
+  #recordProjectWorkspaceToolOutcome({ runId, descriptor, project, workspace, receipt }) {
+    this.#recordUsage({ runId, toolCalls: 1, latencyMs: receipt.durationMs || 0 });
+    this.#recordTrace({
+      runId,
+      operation: `workspace.tool:${descriptor.name}`,
+      status: receipt.status,
+      durationMs: receipt.durationMs || 0,
+      payload: {
+        projectId: project.id,
+        workspaceId: workspace.id,
+        receiptId: receipt.receiptId,
+        authority: receipt.authority?.profile,
+      },
+    });
+  }
+
+  listProjectWorkspaceTerminals(projectId, workspaceId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    return {
+      schemaVersion: 1,
+      project: { id: project.id, name: project.name },
+      workspace: { id: workspace.id, name: workspace.name, kind: workspace.kind },
+      sessions: this.terminalSessionManager.list({
+        workspaceId: workspace.id,
+        includeCompleted: value.includeCompleted !== false,
+      }),
+    };
+  }
+
+  getProjectWorkspaceTerminal(projectId, workspaceId, sessionId, value = {}, securityContext = {}) {
+    const { project, workspace, session } = this.#terminalForProject(projectId, workspaceId, sessionId, securityContext);
+    const details = this.terminalSessionManager.get(session.sessionId, value);
+    return {
+      schemaVersion: 1,
+      project: { id: project.id, name: project.name },
+      workspace: { id: workspace.id, name: workspace.name, kind: workspace.kind },
+      ...details,
+    };
+  }
+
+  async startProjectWorkspaceTerminal(projectId, workspaceId, value = {}, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    if (!this.workspaceAdapter?.forWorkspace) {
+      throw serviceError('COPILOT_WORKSPACE_RUNTIME_UNAVAILABLE', 'The local workspace runtime is unavailable.', 503);
+    }
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    const adapter = this.workspaceAdapter.forWorkspace(workspace.rootPath);
+    const descriptor = adapter.get('exec.run');
+    if (!descriptor) {
+      throw serviceError('COPILOT_WORKSPACE_TERMINAL_UNAVAILABLE', 'The local terminal capability is unavailable.', 503);
+    }
+    const authority = workspaceAuthority(securityContext);
+    const capabilityRuntime = this.capabilityRuntimeFactory({
+      registry: createScopedWorkspaceRegistry(adapter),
+      now: this.now,
+    });
+    const runId = `terminal-run-${crypto.randomUUID()}`;
+    const execution = capabilityRuntime.createExecution({
+      ...this.projectWorkspaceService.executionContext(workspace.id, authority),
+      runId,
+      toolRunId: `terminal-tool-${crypto.randomUUID()}`,
+      timeoutMs: objectValue(value).timeoutMs,
+      authority,
+    });
+    const authorization = capabilityRuntime.authorize({ ...descriptor, source: 'workspace' }, execution);
+    const input = objectValue(value);
+    const lease = await this.projectWorkspaceService.acquireLease(workspace.id, {
+      runId,
+      actorId,
+      mode: 'write',
+      ttlMs: Number(input.timeoutMs) > 0 ? Number(input.timeoutMs) + 30_000 : undefined,
+    });
+    let session;
+    try {
+      session = await this.terminalSessionManager.start({
+        workspaceId: workspace.id,
+        projectId: project.id,
+        runId,
+        toolRunId: execution.toolRunId,
+        authority,
+        workspaceRoot: workspace.rootPath,
+        command: input.command,
+        args: input.args,
+        cwd: input.cwd,
+        env: input.env,
+        envRefs: input.envRefs,
+        inheritEnv: input.inheritEnv,
+        timeoutMs: input.timeoutMs,
+        maxOutputBytes: input.maxOutputBytes,
+        stdin: input.stdin,
+        onSettled: async (settled) => {
+          this.terminalLeases.delete(settled.sessionId);
+          await this.projectWorkspaceService.releaseLease(workspace.id, { leaseId: lease.id, runId, actorId }).catch(() => {});
+          this.#recordTrace({
+            runId,
+            operation: 'workspace.terminal',
+            status: settled.status,
+            payload: {
+              projectId: project.id,
+              workspaceId: workspace.id,
+              sessionId: settled.sessionId,
+              exitCode: settled.exitCode,
+              authorization: authorization.mode,
+            },
+          });
+        },
+      });
+    } catch (error) {
+      await this.projectWorkspaceService.releaseLease(workspace.id, { leaseId: lease.id, runId, actorId }).catch(() => {});
+      throw error;
+    }
+    this.terminalLeases.set(session.sessionId, { projectId: project.id, workspaceId: workspace.id, leaseId: lease.id, runId });
+    this.#recordUsage({ runId, toolCalls: 1, latencyMs: 0 });
+    return {
+      schemaVersion: 1,
+      project: { id: project.id, name: project.name },
+      workspace: { id: workspace.id, name: workspace.name, kind: workspace.kind },
+      authorization: { mode: authorization.mode, automatic: authorization.automatic },
+      session,
+    };
+  }
+
+  writeProjectWorkspaceTerminal(projectId, workspaceId, sessionId, value = {}, securityContext = {}) {
+    const { session } = this.#terminalForProject(projectId, workspaceId, sessionId, securityContext);
+    const input = objectValue(value);
+    return {
+      schemaVersion: 1,
+      ...this.terminalSessionManager.write(session.sessionId, input.input),
+    };
+  }
+
+  async cancelProjectWorkspaceTerminal(projectId, workspaceId, sessionId, value = {}, securityContext = {}) {
+    const { session } = this.#terminalForProject(projectId, workspaceId, sessionId, securityContext);
+    const input = objectValue(value);
+    return {
+      schemaVersion: 1,
+      ...await this.terminalSessionManager.cancel(session.sessionId, { reason: input.reason || 'cancelled' }),
+    };
   }
 
   getUsage(value = {}) {
@@ -644,6 +1542,42 @@ export class DataCopilotService {
     };
   }
 
+  listMcpServers() {
+    this.#requireMcpClientManager();
+    return {
+      schemaVersion: 1,
+      servers: this.mcpClientManager.listServers(),
+      tools: this.mcpClientManager.listTools(),
+    };
+  }
+
+  async upsertMcpServer(value = {}) {
+    this.#requireMcpClientManager();
+    const server = await this.mcpClientManager.upsertServer(value, { connect: false });
+    return {
+      schemaVersion: 1,
+      server,
+      tools: this.mcpClientManager.listTools().filter((tool) => tool.serverId === server?.id),
+    };
+  }
+
+  async removeMcpServer(id) {
+    this.#requireMcpClientManager();
+    const removed = await this.mcpClientManager.removeServer(id);
+    if (!removed) throw serviceError('COPILOT_MCP_SERVER_NOT_FOUND', 'MCP server was not found.', 404);
+    return { schemaVersion: 1, removed: true, id: String(id || '') };
+  }
+
+  async refreshMcpServers(id = null) {
+    this.#requireMcpClientManager();
+    const servers = await this.mcpClientManager.refresh(id);
+    return {
+      schemaVersion: 1,
+      servers,
+      tools: this.mcpClientManager.listTools(),
+    };
+  }
+
   getCapabilities() {
     const registry = this.runtime.registry || this.mcpAdapter?.registry;
     const capabilities = this.runtime.describeCapabilities?.() || {
@@ -660,7 +1594,49 @@ export class DataCopilotService {
       },
       contextManager: { enabled: true, schemaVersion: 2, tokenBudget: true, reservedOutputBudget: true, partitions: true, rankedSources: true, pins: Boolean(this.productionStore), structuredCompaction: true, missingContextContract: true },
       verifier: { enabled: true, schemaVersion: 2, evidenceGraph: true, claimCoverage: true, numericRecalculation: true, strictMode: true },
-      modelGateway: { enabled: true, wireApis: ['responses', 'chat_completions'], streaming: true, statefulResponses: true, backgroundLifecycle: true, capabilityNegotiation: true },
+      modelGateway: {
+        enabled: true,
+        implementation: this.modelRunBroker ? 'model-run-broker-v1' : 'runtime-stream-adapter',
+        wireApis: ['responses', 'chat_completions'],
+        streaming: true,
+        statefulResponses: Boolean(this.modelRunBroker?.retrieve),
+        backgroundLifecycle: Boolean(this.modelRunBroker?.cancel),
+        capabilityNegotiation: true,
+      },
+      localRuntime: {
+        workspaceRoot: this.workspaceAdapter?.workspaceRoot || null,
+        tools: this.capabilityRegistry?.describeCapabilities?.() || null,
+        exec: Boolean(this.workspaceAdapter?.get?.('exec.run')),
+        filesystem: Boolean(this.workspaceAdapter?.get?.('workspace.read')),
+        http: Boolean(this.workspaceAdapter?.get?.('http.request')),
+        automaticToolExecution: capabilities.automaticToolExecution || {
+          enabled: false,
+          mode: 'required',
+          scope: 'approval_required',
+          tools: [],
+          approvalRequiredByDefault: true,
+        },
+      },
+      executionWorker: this.executionWorkerSupervisor?.describe?.() || {
+        schemaVersion: 1,
+        kind: 'execution_worker_supervisor',
+        state: 'unavailable',
+        activeExecutions: 0,
+        durableBacklog: 0,
+        inlineBacklog: 0,
+      },
+      executionApi: {
+        schemaVersion: 1,
+        enabled: Boolean(this.runtimeV3Repository),
+        durableEvents: Boolean(this.runtimeV3Repository?.listEvents),
+        steps: Boolean(this.runtimeV3Repository?.listExecutionSteps),
+        artifacts: Boolean(this.runtimeV3Repository?.listExecutionArtifacts),
+        cancellationKinds: this.toolExecutionBroker?.cancel ? ['tool'] : [],
+      },
+      projectWorkspaces: this.projectWorkspaceService
+        ? { enabled: true, ...this.projectWorkspaceService.describe(), worktreeIsolation: true, leases: true, receipts: true }
+        : { enabled: false, worktreeIsolation: false, leases: false, receipts: false },
+      outboundMcp: this.mcpClientManager?.describe?.() || { initialized: false, servers: [], toolCount: 0 },
       orchestration: {
         enabled: true,
         taskGraph: true,
@@ -675,6 +1651,7 @@ export class DataCopilotService {
         planRevisions: Boolean(this.runCoordinator),
         startupRecovery: Boolean(this.runCoordinator),
         startupRecoveredRuns: this.runCoordinator?.recoveredRunIds?.length || 0,
+        subagents: this.subagentRuntime?.describe?.() || { enabled: false, toolCount: 0 },
       },
       workbench: {
         modes: ['ask', 'analyze', 'build'],
@@ -736,7 +1713,9 @@ export class DataCopilotService {
     }
 
     if (kind === 'artifacts') {
-      const files = await listTaskArtifactFiles(job.outputDir);
+      const files = await listTaskArtifactFiles(job.outputDir, {
+        excludedRoots: [path.join(this.rootDir, 'copilot')],
+      });
       const matched = query
         ? files.filter((item) => `${item.name} ${item.relativePath}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()))
         : files;
@@ -786,7 +1765,7 @@ export class DataCopilotService {
     };
   }
 
-  async sendMessage(conversationId, value = {}) {
+  async sendMessage(conversationId, value = {}, securityContext = {}) {
     const { reference, conversation } = await this.#conversation(conversationId);
     this.policy.validateSnapshot(reference, conversation);
     const text = String(value.content || '').trim();
@@ -797,9 +1776,18 @@ export class DataCopilotService {
       const resolved = await this.artifacts.resolveAttachment(reference, attachmentId);
       return resolved.attachment;
     }));
-    const aiSessionId = String(value.aiSessionId || this.modelSessions.get(reference.conversationId) || '').trim();
+    const persistedSelectedModel = normalizeSelectedModel(conversation.selectedModel);
+    const aiSessionId = String(
+      value.aiSessionId || persistedSelectedModel.aiSessionId || this.modelSessions.get(reference.conversationId) || '',
+    ).trim();
     const workspaceMode = normalizeWorkspaceMode(value.workspaceMode);
-    const selectedModel = this.#resolveSelectedModel(aiSessionId, conversation.selectedModel);
+    const requestedReasoningEffort = normalizeReasoningEffort(value.reasoningEffort);
+    const workspaceBinding = this.#workspaceBindingFromRequest(value, securityContext);
+    const selectedModel = this.#resolveSelectedModel(aiSessionId, {
+      ...persistedSelectedModel,
+      ...(requestedReasoningEffort ? { reasoningEffort: requestedReasoningEffort } : {}),
+    });
+    const reasoningEffort = normalizeReasoningEffort(selectedModel.reasoningEffort);
     const idempotencyKey = normalizeCopilotIdempotencyKey(
       value.idempotencyKey || `message:${crypto.randomUUID()}`,
       'message idempotency key',
@@ -828,6 +1816,8 @@ export class DataCopilotService {
         contextSourceIds,
         aiSessionId,
         workspaceMode,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        ...(workspaceBinding ? { workspaceBinding } : {}),
         idempotencyKey,
       });
       return { ...result, conversation: publicConversation(result.conversation) };
@@ -845,16 +1835,31 @@ export class DataCopilotService {
     return { ...result, conversation: publicConversation(result.conversation) };
   }
 
-  async retry(conversationId, value = {}) {
+  async retry(conversationId, value = {}, securityContext = {}) {
     const { reference, conversation } = await this.#conversation(conversationId);
     this.policy.validateSnapshot(reference, conversation);
-    const aiSessionId = String(value.aiSessionId || this.modelSessions.get(reference.conversationId) || '').trim();
-    const selectedModel = this.#resolveSelectedModel(aiSessionId, conversation.selectedModel);
+    const persistedSelectedModel = normalizeSelectedModel(conversation.selectedModel);
+    const aiSessionId = String(
+      value.aiSessionId || persistedSelectedModel.aiSessionId || this.modelSessions.get(reference.conversationId) || '',
+    ).trim();
+    const requestedReasoningEffort = normalizeReasoningEffort(value.reasoningEffort);
+    const selectedModel = this.#resolveSelectedModel(aiSessionId, {
+      ...persistedSelectedModel,
+      ...(requestedReasoningEffort ? { reasoningEffort: requestedReasoningEffort } : {}),
+    });
+    const reasoningEffort = normalizeReasoningEffort(selectedModel.reasoningEffort);
+    const workspaceBinding = this.#workspaceBindingFromRequest(
+      value,
+      securityContext,
+      conversation.runState?.checkpoint?.workspaceBinding,
+    );
     if (Object.keys(selectedModel).length > 0 && canonicalJson(selectedModel) !== canonicalJson(conversation.selectedModel || {})) {
       await this.store.updateConversation(reference, { selectedModel });
     }
     const result = await this.runtime.retry(reference, {
       aiSessionId,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(workspaceBinding ? { workspaceBinding } : {}),
       idempotencyKey: normalizeCopilotIdempotencyKey(
         value.idempotencyKey || `retry:${crypto.randomUUID()}`,
         'retry idempotency key',
@@ -881,7 +1886,7 @@ export class DataCopilotService {
     return this.artifacts.resolveAttachment(reference, attachmentId);
   }
 
-  async confirmApproval(conversationId, approvalId, value = {}) {
+  async confirmApproval(conversationId, approvalId, value = {}, securityContext = {}) {
     const { reference, conversation } = await this.#conversation(conversationId);
     this.policy.validateSnapshot(reference, conversation);
     const id = requiredCopilotId(approvalId, 'approval ID');
@@ -896,13 +1901,25 @@ export class DataCopilotService {
       value.idempotencyKey || `approval:${id}:${approved ? 'approve' : 'reject'}`,
       'approval idempotency key',
     );
+    const checkpointWorkspaceBinding = conversation.runState?.checkpoint?.workspaceBinding;
+    const workspaceBinding = checkpointWorkspaceBinding
+      ? this.#workspaceBindingFromRequest(value, securityContext, checkpointWorkspaceBinding)
+      : null;
+    if (workspaceBinding && !sameApprovalWorkspaceBinding(current.binding, approvalWorkspaceBinding(workspaceBinding))) {
+      throw serviceError(
+        'COPILOT_APPROVAL_BINDING_MISMATCH',
+        'Approval does not belong to the saved project workspace binding.',
+        409,
+      );
+    }
+    const approvalActor = approvalActorFor(securityContext);
 
     if (!approved) {
       const approval = current.status === 'pending'
         ? await this.approvals.reject(reference, id, {
             idempotencyKey: childKey(baseKey, 'decision'),
             expectedRevision: value.expectedRevision,
-            actor: 'user',
+            actor: approvalActor,
             reason: String(value.reason || 'user_rejected').slice(0, 1000),
           })
         : current;
@@ -919,7 +1936,7 @@ export class DataCopilotService {
       approval = await this.approvals.approve(reference, id, {
         idempotencyKey: childKey(baseKey, 'decision'),
         expectedRevision: value.expectedRevision,
-        actor: 'user',
+        actor: approvalActor,
         reason: String(value.reason || 'user_approved').slice(0, 1000),
       });
     }
@@ -929,6 +1946,7 @@ export class DataCopilotService {
     }
     try {
       const run = await this.runtime.continueApproval(reference, approval, {
+        ...(workspaceBinding ? { workspaceBinding } : {}),
         idempotencyKey: childKey(baseKey, 'continue'),
       });
       this.emit(reference, { type: 'approval.confirmed', approval, runId: run.runId });
@@ -961,7 +1979,12 @@ export class DataCopilotService {
       : eventPayload(normalized);
     normalized.idempotencyKey = normalized.idempotencyKey || `event:${conversationId}:${nextId}`;
     const persisted = jsonEvent(normalized);
-    appendEventDurably(this.#eventFile(conversationId), persisted);
+    // Every event remains append-only and immediately replayable. Streaming
+    // chunks skip fsync because the next terminal event provides the durable
+    // barrier, avoiding one full disk sync per generated token.
+    appendEventDurably(this.#eventFile(conversationId), persisted, {
+      sync: !STREAM_EVENT_TYPES.has(normalized.type),
+    });
     this.eventSequences.set(conversationId, nextId);
     const buffer = this.eventBuffers.get(conversationId) || [];
     buffer.push(persisted);
@@ -986,10 +2009,15 @@ export class DataCopilotService {
     let effectiveEventId = Number.isSafeInteger(requestedEventId) && requestedEventId >= 0 && requestedEventId <= lastEventId
       ? requestedEventId
       : Math.max(0, firstBufferedEventId - 1);
+    let recoveryFrom = 0;
     if (requestedEventId > lastEventId) {
       effectiveEventId = Math.max(0, firstBufferedEventId - 1);
-    } else if (requestedEventId > 0 && firstBufferedEventId > requestedEventId + 1) {
+      if (firstBufferedEventId > 1) recoveryFrom = 1;
+    } else if (firstBufferedEventId > requestedEventId + 1) {
+      recoveryFrom = requestedEventId + 1;
       effectiveEventId = firstBufferedEventId - 1;
+    }
+    if (recoveryFrom > 0) {
       try {
         listener({
           schemaVersion: 1,
@@ -999,7 +2027,7 @@ export class DataCopilotService {
           type: 'stream.gap',
           occurredAt: isoNow(this.now),
           createdAt: isoNow(this.now),
-          payload: { from: requestedEventId + 1, to: effectiveEventId, recovery: 'GET ?format=json&afterSeq=<cursor>' },
+          payload: { from: recoveryFrom, to: effectiveEventId, recovery: 'GET ?format=json&afterSeq=<cursor>' },
           idempotencyKey: `stream-gap:${id}:${requestedEventId}:${effectiveEventId}`,
         });
       } catch { /* Gap notification is isolated per subscriber. */ }
@@ -1093,7 +2121,9 @@ export class DataCopilotService {
   async #captureSnapshot(job) {
     if (!this.productionStore) return null;
     const summary = contextJobRecord(job);
-    const files = await listTaskArtifactFiles(job.outputDir).catch(() => []);
+    const files = await listTaskArtifactFiles(job.outputDir, {
+      excludedRoots: [path.join(this.rootDir, 'copilot')],
+    });
     return this.productionStore.upsertSnapshot({
       jobId: summary.id,
       snapshotId: summary.snapshotId,
@@ -1114,6 +2144,7 @@ export class DataCopilotService {
           relativePath: file.relativePath,
           size: file.size,
           updatedAt: file.updatedAt,
+          sha256: file.sha256,
         })),
       },
     });
@@ -1141,6 +2172,250 @@ export class DataCopilotService {
     }
   }
 
+  #requireSubagentRuntime() {
+    if (!this.subagentRuntime) {
+      throw serviceError('COPILOT_SUBAGENT_RUNTIME_UNAVAILABLE', 'The Data Copilot subagent runtime is unavailable.', 503);
+    }
+  }
+
+  #requireMcpClientManager() {
+    if (!this.mcpClientManager) {
+      throw serviceError('COPILOT_MCP_CLIENT_UNAVAILABLE', 'The outbound MCP client manager is unavailable.', 503);
+    }
+  }
+
+  /**
+   * Converts a public project/workspace selection into the only binding the
+   * runtime is allowed to persist.  In particular, this deliberately ignores
+   * a client-provided authority object: ownership is established by the app
+   * request handler and is refreshed for each message, retry, and approval.
+   */
+  #workspaceBindingFromRequest(value = {}, securityContext = {}, fallback = null) {
+    const body = objectValue(value);
+    const requestedProjectId = String(body.projectId || '').trim();
+    const requestedWorkspaceId = String(body.workspaceId || '').trim();
+    const prior = fallback && typeof fallback === 'object' ? fallback : null;
+    const priorProjectId = String(prior?.projectId || '').trim();
+    const priorWorkspaceId = String(prior?.workspaceId || '').trim();
+    const hasPrior = Boolean(priorProjectId || priorWorkspaceId);
+    if (hasPrior && (!priorProjectId || !priorWorkspaceId)) {
+      throw serviceError('COPILOT_WORKSPACE_BINDING_INVALID', 'The saved project workspace binding is incomplete.', 409);
+    }
+    if ((requestedProjectId && !requestedWorkspaceId) || (!requestedProjectId && requestedWorkspaceId)) {
+      throw serviceError(
+        'COPILOT_WORKSPACE_BINDING_INCOMPLETE',
+        'A project-bound conversation requires both projectId and workspaceId.',
+      );
+    }
+    if (hasPrior && requestedProjectId && (
+      requestedProjectId !== priorProjectId || requestedWorkspaceId !== priorWorkspaceId
+    )) {
+      throw serviceError(
+        'COPILOT_WORKSPACE_BINDING_IMMUTABLE',
+        'A recoverable run must resume in its original project workspace.',
+        409,
+      );
+    }
+    const projectId = hasPrior ? priorProjectId : requestedProjectId;
+    const workspaceId = hasPrior ? priorWorkspaceId : requestedWorkspaceId;
+    if (!projectId && !workspaceId) return null;
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    const priorActorId = String(prior?.authority?.actorId || '').trim();
+    if (priorActorId && priorActorId !== actorId) {
+      throw serviceError(
+        'COPILOT_WORKSPACE_BINDING_ACTOR_MISMATCH',
+        'The project workspace binding belongs to a different local owner.',
+        403,
+      );
+    }
+    this.#requireProjectWorkspaceService();
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    return {
+      schemaVersion: 1,
+      projectId: project.id,
+      workspaceId: workspace.id,
+      ...(workspace.kind === 'worktree' ? { worktreeId: workspace.id } : {}),
+      authority: workspaceAuthority(securityContext),
+    };
+  }
+
+  /**
+   * Builds an execution-local registry for a model run.  It never exposes the
+   * application-wide workspace adapter: each invocation reopens the adapter
+   * at the cataloged workspace root and brackets it with a short-lived lease.
+   */
+  #resolveRuntimeWorkspaceBinding(binding, runtimeContext = {}) {
+    this.#requireProjectWorkspaceService();
+    const actorId = this.#requireLocalWorkspaceAccess(binding?.authority || {});
+    if (!this.workspaceAdapter?.forWorkspace) {
+      throw serviceError('COPILOT_WORKSPACE_RUNTIME_UNAVAILABLE', 'The local workspace runtime is unavailable.', 503);
+    }
+    const project = this.projectWorkspaceService.getProject(binding.projectId);
+    const workspace = this.#workspaceForProject(project, binding.workspaceId);
+    if (binding.worktreeId && binding.worktreeId !== workspace.id) {
+      throw serviceError('COPILOT_WORKSPACE_BINDING_MISMATCH', 'The requested worktree does not match this workspace.', 409);
+    }
+    const projectWorkspaceService = this.projectWorkspaceService;
+    const adapter = this.workspaceAdapter.forWorkspace(workspace.rootPath);
+    const gitAdapter = this.gitAdapter?.forWorkspace?.(workspace.rootPath) || null;
+    const registry = createScopedWorkspaceRegistry(adapter, { serial: true, gitAdapter });
+    const capabilityRuntime = this.capabilityRuntimeFactory({ registry, now: this.now });
+    const authority = workspaceAuthorityFromBinding(binding.authority);
+    const createExecution = (tool, context = {}) => capabilityRuntime.createExecution({
+      ...projectWorkspaceService.executionContext(workspace.id, authority),
+      runId: String(context.runId || runtimeContext.runId || `workspace-run-${crypto.randomUUID()}`),
+      toolRunId: String(context.toolRunId || `workspace-tool-${crypto.randomUUID()}`),
+      conversationId: String(context.reference?.conversationId || runtimeContext.reference?.conversationId || ''),
+      agentDepth: Number(context.agentDepth ?? runtimeContext.agentDepth ?? 0),
+      signal: context.signal || runtimeContext.signal,
+      timeoutMs: context.timeoutMs ?? context.input?.timeoutMs,
+      state: context.state,
+      authority,
+    });
+    const authorize = (tool, context) => capabilityRuntime.authorize(tool, createExecution(tool, context));
+
+    return {
+      registry: {
+        list: (options) => registry.list(options),
+        get: (name) => registry.get(name),
+        async execute(name, input = {}, context = {}) {
+          const descriptor = registry.get(name);
+          if (!descriptor) {
+            throw serviceError('COPILOT_WORKSPACE_TOOL_UNKNOWN', `Unknown project workspace tool: ${String(name || '').trim() || 'unknown'}.`, 404);
+          }
+          const execution = createExecution(descriptor, { ...context, input });
+          const lease = await projectWorkspaceService.acquireLease(workspace.id, {
+            runId: execution.runId,
+            actorId,
+            mode: String(descriptor.risk || 'read') === 'read' ? 'read' : 'write',
+            ttlMs: Number(execution.timeoutMs) > 0 ? Number(execution.timeoutMs) + 30_000 : undefined,
+          });
+          try {
+            return await capabilityRuntime.execute(descriptor.name, input, execution);
+          } finally {
+            await projectWorkspaceService.releaseLease(workspace.id, {
+              leaseId: lease.id,
+              runId: execution.runId,
+              actorId,
+            }).catch(() => {});
+          }
+        },
+      },
+      canAutoExecute: (tool, { execution } = {}) => {
+        try {
+          return authorize(tool, {
+            runId: execution?.runId,
+            conversationId: runtimeContext.reference?.conversationId,
+            agentDepth: execution?.agentDepth,
+            signal: execution?.controller?.signal,
+            state: execution?.state,
+          }).automatic === true;
+        } catch {
+          return false;
+        }
+      },
+      authorizationMode: (tool, { execution } = {}) => {
+        try {
+          const authorization = authorize(tool, {
+            runId: execution?.runId,
+            conversationId: runtimeContext.reference?.conversationId,
+            agentDepth: execution?.agentDepth,
+            signal: execution?.controller?.signal,
+            state: execution?.state,
+          });
+          if (!authorization.automatic) return 'explicit_approval';
+          return authorization.mode === 'owner_local_full' ? 'automatic_owner' : 'automatic_local';
+        } catch {
+          return 'explicit_approval';
+        }
+      },
+    };
+  }
+
+  #requireProjectWorkspaceService() {
+    if (!this.projectWorkspaceService) {
+      throw serviceError('COPILOT_PROJECT_WORKSPACE_UNAVAILABLE', 'Project workspaces are unavailable.', 503);
+    }
+  }
+
+  #requireLocalWorkspaceAccess(securityContext = {}) {
+    const actorId = String(securityContext?.actorId || '').trim();
+    if (securityContext?.trustedLocal !== true || !actorId) {
+      throw serviceError(
+        'COPILOT_WORKSPACE_LOCAL_REQUIRED',
+        'Project workspaces are available only to a trusted local owner connection.',
+        403,
+      );
+    }
+    return actorId;
+  }
+
+  #requireRuntimeV3Repository() {
+    const repository = this.runtimeV3Repository || this.toolExecutionBroker?.repository;
+    if (!repository?.getExecution || !repository?.listExecutions) {
+      throw serviceError(
+        'COPILOT_EXECUTION_STORE_UNAVAILABLE',
+        'The durable execution store is unavailable.',
+        503,
+      );
+    }
+    return repository;
+  }
+
+  #executionForActor(executionId, securityContext = {}) {
+    const actorId = this.#requireLocalWorkspaceAccess(securityContext);
+    const repository = this.#requireRuntimeV3Repository();
+    const id = String(executionId || '').trim();
+    if (!id) {
+      throw serviceError('COPILOT_EXECUTION_ID_REQUIRED', 'An execution ID is required.', 400);
+    }
+    const execution = repository.getExecution(id);
+    if (!execution) {
+      throw serviceError('COPILOT_EXECUTION_NOT_FOUND', 'The execution was not found.', 404);
+    }
+    if (executionActorId(execution) !== actorId) {
+      throw serviceError(
+        'COPILOT_EXECUTION_ACTOR_MISMATCH',
+        'The execution belongs to a different local owner.',
+        403,
+      );
+    }
+    return execution;
+  }
+
+  #requireProjectWorkspaceToolExecutionActor(durableReceipt, actorId) {
+    const executionActorId = String(durableReceipt?.context?.authority?.actorId || '').trim();
+    if (!executionActorId || executionActorId !== actorId) {
+      throw serviceError(
+        'COPILOT_WORKSPACE_TOOL_EXECUTION_ACTOR_MISMATCH',
+        'The tool execution belongs to a different local owner.',
+        403,
+      );
+    }
+  }
+
+  #workspaceForProject(project, workspaceId) {
+    const workspace = this.projectWorkspaceService.getWorkspace(workspaceId);
+    if (workspace.projectId !== project.id) {
+      throw serviceError('COPILOT_WORKSPACE_PROJECT_MISMATCH', 'The workspace does not belong to this project.', 409);
+    }
+    return workspace;
+  }
+
+  #terminalForProject(projectId, workspaceId, sessionId, securityContext = {}) {
+    this.#requireProjectWorkspaceService();
+    this.#requireLocalWorkspaceAccess(securityContext);
+    const project = this.projectWorkspaceService.getProject(projectId);
+    const workspace = this.#workspaceForProject(project, workspaceId);
+    const details = this.terminalSessionManager.get(sessionId, { limit: 1 });
+    const session = details.session;
+    if (session.projectId !== project.id || session.workspaceId !== workspace.id) {
+      throw serviceError('COPILOT_TERMINAL_WORKSPACE_MISMATCH', 'The terminal session does not belong to this project workspace.', 404);
+    }
+    return { project, workspace, session };
+  }
+
   #getJob(jobId) {
     const job = this.manager?.getInternal?.(jobId) || this.manager?.get?.(jobId);
     if (!job) throw serviceError('COPILOT_JOB_NOT_FOUND', 'The bound task was not found.', 404);
@@ -1148,13 +2423,21 @@ export class DataCopilotService {
   }
 
   #resolveSelectedModel(aiSessionId, fallback = {}) {
-    const sessionId = String(aiSessionId || '').trim();
-    if (!sessionId) return normalizeSelectedModel(fallback);
+    const preference = normalizeSelectedModel(fallback);
+    const sessionId = String(aiSessionId || preference.aiSessionId || '').trim();
+    if (!sessionId) return preference;
     if (!this.aiSessions?.resolve) {
       throw serviceError('COPILOT_AI_SESSION_UNAVAILABLE', 'The selected model session is unavailable.', 503);
     }
     const session = this.aiSessions.resolve(sessionId);
-    return normalizeSelectedModel(session);
+    const resolved = normalizeSelectedModel(session);
+    return {
+      ...resolved,
+      aiSessionId: sessionId,
+      ...(resolved.wireApi === 'responses' && preference.reasoningEffort
+        ? { reasoningEffort: preference.reasoningEffort }
+        : {}),
+    };
   }
 
   async #ensureInitialized() {
@@ -1171,6 +2454,246 @@ export class DataCopilotService {
       if (this.operations.get(conversationId) === current) this.operations.delete(conversationId);
     }
   }
+}
+
+function createScopedWorkspaceRegistry(adapter, { serial = false, gitAdapter = null } = {}) {
+  const adapters = [
+    { source: 'workspace', adapter },
+    ...(gitAdapter ? [{ source: 'git', adapter: gitAdapter }] : []),
+  ];
+  const descriptor = (tool, source) => ({
+    ...tool,
+    source,
+    ...(serial ? { parallelSafe: false } : {}),
+  });
+  const entryFor = (name) => {
+    const toolName = String(name || '').trim();
+    for (const entry of adapters) {
+      const tool = entry.adapter?.get?.(toolName);
+      if (tool) return { ...entry, tool };
+    }
+    return null;
+  };
+  return {
+    list: (options) => adapters.flatMap((entry) => {
+      const tools = entry.adapter?.list?.(options) || [];
+      return tools.map((tool) => descriptor(tool, entry.source));
+    }),
+    get: (name) => {
+      const entry = entryFor(name);
+      return entry ? descriptor(entry.tool, entry.source) : null;
+    },
+    execute: (name, input, context) => {
+      const entry = entryFor(name);
+      if (!entry) {
+        throw serviceError('COPILOT_WORKSPACE_TOOL_UNKNOWN', `Unknown project workspace tool: ${String(name || '').trim() || 'unknown'}.`, 404);
+      }
+      return entry.adapter.execute(name, input, context);
+    },
+  };
+}
+
+function workspaceAuthority(securityContext = {}) {
+  const trustedLocal = securityContext?.trustedLocal === true;
+  const ownerLocal = trustedLocal && securityContext?.ownerLocal === true;
+  return {
+    profile: ownerLocal ? 'owner_local_full' : trustedLocal ? 'workspace_auto' : 'observe',
+    actorId: String(securityContext?.actorId || '').trim().slice(0, 200),
+    trustedLocal,
+  };
+}
+
+function workspaceAuthorityFromBinding(value = {}) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const trustedLocal = source.trustedLocal === true;
+  const requestedProfile = String(source.profile || 'observe').trim().toLowerCase();
+  const profile = trustedLocal && ['workspace_auto', 'owner_local_full'].includes(requestedProfile)
+    ? requestedProfile
+    : 'observe';
+  return {
+    profile,
+    actorId: String(source.actorId || '').trim().slice(0, 200),
+    trustedLocal,
+  };
+}
+
+function projectWorkspaceToolExecutionContext({ project, workspace, execution, authority, timeoutMs, idempotencyKey, now }) {
+  const startedAt = now instanceof Date ? now : new Date(now());
+  const timeout = Number(timeoutMs);
+  const deadlineAt = new Date(startedAt.getTime() + (
+    Number.isFinite(timeout) && timeout > 0 ? Math.min(timeout, 24 * 60 * 60 * 1000) : 15 * 60 * 1000
+  ));
+  const toolRunId = String(execution.toolRunId || `workspace-tool-${crypto.randomUUID()}`);
+  return {
+    schemaVersion: 3,
+    taskId: `workspace:${project.id}:${workspace.id}`,
+    runId: String(execution.runId),
+    attemptId: toolRunId,
+    traceId: `trace:${toolRunId}`,
+    deadlineAt: deadlineAt.toISOString(),
+    idempotencyKey: String(idempotencyKey || `workspace-tool:${project.id}:${workspace.id}:${toolRunId}`),
+    environment: {
+      kind: 'project_workspace',
+      projectId: project.id,
+      workspaceId: workspace.id,
+      ...(workspace.kind === 'worktree' ? { worktreeId: workspace.id } : {}),
+    },
+    authority: {
+      profile: authority.profile,
+      actorId: authority.actorId || '',
+      trustedLocal: authority.trustedLocal === true,
+    },
+    modelPolicy: { origin: 'workbench', execution: 'local' },
+    contextSnapshotId: `workspace:${workspace.id}`,
+  };
+}
+
+function projectWorkspaceToolOperation({ projectId, workspaceId, idempotencyKey }) {
+  const normalizedKey = normalizeCopilotIdempotencyKey(
+    idempotencyKey || `workspace-tool:${crypto.randomUUID()}`,
+    'workspace tool idempotency key',
+  );
+  const digest = crypto.createHash('sha256')
+    .update(`${projectId}:${workspaceId}:${normalizedKey}`)
+    .digest('hex')
+    .slice(0, 32);
+  return {
+    idempotencyKey: normalizedKey,
+    runId: `workspace-run-${digest}`,
+    toolExecutionId: `workspace-tool-${digest}`,
+  };
+}
+
+function projectWorkspaceCapabilityReceipt(durableReceipt, {
+  project,
+  workspace,
+  descriptor = null,
+  authority = {},
+  authorization = null,
+  runId = '',
+  toolRunId = '',
+  executionLedger = null,
+} = {}) {
+  const durable = durableReceipt && typeof durableReceipt === 'object' ? durableReceipt : {};
+  const status = durableStatus(durable.status);
+  const startedAt = String(durable.createdAt || '');
+  const completedAt = String(durable.completedAt || durable.updatedAt || '');
+  const durationMs = durationBetween(startedAt, completedAt);
+  return {
+    type: 'capability.receipt',
+    schemaVersion: 1,
+    receiptId: String(durable.executionId || durable.toolExecutionId || toolRunId || ''),
+    toolExecutionId: String(durable.toolExecutionId || durable.executionId || toolRunId || ''),
+    executionId: String(durable.executionId || durable.toolExecutionId || toolRunId || ''),
+    runId: String(runId || durable.context?.runId || ''),
+    toolRunId: String(toolRunId || durable.toolExecutionId || durable.executionId || ''),
+    projectId: project?.id,
+    workspaceId: workspace?.id,
+    ...(workspace?.kind === 'worktree' ? { worktreeId: workspace.id } : {}),
+    tool: String(durable.toolName || descriptor?.name || ''),
+    source: String(descriptor?.source || durable.context?.environment?.tool?.source || 'workspace'),
+    status,
+    startedAt: startedAt || undefined,
+    completedAt: completedAt || undefined,
+    durationMs,
+    authority: {
+      profile: String(authorization?.mode || authority.profile || 'observe'),
+      automatic: authorization?.automatic === true,
+    },
+    effectClass: String(durable.effectClass || ''),
+    ...(durable.result !== undefined ? { result: structuredClone(durable.result) } : {}),
+    ...(durable.error && Object.keys(durable.error).length > 0 ? { error: structuredClone(durable.error) } : {}),
+    durable: {
+      status: String(durable.status || ''),
+      createdAt: startedAt || undefined,
+      updatedAt: String(durable.updatedAt || '') || undefined,
+      completedAt: String(durable.completedAt || '') || undefined,
+    },
+    ...(executionLedger ? { executionLedger } : {}),
+  };
+}
+
+function durableStatus(value) {
+  const status = String(value || '').trim().toLowerCase();
+  if (status === 'succeeded') return 'completed';
+  if (['queued', 'running', 'failed', 'cancelled', 'reconcile_required'].includes(status)) return status;
+  return 'failed';
+}
+
+function durationBetween(startedAt, completedAt) {
+  const started = Date.parse(startedAt);
+  const completed = Date.parse(completedAt);
+  return Number.isFinite(started) && Number.isFinite(completed)
+    ? Math.max(0, completed - started)
+    : 0;
+}
+
+function isPendingCapabilityReceipt(receipt = {}) {
+  const status = String(receipt?.status || '').trim().toLowerCase();
+  return status === 'queued' || status === 'running';
+}
+
+function boundedToolCancellationReason(value) {
+  const reason = String(value || 'user_cancelled').trim();
+  return (reason || 'user_cancelled').slice(0, 400);
+}
+
+function nonNegativeInteger(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+}
+
+function approvalWorkspaceBinding(value = {}) {
+  const binding = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const projectId = String(binding.projectId || '').trim();
+  const workspaceId = String(binding.workspaceId || '').trim();
+  if (!projectId || !workspaceId) return null;
+  return {
+    schemaVersion: 1,
+    projectId,
+    workspaceId,
+    ...(String(binding.worktreeId || '').trim() ? { worktreeId: String(binding.worktreeId).trim() } : {}),
+    actorId: String(binding.authority?.actorId || '').trim(),
+  };
+}
+
+function sameApprovalWorkspaceBinding(left, right) {
+  if (!left && !right) return true;
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+  return String(left.projectId || '') === String(right.projectId || '')
+    && String(left.workspaceId || '') === String(right.workspaceId || '')
+    && String(left.worktreeId || '') === String(right.worktreeId || '')
+    && String(left.actorId || '') === String(right.actorId || '');
+}
+
+function approvalActorFor(securityContext = {}) {
+  return String(securityContext?.actorId || '').trim().slice(0, 200) || 'user';
+}
+
+function isSubagentRunState(state) {
+  return state?.turn?.contract?.type === 'subagent.run'
+    || (Array.isArray(state?.nodes) && state.nodes.some((node) => String(node.kind || '').startsWith('subagent.')));
+}
+
+function firstSubagentInput(state) {
+  return state?.nodes?.[0]?.input || {};
+}
+
+function subagentParentIds(state) {
+  const contract = state?.turn?.contract || {};
+  const input = firstSubagentInput(state);
+  return {
+    parentRunId: String(contract.parentRunId || input.parentRunId || state?.run?.runId || ''),
+    parentToolRunId: String(contract.parentToolRunId || input.parentToolRunId || `subagent:${state?.run?.runId || 'run'}`),
+  };
+}
+
+function resolveSubagentSessionId(value, state, currentSessionId) {
+  return String(value?.aiSessionId || currentSessionId || firstSubagentInput(state).aiSessionId || '').trim();
+}
+
+function isAbortSignal(value) {
+  return Boolean(value && typeof value === 'object' && typeof value.addEventListener === 'function' && typeof value.aborted === 'boolean');
 }
 
 function publicConversation(value) {
@@ -1396,8 +2919,22 @@ function contextArtifactRecord(jobId, item) {
   };
 }
 
-async function listTaskArtifactFiles(outputDir) {
+async function listTaskArtifactFiles(outputDir, { excludedRoots = [] } = {}) {
   const root = path.resolve(String(outputDir || ''));
+  let canonicalRoot;
+  try {
+    canonicalRoot = await realpath(root);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+  const exclusions = await Promise.all(excludedRoots.map(async (value) => {
+    const resolved = path.resolve(String(value));
+    return realpath(resolved).catch((error) => {
+      if (error?.code === 'ENOENT') return resolved;
+      throw error;
+    });
+  }));
   const pending = [''];
   const files = [];
   while (pending.length && files.length < 5000) {
@@ -1411,22 +2948,78 @@ async function listTaskArtifactFiles(outputDir) {
     }
     for (const entry of entries) {
       if (entry.name.startsWith('.') || ['run.log', 'workflow-state.json'].includes(entry.name)) continue;
+      if (entry.isSymbolicLink()) continue;
       const relativePath = path.join(relativeDirectory, entry.name);
+      const absolutePath = path.resolve(root, relativePath);
+      if (!pathIsWithin(canonicalRoot, absolutePath)) continue;
+      let canonicalPath;
+      try {
+        canonicalPath = await realpath(absolutePath);
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue;
+        throw error;
+      }
+      if (!pathIsWithin(canonicalRoot, canonicalPath)) continue;
+      if (exclusions.some((excludedRoot) => pathIsWithin(excludedRoot, canonicalPath))) continue;
       if (entry.isDirectory()) {
         pending.push(relativePath);
         continue;
       }
       if (!entry.isFile()) continue;
-      const metadata = await stat(path.join(root, relativePath));
+      const snapshot = await hashStableFile(canonicalPath);
+      const canonicalPathAfterHash = await realpath(absolutePath).catch(() => '');
+      if (canonicalPathAfterHash !== canonicalPath) {
+        throw serviceError(
+          'COPILOT_ARTIFACT_CHANGED',
+          `Artifact path changed while capturing snapshot: ${relativePath}`,
+          409,
+        );
+      }
       files.push({
         name: entry.name,
         relativePath: relativePath.split(path.sep).join('/'),
-        size: metadata.size,
-        updatedAt: metadata.mtime.toISOString(),
+        size: snapshot.metadata.size,
+        updatedAt: snapshot.metadata.mtime.toISOString(),
+        sha256: snapshot.sha256,
       });
     }
   }
   return files.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+}
+
+function pathIsWithin(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+export async function hashStableFile(filePath, { beforeRead } = {}) {
+  const handle = await open(filePath, 'r');
+  try {
+    const before = await handle.stat();
+    if (!before.isFile()) {
+      throw serviceError('COPILOT_ARTIFACT_INVALID', 'Snapshot artifacts must be regular files.', 409);
+    }
+    await beforeRead?.({ filePath, handle, metadata: before });
+    const hash = crypto.createHash('sha256');
+    await new Promise((resolve, reject) => {
+      const stream = handle.createReadStream({ autoClose: false });
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.once('end', resolve);
+      stream.once('error', reject);
+    });
+    const after = await handle.stat();
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+    ) {
+      throw serviceError('COPILOT_ARTIFACT_CHANGED', 'Artifact changed while capturing snapshot.', 409);
+    }
+    return { metadata: after, sha256: hash.digest('hex') };
+  } finally {
+    await handle.close();
+  }
 }
 
 function contextSection(sourceId, label, description) {
@@ -1525,10 +3118,12 @@ function formatBytes(value) {
 function normalizeSelectedModel(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const result = {};
-  for (const field of ['provider', 'model', 'wireApi']) {
+  for (const field of ['aiSessionId', 'provider', 'model', 'wireApi']) {
     const text = String(value[field] || '').trim();
     if (text) result[field] = text.slice(0, 500);
   }
+  const reasoningEffort = normalizeReasoningEffort(value.reasoningEffort);
+  if (reasoningEffort) result.reasoningEffort = reasoningEffort;
   return result;
 }
 
@@ -1552,6 +3147,168 @@ function normalizeIdList(value, label, maximum) {
   if (!Array.isArray(value)) throw serviceError('COPILOT_ATTACHMENTS_INVALID', 'attachmentIds must be an array.');
   if (value.length > maximum) throw serviceError('COPILOT_ATTACHMENTS_EXCEEDED', `At most ${maximum} attachments are allowed.`, 413);
   return [...new Set(value.map((item) => requiredCopilotId(item, label)))];
+}
+
+function executionActorId(execution) {
+  return String(execution?.context?.authority?.actorId || '').trim();
+}
+
+function executionProjection(execution) {
+  const context = objectValue(execution?.context);
+  const metadata = objectValue(execution?.metadata);
+  const dispatcher = objectValue(metadata.dispatcher);
+  const environment = objectValue(context.environment);
+  const error = objectValue(execution?.error);
+  return {
+    schemaVersion: 1,
+    executionId: String(execution?.executionId || ''),
+    kind: String(execution?.kind || ''),
+    status: String(execution?.status || ''),
+    phase: String(metadata.phase || dispatcher.phase || ''),
+    taskId: String(context.taskId || ''),
+    runId: String(context.runId || ''),
+    attemptId: String(context.attemptId || ''),
+    traceId: String(context.traceId || ''),
+    parentExecutionId: String(context.parentExecutionId || ''),
+    contextSnapshotId: String(context.contextSnapshotId || ''),
+    deadlineAt: String(context.deadlineAt || ''),
+    environment: executionEnvironmentProjection(environment),
+    authority: {
+      profile: String(context.authority?.profile || context.authority?.mode || ''),
+      automatic: context.authority?.automatic === true,
+    },
+    tool: execution.kind === 'tool' ? {
+      name: String(metadata.toolName || ''),
+      source: String(metadata.source || ''),
+      effectClass: String(metadata.effectClass || dispatcher.effectClass || ''),
+    } : undefined,
+    handler: String(dispatcher.handlerKey || metadata.handlerKey || ''),
+    cancellation: dispatcher.cancelRequestedAt ? {
+      requestedAt: String(dispatcher.cancelRequestedAt),
+      reason: redactExecutionText(dispatcher.cancelReason || 'cancelled', 2_000),
+    } : null,
+    hasResult: execution?.result !== null && execution?.result !== undefined,
+    error: Object.keys(error).length > 0 ? {
+      code: String(error.code || 'COPILOT_EXECUTION_FAILED'),
+      message: redactExecutionText(error.message || 'Execution failed.', 4_000),
+      status: Number(error.status || 0) || undefined,
+      retryable: error.retryable === true,
+    } : null,
+    eventStreams: executionEventStreams(execution),
+    createdAt: String(execution?.createdAt || ''),
+    updatedAt: String(execution?.updatedAt || ''),
+    completedAt: String(execution?.completedAt || ''),
+  };
+}
+
+function executionEnvironmentProjection(environment = {}) {
+  return Object.fromEntries([
+    ['kind', environment.kind],
+    ['projectId', environment.projectId],
+    ['workspaceId', environment.workspaceId],
+    ['worktreeId', environment.worktreeId],
+    ['conversationId', environment.conversationId],
+    ['jobId', environment.jobId],
+    ['snapshotId', environment.snapshotId],
+  ].filter(([, value]) => String(value || '').trim()).map(([key, value]) => [key, String(value)]));
+}
+
+function executionEventStreams(execution) {
+  const runId = String(execution?.context?.runId || '').trim();
+  const executionId = String(execution?.executionId || '').trim();
+  const streams = runId ? [{ scope: 'run', streamId: `run:${runId}` }] : [];
+  if (execution?.kind === 'tool' && runId && executionId) {
+    streams.unshift({ scope: 'execution', streamId: `execution:${runId}:tool:${executionId}` });
+  }
+  return streams;
+}
+
+function executionStepProjection(step) {
+  return {
+    schemaVersion: 1,
+    stepId: String(step?.stepId || ''),
+    executionId: String(step?.executionId || ''),
+    parentStepId: String(step?.parentStepId || ''),
+    ordinal: Number(step?.ordinal || 0),
+    kind: String(step?.kind || ''),
+    status: String(step?.status || ''),
+    handler: String(step?.handlerKey || ''),
+    effectClass: String(step?.effectClass || ''),
+    descriptorVersion: String(step?.descriptorVersion || ''),
+    inputHash: String(step?.inputHash || ''),
+    resultRef: String(step?.resultRef || ''),
+    metadata: redactExecutionValue(step?.metadata),
+    error: redactExecutionValue(step?.error),
+    attempt: Number(step?.attempt || 0),
+    maxAttempts: Number(step?.maxAttempts || 1),
+    createdAt: String(step?.createdAt || ''),
+    updatedAt: String(step?.updatedAt || ''),
+    startedAt: String(step?.startedAt || ''),
+    completedAt: String(step?.completedAt || ''),
+  };
+}
+
+function executionArtifactProjection(artifact) {
+  return {
+    schemaVersion: 1,
+    artifactId: String(artifact?.artifactId || ''),
+    executionId: String(artifact?.executionId || ''),
+    stepId: String(artifact?.stepId || ''),
+    kind: String(artifact?.kind || ''),
+    mimeType: String(artifact?.mimeType || 'application/octet-stream'),
+    contentHash: String(artifact?.contentHash || ''),
+    sizeBytes: Number(artifact?.sizeBytes || 0),
+    metadata: redactExecutionValue(artifact?.metadata),
+    createdAt: String(artifact?.createdAt || ''),
+  };
+}
+
+function executionEventProjection(event) {
+  return {
+    schemaVersion: Number(event?.schemaVersion || 1),
+    eventId: String(event?.eventId || ''),
+    streamId: String(event?.streamId || ''),
+    sequence: Number(event?.sequence || 0),
+    type: String(event?.type || ''),
+    occurredAt: String(event?.occurredAt || ''),
+    taskId: String(event?.taskId || ''),
+    runId: String(event?.runId || ''),
+    agentId: String(event?.agentId || ''),
+    attemptId: String(event?.attemptId || ''),
+    payload: redactExecutionValue(event?.payload),
+  };
+}
+
+function redactExecutionValue(value, maximum = 12_000, seen = new WeakSet()) {
+  if (value === undefined || value === null) return value ?? null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string') return redactExecutionText(value, maximum);
+  if (typeof value === 'bigint') return String(value);
+  if (Array.isArray(value)) return value.slice(0, 200).map((item) => redactExecutionValue(item, maximum, seen));
+  if (typeof value !== 'object') return redactExecutionText(String(value), maximum);
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  return Object.fromEntries(Object.entries(value).slice(0, 200).map(([key, item]) => [
+    key,
+    executionSecretKey(key) ? '[redacted]' : redactExecutionValue(item, maximum, seen),
+  ]));
+}
+
+function executionSecretKey(key) {
+  return /(?:api[_-]?key|authorization|password|secret|token|cookie|credential)/iu.test(String(key));
+}
+
+function redactExecutionText(value, maximum = 12_000) {
+  return String(value || '')
+    .replace(
+      /\b((?:api[_-]?key|authorization|password|secret|token|cookie|credential)\s*[:=]\s*)(?:(?:Bearer|Basic)\s+)?[^\s,;]+/giu,
+      '$1[redacted]',
+    )
+    .replace(/\bBearer\s+[^\s,;]+/giu, 'Bearer [redacted]')
+    .replace(/\bBasic\s+[A-Za-z0-9+/=]+/giu, 'Basic [redacted]')
+    .replace(/(https?:\/\/[^:\s/?#]+:)[^@\s/]+@/giu, '$1[redacted]@')
+    .slice(0, maximum);
 }
 
 function objectValue(value) {
@@ -1585,7 +3342,7 @@ function jsonEvent(value) {
   }
 }
 
-function appendEventDurably(filePath, event) {
+function appendEventDurably(filePath, event, { sync = true } = {}) {
   const buffer = Buffer.from(`${JSON.stringify(event)}\n`, 'utf8');
   let descriptor;
   try {
@@ -1596,7 +3353,7 @@ function appendEventDurably(filePath, event) {
       if (written <= 0) throw new Error('Event log write did not advance.');
       offset += written;
     }
-    fsyncSync(descriptor);
+    if (sync) fsyncSync(descriptor);
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
@@ -1670,6 +3427,17 @@ function normalizeWorkspaceMode(value) {
   const mode = String(value || 'ask').trim().toLowerCase();
   if (!['ask', 'analyze', 'build'].includes(mode)) throw serviceError('COPILOT_WORKSPACE_MODE_INVALID', 'Workspace mode must be ask, analyze, or build.');
   return mode;
+}
+
+function normalizeReasoningEffort(value) {
+  if (value === undefined || value === null || value === '') return '';
+  const effort = String(value).trim().toLowerCase();
+  if (['none', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) return effort;
+  throw serviceError(
+    'COPILOT_REASONING_EFFORT_INVALID',
+    'Reasoning effort must be none, low, medium, high, xhigh, or max.',
+    400,
+  );
 }
 
 function isoNow(now) {

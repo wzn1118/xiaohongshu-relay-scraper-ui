@@ -824,6 +824,8 @@ for (const viewport of [
       .click();
     const panel = page.locator(".audience-ai-panel");
     await expect(panel).toContainText("旧版综合结论仍保持可见");
+    await expect(panel).toContainText("估算值仅用于运行前预览");
+    await expect(panel.getByRole("link", { name: "manifest.json" })).toBeVisible();
     expect(
       await page.evaluate(() => {
         const target =

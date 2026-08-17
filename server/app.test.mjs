@@ -183,6 +183,7 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
         return { provider: value.provider, baseUrl: value.baseUrl, models: ['gpt-5.6-terra', 'gpt-4.1-mini'], fetchedAt: new Date().toISOString() };
       },
       create: async () => ({ id: 'ai-session-1', provider: 'openai' }),
+      probe: async (id) => ({ ok: true, sessionId: id, provider: 'openai', model: 'gpt-4.1-mini', wireApi: 'responses', latencyMs: 12, responseText: 'READY', testedAt: new Date().toISOString() }),
       delete: () => true,
     },
     localModels: {
@@ -330,6 +331,21 @@ test('HTTP contract exposes direct frontend-compatible responses', async () => {
     assert.equal(discoveredModels.status, 200);
     assert.deepEqual((await discoveredModels.json()).models, ['gpt-5.6-terra', 'gpt-4.1-mini']);
     assert.equal(modelDiscoveryCalls.length, 1);
+
+    const aiSession = await fetch(`${origin}/api/ai/sessions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'openai', apiKey: 'test-key', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4.1-mini', wireApi: 'responses' }),
+    }).then((response) => response.json());
+    const aiProbeResponse = await fetch(`${origin}/api/ai/sessions/${aiSession.id}/probe`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(aiProbeResponse.status, 200);
+    const aiProbe = await aiProbeResponse.json();
+    assert.equal(aiProbe.ok, true);
+    assert.equal(aiProbe.responseText, 'READY');
 
     const localModels = await fetch(`${origin}/api/ai/local-models`).then((response) => response.json());
     assert.equal(localModels.runtime.ready, true);
@@ -1096,5 +1112,74 @@ test('resume endpoint keeps the original job identity and forwards scope and ide
     assert.equal((await invalid.json()).error.code, 'RESUME_SCOPE_INVALID');
   } finally {
     await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  }
+});
+
+test('complete-missing can resume a completed task in place', async () => {
+  const fixture = await mkdtemp(path.join(os.tmpdir(), 'xhs-complete-missing-'));
+  const outputDir = path.join(fixture, 'artifacts');
+  const id = '20260808175148-d2a81209';
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
+    records: [{
+      note_id: 'missing-1',
+      title: '待补全记录',
+      note_url: 'https://www.xiaohongshu.com/explore/missing-1',
+    }],
+  }), 'utf8');
+
+  const job = {
+    id,
+    keyword: '补全测试',
+    status: 'completed',
+    createdAt: '2026-08-08T09:51:48.000Z',
+  };
+  const internal = {
+    ...job,
+    outputDir,
+    logPath: path.join(fixture, 'run.log'),
+    params: { keyword: job.keyword, analysisMode: 'general', skipPostprocess: true },
+  };
+  const resumeCalls = [];
+  const manager = {
+    active: null,
+    list: () => [job],
+    get: (jobId) => jobId === id ? job : null,
+    getInternal: (jobId) => jobId === id ? internal : null,
+    resume: async (jobId, options) => {
+      resumeCalls.push([jobId, options]);
+      return { ...job, status: 'resuming', attemptId: 'attempt-2' };
+    },
+  };
+  const server = http.createServer(createApp({
+    manager,
+    config: { host: '127.0.0.1', port: 0, maxBodyBytes: 4096, staticDir: null, runnerAvailable: true },
+  }));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    const response = await fetch(`${origin}/api/jobs/${id}/complete-missing`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ idempotencyKey: 'complete-missing-completed-1' }),
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 202, JSON.stringify(payload));
+    assert.equal(payload.action, 'started');
+    assert.equal(payload.sourceJobId, id);
+    assert.equal(payload.incompleteBefore, 1);
+    assert.equal(resumeCalls.length, 1);
+    assert.equal(resumeCalls[0][0], id);
+    assert.equal(resumeCalls[0][1].scope, 'body_completion');
+    assert.equal(resumeCalls[0][1].forceCompleted, true);
+    assert.equal(resumeCalls[0][1].requestedBy, 'complete_missing_api');
+    assert.equal(resumeCalls[0][1].params.completeMissingOnly, true);
+    assert.equal(resumeCalls[0][1].params.resumeFromJobId, id);
+    assert.equal(resumeCalls[0][1].params.skipPostprocess, false);
+    assert.equal(resumeCalls[0][1].params.useCodexRuntime, true);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    await rm(fixture, { recursive: true, force: true });
   }
 });

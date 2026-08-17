@@ -624,7 +624,7 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     return fulfillJson(route, {})
   })
 
-  await page.goto('/', { waitUntil: 'domcontentloaded' })
+  await page.goto('/?screen=workspace', { waitUntil: 'domcontentloaded' })
   await expect(page.getByRole('button', { name: '查看岗位：岗位 A1' })).toBeVisible()
   await expect(page.getByLabel('私信文案')).toHaveValue(baseDraft.greeting)
   return state
@@ -708,6 +708,7 @@ test('连续切换时自动保存只执行一次并继续第一次操作', async
   const changed = `${baseDraft.greeting} 快速自动保存`
   await page.getByLabel('私信文案').fill(changed)
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
+  await page.getByRole('button', { name: '历史' }).click()
   await page.getByRole('row', { name: /任务乙/ }).click({ force: true })
   await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
   expect(state.draftRequests).toBe(1)
@@ -735,6 +736,7 @@ test('保存完成前再次切换不会抢占正在处理的目标', async ({ pa
   const state = await mockApi(page, { saveDelayMs: 1_500 })
   await dirtyGreeting(page, ' 保存中切换')
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
+  await page.getByRole('button', { name: '历史' }).click()
   await page.getByRole('row', { name: /任务乙/ }).click({ force: true })
   await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
   expect(state.draftRequests).toBe(1)
@@ -796,6 +798,7 @@ test('无修改时岗位和任务切换不弹窗', async ({ page }) => {
   await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
   await expect(page.getByRole('alertdialog')).toHaveCount(0)
 
+  await page.getByRole('button', { name: '历史' }).click()
   await page.getByRole('row', { name: /任务乙/ }).click()
   await expect(page.getByRole('button', { name: '查看岗位：岗位 B1' })).toBeVisible()
   await expect(page.getByRole('alertdialog')).toHaveCount(0)

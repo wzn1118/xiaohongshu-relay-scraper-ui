@@ -55,15 +55,18 @@ function Get-HegelSalonManifestFiles {
 }
 
 Import-HegelSalonDotEnv
-$port = if ($env:PORT -match '^\d+$') { [int]$env:PORT } else { 4317 }
+$port = if ($env:PORT -match '^\d+$') { [int]$env:PORT } else { 4327 }
 $environment = Initialize-HegelSalonEnvironment -Hostname 'relay.hegelsalon.com' -Port $port
 Ensure-HegelSalonDirectories $environment
-$tracked = Get-HegelSalonTrackedServerProcess $environment.RuntimeRoot
-if ($tracked -and $Quiesce) {
+$trackedServer = Get-HegelSalonTrackedServerProcess $environment.RuntimeRoot
+$trackedTunnel = Get-HegelSalonTrackedTunnelProcess $environment.RuntimeRoot
+if (($trackedServer -or $trackedTunnel) -and $Quiesce) {
+    Stop-HegelSalonTrackedTunnel $environment.RuntimeRoot
     Stop-HegelSalonTrackedServer $environment.RuntimeRoot
-    $tracked = $null
+    $trackedServer = $null
+    $trackedTunnel = $null
 }
-if ($tracked) { Write-Warning "The tracked origin PID $($tracked.Id) is running; use -Quiesce for a point-in-time application backup." }
+if ($trackedServer -or $trackedTunnel) { Write-Warning 'A tracked production origin or Tunnel is running; use -Quiesce for a point-in-time application backup.' }
 
 if ([string]::IsNullOrWhiteSpace($Destination)) {
     $parent = Split-Path -Parent $root
@@ -82,7 +85,12 @@ foreach ($entry in (Get-HegelSalonRuntimePaths).GetEnumerator()) {
     Add-HegelSalonBackupSource -SourceMap $sources -Label ([string]$entry.Key) -Path ([string]$entry.Value)
 }
 
-$temporary = Join-Path ([IO.Path]::GetTempPath()) ("hegelsalon-backup-" + [guid]::NewGuid().ToString('N'))
+$temporaryParent = [IO.Path]::GetTempPath()
+if (-not (Test-Path -LiteralPath $temporaryParent -PathType Container)) {
+    $temporaryParent = Join-Path $root '.backup-staging'
+    New-Item -ItemType Directory -Path $temporaryParent -Force | Out-Null
+}
+$temporary = Join-Path $temporaryParent ("hegelsalon-backup-" + [guid]::NewGuid().ToString('N'))
 $payloadRoot = Join-Path $temporary 'payload'
 New-Item -ItemType Directory -Path $payloadRoot -Force | Out-Null
 try {
@@ -90,7 +98,7 @@ try {
         Copy-HegelSalonBackupSource -Label $entry.Key -Source $entry.Value -PayloadRoot $payloadRoot
     }
     $manifest = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         createdAt = (Get-Date).ToUniversalTime().ToString('o')
         application = 'xiaohongshu-relay-scraper-ui'
         includes = @($sources.Keys)
@@ -98,9 +106,10 @@ try {
     }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $temporary 'manifest.json') -Encoding UTF8
     $notes = @{
-        backup = 'Runtime state archive. Keep this ZIP private; auth and SMTP configuration may be included.'
-        consistency = if ($Quiesce) { 'Origin was quiesced before copying.' } else { 'Origin was not quiesced; use -Quiesce for a point-in-time copy.' }
+        backup = 'Runtime state archive. Keep this ZIP private; auth, MCP token pepper, Grant hashes, and SMTP configuration may be included.'
+        consistency = if ($Quiesce) { 'Tracked origin and Tunnel were quiesced before copying.' } else { 'Origin was not quiesced; use -Quiesce for a point-in-time copy.' }
         sidecars = 'SQLite -wal and -shm files are copied when present.'
+        restoreBoundary = 'Restore revokes active MCP Grants by default. Reissue replacement tokens after restore.'
     }
     $notes | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $temporary 'backup-notes.json') -Encoding UTF8
     Add-Type -AssemblyName System.IO.Compression.FileSystem

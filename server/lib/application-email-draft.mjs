@@ -119,9 +119,9 @@ export function isNoisyApplicationTitle(value) {
     || normalizeSubjectComparison(normalized) !== normalizeSubjectComparison(original);
 }
 
-export function applicationSubjectGuard(record, subject = '', suppliedValues = {}) {
+export function applicationSubjectGuard(record, subject = '', suppliedValues = {}, options = {}) {
   const values = { ...applicationValues(record, {}), ...suppliedValues };
-  const rule = applicationDeliverySubjectRule(record);
+  const rule = applicationDeliverySubjectRule(record, options);
   const rawTitles = applicationRawRoleTitles(record);
   const noisyTitle = rawTitles.find((value) => isNoisyApplicationTitle(value)) || '';
   const requested = String(subject || '').trim();
@@ -203,30 +203,32 @@ export function applicationSubjectRule(record) {
 }
 
 /** Resolve the effective outbound subject rule without changing raw rule detection. */
-export function applicationDeliverySubjectRule(record) {
+export function applicationDeliverySubjectRule(record, options = {}) {
   const emailRule = applicationSubjectRule(record);
   const attachmentRule = detectApplicationAttachmentRule(record);
   const sharedAttachmentRule = attachmentRule.detected
     && sharedSubjectAttachmentRule(attachmentRule.evidence)
     && subjectTemplateIdentity(attachmentRule.template) === subjectTemplateIdentity(emailRule.template);
-  if (emailRule.detected && !sharedAttachmentRule) {
+  if (emailRule.detected) {
     return {
       ...emailRule,
-      source: 'email_subject_requirement',
+      ...(sharedAttachmentRule ? {
+        attachmentTemplate: attachmentRule.template,
+        evidence: attachmentRule.evidence,
+      } : {}),
+      source: sharedAttachmentRule
+        ? 'shared_subject_attachment_requirement'
+        : 'email_subject_requirement',
     };
   }
-
-  if (attachmentRule.detected) {
+  if (options?.includeAttachmentOnly && attachmentRule.detected) {
     return {
       ...attachmentRule,
       template: stripAttachmentTemplateExtension(attachmentRule.template),
       attachmentTemplate: attachmentRule.template,
-      source: sharedSubjectAttachmentRule(attachmentRule.evidence)
-        ? 'shared_subject_attachment_requirement'
-        : 'attachment_requirement',
+      source: 'attachment_requirement',
     };
   }
-
   return {
     ...emailRule,
     source: 'generated_default',
@@ -235,11 +237,11 @@ export function applicationDeliverySubjectRule(record) {
 
 export function resolveApplicationEmailSubject(record, suppliedSubject = '', input = {}) {
   const values = applicationValues(record, input);
-  const rule = applicationDeliverySubjectRule(record);
+  const rule = applicationDeliverySubjectRule(record, input);
   const generated = generatedSubjectForRule(record, rule, values);
   const requested = String(suppliedSubject || '').trim().slice(0, 300);
   const validation = validateApplicationEmailSubject(record, requested, values);
-  const requestedGuard = applicationSubjectGuard(record, requested, values);
+  const requestedGuard = applicationSubjectGuard(record, requested, values, input);
   const subject = rule.detected
     ? (validation.status === 'compliant' ? requested : generated.subject)
     : (requested
@@ -248,7 +250,7 @@ export function resolveApplicationEmailSubject(record, suppliedSubject = '', inp
       && !requestedGuard.requestedNoisyTitle
       ? requested
       : generated.subject);
-  const subjectGuard = applicationSubjectGuard(record, subject, values);
+  const subjectGuard = applicationSubjectGuard(record, subject, values, input);
   return {
     subject: boundedApplicationEmailSubject(subject),
     rule,

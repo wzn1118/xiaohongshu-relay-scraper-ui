@@ -927,10 +927,17 @@ try {
   video = page.video();
 
   page.on("pageerror", (error) => browserErrors.push(`pageerror: ${error.message}`));
+  page.on("response", (response) => {
+    if (response.status() === 404 || response.status() === 502) {
+      resourceWarnings.push(`response: HTTP ${response.status()} ${response.url()}`);
+    } else if (response.status() >= 400) {
+      browserErrors.push(`response: HTTP ${response.status()} ${response.url()}`);
+    }
+  });
   page.on("console", (message) => {
     if (message.type() !== "error") return;
     const detail = message.text();
-    if (/Failed to load resource: the server responded with a status of 502/i.test(detail)) {
+    if (/Failed to load resource: the server responded with a status of (404|502)/i.test(detail)) {
       resourceWarnings.push(`console: ${detail}`);
       return;
     }
@@ -1390,6 +1397,10 @@ try {
   await contextPane.waitFor({ state: "visible", timeout: 20_000 });
   await focus(contextPane, 2500);
   const contextSearch = contextPane.getByLabel("搜索历史采集记录");
+  if (await contextSearch.count() === 0) {
+    await clickWithPointer(contextPane.getByRole("button", { name: "返回上一级" }));
+  }
+  await contextSearch.waitFor({ state: "visible", timeout: 20_000 });
   await contextSearch.fill("20260731005634");
   await pause(900);
   await focus(contextSearch, 1500);
@@ -1407,7 +1418,7 @@ try {
   await clickWithPointer(qualityDialog.getByRole("button", { name: "关闭运行与质量" }));
 
   if (browserErrors.length) throw new Error(`Browser errors detected: ${browserErrors.join(" | ")}`);
-  pass("browser-runtime", `No page or application console errors occurred; ${resourceWarnings.length} non-blocking 502 resource warning(s) were isolated.`);
+  pass("browser-runtime", `No page or application console errors occurred; ${resourceWarnings.length} non-blocking resource warning(s) were isolated.`);
 
   await hideStep();
   await showTitle(

@@ -51,6 +51,8 @@ function Find-CommandPath {
 function Find-BrowserPath {
     $candidates = @(
         $env:XHS_BROWSER_PATH,
+        (Join-Path $projectRoot 'runtime\browser\chrome.exe'),
+        (Join-Path $projectRoot 'runtime\browser\msedge.exe'),
         (Join-Path ${env:ProgramFiles} 'Google\Chrome\Application\chrome.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe'),
         (Join-Path $env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe'),

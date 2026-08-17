@@ -16,9 +16,12 @@ import {
   Mail,
   Paperclip,
   Pause,
+  Pencil,
   Play,
   RotateCcw,
+  Save,
   Search,
+  Send,
   ShieldCheck,
   SlidersHorizontal,
   WandSparkles,
@@ -82,6 +85,13 @@ type CandidateCorpusPage = {
   contactDiscovery: ApplicationContactDiscoverySummary | null
 }
 
+type BatchCopyEditor = {
+  noteId: string
+  emailSubject: string
+  emailBody: string
+  coverLetter: string
+}
+
 const DEFAULT_WORKBENCH_FILTERS: BatchWorkbenchFilters = {
   view: 'all',
   recipient: 'all',
@@ -138,6 +148,7 @@ const BULK_POLISH_INSTRUCTIONS = '保持所有事实可核验，逐项回应岗�
 
 export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = false, onOpenItem }: BatchApplicationPanelProps) {
   const [expanded, setExpanded] = useState(standalone)
+  const [layoutMode, setLayoutMode] = useState<'quick' | 'detail'>('quick')
   const [query, setQuery] = useState(() => loadWorkbenchPreferences(jobId).query)
   const [workbenchFilters, setWorkbenchFilters] = useState<BatchWorkbenchFilters>(() => loadWorkbenchPreferences(jobId).filters)
   const [selectionLimit, setSelectionLimit] = useState(() => loadWorkbenchPreferences(jobId).selectionLimit)
@@ -148,6 +159,8 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   const [preferencesJobId, setPreferencesJobId] = useState(jobId)
   const [expandedCoverLetters, setExpandedCoverLetters] = useState<Set<string>>(new Set())
   const [copiedDeliveryNoteId, setCopiedDeliveryNoteId] = useState('')
+  const [copyEditor, setCopyEditor] = useState<BatchCopyEditor | null>(null)
+  const [copySavingNoteId, setCopySavingNoteId] = useState('')
   const [candidateQuery, setCandidateQuery] = useState('')
   const [candidateOffset, setCandidateOffset] = useState(0)
   const [candidatePageRequest, setCandidatePageRequest] = useState<{
@@ -232,6 +245,8 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     setPreferencesJobId(jobId)
     setExpandedCoverLetters(new Set())
     setCopiedDeliveryNoteId('')
+    setCopyEditor(null)
+    setCopySavingNoteId('')
     setCandidateQuery('')
     setCandidateOffset(0)
     setCandidatePageRequest({ filterSignature: '', offset: 0, cursor: undefined })
@@ -595,7 +610,6 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   const preflightReadyCount = preflight?.readyNoteIds.length || 0
   const preflightPreparableCount = preflight?.items.filter((item) => item.status !== 'ready' && item.canPrepare).length || 0
   const preflightBlockedCount = preflight ? Math.max(0, preflight.items.length - preflightReadyCount - preflightPreparableCount) : 0
-  const currentBatchReady = batch?.status === 'ready'
   const preflightReference = preflight?.preflightId || preflight?.planId || ''
   const selectedMatchesPreflight = Boolean(preflightReference && preflight?.manifestHash)
     && selectedIds.length === preflight?.readyNoteIds.length
@@ -606,6 +620,27 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     && preflightSelectionConfirmed
     && !busy
   const batchTerminal = batch ? ['completed', 'cancelled'].includes(batch.status) : true
+  const batchAwaitingSend = Boolean(batch && ['ready', 'approved'].includes(batch.status))
+  const canStartNewBatch = (!batch || batchTerminal) && canCreate
+  const sendCount = batchAwaitingSend && batch
+    ? Math.max(batch.counts.ready || 0, batch.items.filter((item) => ['ready', 'failed_retryable'].includes(item.status)).length)
+    : selected.size
+  const canSend = (batchAwaitingSend || canStartNewBatch) && !busy
+  const sendNextStep = batch?.status === 'running'
+    ? '正在发送'
+    : batch?.status === 'paused'
+      ? '发送已暂停'
+      : batchAwaitingSend
+        ? `${sendCount} 封邮件待发送`
+        : selectedMatchesPreflight && preflightSelectionConfirmed
+          ? `${sendCount} 封邮件已就绪`
+          : !selected.size
+            ? batch?.status === 'completed'
+              ? '发送已完成'
+              : batch?.status === 'cancelled'
+                ? '批次已取消'
+                : '未选择岗位'
+            : `${selected.size} 个岗位待预览`
 
   const buildRequest = (noteIds: string[], nextApprovals = approvals, frozenPreflight?: ApplicationBatchPreflight | null): ApplicationBatchRequest => {
     const selectionRevisions = noteIds.flatMap((noteId) => {
@@ -695,35 +730,70 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
     await runDryRun(nextScope.length ? nextScope : [noteId], next)
   }
 
-  async function createBatch() {
-    if (!canCreate) return
-    setBusy('create')
+  function storeBatch(next: ApplicationBatch) {
+    setBatch(next)
+    setBatchJobId(jobId)
+    setBatches((current) => replaceBatch(current, next))
+  }
+
+  async function sendPreviewedBatch() {
+    const resumableBatch = batch && ['ready', 'approved'].includes(batch.status) ? batch : null
+    if (!resumableBatch && !canStartNewBatch) return
+
+    setBusy('send')
     setNotice(null)
+    let activeBatch = resumableBatch
     try {
-      const result = await api.createApplicationBatch(jobId, buildRequest(selectedIds, approvals, preflight))
-      setPreflight(result.preflight)
-      setBatch(result.batch)
-      setBatchJobId(jobId)
-      setBatches((current) => replaceBatch(current, result.batch))
-      setNotice({ tone: 'success', text: `批次已冻结，${result.batch.counts.ready || 0} 封邮件等待审批。` })
-    } catch (error) {
-      const apiError = error as ApiError
-      if (['APPLICATION_BATCH_PREFLIGHT_STALE', 'APPLICATION_BATCH_PREFLIGHT_EXPIRED'].includes(apiError.code || '')) {
-        setPreflight(null)
-        setPreflightSelectionConfirmed(false)
-        setNotice({ tone: 'error', text: '投递预演已过期或岗位数据发生变化，请重新运行投递预演后再冻结批次。' })
+      if (!activeBatch) {
+        const result = await api.createApplicationBatch(jobId, buildRequest(selectedIds, approvals, preflight))
+        setPreflight(result.preflight)
+        activeBatch = result.batch
+        storeBatch(activeBatch)
+      }
+
+      if (activeBatch.status === 'ready') {
+        activeBatch = await api.approveApplicationBatch(jobId, activeBatch.batchId, activeBatch.revision)
+        storeBatch(activeBatch)
+      }
+
+      if (activeBatch.status === 'approved') {
+        activeBatch = await api.controlApplicationBatch(jobId, activeBatch.batchId, 'start', activeBatch.revision)
+        storeBatch(activeBatch)
+        setNotice({ tone: 'success', text: `已启动 ${sendCount || activeBatch.items.length} 封邮件的真实投递，请在批次明细中查看逐封结果。` })
         return
       }
-      if (isPreflightDetails(apiError.details)) setPreflight(apiError.details)
-      setNotice({ tone: 'error', text: apiError.message })
+
+      const statusText = activeBatch.status === 'running'
+        ? '批次已经在发送中。'
+        : activeBatch.status === 'paused'
+          ? '批次当前已暂停，请在批次明细中点击继续发送。'
+          : activeBatch.status === 'completed'
+            ? '该批次已经发送完成，没有重复投递。'
+            : '该批次已取消，没有启动投递。'
+      setNotice({ tone: activeBatch.status === 'completed' ? 'success' : 'info', text: statusText })
+    } catch (error) {
+      const apiError = error as ApiError
+      if (!activeBatch && ['APPLICATION_BATCH_PREFLIGHT_STALE', 'APPLICATION_BATCH_PREFLIGHT_EXPIRED'].includes(apiError.code || '')) {
+        setPreflight(null)
+        setPreflightSelectionConfirmed(false)
+        setNotice({ tone: 'error', text: '邮件预览已过期或岗位数据发生变化，请重新预览后再发送。' })
+        return
+      }
+      if (!activeBatch && isPreflightDetails(apiError.details)) setPreflight(apiError.details)
+      if (activeBatch) {
+        try {
+          storeBatch(await api.applicationBatch(jobId, activeBatch.batchId))
+        } catch {
+          storeBatch(activeBatch)
+        }
+      }
+      setNotice({
+        tone: 'error',
+        text: `${apiError.message}${activeBatch ? '；已完成的冻结或审批状态已保留，可再次点击发送继续。' : ''}`,
+      })
     } finally {
       setBusy('')
     }
-  }
-
-  async function approveBatch() {
-    if (!batch || batch.status !== 'ready') return
-    await runBatchAction('approve', async () => api.approveApplicationBatch(jobId, batch.batchId, batch.revision), '批次审批已绑定当前收件人、正文、附件和 SMTP 配置。')
   }
 
   async function controlBatch(action: 'start' | 'pause' | 'resume' | 'cancel') {
@@ -755,6 +825,74 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
       }
     } finally {
       setBusy('')
+    }
+  }
+
+  function openCopyEditor(item: ApplicationResult, emailSubject: string, emailBody: string, coverLetter: string) {
+    setCopyEditor({ noteId: item.note_id, emailSubject, emailBody, coverLetter })
+    setExpandedCoverLetters((current) => new Set(current).add(item.note_id))
+    setNotice({ tone: 'info', text: '正在编辑当前草稿；保存后旧的投递预演会失效，冻结批次中的历史快照不会被改写。' })
+  }
+
+  async function saveCopyEditor(item: ApplicationResult) {
+    if (!copyEditor || copyEditor.noteId !== item.note_id || copySavingNoteId) return
+    const outreach: OutreachDraft = {
+      ...applicationOutreachDraft(item),
+      email_subject: copyEditor.emailSubject.trim(),
+      email_body: copyEditor.emailBody.trim(),
+      cover_letter: copyEditor.coverLetter.trim(),
+    }
+    if (!outreach.email_body) {
+      setNotice({ tone: 'error', text: '邮件正文不能为空，请补充后再保存。' })
+      return
+    }
+    if (!outreach.cover_letter) {
+      setNotice({ tone: 'error', text: 'Cover Letter 不能为空，请补充后再保存。' })
+      return
+    }
+    setCopySavingNoteId(item.note_id)
+    setNotice(null)
+    try {
+      const applicationContext = item.outreach.applicationContext || defaultApplicationContext(item)
+      const response = await api.saveDraft(jobId, item.note_id, outreach, item.draftVersion, applicationContext)
+      if (!response.draftVersion) throw new Error('服务端未返回草稿版本，请刷新后重试。')
+      // The server is the source of truth for job-specific subject rules. It may
+      // replace the submitted subject with the generated compliant subject.
+      const savedOutreach: OutreachDraft = {
+        ...outreach,
+        ...response.outreach,
+      }
+      const subjectWasNormalized = savedOutreach.email_subject !== outreach.email_subject
+      const nextItem: ApplicationResult = {
+        ...item,
+        emailSubjectPreview: savedOutreach.email_subject,
+        outreach: { ...item.outreach, ...savedOutreach, applicationContext },
+        draftVersion: response.draftVersion,
+        delivery: response.delivery,
+        cover_letter_evaluation: response.cover_letter_evaluation || item.cover_letter_evaluation,
+      }
+      candidateItemCache.current.set(item.note_id, nextItem)
+      setCandidateCorpus((current) => current && current.jobId === jobId
+        ? { ...current, items: current.items.map((candidate) => candidate.note_id === item.note_id ? nextItem : candidate) }
+        : current)
+      dryRunRequest.current += 1
+      setPreflight(null)
+      setPreflightSelectionConfirmed(false)
+      setCopyEditor(null)
+      setNotice({ tone: 'success', text: subjectWasNormalized
+        ? `正文已保存为 v${response.draftVersion.version}；邮件标题已按岗位要求更新，请重新运行投递预演后再发送。`
+        : `正文已保存为 v${response.draftVersion.version}；请重新运行投递预演后再发送。` })
+      refreshCandidateCorpus()
+    } catch (error) {
+      const apiError = error as ApiError
+      setNotice({
+        tone: 'error',
+        text: apiError.code === 'DRAFT_VERSION_CONFLICT'
+          ? '该正文已在其他窗口更新。当前修改仍保留在编辑框中，请刷新候选清单后再保存。'
+          : apiError.message || '正文保存失败，请稍后重试。',
+      })
+    } finally {
+      setCopySavingNoteId('')
     }
   }
 
@@ -1069,47 +1207,60 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
   }
 
   return (
-    <section id="batch-application-panel" className={`batch-application-panel ${standalone ? 'standalone' : ''}`} aria-label="批量投递工作台">
+    <section id="batch-application-panel" className={`batch-application-panel ${standalone ? 'standalone' : ''} ${layoutMode === 'quick' ? 'quick-view' : 'detail-view'}`} aria-label="批量投递工作台">
       <header className="batch-application-header">
         <div className="batch-application-heading">
-          <span className="batch-application-icon"><Layers3 size={19} /></span>
-          <div><span className="step-label">BATCH APPLICATION DELIVERY</span><h3>批量投递工作台</h3></div>
+          <span className="batch-application-icon"><Send size={18} /></span>
+          <div><h3>极速投递</h3><small>{candidateTotal} 个岗位 · 已选 {selected.size}</small></div>
         </div>
         <div className="batch-application-header-actions">
+          <div className="batch-layout-switch" role="group" aria-label="投递视图">
+            <button type="button" aria-label="极速视图" aria-pressed={layoutMode === 'quick'} onClick={() => setLayoutMode('quick')}><Gauge size={14} /><span>极速</span></button>
+            <button type="button" aria-label="详细视图" aria-pressed={layoutMode === 'detail'} onClick={() => setLayoutMode('detail')}><Layers3 size={14} /><span>详细</span></button>
+          </div>
           {batch && <span className={`batch-status-badge ${batch.status}`}>{batchStatusLabel(batch.status)}</span>}
           {batch && !batchTerminal && <span className={`batch-stream-state ${streamState}`}><i />{streamState === 'live' ? '实时' : '连接中'}</span>}
           {!standalone && <button type="button" className="icon-button" title={expanded ? '收起批量投递工作台' : '展开批量投递工作台'} aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}</button>}
         </div>
       </header>
 
-      {expanded && <div className="batch-application-guide">
-        <span><Paperclip size={14} /><strong>附件准备</strong><small>投递预演显示原文件名和计划发送名，不会修改源附件；冻结后锁定实际发送名。</small></span>
-        <span><Gauge size={14} /><strong>投递预演</strong><small>先生成不发送的投递预演，逐条确认收件人、标题、Cover Letter 和附件名。</small></span>
-        <span><ShieldCheck size={14} /><strong>批量投递</strong><small>审批后按间隔逐封发送；超时会进入人工核对，不会自动重复发送。</small></span>
-      </div>}
-
       {expanded && <div className="batch-application-body">
         <div className="batch-toolbar">
           <label className="batch-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索岗位、邮箱、主题或附件名" title="同时搜索邮件正文和 Cover Letter" /><span className="batch-search-summary" aria-live="polite"><b>待投岗位 {candidateSourceTotal} 项</b><b>筛选结果 {candidateTotal} 项</b>{batch && <b>当前批次 {visibleBatchItems.length} 封</b>}</span></label>
           <div className="batch-selection-actions">
             <span className="batch-selection-summary">已选 <strong>{selected.size}</strong> / {MAX_BATCH_SIZE}<small>{candidateLoading ? '选择校验中' : `筛选外 ${selectedOutsideFilterIds.length} · 无效 ${selectedInvalidIds.length}${selectedMissingRevisionIds.length ? ` · 修订缺失 ${selectedMissingRevisionIds.length}，请重新加载` : ''}`}</small></span>
-            <button type="button" onClick={selectCurrentPage} disabled={candidateLoading || rows.length === 0}><CheckCircle2 size={15} />选择当前页</button>
+            <button type="button" aria-label="选择当前页" onClick={selectCurrentPage} disabled={candidateLoading || rows.length === 0}><CheckCircle2 size={15} /><span>本页全选</span></button>
             <label className={`batch-selection-limit ${selectionLimitMode === 'custom' ? 'custom' : ''}`}><span>批量数量</span><select aria-label="批量数量预设" value={selectionLimitMode === 'custom' ? 'custom' : selectionLimit} onChange={(event) => { if (event.target.value === 'custom') { setSelectionLimitMode('custom') } else { setSelectionLimitMode('preset'); setSelectionLimit(clampSelectionLimit(event.target.value)) } }}><option value={10}>10</option><option value={20}>20</option><option value={50}>50</option><option value={100}>100</option><option value="custom">自定义</option></select>{selectionLimitMode === 'custom' && <input aria-label="自定义批量数量" type="number" min={1} max={MAX_BATCH_SIZE} step={1} value={selectionLimit} onChange={(event) => setSelectionLimit(clampSelectionLimit(event.target.value))} />}</label>
-            <button type="button" onClick={selectFirstReady} disabled={candidateLoading || candidateTotal === 0}><CheckCircle2 size={15} />选择前 {selectionLimit} 条可投递</button>
-            <button type="button" className="batch-bulk-polish" title={aiSessionId ? '按岗位要求逐条重写已选 Cover Letter；完成后需要重新质量检查' : '请先启用高级模型'} disabled={!selected.size || !aiSessionId || Boolean(busy) || candidateLoading} onClick={() => void bulkPolishSelected()}>{busy === 'bulk-polish' ? <LoaderCircle className="spin" size={15} /> : <WandSparkles size={15} />}批量一键润色</button>
-            <button type="button" onClick={keepOnlyReady} disabled={candidateLoading || selected.size === 0}>仅保留可投递</button>
-            <button type="button" onClick={cleanupSelection} disabled={candidateLoading || selectedOutsideFilterIds.length + selectedInvalidIds.length === 0}>清理选择</button>
-            <button type="button" onClick={clearSelection} disabled={selected.size === 0}><XCircle size={15} />清空</button>
-            {bulkPolishProgress.total > 0 && <span className={`batch-polish-progress ${bulkPolishProgress.failed ? 'partial' : ''}`} role="status" aria-live="polite">已处理 {bulkPolishProgress.completed}/{bulkPolishProgress.total}<small>成功 {bulkPolishProgress.succeeded} · 失败 {bulkPolishProgress.failed}</small></span>}
+            <button type="button" className="batch-select-ready" aria-label={`选择前 ${selectionLimit} 条可投递`} onClick={selectFirstReady} disabled={candidateLoading || candidateTotal === 0}><CheckCircle2 size={15} /><span>选前 {selectionLimit} 个</span></button>
+            <button type="button" className="batch-clear-selection" aria-label="清空" onClick={clearSelection} disabled={selected.size === 0}><XCircle size={15} /><span>清空</span></button>
+            <details className="batch-settings batch-more-tools">
+              <summary><SlidersHorizontal size={15} />更多</summary>
+              <div className="batch-more-tools-menu">
+                <div className="batch-more-actions">
+                  <button type="button" className="batch-bulk-polish" title={aiSessionId ? '按岗位要求逐条重写已选 Cover Letter；完成后需要重新质量检查' : '请先启用高级模型'} disabled={!selected.size || !aiSessionId || Boolean(busy) || candidateLoading} onClick={() => void bulkPolishSelected()}>{busy === 'bulk-polish' ? <LoaderCircle className="spin" size={15} /> : <WandSparkles size={15} />}批量一键润色</button>
+                  <button type="button" onClick={keepOnlyReady} disabled={candidateLoading || selected.size === 0}>仅保留可投递</button>
+                  <button type="button" onClick={cleanupSelection} disabled={candidateLoading || selectedOutsideFilterIds.length + selectedInvalidIds.length === 0}>清理选择</button>
+                </div>
+                <div className="batch-settings-fields">
+                  <label><span>默认附件格式</span><input value={attachmentTemplate} onChange={(event) => updateAttachmentTemplate(event.target.value)} /></label>
+                  <label><span>发送间隔（秒）</span><input type="number" min={0} max={60} step={1} value={minIntervalSeconds} onChange={(event) => setMinIntervalSeconds(Number(event.target.value) || 0)} /></label>
+                </div>
+                {bulkPolishProgress.total > 0 && <span className={`batch-polish-progress ${bulkPolishProgress.failed ? 'partial' : ''}`} role="status" aria-live="polite">已处理 {bulkPolishProgress.completed}/{bulkPolishProgress.total}<small>成功 {bulkPolishProgress.succeeded} · 失败 {bulkPolishProgress.failed}</small></span>}
+              </div>
+            </details>
           </div>
-          <details className="batch-settings">
-            <summary><SlidersHorizontal size={15} />批次设置</summary>
-            <div>
-              <label><span>默认附件格式</span><input value={attachmentTemplate} onChange={(event) => updateAttachmentTemplate(event.target.value)} /></label>
-              <label><span>发送间隔（秒）</span><input type="number" min={0} max={60} step={1} value={minIntervalSeconds} onChange={(event) => setMinIntervalSeconds(Number(event.target.value) || 0)} /></label>
-            </div>
-          </details>
         </div>
+
+        <section className="batch-send-dock" aria-label="批量投递操作">
+          <div className="batch-send-dock-summary" aria-live="polite">
+            <strong>{sendNextStep}</strong>
+            <small>{preflight ? `${preflightReadyCount} 就绪${preflightPreparableCount > 0 ? ` · ${preflightPreparableCount} 可准备` : ''}${preflightBlockedCount > 0 ? ` · ${preflightBlockedCount} 阻塞` : ''}` : `${candidateTotal} 个岗位`}</small>
+          </div>
+          <div className="batch-send-actions">
+            <button type="button" aria-label="预览邮件" title={selectedMissingRevisionIds.length ? '已选岗位修订缺失，请重新加载候选清单' : !batchTerminal ? '当前批次结束后才能预览下一批邮件' : '生成待发送邮件预览，不会发送'} disabled={!selected.size || selectedMissingRevisionIds.length > 0 || Boolean(busy) || candidateLoading || !batchTerminal} onClick={() => void runDryRun()}>{busy === 'dry-run' ? <LoaderCircle className="spin" size={17} /> : <Eye size={17} />}<span>预览</span><small>{selected.size || ''}</small></button>
+            <button type="button" className="actual-send" aria-label="发送邮件" disabled={!canSend} title={batchAwaitingSend ? `继续真实发送 ${sendCount} 封邮件` : canStartNewBatch ? `锁定当前预览并真实发送 ${sendCount} 封邮件` : '请先预览邮件，并保持就绪清单与命名规则不变'} onClick={() => void sendPreviewedBatch()}>{busy === 'send' ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}<span>{busy === 'send' ? '启动中' : batch?.status === 'running' ? '发送中' : '发送'}</span><small>{sendCount || ''}</small></button>
+          </div>
+        </section>
 
         {shouldShowCommentCollection && <div className="batch-contact-discovery-bar" role="status" aria-live="polite">
           <div className="batch-contact-discovery-summary">
@@ -1131,7 +1282,6 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
         </div>}
 
         <div className="batch-filter-strip" aria-label="投递筛选">
-          <span className="batch-filter-heading"><SlidersHorizontal size={14} />筛选</span>
           <div className="batch-filter-options" role="group" aria-label="投递状态筛选">
             {BATCH_VIEW_OPTIONS.map((option) => <button
               key={option.value}
@@ -1141,12 +1291,15 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
               onClick={() => { setWorkbenchFilters((current) => ({ ...current, view: option.value })); setCandidateOffset(0) }}
             >{option.label}</button>)}
           </div>
-          <div className="batch-filter-selects">
-            <select aria-label="收件人筛选" value={workbenchFilters.recipient} onChange={(event) => { setWorkbenchFilters((current) => ({ ...current, recipient: event.target.value as BatchRecipientFilter })); setCandidateOffset(0) }}>{RECIPIENT_FILTER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
-            <select aria-label="文案筛选" value={workbenchFilters.copy} onChange={(event) => { setWorkbenchFilters((current) => ({ ...current, copy: event.target.value as BatchCopyFilter })); setCandidateOffset(0) }}>{COPY_FILTER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
-            <select aria-label="标题筛选" value={workbenchFilters.subject} onChange={(event) => { setWorkbenchFilters((current) => ({ ...current, subject: event.target.value as BatchSubjectFilter })); setCandidateOffset(0) }}>{SUBJECT_FILTER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
-            <select aria-label="附件筛选" value={workbenchFilters.attachment} onChange={(event) => { setWorkbenchFilters((current) => ({ ...current, attachment: event.target.value as BatchAttachmentFilter })); setCandidateOffset(0) }}>{ATTACHMENT_FILTER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
-          </div>
+          <details className="batch-filter-details">
+            <summary><SlidersHorizontal size={14} />精确筛选</summary>
+            <div className="batch-filter-selects">
+              <select aria-label="收件人筛选" value={workbenchFilters.recipient} onChange={(event) => { setWorkbenchFilters((current) => ({ ...current, recipient: event.target.value as BatchRecipientFilter })); setCandidateOffset(0) }}>{RECIPIENT_FILTER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
+              <select aria-label="文案筛选" value={workbenchFilters.copy} onChange={(event) => { setWorkbenchFilters((current) => ({ ...current, copy: event.target.value as BatchCopyFilter })); setCandidateOffset(0) }}>{COPY_FILTER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
+              <select aria-label="标题筛选" value={workbenchFilters.subject} onChange={(event) => { setWorkbenchFilters((current) => ({ ...current, subject: event.target.value as BatchSubjectFilter })); setCandidateOffset(0) }}>{SUBJECT_FILTER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
+              <select aria-label="附件筛选" value={workbenchFilters.attachment} onChange={(event) => { setWorkbenchFilters((current) => ({ ...current, attachment: event.target.value as BatchAttachmentFilter })); setCandidateOffset(0) }}>{ATTACHMENT_FILTER_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
+            </div>
+          </details>
           {(!isDefaultWorkbenchFilters(workbenchFilters) || normalizedQuery) && <button type="button" className="batch-clear-filters" onClick={() => { setWorkbenchFilters(DEFAULT_WORKBENCH_FILTERS); setQuery(''); setCandidateOffset(0) }}>清除筛选</button>}
         </div>
 
@@ -1164,10 +1317,12 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
               const savedFilenames = Array.isArray(savedBatchItem?.payload.finalFilenames) ? savedBatchItem.payload.finalFilenames.map(String) : []
               const emailBody = applicationEmailBody(item, checked, savedBatchItem)
               const coverLetter = applicationCoverLetter(item, checked, savedBatchItem)
+              const roleName = item.job_card?.role_name || item.title || '未命名岗位'
               const responsibilities = applicationFactPoints(item, 'responsibilities')
               const requirements = applicationFactPoints(item, 'requirements')
               const originalBody = item.body?.trim() || ''
               const coverLetterExpanded = expandedCoverLetters.has(item.note_id)
+              const copyEditorOpen = copyEditor?.noteId === item.note_id
               const contentVersion = checked?.preview?.draftVersion || savedBatchItem?.payload.coverLetterVersion || item.draftVersion?.version
               const contentHash = checked?.manifestHash || checked?.coverLetterHash || savedBatchItem?.payload.coverLetterHash || item.draftVersion?.contentHash || ''
               const resultContact = firstApplicationContact(item)
@@ -1192,9 +1347,10 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
               const aiMechanismPending = copyQuality?.ai_product_role === true && copyQuality.ai_product_mechanism_pass === false
               const candidates = liveResolution?.candidates || []
               const collectionIncomplete = liveResolution && liveResolution.collectionStatus !== 'complete'
+              const candidateReady = isCandidateReady(item, checked, savedBatchItem)
               return <tr key={item.note_id} className={`${selected.has(item.note_id) ? 'selected' : ''} ${status ? `status-${status}` : ''}`}>
                 <td data-label="选择"><label className="batch-checkbox"><input type="checkbox" checked={selected.has(item.note_id)} onChange={(event) => toggle(item.note_id, event.target.checked)} /><span><Check size={13} /></span></label></td>
-                <td data-label="岗位"><strong>{item.job_card?.role_name || item.title || '未命名岗位'}</strong><small>{item.title}</small><small className={`batch-body-status ${item.body?.trim() ? 'ready' : 'pending'}`}>{item.body?.trim() ? `正文已保存 · ${item.body.trim().length} 字` : '正文待续采'}</small>{item.body?.trim() && <button type="button" className="batch-body-open" onClick={() => onOpenItem(item)}><FileText size={12} />查看正文</button>}</td>
+                <td data-label="岗位"><strong>{roleName}</strong><small>{item.title}</small><small className={`batch-body-status ${item.body?.trim() ? 'ready' : 'pending'}`}>{item.body?.trim() ? `正文已保存 · ${item.body.trim().length} 字` : '正文待续采'}</small>{item.body?.trim() && <button type="button" className="batch-body-open" onClick={() => onOpenItem(item)}><FileText size={12} />查看正文</button>}</td>
                 <td data-label="收件邮箱">
                   {email ? <><strong className="batch-email"><Mail size={13} />{email}</strong><span className={`contact-source ${resolvedContact?.source || (savedRecipient ? 'batch' : 'body')}`}>{resolvedContact ? contactSourceLabel(resolvedContact.source, resolvedContact.verificationStatus, resolvedContact.normalizationApplied) : '发送批次'}</span></> : <span className="batch-muted">待解析</span>}
                   {contactEvidence && (contactWasNormalized || resolvedContact?.source === 'image') && <small className="batch-contact-evidence" title={contactEvidence.evidenceText}>{contactWasNormalized ? '原始写法' : 'OCR 证据'}：{contactEvidence.evidenceText}</small>}
@@ -1211,12 +1367,39 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
                   </small>}
                 </td>
                 <td data-label="投递正文" className="batch-cover-letter-cell batch-delivery-copy-cell">
-                  <div className="batch-delivery-copy-heading"><small className="batch-field-label">邮件正文</small><button type="button" className="batch-copy-content" title="复制邮件正文与 Cover Letter" disabled={!emailBody && !coverLetter} onClick={() => void copyDeliveryContent(item.note_id, emailBody, coverLetter)}><Copy size={12} />{copiedDeliveryNoteId === item.note_id ? '已复制' : '复制正文'}</button></div>
-                  {emailBody ? <div className={`batch-cover-letter-text batch-email-body-text ${coverLetterExpanded ? 'expanded' : ''}`} data-testid={`batch-email-body-${item.note_id}`}>{emailBody}</div> : <span className="batch-cover-letter-empty">邮件正文待生成</span>}
-                  <small className="batch-field-label batch-cover-letter-label">Cover Letter</small>
-                  {coverLetter ? <div className={`batch-cover-letter-text ${coverLetterExpanded ? 'expanded' : ''}`} data-testid={`batch-cover-letter-${item.note_id}`}>{coverLetter}</div> : <span className="batch-cover-letter-empty">Cover Letter 待生成</span>}
-                  <span className="batch-cover-letter-meta">{emailBody.length} / {coverLetter.length} 字 · {contentVersion ? `v${contentVersion}` : '版本待生成'} · {contentHash ? `Hash ${contentHash.slice(0, 10)}...` : 'Hash 待生成'}</span>
-                  {(emailBody || coverLetter) && <button type="button" className="batch-cover-letter-toggle" aria-expanded={coverLetterExpanded} onClick={() => toggleCoverLetter(item.note_id)}><FileText size={12} />{coverLetterExpanded ? '收起全文' : '展开全文'}</button>}
+                  <div className="batch-delivery-copy-heading">
+                    <small className="batch-field-label">邮件正文与 Cover Letter</small>
+                    {!copyEditorOpen && <span className="batch-delivery-copy-tools">
+                      <button
+                        type="button"
+                        className="batch-copy-content"
+                        aria-label={copiedDeliveryNoteId === item.note_id ? '已复制' : '复制正文'}
+                        title="复制邮件正文与 Cover Letter"
+                        disabled={!emailBody && !coverLetter}
+                        onClick={() => void copyDeliveryContent(item.note_id, emailBody, coverLetter)}
+                      >
+                        <Copy size={12} />
+                        {copiedDeliveryNoteId === item.note_id ? '已复制' : '复制'}
+                      </button>
+                      <button type="button" className="batch-edit-content" title="编辑邮件标题、邮件正文和 Cover Letter" onClick={() => openCopyEditor(item, savedSubject, emailBody, coverLetter)}><Pencil size={12} />编辑正文</button>
+                    </span>}
+                  </div>
+                  {copyEditorOpen && copyEditor ? <div className="batch-copy-editor" data-testid={`batch-copy-editor-${item.note_id}`}>
+                    <label><span>邮件标题</span><input aria-label={`邮件标题 ${item.note_id}`} value={copyEditor.emailSubject} onChange={(event) => setCopyEditor((current) => current?.noteId === item.note_id ? { ...current, emailSubject: event.target.value } : current)} /></label>
+                    <label><span>邮件正文</span><textarea aria-label={`邮件正文 ${item.note_id}`} rows={7} value={copyEditor.emailBody} onChange={(event) => setCopyEditor((current) => current?.noteId === item.note_id ? { ...current, emailBody: event.target.value } : current)} /></label>
+                    <label><span>Cover Letter</span><textarea aria-label={`Cover Letter ${item.note_id}`} rows={9} value={copyEditor.coverLetter} onChange={(event) => setCopyEditor((current) => current?.noteId === item.note_id ? { ...current, coverLetter: event.target.value } : current)} /></label>
+                    <small>保存会生成新草稿版本；旧投递预演自动失效，已冻结的历史批次保持不变。</small>
+                    <div className="batch-copy-editor-actions">
+                      <button type="button" disabled={copySavingNoteId === item.note_id} onClick={() => setCopyEditor(null)}>取消</button>
+                      <button type="button" className="primary" disabled={copySavingNoteId === item.note_id} onClick={() => void saveCopyEditor(item)}>{copySavingNoteId === item.note_id ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}保存正文</button>
+                    </div>
+                  </div> : <>
+                    {emailBody ? <div className={`batch-cover-letter-text batch-email-body-text ${coverLetterExpanded ? 'expanded' : ''}`} data-testid={`batch-email-body-${item.note_id}`}>{emailBody}</div> : <span className="batch-cover-letter-empty">邮件正文待生成</span>}
+                    <small className="batch-field-label batch-cover-letter-label">Cover Letter</small>
+                    {coverLetter ? <div className={`batch-cover-letter-text ${coverLetterExpanded ? 'expanded' : ''}`} data-testid={`batch-cover-letter-${item.note_id}`}>{coverLetter}</div> : <span className="batch-cover-letter-empty">Cover Letter 待生成</span>}
+                    <span className="batch-cover-letter-meta">{emailBody.length} / {coverLetter.length} 字 · {contentVersion ? `v${contentVersion}` : '版本待生成'} · {contentHash ? `Hash ${contentHash.slice(0, 10)}...` : 'Hash 待生成'}</span>
+                    {(emailBody || coverLetter) && <button type="button" className="batch-cover-letter-toggle" aria-expanded={coverLetterExpanded} onClick={() => toggleCoverLetter(item.note_id)}><FileText size={12} />{coverLetterExpanded ? '收起全文' : '展开全文'}</button>}
+                  </>}
                 </td>
                 <td data-label="岗位事实" className="batch-job-facts-cell">
                   <div className="batch-job-fact-block">
@@ -1254,7 +1437,8 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
                   </>}
                 </td>
                 <td data-label="状态 / 修复">
-                  <span className={`item-status ${status || 'resolving'}`}>{status ? itemStatusLabel(status) : '待 Dry Run'}</span>
+                  <span className={`batch-quick-readiness ${candidateReady ? 'ready' : 'review'}`}>{candidateReady ? '可投递' : '需处理'}</span>
+                  <span className={`item-status ${status || 'resolving'}`}>{status ? itemStatusLabel(status) : '待预览'}</span>
                   {copyQuality?.attachment_claim_without_context && <small className="batch-blocker">附件声明缺少上下文</small>}
                   {copyQualityBlocked && <small className="batch-blocker">文案质量门禁未通过，请重新生成</small>}
                   {subjectNeedsReview && <small className="batch-blocker">邮件主题需要岗位名复核</small>}
@@ -1262,6 +1446,7 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
                   {checked?.canPrepare && checked.status !== 'ready' && <button type="button" className="batch-row-action" onClick={() => toggle(item.note_id, true)}>纳入自动准备</button>}
                   {checked && !checked.canPrepare && checked.status !== 'ready' && candidates.length === 0 && <button type="button" className="batch-row-action" onClick={() => onOpenItem(item)}>打开岗位</button>}
                   {candidates.length > 0 && <div className="contact-review-list">{candidates.map((candidate) => <button type="button" className={approvals[item.note_id] === candidate.evidenceHash ? 'confirmed' : ''} key={candidate.evidenceHash} onClick={() => void confirmContact(item.note_id, candidate)} title={candidate.evidenceText}><span>{candidate.address}</span><small>{contactSourceLabel(candidate.source, candidate.verificationStatus, candidate.normalizationApplied)} · {candidate.evidenceText}</small>{approvals[item.note_id] === candidate.evidenceHash ? <Check size={13} /> : <ShieldCheck size={13} />}</button>)}</div>}
+                  <button type="button" className="batch-row-detail" aria-label={`查看 ${roleName} 投递详情`} onClick={() => setLayoutMode('detail')}><Eye size={13} /><span>详情</span></button>
                 </td>
               </tr>
             })}{rows.length === 0 && <tr className="batch-search-empty-row"><td colSpan={8} data-label="搜索">当前筛选没有匹配岗位{batch ? `；当前发送批次匹配 ${visibleBatchItems.length} 封` : ''}。</td></tr>}</tbody>
@@ -1275,12 +1460,6 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
             <button type="button" title="上一页待投岗位" disabled={candidateLoading || candidateOffset === 0} onClick={showPreviousCandidatePage}><ChevronLeft size={16} /></button>
             <button type="button" title="下一页待投岗位" disabled={candidateLoading || !candidateCorpus?.nextCursor} onClick={showNextCandidatePage}><ChevronRight size={16} /></button>
           </div>
-        </div>
-
-        <div className="batch-primary-actions">
-          <button type="button" aria-label="Dry Run" title={selectedMissingRevisionIds.length ? '已选岗位修订缺失，请重新加载候选清单' : '只生成投递预演，不发送邮件'} disabled={!selected.size || selectedMissingRevisionIds.length > 0 || Boolean(busy) || candidateLoading} onClick={() => void runDryRun()}>{busy === 'dry-run' ? <LoaderCircle className="spin" size={16} /> : <Gauge size={16} />}投递预演 <small>不发送</small></button>
-          <button type="button" className="primary" title={selectedMatchesPreflight && preflightSelectionConfirmed ? '冻结当前投递预演' : '请先运行投递预演，并保持就绪清单与命名规则不变'} disabled={!canCreate} onClick={() => void createBatch()}>{busy === 'create' ? <LoaderCircle className="spin" size={16} /> : <Eye size={16} />}冻结批次预览</button>
-          {preflight && <span><strong>{preflightReadyCount}</strong> 项就绪{preflightPreparableCount > 0 && <> · <strong>{preflightPreparableCount}</strong> 项可自动准备</>} · <strong>{preflightBlockedCount}</strong> 项阻塞</span>}
         </div>
 
         {(batch || batches.length > 0) && <section className="batch-frozen-preview" aria-label="冻结批次预览">
@@ -1345,11 +1524,10 @@ export function BatchApplicationPanel({ jobId, items, aiSessionId, standalone = 
               </div>
             </section>
             <div className="batch-control-actions">
-              <button type="button" disabled={!currentBatchReady || Boolean(busy)} onClick={() => void approveBatch()}>{busy === 'approve' ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}审批</button>
-              <button type="button" className="primary" disabled={batch.status !== 'approved' || Boolean(busy)} onClick={() => void controlBatch('start')}>{busy === 'start' ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}开始</button>
-              <button type="button" disabled={batch.status !== 'running' || Boolean(busy)} onClick={() => void controlBatch('pause')}>{busy === 'pause' ? <LoaderCircle className="spin" size={16} /> : <Pause size={16} />}暂停</button>
-              <button type="button" disabled={batch.status !== 'paused' || Boolean(busy) || !(batch.counts.ready || batch.counts.failed_retryable)} onClick={() => void controlBatch('resume')}>{busy === 'resume' ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}恢复</button>
-              <button type="button" className="danger" disabled={batchTerminal || Boolean(busy)} onClick={() => void controlBatch('cancel')}>{busy === 'cancel' ? <LoaderCircle className="spin" size={16} /> : <XCircle size={16} />}取消</button>
+              <span>发送中控制</span>
+              <button type="button" disabled={batch.status !== 'running' || Boolean(busy)} onClick={() => void controlBatch('pause')}>{busy === 'pause' ? <LoaderCircle className="spin" size={16} /> : <Pause size={16} />}暂停发送</button>
+              <button type="button" disabled={batch.status !== 'paused' || Boolean(busy) || !(batch.counts.ready || batch.counts.failed_retryable)} onClick={() => void controlBatch('resume')}>{busy === 'resume' ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}继续发送</button>
+              <button type="button" className="danger" disabled={batchTerminal || Boolean(busy)} onClick={() => void controlBatch('cancel')}>{busy === 'cancel' ? <LoaderCircle className="spin" size={16} /> : <XCircle size={16} />}取消未发送邮件</button>
             </div>
           </>}
         </section>}

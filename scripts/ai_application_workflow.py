@@ -252,6 +252,32 @@ def content_analysis_schema() -> dict[str, Any]:
     }
 
 
+def content_grounding_repair_schema(segment_count: int = 1) -> dict[str, Any]:
+    upper_bound = max(1, int(segment_count))
+    module = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["id", "evidence_segment_ids"],
+        "properties": {
+            "id": _string(),
+            "evidence_segment_ids": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {"type": "integer", "minimum": 1, "maximum": upper_bound},
+            },
+        },
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["modules"],
+        "properties": {
+            "modules": {"type": "array", "minItems": 1, "items": module},
+        },
+    }
+
+
 def writing_schema() -> dict[str, Any]:
     string = _string()
     return {
@@ -1283,6 +1309,54 @@ AI_CLICHE_PATTERN = re.compile(
     re.I,
 )
 
+
+def _non_job_title_signal(value: Any) -> bool:
+    headline = re.sub(r"#[^#\s]+", " ", str(value or ""))
+    headline = re.sub(r"\s+", " ", headline).strip()[:180]
+    return bool(NON_JOB_TITLE_PATTERN.search(headline))
+
+
+def _role_name_mentioned(role_name: str, text: str) -> bool:
+    """Accept exact role names and equivalent multi-role labels with added qualifiers."""
+    compact_text = _compact_text(text)
+    compact_role = _compact_text(role_name)
+    if not compact_role or not compact_text:
+        return False
+    if compact_role in compact_text:
+        return True
+    parts = [
+        _compact_text(part)
+        for part in re.split(r"[/／、|｜]", role_name)
+        if len(_compact_text(part)) >= 2
+    ]
+    return len(parts) > 1 and all(part in compact_text for part in parts)
+
+
+def _stable_application_media(media: Any) -> dict[str, Any] | None:
+    """Keep original media identity while ignoring cache and proxy URL rewrites."""
+    if not isinstance(media, dict):
+        return None
+
+    stable: dict[str, Any] = {}
+    cover_url = str(media.get("cover_original_url") or media.get("cover_url") or "").strip()
+    if cover_url:
+        stable["cover_url"] = cover_url
+
+    images: list[dict[str, str]] = []
+    raw_images = media.get("images")
+    if isinstance(raw_images, list):
+        for value in raw_images:
+            if isinstance(value, dict):
+                image_url = str(value.get("original_url") or value.get("url") or "").strip()
+            else:
+                image_url = str(value or "").strip()
+            if image_url:
+                images.append({"url": image_url})
+    if images:
+        stable["images"] = images
+    return stable or None
+
+
 def _application_copy_source_hash(
     record: dict[str, Any],
     candidate_profile: dict[str, str] | None = None,
@@ -1295,9 +1369,7 @@ def _application_copy_source_hash(
         for key, value in (candidate_profile or {}).items()
         if str(value or "").strip()
     }
-    media = record.get("media")
-    if isinstance(media, dict):
-        media = {key: value for key, value in media.items() if key != "analysis"} or None
+    media = _stable_application_media(record.get("media"))
     evidence = candidate_evidence
     if evidence is None:
         evidence = [
@@ -1467,6 +1539,17 @@ def _rubric_for_score(score: int) -> dict[str, int]:
     return rubric
 
 
+COMMUNICATION_NEXT_STEP_PATTERN = re.compile(
+    r"(?:(?:\u671f\u5f85|\u5e0c\u671b|\u65b9\u4fbf|\u613f\u610f).{0,32}(?:\u6c9f\u901a|\u4ea4\u6d41|\u9762\u8bd5|\u8fdb\u4e00\u6b65\u4e86\u89e3)|"
+    r"(?:welcome|hope|available).{0,24}(?:interview|discuss|conversation|talk))",
+    re.I,
+)
+
+
+def _has_clear_communication_next_step(value: str) -> bool:
+    return bool(COMMUNICATION_NEXT_STEP_PATTERN.search(re.sub(r"\s+", "", str(value or ""))))
+
+
 def _deterministic_problems(
     draft: dict[str, Any],
     role: dict[str, Any],
@@ -1578,10 +1661,8 @@ def _deterministic_problems(
         problems.append(f"邮件主题当前 {len(subject)} 字，必须控制在 8-120 字")
 
     role_name = str(role.get("role_name") or "").strip()
-    if role_name and role_name not in subject and role_name not in greeting:
+    if role_name and not _role_name_mentioned(role_name, f"{subject}\n{greeting}"):
         problems.append("主题或私信没有准确点名当前岗位")
-    if not re.search(r"^主题[：:]", cover):
-        problems.append("Cover Letter 缺少首行主题")
     if not re.search(r"尊敬的.{0,20}招聘负责人[：:]", cover):
         problems.append("Cover Letter 缺少规范招聘负责人称呼")
     if "此致" not in cover or "敬礼" not in cover:
@@ -1590,8 +1671,10 @@ def _deterministic_problems(
     if any(item in subject for item in prohibited_subjects):
         problems.append("邮件主题过于模板化，应写明岗位、姓名和一项最相关能力")
 
-    if name and (name not in subject or name not in cover):
-        problems.append("主题或 Cover Letter 缺少候选人姓名")
+    if name and name not in cover:
+        problems.append("Cover Letter 缺少候选人姓名")
+    if name and bool(role.get("subject_requires_candidate_name", True)) and name not in subject:
+        problems.append("邮件主题缺少候选人姓名")
     availability = str(profile.get("availabilityDays") or "").strip()
     if availability and f"每周可实习{availability}天" not in cover:
         problems.append("Cover Letter 未写明候选人的每周可实习天数")
@@ -1603,7 +1686,7 @@ def _deterministic_problems(
     if repeated_contacts:
         problems.append("联系方式在多段文案中重复堆砌，只需在必要位置保留一次")
 
-    if not re.search(r"(?:期待|希望|方便|愿意).{0,18}(?:沟通|交流|面试|进一步了解)", narrative):
+    if not _has_clear_communication_next_step(narrative):
         problems.append("文案缺少清晰、克制的沟通下一步")
     if _compact_text(email) == _compact_text(cover) or (
         len(email) >= 80 and _compact_text(email) in _compact_text(cover)
@@ -1633,7 +1716,7 @@ def _deterministic_problems(
     if record:
         title = str(record.get("title") or "")
         source_text = "\n".join(str(record.get(field) or "") for field in ("title", "body", "source_card_text"))
-        if NON_JOB_TITLE_PATTERN.search(title) or (not _has_application_signal(record) and not EXPLICIT_JOB_PATTERN.search(source_text)):
+        if _non_job_title_signal(title) or (not _has_application_signal(record) and not EXPLICIT_JOB_PATTERN.search(source_text)):
             problems.append("当前内容缺少可验证的招聘或投递信号，只能保留为待审核卡片")
     return list(dict.fromkeys(problems))
 
@@ -1776,12 +1859,7 @@ def _human_quality_dimensions(
     email_paragraphs = [item.strip() for item in re.split(r"\n\s*\n", email) if item.strip()]
     normalized_email = _compact_text(email)
     repeated = bool(normalized_email and len(normalized_email) >= 80 and normalized_email in _compact_text(cover))
-    cta_found = bool(re.search(
-        r"(?:(?:期待|希望|方便|愿意).{0,18}(?:沟通|交流|面试|进一步了解)|"
-        r"(?:welcome|hope|available).{0,24}(?:interview|discuss|conversation|talk))",
-        email,
-        re.I,
-    ))
+    cta_found = _has_clear_communication_next_step(email)
     templated_subject = bool(re.search(
         r"^(?:求职申请|应聘贵司职位|一封来自优秀候选人的邮件|关于贵司岗位的自荐信|怀着热忱申请|application)$",
         subject,
@@ -1838,7 +1916,12 @@ def _human_quality_dimensions(
     if unsupported_numbers:
         grounding_problems.append(f"未获证据支持的数字：{'、'.join(unsupported_numbers)}")
     specificity_problems = [] if evidence_terms else ["正文没有写出可核验的行动、项目或结果锚点"]
-    relevance_problems = [] if role_name and role_name in subject else ["主题没有准确点名当前岗位"]
+    subject_rule_detected = bool(role.get("subject_rule_detected"))
+    role_named_for_relevance = _role_name_mentioned(role_name, subject) or (
+        subject_rule_detected
+        and _role_name_mentioned(role_name, str(draft.get("greeting") or ""))
+    )
+    relevance_problems = [] if role_named_for_relevance else ["主题没有准确点名当前岗位"]
     if templated_subject:
         relevance_problems.append("邮件主题使用了通用模板，未体现当前岗位和候选人证据")
     alignment = _role_evidence_alignment(
@@ -2914,6 +2997,24 @@ def _is_grounded_text(value: Any, source_text: str) -> bool:
     return len(candidate) >= 4 and candidate in _normalized_evidence_text(source_text)
 
 
+def _source_grounding_segments(source_text: str, *, max_length: int = 240) -> list[str]:
+    parts = re.split(r"(?:\r?\n)+|(?<=[.!?。！？；;])\s*", str(source_text or ""))
+    segments: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        value = part.strip()
+        if not value:
+            continue
+        chunks = [value[index:index + max_length].strip() for index in range(0, len(value), max_length)]
+        for chunk in chunks:
+            normalized = _normalized_evidence_text(chunk)
+            if len(normalized) < 4 or normalized in seen:
+                continue
+            seen.add(normalized)
+            segments.append(chunk)
+    return segments
+
+
 def _record_general_source_text(record: dict[str, Any]) -> str:
     media = record.get("media") if isinstance(record.get("media"), dict) else {}
     image_analysis = media.get("analysis") if isinstance(media.get("analysis"), dict) else {}
@@ -3043,6 +3144,115 @@ def _normalize_grounded_content_analysis(
         "modules": normalized_modules,
         "source_character_count": _source_character_count(source_text),
         "grounded_evidence_count": grounded_count,
+    }
+
+
+def _repair_ungrounded_content_analysis(
+    provider: AIProvider,
+    result: dict[str, Any],
+    presentation: dict[str, Any],
+    source_text: str,
+) -> dict[str, Any]:
+    source_segments = _source_grounding_segments(source_text)
+    if not source_segments:
+        return result
+    repair = provider.generate_json(
+        (
+            "你是原文证据校对员。候选原文已经切成带编号的只读片段。"
+            "只选择能够直接支持某个栏目结论的片段编号，不要复制、改写或生成引文。"
+            "至少返回一个有直接原文支持的栏目；没有支持的栏目不要返回。"
+        ),
+        json.dumps({
+            "source_segments": [
+                {"id": index, "text": segment}
+                for index, segment in enumerate(source_segments, start=1)
+            ],
+            "modules": [
+                {
+                    "id": module.get("id"),
+                    "question": next((
+                        definition.get("question")
+                        for definition in presentation.get("modules", [])
+                        if _content_module_id(definition.get("id"), 0) == _content_module_id(module.get("id"), 0)
+                    ), ""),
+                    "summary_to_verify": module.get("summary"),
+                }
+                for module in result.get("modules", [])
+                if isinstance(module, dict)
+            ],
+        }, ensure_ascii=False),
+        content_grounding_repair_schema(len(source_segments)),
+    )
+    repaired_modules = [
+        module for module in repair.get("modules", [])
+        if isinstance(module, dict)
+    ] if isinstance(repair.get("modules"), list) else []
+    repaired_by_id = {
+        _content_module_id(module.get("id"), index): module
+        for index, module in enumerate(repaired_modules, start=1)
+    }
+    merged = {**result}
+    merged_modules = []
+    for index, module in enumerate(result.get("modules", []), start=1):
+        if not isinstance(module, dict):
+            continue
+        module_id = _content_module_id(module.get("id"), index)
+        repaired = repaired_by_id.get(module_id)
+        if repaired is None and index <= len(repaired_modules):
+            repaired = repaired_modules[index - 1]
+        repaired = repaired or {}
+        evidence = [
+            str(item).strip()
+            for item in repaired.get("evidence", [])
+            if str(item).strip() and _is_grounded_text(item, source_text)
+        ]
+        for segment_id in repaired.get("evidence_segment_ids", []):
+            try:
+                segment_index = int(segment_id) - 1
+            except (TypeError, ValueError):
+                continue
+            if 0 <= segment_index < len(source_segments):
+                evidence.append(source_segments[segment_index])
+        evidence = list(dict.fromkeys(evidence))[:6]
+        merged_modules.append({
+            **module,
+            "evidence": evidence,
+        })
+    merged["modules"] = merged_modules
+    return merged
+
+
+def _conservative_grounded_result(
+    result: dict[str, Any],
+    presentation: dict[str, Any],
+    source_text: str,
+) -> dict[str, Any]:
+    source_segments = _source_grounding_segments(source_text)
+    if not source_segments:
+        return result
+    excerpt = source_segments[0]
+    definitions = [
+        item for item in presentation.get("modules", [])
+        if isinstance(item, dict)
+    ]
+    if not definitions:
+        definitions = [{"id": "source", "title": "Source excerpt"}]
+    modules = []
+    for index, definition in enumerate(definitions, start=1):
+        modules.append({
+            "id": _content_module_id(definition.get("id"), index),
+            "title": str(definition.get("title") or f"Analysis module {index}"),
+            "summary": excerpt if index == 1 else "",
+            "items": [excerpt] if index == 1 else [],
+            "evidence": [excerpt] if index == 1 else [],
+        })
+    return {
+        **result,
+        "overview": excerpt,
+        "content_type": "Source excerpt",
+        "relevance_score": 0,
+        "relevance_reason": "Only a verbatim, source-grounded excerpt is retained.",
+        "modules": modules,
     }
 
 
@@ -3217,7 +3427,38 @@ def enrich_general_payload(
                 }, ensure_ascii=False),
                 content_analysis_schema(),
             )
-            record["content_analysis"] = _normalize_grounded_content_analysis(result, presentation, source_text)
+            analysis = _normalize_grounded_content_analysis(result, presentation, source_text)
+            analysis["grounding_repair_attempted"] = False
+            analysis["grounding_repair_succeeded"] = False
+            if analysis["status"] != "completed":
+                analysis["grounding_repair_attempted"] = True
+                try:
+                    repaired_result = _repair_ungrounded_content_analysis(
+                        provider,
+                        result,
+                        presentation,
+                        source_text,
+                    )
+                    repaired = _normalize_grounded_content_analysis(repaired_result, presentation, source_text)
+                    repaired["grounding_repair_attempted"] = True
+                    repaired["grounding_repair_succeeded"] = repaired["status"] == "completed"
+                    analysis = repaired
+                    if analysis["status"] != "completed":
+                        conservative_result = _conservative_grounded_result(result, presentation, source_text)
+                        conservative = _normalize_grounded_content_analysis(conservative_result, presentation, source_text)
+                        conservative["grounding_repair_attempted"] = True
+                        conservative["grounding_repair_succeeded"] = conservative["status"] == "completed"
+                        conservative["grounding_repair_mode"] = "deterministic_source_excerpt"
+                        analysis = conservative
+                except (AIProviderError, ValueError, TypeError, KeyError) as repair_error:
+                    conservative_result = _conservative_grounded_result(result, presentation, source_text)
+                    conservative = _normalize_grounded_content_analysis(conservative_result, presentation, source_text)
+                    conservative["grounding_repair_attempted"] = True
+                    conservative["grounding_repair_succeeded"] = conservative["status"] == "completed"
+                    conservative["grounding_repair_mode"] = "deterministic_source_excerpt"
+                    conservative["grounding_repair_error"] = str(repair_error)[:300]
+                    analysis = conservative
+            record["content_analysis"] = analysis
             if not record["content_analysis"]["overview"] or not record["content_analysis"]["modules"]:
                 raise ValueError("content analysis is missing overview or modules")
             status = str(record["content_analysis"]["status"])

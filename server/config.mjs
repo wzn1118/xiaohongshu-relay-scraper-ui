@@ -14,6 +14,12 @@ const applicationContactOcrPath = path.resolve(serverDir, '..', 'scripts', 'reso
 const dataDir = path.resolve(process.env.XHS_SERVER_DATA_DIR || path.join(serverDir, '..', 'data', 'jobs'));
 const authRoot = path.resolve(process.env.XHS_AUTH_DATA_DIR || path.join(dataDir, '..', 'auth'));
 const authRequired = readBoolean(process.env.XHS_AUTH_REQUIRED, process.env.NODE_ENV === 'production');
+const host = String(process.env.HOST || '127.0.0.1').trim() || '127.0.0.1';
+const defaultCopilotApprovalMode = process.env.NODE_ENV === 'production' || !isLoopbackAppHost(host)
+  ? 'required'
+  : 'never';
+const mcpHost = normalizeLoopbackHost(process.env.XHS_MCP_HOST || '127.0.0.1');
+const mcpPublicOrigin = normalizeOptionalHttpsOrigin(process.env.XHS_MCP_PUBLIC_URL, 'XHS_MCP_PUBLIC_URL');
 const smtpPort = readPort(process.env.SMTP_PORT, 587);
 const smtpUser = String(process.env.SMTP_USER || '').trim();
 const smtpPass = String(process.env.SMTP_PASS || '');
@@ -22,8 +28,48 @@ const smtpAuth = String(process.env.SMTP_AUTH || 'auto').trim().toLowerCase();
 const smtpOAuthTenant = normalizeMicrosoftTenant(process.env.SMTP_OAUTH_TENANT);
 
 export const config = Object.freeze({
-  host: process.env.HOST || '127.0.0.1',
+  host,
   port: readPort(process.env.PORT, 4317),
+  mcpEnabled: readBoolean(process.env.XHS_MCP_ENABLED, true),
+  mcpHost,
+  mcpPort: readPort(process.env.XHS_MCP_PORT, 4328),
+  mcpPublicOrigin,
+  mcpPublicHost: mcpPublicOrigin ? new URL(mcpPublicOrigin).host.toLowerCase() : '',
+  mcpRequireCloudflareHeaders: readBoolean(
+    process.env.XHS_MCP_REQUIRE_CLOUDFLARE_HEADERS,
+    Boolean(mcpPublicOrigin),
+  ),
+  mcpPublicShowcaseEnabled: readBoolean(
+    process.env.XHS_MCP_PUBLIC_SHOWCASE_ENABLED,
+    Boolean(mcpPublicOrigin),
+  ),
+  mcpPublicShowcaseMaxBodyBytes: readInt(
+    process.env.XHS_MCP_PUBLIC_SHOWCASE_MAX_BODY_BYTES,
+    64 * 1024,
+    1024,
+    256 * 1024,
+  ),
+  mcpPublicShowcaseMaxCallsPerMinute: readInt(
+    process.env.XHS_MCP_PUBLIC_SHOWCASE_MAX_CALLS_PER_MINUTE,
+    60,
+    1,
+    1000,
+  ),
+  mcpPublicShowcaseMaxConcurrentRequests: readInt(
+    process.env.XHS_MCP_PUBLIC_SHOWCASE_MAX_CONCURRENT_REQUESTS,
+    4,
+    1,
+    32,
+  ),
+  mcpMaxBodyBytes: readInt(process.env.XHS_MCP_MAX_BODY_BYTES, 1024 * 1024, 1024, 8 * 1024 * 1024),
+  mcpMaxOutputBytes: readInt(process.env.XHS_MCP_MAX_OUTPUT_BYTES, 2 * 1024 * 1024, 1024, 16 * 1024 * 1024),
+  mcpToolTimeoutMs: readInt(process.env.XHS_MCP_TOOL_TIMEOUT_MS, 120_000, 1_000, 15 * 60 * 1000),
+  mcpMaxConcurrentToolsPerGrant: readInt(process.env.XHS_MCP_MAX_CONCURRENT_TOOLS_PER_GRANT, 4, 1, 32),
+  mcpMaxCallsPerMinute: readInt(process.env.XHS_MCP_MAX_CALLS_PER_MINUTE, 120, 1, 10_000),
+  mcpSessionIdleSeconds: readInt(process.env.XHS_MCP_SESSION_IDLE_SECONDS, 1800, 30, 24 * 60 * 60),
+  mcpMaxSessions: readInt(process.env.XHS_MCP_MAX_SESSIONS, 20, 1, 200),
+  mcpMaxSessionsPerGrant: readInt(process.env.XHS_MCP_MAX_SESSIONS_PER_GRANT, 4, 1, 32),
+  mcpTokenPepperPath: path.resolve(process.env.XHS_MCP_TOKEN_PEPPER_PATH || path.join(authRoot, 'mcp-token-pepper')),
   pythonBin: process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3'),
   runnerPath,
   runnerAvailable: existsSync(runnerPath),
@@ -63,6 +109,15 @@ export const config = Object.freeze({
   managedBrowserDataDir: path.resolve(process.env.XHS_BROWSER_DATA_DIR || path.join(dataDir, '..', 'browser')),
   relayConfigPath: path.resolve(process.env.XHS_RELAY_CONFIG_PATH || path.join(dataDir, '..', 'relay-config.json')),
   aiConfigPath: path.resolve(process.env.XHS_AI_CONFIG_PATH || path.join(dataDir, '..', 'ai-config.json')),
+  copilotMcpConfigPath: path.resolve(process.env.XHS_COPILOT_MCP_CONFIG_PATH || path.join(dataDir, '..', 'copilot-mcp-servers.json')),
+  copilotWorkspaceRoot: path.resolve(process.env.XHS_COPILOT_WORKSPACE_ROOT || path.join(serverDir, '..')),
+  copilotApprovalMode: normalizeCopilotApprovalMode(
+    process.env.XHS_COPILOT_APPROVAL_MODE,
+    defaultCopilotApprovalMode,
+  ),
+  copilotExecTimeoutMs: readInt(process.env.XHS_COPILOT_EXEC_TIMEOUT_MS, 30_000, 50, 5 * 60 * 1000),
+  copilotHttpTimeoutMs: readInt(process.env.XHS_COPILOT_HTTP_TIMEOUT_MS, 30_000, 50, 5 * 60 * 1000),
+  copilotMaxOutputBytes: readInt(process.env.XHS_COPILOT_MAX_OUTPUT_BYTES, 256 * 1024, 1024, 8 * 1024 * 1024),
   smtpConfigPath: path.resolve(process.env.XHS_SMTP_CONFIG_PATH || path.join(dataDir, '..', 'smtp-config.json')),
   dataRetentionPath: path.resolve(process.env.XHS_DATA_RETENTION_PATH || path.join(dataDir, '..', 'data-retention.json')),
   deletionAuditPath: path.resolve(process.env.XHS_DELETION_AUDIT_PATH || path.join(dataDir, '..', 'deletion-audit.jsonl')),
@@ -97,6 +152,7 @@ export const config = Object.freeze({
   attachmentMaxFileBytes: readInt(process.env.XHS_ATTACHMENT_MAX_FILE_BYTES, 10 * 1024 * 1024, 1024, 64 * 1024 * 1024),
   attachmentMaxTotalBytes: readInt(process.env.XHS_ATTACHMENT_MAX_TOTAL_BYTES, 20 * 1024 * 1024, 1024, 128 * 1024 * 1024),
   relayMonitorIntervalMs: readInt(process.env.XHS_RELAY_MONITOR_INTERVAL_MS, 15_000, 2_000, 300_000),
+  relayAutoConnect: readBoolean(process.env.XHS_RELAY_AUTOCONNECT, true),
   relayFailureThreshold: readInt(process.env.XHS_RELAY_FAILURE_THRESHOLD, 2, 1, 10),
   relayRecoveryCooldownMs: readInt(process.env.XHS_RELAY_RECOVERY_COOLDOWN_MS, 60_000, 5_000, 900_000),
   relayConnectTimeoutMs: readInt(process.env.XHS_RELAY_CONNECT_TIMEOUT_MS, 25_000, 1_000, 120_000),
@@ -116,6 +172,51 @@ function readInt(value, fallback, min, max) {
 function readBoolean(value, fallback = false) {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function normalizeCopilotApprovalMode(value, fallback = 'required') {
+  const normalizedFallback = ['required', 'workspace_auto', 'never'].includes(String(fallback).toLowerCase())
+    ? String(fallback).toLowerCase()
+    : 'required';
+  const mode = String(value || normalizedFallback).trim().toLowerCase();
+  return ['required', 'workspace_auto', 'never'].includes(mode) ? mode : normalizedFallback;
+}
+
+function isLoopbackAppHost(value) {
+  return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(String(value || '').trim().toLowerCase());
+}
+
+function normalizeLoopbackHost(value) {
+  const host = String(value || '').trim().toLowerCase();
+  if (!['127.0.0.1', 'localhost', '::1'].includes(host)) {
+    throw new Error('XHS_MCP_HOST must resolve to a loopback-only listener.');
+  }
+  return host;
+}
+
+function normalizeOptionalHttpsOrigin(value, name) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`${name} must be an absolute HTTPS origin.`);
+  }
+  if (
+    parsed.protocol !== 'https:'
+    || parsed.username
+    || parsed.password
+    || parsed.pathname !== '/'
+    || parsed.search
+    || parsed.hash
+  ) {
+    throw new Error(`${name} must be an HTTPS origin without credentials, path, query, or fragment.`);
+  }
+  if (['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname.toLowerCase())) {
+    throw new Error(`${name} must use a public hostname.`);
+  }
+  return parsed.origin;
 }
 
 function normalizeLocalModelEndpoint(value) {

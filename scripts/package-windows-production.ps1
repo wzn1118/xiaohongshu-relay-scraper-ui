@@ -16,32 +16,68 @@ function Copy-ReleaseTree {
     param([string]$Source, [string]$Destination)
     # Keep dependencies out of the generic tree copy so the explicit dependency
     # copy below is the only node_modules operation.
-    $excludedDirectories = @('.git', '.runtime', '.cloudflared', 'data', 'scripts\data', 'artifacts', 'output', 'profiles', 'test-results', 'tmp', 'deliverables', '.playwright-cli', '.pytest_cache', '__pycache__', 'node_modules', 'dist')
+    $excludedDirectories = @('.git', '.runtime', '.cloudflared', '.package-staging', 'data', 'scripts\data', 'artifacts', 'output', 'profiles', 'test-results', 'tmp', 'deliverables', '.playwright-cli', '.pytest_cache', '__pycache__', 'node_modules', 'dist')
     $excludedFiles = @('.env*', 'production.env.local', '*.token', 'cert.pem', 'session-secret', 'secret.json', 'secrets.json', 'credential.json', 'credentials.json', 'password.json', 'password.txt', '*-secret.json', '*-secrets.json', '*-credential.json', '*-credentials.json', '*-password.json', '*-password.txt', 'api-key.json', 'api-key.txt', 'apikey.json', 'apikey.txt', 'private-key.pem', '*.key', 'id_rsa', 'id_ed25519', '*.log', '*.sqlite', '*.sqlite-wal', '*.sqlite-shm')
     $robocopyArgs = @($Source, $Destination, '/E', '/COPY:DAT', '/DCOPY:DAT', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
     foreach ($directory in $excludedDirectories) { $robocopyArgs += @('/XD', (Join-Path $Source $directory)) }
     foreach ($file in $excludedFiles) { $robocopyArgs += @('/XF', $file) }
     & robocopy.exe @robocopyArgs | Out-Null
-    if ($LASTEXITCODE -gt 7) { throw "Release tree copy failed with robocopy exit code $LASTEXITCODE." }
+    $copyExitCode = $LASTEXITCODE
+    if ($copyExitCode -gt 7) { throw "Release tree copy failed with robocopy exit code $copyExitCode." }
+    # robocopy uses 1-7 for successful copy states. Do not leak one of those
+    # values as this script's process exit code after the package is verified.
+    $global:LASTEXITCODE = 0
+}
+
+function Copy-PortableRuntime {
+    param([string]$Source, [string]$Destination)
+
+    # Copy the runtime tree as ordinary files. Copy-Item can preserve a source
+    # reparse point, which makes Get-ChildItem see the files in staging while
+    # ZipFile.CreateFromDirectory omits the linked directory from the archive.
+    $robocopyArgs = @($Source, $Destination, '/E', '/COPY:DAT', '/DCOPY:DAT', '/XJ', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+    & robocopy.exe @robocopyArgs | Out-Null
+    $copyExitCode = $LASTEXITCODE
+    if ($copyExitCode -gt 7) {
+        throw "Portable runtime copy failed with robocopy exit code $copyExitCode."
+    }
+    $global:LASTEXITCODE = 0
 }
 
 function Copy-PrivateDataTree {
     param([string]$Source, [string]$Destination)
-    $excludedDirectories = @('.cloudflared', 'cloudflared', 'tunnel-credentials')
-    $robocopyArgs = @($Source, $Destination, '/E', '/COPY:DAT', '/DCOPY:DAT', '/R:1', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
+    $excludedDirectories = @('.cloudflared', 'cloudflared', 'tunnel-credentials', 'browser')
+    $excludedFiles = @(
+        (Join-Path $Source 'auth\users.json'),
+        (Join-Path $Source 'auth\session-secret'),
+        (Join-Path $Source 'auth\mcp-token-pepper'),
+        'ai-config*.json',
+        'smtp-config*.json'
+    )
+    $robocopyArgs = @($Source, $Destination, '/E', '/COPY:DAT', '/DCOPY:DAT', '/Z', '/XJ', '/R:5', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS', '/NP')
     foreach ($directory in $excludedDirectories) { $robocopyArgs += @('/XD', (Join-Path $Source $directory)) }
-    foreach ($authFile in @('users.json', 'session-secret')) { $robocopyArgs += @('/XF', (Join-Path $Source "auth\$authFile")) }
-    & robocopy.exe @robocopyArgs | Out-Null
-    if ($LASTEXITCODE -gt 7) { throw "Private data copy failed with robocopy exit code $LASTEXITCODE." }
+    foreach ($file in $excludedFiles) { $robocopyArgs += @('/XF', $file) }
+    $copyOutput = @(& robocopy.exe @robocopyArgs)
+    $copyExitCode = $LASTEXITCODE
+    if ($copyExitCode -gt 7) {
+        $diagnosticTail = ($copyOutput | Select-Object -Last 40) -join [Environment]::NewLine
+        throw "Private data copy failed with robocopy exit code $copyExitCode.$([Environment]::NewLine)$diagnosticTail"
+    }
+    $global:LASTEXITCODE = 0
 }
 
 function Get-PrivateExclusions {
     param([string]$Source)
     $entries = [Collections.Generic.List[object]]::new()
-    foreach ($relative in @('auth\users.json', 'auth\session-secret')) {
+    foreach ($relative in @('auth\users.json', 'auth\session-secret', 'auth\mcp-token-pepper')) {
         $path = Join-Path $Source $relative
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             $entries.Add([ordered]@{ path = ($relative -replace '\\', '/'); reason = 'machine authentication state' })
+        }
+    }
+    foreach ($pattern in @('ai-config*.json', 'smtp-config*.json')) {
+        foreach ($file in Get-ChildItem -LiteralPath $Source -File -Filter $pattern -ErrorAction SilentlyContinue) {
+            $entries.Add([ordered]@{ path = $file.Name; reason = 'machine provider credentials and configuration' })
         }
     }
     foreach ($relative in @('.cloudflared', 'cloudflared', 'tunnel-credentials')) {
@@ -50,14 +86,17 @@ function Get-PrivateExclusions {
             $entries.Add([ordered]@{ path = "$relative/"; reason = 'tunnel credentials' })
         }
     }
+    $browserPath = Join-Path $Source 'browser'
+    if (Test-Path -LiteralPath $browserPath -PathType Container) {
+        $entries.Add([ordered]@{ path = 'browser/'; reason = 'machine browser profile, cookies, and authenticated session state' })
+    }
     return $entries
 }
 
 function Assert-NoEmbeddedPrivateCredentials {
     param([string]$DataRoot)
-    $aiConfigPath = Join-Path $DataRoot 'ai-config.json'
-    if (Test-Path -LiteralPath $aiConfigPath -PathType Leaf) {
-        try { $aiConfig = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($aiConfigPath)) } catch { throw "ai-config.json is not valid JSON. $($_.Exception.Message)" }
+    foreach ($aiConfigPath in @(Get-ChildItem -LiteralPath $DataRoot -File -Filter 'ai-config*.json' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)) {
+        try { $aiConfig = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($aiConfigPath)) } catch { throw "AI configuration is not valid JSON: $aiConfigPath. $($_.Exception.Message)" }
         if ($aiConfig.providers) {
             foreach ($provider in $aiConfig.providers.PSObject.Properties) {
                 $apiKeyProperty = $provider.Value.PSObject.Properties['apiKey']
@@ -68,9 +107,8 @@ function Assert-NoEmbeddedPrivateCredentials {
         }
     }
 
-    $smtpConfigPath = Join-Path $DataRoot 'smtp-config.json'
-    if (Test-Path -LiteralPath $smtpConfigPath -PathType Leaf) {
-        try { $smtpConfig = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($smtpConfigPath)) } catch { throw "smtp-config.json is not valid JSON. $($_.Exception.Message)" }
+    foreach ($smtpConfigPath in @(Get-ChildItem -LiteralPath $DataRoot -File -Filter 'smtp-config*.json' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)) {
+        try { $smtpConfig = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($smtpConfigPath)) } catch { throw "SMTP configuration is not valid JSON: $smtpConfigPath. $($_.Exception.Message)" }
         foreach ($name in @('pass', 'password', 'credentialVault')) {
             $property = $smtpConfig.PSObject.Properties[$name]
             if ($property -and $null -ne $property.Value -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
@@ -114,7 +152,9 @@ function Test-ForbiddenReleasePath {
     if ($leaf -match '^\.env' -and $leaf -notin @('.env.example', '.env.production.example')) { return $true }
     if ($leaf -eq 'production.env.local') { return $true }
     if ($leaf -eq 'cert.pem' -or $leaf -like '*.token') { return $true }
-    if ($normalized -match '^data/auth/(?:users\.json|session-secret)$') { return $true }
+    if ($normalized -match '^data/auth/(?:users\.json|session-secret|mcp-token-pepper)$') { return $true }
+    if ($normalized -match '^data/(?:ai-config|smtp-config)[^/]*\.json$') { return $true }
+    if ($normalized -match '^data/browser(?:/|$)') { return $true }
     if ($leaf -match '^(?:session-secret|secret|secrets|credential|credentials|password|passwords|passwd)$') { return $true }
     if ($leaf -match '(?:^|[-_.])(?:secret|secrets|credential|credentials|password|passwords|passwd|api[-_.]?key)(?:[-_.][^.]+)*\.(?:json|ya?ml|toml|ini|conf|config|txt|pem)$') { return $true }
     if ($leaf -match '^(?:id_rsa|id_ed25519)$' -or $leaf -like '*.key') { return $true }
@@ -158,7 +198,7 @@ if (-not $OmitNodeModules -and -not (Test-Path -LiteralPath (Join-Path $root 'no
 if (-not $PortableRuntimeRoot) { throw '-PortableRuntimeRoot is required for a one-click production package.' }
 $runtimeSource = if ([IO.Path]::IsPathRooted($PortableRuntimeRoot)) { [IO.Path]::GetFullPath($PortableRuntimeRoot) } else { [IO.Path]::GetFullPath((Join-Path $root $PortableRuntimeRoot)) }
 if (-not (Test-Path -LiteralPath $runtimeSource -PathType Container)) { throw "Portable runtime directory was not found: $runtimeSource" }
-$requiredRuntimeFiles = @('node\node.exe', 'node\npm.cmd', 'python\python.exe', 'cloudflared\cloudflared.exe')
+$requiredRuntimeFiles = @('node\node.exe', 'node\npm.cmd', 'python\python.exe', 'cloudflared\cloudflared.exe', 'browser\chrome.exe')
 foreach ($relative in $requiredRuntimeFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $runtimeSource $relative) -PathType Leaf)) {
         throw "Portable runtime is incomplete: $relative"
@@ -179,7 +219,6 @@ if ($IncludeData) {
     if (-not $DataSource) { throw '-DataSource is required when -IncludeData is used.' }
     $resolvedDataSource = if ([IO.Path]::IsPathRooted($DataSource)) { [IO.Path]::GetFullPath($DataSource) } else { [IO.Path]::GetFullPath((Join-Path $root $DataSource)) }
     if (-not (Test-Path -LiteralPath $resolvedDataSource -PathType Container)) { throw "Data source directory was not found: $resolvedDataSource" }
-    Assert-NoEmbeddedPrivateCredentials -DataRoot $resolvedDataSource
     $dataSourceLabel = Split-Path -Leaf $resolvedDataSource.TrimEnd('\', '/')
     if (-not $dataSourceLabel) { $dataSourceLabel = 'external-data' }
     $sourceCardsCount = Get-JsonArrayCount -Path (Join-Path $resolvedDataSource $cardsRelativePath)
@@ -201,7 +240,14 @@ $outputParent = Split-Path -Parent $OutputPath
 if (-not (Test-Path -LiteralPath $outputParent -PathType Container)) { New-Item -ItemType Directory -Path $outputParent -Force | Out-Null }
 if (Test-Path -LiteralPath $OutputPath) { Remove-Item -LiteralPath $OutputPath -Force }
 
-$stage = Join-Path ([IO.Path]::GetTempPath()) ("hegelsalon-release-" + [guid]::NewGuid().ToString('N'))
+# Stage beside the requested archive. Portable runtimes can exceed 1 GB, and
+# cross-drive staging is both slower and more likely to leave an incomplete
+# runtime tree before archive creation on constrained system drives.
+$stageParent = Join-Path $outputParent '.package-staging'
+if (-not (Test-Path -LiteralPath $stageParent -PathType Container)) {
+    New-Item -ItemType Directory -Path $stageParent -Force | Out-Null
+}
+$stage = Join-Path $stageParent ("hegelsalon-release-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 try {
     Copy-ReleaseTree -Source $root -Destination $stage
@@ -223,7 +269,7 @@ try {
     if (-not $OmitNodeModules) {
         Copy-Item -LiteralPath (Join-Path $root 'node_modules') -Destination (Join-Path $stage 'node_modules') -Recurse -Force
     }
-    Copy-Item -LiteralPath $runtimeSource -Destination (Join-Path $stage 'runtime') -Recurse -Force
+    Copy-PortableRuntime -Source $runtimeSource -Destination (Join-Path $stage 'runtime')
     foreach ($relative in $requiredRuntimeFiles) {
         if (-not (Test-Path -LiteralPath (Join-Path $stage "runtime\$relative") -PathType Leaf)) {
             throw "Staged portable runtime is incomplete: $relative"
@@ -234,6 +280,11 @@ try {
         New-Item -ItemType Directory -Path $stageData -Force | Out-Null
         Copy-PrivateDataTree -Source $resolvedDataSource -Destination $stageData
         Assert-NoEmbeddedPrivateCredentials -DataRoot $stageData
+        $stageCopilotDatabase = Join-Path $stageData 'copilot\copilot-state.sqlite'
+        $revocationScript = Join-Path $root 'scripts\revoke-mcp-grants-after-restore.mjs'
+        $portableNode = Join-Path $runtimeSource 'node\node.exe'
+        $revocationResult = @(& $portableNode $revocationScript --database $stageCopilotDatabase 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Staged MCP Grant revocation failed: $($revocationResult -join [Environment]::NewLine)" }
         $stageCardsCount = Get-JsonArrayCount -Path (Join-Path $stageData $cardsRelativePath)
         $stageNotesCount = Get-JsonArrayCount -Path (Join-Path $stageData $notesRelativePath)
         if ($stageCardsCount -ne $sourceCardsCount -or $stageNotesCount -ne $sourceNotesCount) {
@@ -246,6 +297,9 @@ try {
             schemaVersion = 1
             createdAt = (Get-Date).ToUniversalTime().ToString('o')
             includesRawData = $true
+            rawDatasetRecordsUnmodified = $true
+            machineCredentialFilesExcluded = @('data/auth/users.json', 'data/auth/session-secret', 'data/auth/mcp-token-pepper', 'data/ai-config*.json', 'data/smtp-config*.json', 'data/browser/')
+            activeMcpGrantsRevoked = $true
             dataSource = $dataSourceLabel
             datasetTaskId = $datasetTaskId
             cards = [ordered]@{ path = "data/$($cardsRelativePath -replace '\\', '/')"; count = $stageCardsCount }
@@ -263,9 +317,38 @@ try {
             'PRIVATE RAW-DATA BUNDLE - NOT FOR PUBLIC GITHUB',
             '',
             'This archive contains unredacted application data and is intended for private transfer only.',
-            'Administrator accounts, session secrets, environment files, tunnel tokens, certificates, and credential files are excluded.',
+            'The 715 cards, 715 notes, job artifacts, and workflow state are copied without content redaction.',
+            'Administrator accounts, session secrets, MCP token pepper, browser profile/cookies, AI/SMTP machine configuration, environment files, tunnel tokens, certificates, and credential files are excluded.',
+            'Any MCP Grant copied in the application database is revoked during packaging and must be reissued on the target machine.',
+            'Node.js, Python, cloudflared, Chromium, and application dependencies are bundled for a Windows machine with no developer runtime installed.',
+            'On a new computer, launch the managed browser once and sign in there; the browser session is intentionally created on that machine.',
             'Use the clean package for a public repository or public release.'
         ) | Set-Content -LiteralPath (Join-Path $stage 'PRIVATE-BUNDLE-NOT-FOR-GITHUB.txt') -Encoding UTF8
+    } else {
+        [ordered]@{
+            schemaVersion = 1
+            createdAt = (Get-Date).ToUniversalTime().ToString('o')
+            includesRawData = $false
+            rawDatasetRecordsUnmodified = $false
+            machineCredentialFilesExcluded = @('data/', 'data/auth/users.json', 'data/auth/session-secret', 'data/auth/mcp-token-pepper', 'data/ai-config*.json', 'data/smtp-config*.json', 'data/browser/')
+            activeMcpGrantsRevoked = $true
+            dataSource = $null
+            datasetTaskId = $null
+            cards = [ordered]@{ path = $null; count = 0 }
+            notes = [ordered]@{ path = $null; count = 0 }
+            restoredWorkflow = [ordered]@{ taskId = $null; path = $null; present = $false }
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $stage 'PORTABLE_DATASET.json') -Encoding UTF8
+        Add-Content -LiteralPath (Join-Path $stage 'PORTABLE_DATASET.json') -Value ''
+        [ordered]@{
+            schemaVersion = 1
+            excluded = @(
+                [ordered]@{ path = 'data/'; reason = 'all runtime and raw application data is excluded from the public release' },
+                [ordered]@{ path = '.env and production.env.local'; reason = 'machine environment and secrets' },
+                [ordered]@{ path = 'browser profiles and cookies'; reason = 'machine browser authentication state' },
+                [ordered]@{ path = 'tunnel credentials'; reason = 'machine tunnel authentication state' }
+            )
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stage 'PRIVATE_EXCLUSIONS.json') -Encoding UTF8
+        Add-Content -LiteralPath (Join-Path $stage 'PRIVATE_EXCLUSIONS.json') -Value ''
     }
     $manifest = [ordered]@{
         schemaVersion = 1
@@ -274,11 +357,14 @@ try {
         integrity = 'Verify the complete archive with the separately reported SHA-256.'
         publicHost = 'relay.hegelsalon.com'
         originPort = 4327
+        publicMcpHost = 'mcp.hegelsalon.com'
+        mcpOriginPort = 4328
+        publicMcpEndpoint = 'https://mcp.hegelsalon.com/mcp'
         includesNodeModules = (Test-Path -LiteralPath (Join-Path $stage 'node_modules') -PathType Container)
         includesPortableRuntime = ($requiredRuntimeFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $stage "runtime\$_") -PathType Leaf) }).Count -eq 0
         includesRawData = [bool]$IncludeData
         dataSource = $dataSourceLabel
-        excluded = if ($IncludeData) { @('.git', '.runtime', 'data/auth/users.json', 'data/auth/session-secret', '.env and .env.* except *.example', '*.token', 'cert.pem', 'tunnel credentials') } else { @('.git', '.runtime', 'data', 'artifacts', 'output', 'profiles', '.env and .env.* except *.example', '*.token', 'cert.pem', 'tunnel credentials') }
+        excluded = if ($IncludeData) { @('.git', '.runtime', 'data/auth/users.json', 'data/auth/session-secret', 'data/auth/mcp-token-pepper', 'data/ai-config*.json', 'data/smtp-config*.json', 'data/browser', '.env and .env.* except *.example', '*.token', 'cert.pem', 'tunnel credentials') } else { @('.git', '.runtime', 'data', 'artifacts', 'output', 'profiles', '.env and .env.* except *.example', '*.token', 'cert.pem', 'tunnel credentials') }
         files = @(Get-Manifest -Stage $stage)
     }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stage 'PORTABLE_MANIFEST.json') -Encoding UTF8
@@ -289,26 +375,75 @@ try {
     $archive = [IO.Compression.ZipFile]::OpenRead($OutputPath)
     try {
         $names = @($archive.Entries | ForEach-Object { $_.FullName -replace '\\', '/' })
-        if (-not ($names -contains 'PORTABLE_MANIFEST.json')) { throw 'Archive is missing PORTABLE_MANIFEST.json.' }
+        $requiredArchiveEntries = @(
+            'PORTABLE_MANIFEST.json',
+            'PORTABLE_DATASET.json',
+            'PRIVATE_EXCLUSIONS.json',
+            'start-windows.cmd',
+            'start-mcp.cmd',
+            'mcp-stdio.cmd',
+            'verify-mcp.cmd',
+            'start-production-windows.cmd',
+            'MCP_PACKAGE_INFO.json',
+            'config/mcp-client.example.json',
+            'docs/PUBLIC_RELEASE_MCP_GUIDE.md',
+            'runtime/node/node.exe',
+            'runtime/node/npm.cmd',
+            'runtime/python/python.exe',
+            'runtime/cloudflared/cloudflared.exe',
+            'runtime/browser/chrome.exe',
+            'scripts/verify-mcp-production.mjs',
+            'scripts/verify-mcp-public-production.ps1',
+            'scripts/verify-mcp-public-showcase.mjs',
+            'scripts/verify-public-package-mcp.ps1',
+            'scripts/revoke-mcp-grants-after-restore.mjs',
+            'server/mcp-access-service.mjs',
+            'server/mcp-http-server.mjs',
+            'server/mcp-management-http.mjs',
+            'server/mcp-public-showcase.mjs',
+            'src/McpAccessPanel.tsx'
+        )
+        foreach ($requiredEntry in $requiredArchiveEntries) {
+            if (-not ($names -contains $requiredEntry)) { throw "Archive is missing required release metadata: $requiredEntry" }
+        }
         foreach ($name in $names) {
             if (Test-ForbiddenReleasePath -RelativePath $name -AllowData ([bool]$IncludeData)) {
                 throw "Archive contains a forbidden secret or runtime path: $name"
             }
         }
         if ($IncludeData) {
-            foreach ($requiredEntry in @('PORTABLE_DATASET.json', 'PRIVATE_EXCLUSIONS.json', 'PRIVATE-BUNDLE-NOT-FOR-GITHUB.txt', "data/$($cardsRelativePath -replace '\\', '/')", "data/$($notesRelativePath -replace '\\', '/')", "data/$($workflowStateRelativePath -replace '\\', '/')")) {
+            foreach ($requiredEntry in @('PRIVATE-BUNDLE-NOT-FOR-GITHUB.txt', "data/$($cardsRelativePath -replace '\\', '/')", "data/$($notesRelativePath -replace '\\', '/')", "data/$($workflowStateRelativePath -replace '\\', '/')")) {
                 if (-not ($names -contains $requiredEntry)) { throw "Private archive is missing required entry: $requiredEntry" }
             }
         } elseif ($names | Where-Object { $_ -match '^data(?:/|$)' }) {
             throw 'Clean archive contains a data path.'
         }
+
+        $buffer = New-Object byte[] 131072
+        foreach ($entry in $archive.Entries) {
+            if ($entry.FullName.EndsWith('/')) { continue }
+            $stream = $entry.Open()
+            try {
+                while ($stream.Read($buffer, 0, $buffer.Length) -gt 0) { }
+            } finally {
+                $stream.Dispose()
+            }
+        }
     } finally { $archive.Dispose() }
     $hash = (Get-FileHash -LiteralPath $OutputPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $checksumPath = "$OutputPath.sha256"
+    $checksumLine = "$hash  $([IO.Path]::GetFileName($OutputPath))`r`n"
+    [IO.File]::WriteAllText($checksumPath, $checksumLine, [Text.Encoding]::ASCII)
     Write-Host "Production package created: $OutputPath"
     Write-Host "Archive SHA-256: $hash"
+    Write-Host "Archive checksum file: $checksumPath"
     Write-Host "Node dependencies included: $(-not $OmitNodeModules)"
     Write-Host "Portable runtime included: $([bool]$PortableRuntimeRoot)"
     Write-Host "Raw application data included: $([bool]$IncludeData)"
 } finally {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# A successful PowerShell script must not inherit robocopy's successful
+# nonzero status code when callers invoke it from cmd.exe or another shell.
+$global:LASTEXITCODE = 0

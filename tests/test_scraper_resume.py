@@ -417,6 +417,29 @@ def test_atomic_write_preserves_existing_checkpoint_when_replace_fails(tmp_path,
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_atomic_write_retries_transient_windows_access_conflict(tmp_path, monkeypatch) -> None:
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text("old", encoding="utf-8")
+    real_replace = SCRAPER.os.replace
+    calls = 0
+
+    def flaky_replace(source, destination) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise PermissionError(SCRAPER.errno.EACCES, "locked", destination)
+        real_replace(source, destination)
+
+    monkeypatch.setattr(SCRAPER.os, "replace", flaky_replace)
+    monkeypatch.setattr(SCRAPER.time, "sleep", lambda _seconds: None)
+
+    SCRAPER.write_text_atomically(checkpoint, "new", encoding="utf-8")
+
+    assert calls == 2
+    assert checkpoint.read_text(encoding="utf-8") == "new"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_unreadable_resume_checkpoint_is_recollected(tmp_path) -> None:
     checkpoint = tmp_path / "checkpoint.json"
     checkpoint.write_text("[truncated", encoding="utf-8")

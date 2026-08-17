@@ -649,6 +649,11 @@ def _infer_role_name_from_body(record: dict[str, Any]) -> str:
             r"(?=\s*(?:\d{1,2}月|ASAP|尽快|立即|【|工作内容|岗位职责|职位描述|任职要求|$))",
             re.I,
         ),
+        re.compile(
+            r"^\s*([^\n。！!?；;]{2,48}?(?:实习生|实习岗位|管培生|助理|专员|经理|分析师|研究员|顾问|工程师|运营|产品|设计|编辑|剪辑))"
+            r"(?=\s+(?:负责|参与|协助|工作|岗位|职位|基本信息|我们)|\s*$)",
+            re.I,
+        ),
     )
     for pattern in patterns:
         match = pattern.search(body)
@@ -676,8 +681,8 @@ def build_cover_letter_rewrite_input(
     application = record.get("application_info") if isinstance(record.get("application_info"), dict) else {}
     job_card = record.get("job_card") if isinstance(record.get("job_card"), dict) else {}
     raw_role_name = (
-        application.get("role_name")
-        or job_card.get("role_name")
+        job_card.get("role_name")
+        or application.get("role_name")
         or record.get("role_name")
         or record.get("title")
     )

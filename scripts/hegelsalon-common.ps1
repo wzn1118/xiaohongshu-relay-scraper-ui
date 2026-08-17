@@ -9,6 +9,42 @@ function Get-HegelSalonRoot {
     return $script:HegelSalonRoot
 }
 
+function Initialize-HegelSalonProxyEnvironment {
+    [CmdletBinding()]
+    param()
+
+    $existing = @($env:HTTPS_PROXY, $env:https_proxy, $env:HTTP_PROXY, $env:http_proxy, $env:ALL_PROXY, $env:all_proxy) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -First 1
+    if ($existing) { return }
+    if ($env:OS -ne 'Windows_NT') { return }
+
+    try {
+        $settings = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        if ([int]$settings.ProxyEnable -ne 1) { return }
+        $rawProxy = [string]$settings.ProxyServer
+        if ([string]::IsNullOrWhiteSpace($rawProxy)) { return }
+        $parts = $rawProxy -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        $selected = ($parts | Where-Object { $_ -match '^(?i:https)=' } | Select-Object -First 1)
+        if (-not $selected) { $selected = ($parts | Where-Object { $_ -match '^(?i:http)=' } | Select-Object -First 1) }
+        if (-not $selected) { $selected = $parts | Select-Object -First 1 }
+        $candidate = ([string]$selected -replace '^(?i:https?|socks)=').Trim()
+        if ($candidate -notmatch '^[A-Za-z][A-Za-z0-9+.-]*://') { $candidate = "http://$candidate" }
+        $uri = [Uri]$candidate
+        if ($uri.Scheme -notin @('http', 'https') -or [string]::IsNullOrWhiteSpace($uri.Host)) { return }
+        $proxy = $uri.GetLeftPart([UriPartial]::Authority)
+        $env:HTTPS_PROXY = $proxy
+        $env:HTTP_PROXY = $proxy
+        if ([string]::IsNullOrWhiteSpace($env:NO_PROXY)) {
+            $bypass = @('127.0.0.1', 'localhost', '::1')
+            $bypass += ([string]$settings.ProxyOverride -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne '<local>' })
+            $env:NO_PROXY = ($bypass | Select-Object -Unique) -join ','
+        }
+    } catch {
+        return
+    }
+}
+
 function Import-HegelSalonDotEnv {
     [CmdletBinding()]
     param(
@@ -66,16 +102,48 @@ function Initialize-HegelSalonEnvironment {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Hostname,
+        [string]$McpHostname = '',
         [ValidateRange(1, 65535)][int]$Port = 4327
     )
 
     $publicHost = Test-HegelSalonHostname $Hostname
+    $mcpPublicHost = if ($McpHostname) { Test-HegelSalonHostname $McpHostname } else { '' }
+    if ($mcpPublicHost -and $mcpPublicHost -eq $publicHost) { throw 'The application and MCP public hostnames must differ.' }
     $env:NODE_ENV = 'production'
     $env:HOST = '127.0.0.1'
     $env:PORT = [string]$Port
-    $env:XHS_AUTH_REQUIRED = 'true'
+    $authRequired = [Environment]::GetEnvironmentVariable('XHS_AUTH_REQUIRED', 'Process')
+    if ([string]::IsNullOrWhiteSpace($authRequired)) { $authRequired = 'true' }
+    $authRequired = $authRequired.Trim().ToLowerInvariant()
+    if ($authRequired -notin @('true', 'false')) { throw 'XHS_AUTH_REQUIRED must be true or false.' }
+    $env:XHS_AUTH_REQUIRED = $authRequired
     $env:XHS_AUTH_SECURE_COOKIE = 'true'
     $env:XHS_AUTH_ORIGIN = "https://$publicHost"
+    $env:XHS_MCP_ENABLED = 'true'
+    $env:XHS_MCP_HOST = '127.0.0.1'
+    $mcpPort = 0
+    $configuredMcpPort = [Environment]::GetEnvironmentVariable('XHS_MCP_PORT', 'Process')
+    if ([string]::IsNullOrWhiteSpace($configuredMcpPort)) {
+        if ($Port -ge 65535) { throw 'The application port must leave room for a dedicated MCP port.' }
+        $mcpPort = $Port + 1
+    } elseif (-not [int]::TryParse($configuredMcpPort, [ref]$mcpPort) -or $mcpPort -lt 1 -or $mcpPort -gt 65535) {
+        throw "XHS_MCP_PORT must be an integer from 1 to 65535: $configuredMcpPort"
+    }
+    if ($mcpPort -eq $Port) { throw 'XHS_MCP_PORT must differ from the application PORT.' }
+    $env:XHS_MCP_PORT = [string]$mcpPort
+    if ($mcpPublicHost) {
+        $env:XHS_MCP_PUBLIC_URL = "https://$mcpPublicHost"
+        $env:XHS_MCP_REQUIRE_CLOUDFLARE_HEADERS = 'true'
+        $publicShowcaseEnabled = [Environment]::GetEnvironmentVariable('XHS_MCP_PUBLIC_SHOWCASE_ENABLED', 'Process')
+        if ([string]::IsNullOrWhiteSpace($publicShowcaseEnabled)) {
+            $env:XHS_MCP_PUBLIC_SHOWCASE_ENABLED = 'true'
+        }
+    }
+
+    $audienceAiEnabled = [Environment]::GetEnvironmentVariable('XHS_AUDIENCE_AI_ENABLED', 'Process')
+    if ([string]::IsNullOrWhiteSpace($audienceAiEnabled)) {
+        [Environment]::SetEnvironmentVariable('XHS_AUDIENCE_AI_ENABLED', 'true', 'Process')
+    }
 
     $defaults = [ordered]@{
         XHS_SERVER_DATA_DIR = (Join-Path $script:HegelSalonRoot 'data\jobs')
@@ -89,6 +157,7 @@ function Initialize-HegelSalonEnvironment {
         XHS_DIAGNOSTICS_PATH = (Join-Path $script:HegelSalonRoot 'data\diagnostics.jsonl')
         XHS_AUTH_USERS_PATH = (Join-Path $script:HegelSalonRoot 'data\auth\users.json')
         XHS_AUTH_SESSION_SECRET_PATH = (Join-Path $script:HegelSalonRoot 'data\auth\session-secret')
+        XHS_MCP_TOKEN_PEPPER_PATH = (Join-Path $script:HegelSalonRoot 'data\auth\mcp-token-pepper')
     }
     foreach ($entry in $defaults.GetEnumerator()) {
         $current = [Environment]::GetEnvironmentVariable($entry.Key, 'Process')
@@ -100,8 +169,12 @@ function Initialize-HegelSalonEnvironment {
         Hostname = $publicHost
         Port = $Port
         Origin = "http://127.0.0.1:$Port"
+        McpPort = $mcpPort
+        McpOrigin = "http://127.0.0.1:$mcpPort"
+        McpPublicHostname = $mcpPublicHost
+        McpPublicOrigin = if ($mcpPublicHost) { "https://$mcpPublicHost" } else { '' }
         PublicOrigin = "https://$publicHost"
-        RuntimeRoot = (Join-Path $script:HegelSalonRoot '.runtime\hegelsalon')
+        RuntimeRoot = (Join-Path $script:HegelSalonRoot '.runtime\production')
         AuthUsersPath = [Environment]::GetEnvironmentVariable('XHS_AUTH_USERS_PATH', 'Process')
     }
 }
@@ -125,7 +198,8 @@ function Ensure-HegelSalonDirectories {
         (Split-Path -Parent $env:XHS_DELETION_AUDIT_PATH),
         (Split-Path -Parent $env:XHS_DIAGNOSTICS_PATH),
         (Split-Path -Parent $env:XHS_AUTH_USERS_PATH),
-        (Split-Path -Parent $env:XHS_AUTH_SESSION_SECRET_PATH)
+        (Split-Path -Parent $env:XHS_AUTH_SESSION_SECRET_PATH),
+        (Split-Path -Parent $env:XHS_MCP_TOKEN_PEPPER_PATH)
     )
     foreach ($path in $paths | Where-Object { $_ } | Select-Object -Unique) {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
@@ -312,6 +386,17 @@ function Invoke-HegelSalonHealth {
     } catch { return $false }
 }
 
+function Invoke-HegelSalonMcpHealth {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+    try {
+        $response = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 3
+        return ($response.ok -eq $true -and $response.service -eq 'xiaohongshu-relay-scraper-mcp')
+    } catch { return $false }
+}
+
 function Get-HegelSalonPidFile {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
@@ -324,10 +409,10 @@ function Get-HegelSalonTrackedServerProcess {
     $pidFile = Get-HegelSalonPidFile $RuntimeRoot
     if (-not (Test-Path -LiteralPath $pidFile -PathType Leaf)) { return $null }
     $raw = (Get-Content -LiteralPath $pidFile -Raw).Trim()
-    $pid = 0
-    if (-not [int]::TryParse($raw, [ref]$pid) -or $pid -le 0) { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue; return $null }
+    $trackedPid = 0
+    if (-not [int]::TryParse($raw, [ref]$trackedPid) -or $trackedPid -le 0) { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue; return $null }
     try {
-        $process = Get-Process -Id $pid -ErrorAction Stop
+        $process = Get-Process -Id $trackedPid -ErrorAction Stop
         if ($process.HasExited) { throw 'exited' }
         return $process
     } catch {
@@ -344,6 +429,66 @@ function Stop-HegelSalonTrackedServer {
         & taskkill.exe /PID $process.Id /T /F *> $null
     }
     Remove-Item -LiteralPath (Get-HegelSalonPidFile $RuntimeRoot) -Force -ErrorAction SilentlyContinue
+}
+
+function Get-HegelSalonTunnelPidFile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+    return Join-Path $RuntimeRoot 'tunnel.pid'
+}
+
+function Get-HegelSalonTrackedTunnelProcess {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+    $pidFile = Get-HegelSalonTunnelPidFile $RuntimeRoot
+    if (-not (Test-Path -LiteralPath $pidFile -PathType Leaf)) { return $null }
+    $raw = (Get-Content -LiteralPath $pidFile -Raw).Trim()
+    $trackedPid = 0
+    if (-not [int]::TryParse($raw, [ref]$trackedPid) -or $trackedPid -le 0) { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue; return $null }
+    try {
+        $process = Get-Process -Id $trackedPid -ErrorAction Stop
+        if ($process.HasExited -or $process.ProcessName -notmatch '^cloudflared$') { throw 'exited or mismatched' }
+        return $process
+    } catch {
+        Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+}
+
+function Stop-HegelSalonTrackedTunnel {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 15
+    )
+    $process = Get-HegelSalonTrackedTunnelProcess $RuntimeRoot
+    if ($process) {
+        $trackedPid = $process.Id
+        & taskkill.exe /PID $trackedPid /T /F *> $null
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        do {
+            if (-not (Get-Process -Id $trackedPid -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (Get-Process -Id $trackedPid -ErrorAction SilentlyContinue) {
+            throw "Tracked cloudflared process $trackedPid did not exit within $TimeoutSeconds seconds."
+        }
+    }
+    Remove-Item -LiteralPath (Get-HegelSalonTunnelPidFile $RuntimeRoot) -Force -ErrorAction SilentlyContinue
+
+    $metrics = if ($env:CLOUDFLARE_METRICS) { [string]$env:CLOUDFLARE_METRICS } else { '127.0.0.1:20242' }
+    try {
+        $metricsUri = [Uri]"http://$metrics"
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        do {
+            if (-not (Test-HegelSalonPortOpen -HostName $metricsUri.Host -Port $metricsUri.Port)) { return }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTime]::UtcNow -lt $deadline)
+        throw "Cloudflare metrics endpoint $metrics did not release within $TimeoutSeconds seconds."
+    } catch {
+        if ($_.Exception.Message -like 'Cloudflare metrics endpoint*') { throw }
+        throw "Invalid CLOUDFLARE_METRICS endpoint: $metrics"
+    }
 }
 
 function Get-HegelSalonRuntimePaths {

@@ -1,0 +1,5 @@
+只返回 JSON：{"items":[...] }。每个 job 必须有且只有一项，note_id 原样保留。
+
+每项包含 note_id、greeting、email_subject、email_body、cover_letter、used_evidence_ids、capability_matches、evidence_coverage、responsibility_coverage。greeting 30-180 字，以“您好，我是”开头并点名 TARGET_ROLE；email_subject 8-120 字，含岗位和姓名；email_body 120-260 字、第一人称、最多四段，含真实经历和沟通邀请。cover_letter 只写正文，以“尊敬的招聘负责人：”开头，第一段含 TARGET_ROLE，含“此致”“敬礼”和姓名，共 800-1600 个非空白字符。
+
+至少回应两项职责或要求。事实只能来自该 job.EVIDENCE，不得补写输入中没有的事实。used_evidence_ids 只能从 allowed_evidence_ids 选，并满足两个 minimum 数量。capability_matches 不得为空，每项格式为“岗位职责：具体职责；证据 evidence-id；可迁移价值：具体行动”，evidence-id 必须已使用。禁止元叙述、绝对承诺、遗漏或合并岗位。

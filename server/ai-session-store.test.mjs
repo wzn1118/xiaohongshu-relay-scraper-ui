@@ -253,3 +253,79 @@ test('relay model discovery explains authentication failures without trying anot
   );
   assert.deepEqual(calls, ['https://gateway.example/v1/models']);
 });
+
+test('AI session probe executes a real chat completion without exposing credentials', async () => {
+  const calls = [];
+  const store = new AiSessionStore({
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: 'READY' } }] }),
+      };
+    },
+  });
+  const session = await store.create({
+    provider: 'openai',
+    apiKey: 'secret-key',
+    baseUrl: 'https://api.example/v1',
+    model: 'model-a',
+    wireApi: 'chat_completions',
+  });
+
+  const probe = await store.probe(session.id);
+  assert.equal(probe.ok, true);
+  assert.equal(probe.responseText, 'READY');
+  assert.equal(probe.model, 'model-a');
+  assert.equal('apiKey' in probe, false);
+  assert.equal(calls[0].url, 'https://api.example/v1/chat/completions');
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer secret-key');
+  assert.equal(JSON.parse(calls[0].options.body).messages[1].content, 'Reply READY.');
+});
+
+test('AI session probe retries a transient transport failure before reporting the session unavailable', async () => {
+  let attempts = 0;
+  const store = new AiSessionStore({
+    probeTransportAttempts: 3,
+    probeRetryDelayMs: 0,
+    fetchImpl: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new TypeError('fetch failed');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: 'READY' } }] }),
+      };
+    },
+  });
+  const session = await store.create({
+    provider: 'relay',
+    apiKey: 'relay-key',
+    baseUrl: 'https://gateway.example/v1',
+    model: 'model-a',
+    wireApi: 'chat_completions',
+  });
+
+  const probe = await store.probe(session.id);
+  assert.equal(probe.ok, true);
+  assert.equal(attempts, 2);
+});
+
+test('AI session probe supports the Responses API and rejects empty output', async () => {
+  let output = { output: [{ content: [{ type: 'output_text', text: 'READY' }] }] };
+  const store = new AiSessionStore({
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => output }),
+  });
+  const session = await store.create({
+    provider: 'codex',
+    apiKey: 'secret-key',
+    baseUrl: 'https://api.example/v1',
+    model: 'model-r',
+    wireApi: 'responses',
+  });
+  assert.equal((await store.probe(session.id)).responseText, 'READY');
+
+  output = { output: [] };
+  await assert.rejects(store.probe(session.id), (error) => error.code === 'AI_PROBE_FAILED');
+});

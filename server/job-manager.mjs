@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { createWriteStream } from 'node:fs';
-import { appendFile, mkdir, open, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, open, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { buildRunnerArgs } from './lib/contracts.mjs';
 import { isIncompleteApplicationRecord, isIncompleteGeneralRecord } from './lib/application-records.mjs';
@@ -115,7 +115,7 @@ export class JobManager {
     const now = new Date().toISOString();
     let changed = false;
     for (const job of this.jobs) {
-      changed = migrateLegacyJob(job, this.dataDir, now) || changed;
+      changed = await migrateLegacyJob(job, this.dataDir, now) || changed;
       changed = await this.#loadEventJournal(job) || changed;
       const expansionBeforeState = job.workflowSummary?.expansion;
       const state = await initializeWorkflowState(job.statePath, workflowStateFromJob(job));
@@ -230,9 +230,12 @@ export class JobManager {
       const expansion = (recoveredExpansion || diskSummary?.expansion || persistedExpansion)
         ? { ...(recoveredExpansion || {}), ...(diskSummary?.expansion || {}), ...(persistedExpansion || {}) }
         : null;
-      job.workflowSummary = expansion
-        ? { ...persistedWorkflow, ...(diskSummary || {}), expansion }
+      const baseSummary = diskSummary?.rawCollection === true
+        ? diskSummary
         : { ...persistedWorkflow, ...(diskSummary || {}) };
+      job.workflowSummary = expansion
+        ? { ...baseSummary, expansion }
+        : baseSummary;
       if (!persistedExpansion && recoveredExpansion) changed = true;
       if (!job.rateLimit && job.workflowSummary?.rateLimit?.status === 'stopped') {
         job.rateLimit = {
@@ -1746,8 +1749,6 @@ export class JobManager {
         append('system', `Checkpoint analysis failed: ${job.checkpointAnalysisError}\n`);
       }
       this.runtimeContexts.delete(job.id);
-      job.workflowSummary = mergeWorkflowSummary(job.workflowSummary, await readWorkflowSummary(job.outputDir));
-      job.artifactCount = await countArtifactFiles(job.outputDir);
       let latestState;
       try {
         latestState = await readWorkflowState(job.statePath);
@@ -1759,6 +1760,8 @@ export class JobManager {
         job.error = String(error?.message || error);
         append('system', `${job.error}\n`);
       }
+      job.workflowSummary = mergeWorkflowSummary(job.workflowSummary, await readWorkflowSummary(job.outputDir));
+      job.artifactCount = await countArtifactFiles(job.outputDir);
       if (job.status !== 'succeeded') {
         finalizeRunningAudienceStage(job, stopReasonForJob(job), job.finishedAt);
       }
@@ -1820,17 +1823,28 @@ export class JobManager {
     }
     const runtime = this.runtimeContexts.get(job.id) || {};
     const profilePath = await resolveCheckpointProfilePath(job, runtime.profilePath || this.legacyProfilePath);
+    const summaryBeforeAnalysis = await readWorkflowSummary(job.outputDir);
+    const rawCollectionSummary = job.params?.skipPostprocess === true && summaryBeforeAnalysis?.rawCollection === true
+      ? summaryBeforeAnalysis
+      : null;
     append('system', `Parsing ${expected} body-backed records from the saved checkpoint.\n`);
-    const result = await this.checkpointAnalyzerImpl({
-      pythonBin: this.pythonBin,
-      runnerPath: this.runnerPath,
-      outputDir: job.outputDir,
-      profilePath,
-      analysisMode: job.params?.analysisMode === 'general' ? 'general' : 'job',
-      keyword: String(job.params?.keyword || ''),
-      contentPreset: String(job.params?.contentPreset || 'auto'),
-      contentGoal: String(job.params?.contentGoal || ''),
-    });
+    let result;
+    try {
+      result = await this.checkpointAnalyzerImpl({
+        pythonBin: this.pythonBin,
+        runnerPath: this.runnerPath,
+        outputDir: job.outputDir,
+        profilePath,
+        analysisMode: job.params?.analysisMode === 'general' ? 'general' : 'job',
+        keyword: String(job.params?.keyword || ''),
+        contentPreset: String(job.params?.contentPreset || 'auto'),
+        contentGoal: String(job.params?.contentGoal || ''),
+      });
+    } finally {
+      if (rawCollectionSummary) {
+        await restoreRawCollectionMetadata(job.outputDir, rawCollectionSummary);
+      }
+    }
     if (result?.stdout) append('stdout', result.stdout);
     if (result?.stderr) append('stderr', result.stderr);
     const generated = await countApplicationRecords(path.join(job.outputDir, 'application_intelligence.json'));
@@ -2639,7 +2653,7 @@ function resumeScopeIsComplete(state, exposedJob, scope) {
   return selected.every((stageName) => stages[stageName]?.status === 'completed');
 }
 
-function migrateLegacyJob(job, dataDir, now) {
+async function migrateLegacyJob(job, dataDir, now) {
   let changed = false;
   const assign = (key, value) => {
     if (job[key] !== undefined && job[key] !== null) return;
@@ -2657,6 +2671,20 @@ function migrateLegacyJob(job, dataDir, now) {
   assign('outputDir', path.join(dataDir, job.id, 'artifacts'));
   assign('logPath', path.join(path.dirname(job.outputDir), 'run.log'));
   assign('statePath', workflowStatePath(job.outputDir));
+  const portableJobDir = path.join(dataDir, job.id);
+  const portableOutputDir = path.join(portableJobDir, 'artifacts');
+  const portableStatePath = workflowStatePath(portableOutputDir);
+  if (path.resolve(job.statePath) !== path.resolve(portableStatePath)) {
+    try {
+      await access(portableStatePath);
+      job.outputDir = portableOutputDir;
+      job.logPath = path.join(portableJobDir, 'run.log');
+      job.statePath = portableStatePath;
+      changed = true;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
   assign('resumeCount', 0);
   assign('lastResumedAt', null);
   assign('revision', 0);
@@ -3847,6 +3875,32 @@ async function readWorkflowSummary(outputDir) {
   }
 }
 
+async function restoreRawCollectionMetadata(outputDir, summary) {
+  const summaryPath = path.join(outputDir, 'workflow-summary.json');
+  await writeJsonAtomically(summaryPath, summary);
+
+  const manifestPath = path.join(outputDir, 'artifact-manifest.json');
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) return;
+
+  const summaryBytes = await readFile(summaryPath);
+  const artifacts = Array.isArray(manifest.artifacts) ? manifest.artifacts : [];
+  const summaryArtifact = artifacts.find((artifact) => artifact?.path === 'workflow-summary.json');
+  if (summaryArtifact) {
+    summaryArtifact.bytes = summaryBytes.length;
+    summaryArtifact.sha256 = crypto.createHash('sha256').update(summaryBytes).digest('hex');
+  }
+  manifest.status = String(summary.status || manifest.status || '');
+  manifest.updatedAt = String(summary.generatedAt || new Date().toISOString());
+  await writeJsonAtomically(manifestPath, manifest);
+}
+
 async function readBodyCheckpoint(outputDir) {
   try {
     const [ledgerPayload, summaryPayload] = await Promise.all([
@@ -4378,9 +4432,19 @@ async function countArtifactFiles(root) {
 async function createRuntimeProfile(profilePath, candidateProfile, jobDir) {
   const values = candidateProfile && typeof candidateProfile === 'object' ? candidateProfile : {};
   const hasCandidateValues = Object.values(values).some((value) => typeof value === 'string' && value.trim());
-  if (!profilePath || !hasCandidateValues) return profilePath;
+  if (!hasCandidateValues) return profilePath;
 
-  const base = JSON.parse(await readFile(profilePath, 'utf8'));
+  let base = {};
+  if (profilePath) {
+    try {
+      base = JSON.parse(await readFile(profilePath, 'utf8'));
+    } catch (error) {
+      // Historical tasks persist candidateProfile in workflow state, but the
+      // old machine's legacy profile file is intentionally absent from a
+      // portable package. The task-local snapshot is sufficient to resume.
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
   const runtimePath = path.join(jobDir, 'candidate-profile.runtime.json');
   const merged = {
     ...(base && typeof base === 'object' && !Array.isArray(base) ? base : {}),

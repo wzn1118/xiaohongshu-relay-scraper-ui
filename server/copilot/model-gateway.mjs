@@ -83,19 +83,28 @@ export class ModelGateway {
       throw gatewayError(body?.error?.message || `Model request failed with ${response.status}.`, response.status);
     }
     if (!response.body) throw gatewayError('The model returned an empty stream.', 502);
+    const cancelBody = () => {
+      void response.body.cancel?.(input.signal?.reason).catch?.(() => {});
+    };
+    input.signal?.addEventListener('abort', cancelBody, { once: true });
     const decoder = new TextDecoder();
     let buffer = '';
-    for await (const chunk of response.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split(/\r?\n/u);
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        const data = line.startsWith('data:') ? line.slice(5).trim() : '';
-        if (!data || data === '[DONE]') continue;
-        let parsed;
-        try { parsed = JSON.parse(data); } catch { continue; }
-        yield normalizeStreamEvent(parsed, request.wireApi, this.now);
+    try {
+      for await (const chunk of response.body) {
+        if (input.signal?.aborted) throw new ModelGatewayError('MODEL_REQUEST_ABORTED', 'Model request was aborted or timed out.', 504);
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split(/\r?\n/u);
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const data = line.startsWith('data:') ? line.slice(5).trim() : '';
+          if (!data || data === '[DONE]') continue;
+          let parsed;
+          try { parsed = JSON.parse(data); } catch { continue; }
+          yield normalizeStreamEvent(parsed, request.wireApi, this.now);
+        }
       }
+    } finally {
+      input.signal?.removeEventListener('abort', cancelBody);
     }
   }
 
@@ -107,8 +116,10 @@ export class ModelGateway {
     const baseUrl = String(provider.baseUrl || '').replace(/\/$/u, '');
     const model = String(provider.model || '').trim();
     if (!baseUrl || !model) throw new ModelGatewayError('MODEL_CONFIGURATION_INCOMPLETE', 'Model base URL and model are required.', 400);
-    const url = wireApi === 'responses' ? `${baseUrl}/responses` : `${baseUrl}/chat/completions`;
+    const urls = modelEndpointCandidates({ providerId, baseUrl }, wireApi);
+    const url = urls[0];
     const headers = this.#headers(provider);
+    if (stream) headers.Accept = 'text/event-stream, application/json';
     validateCapabilities(input, capabilities, wireApi, stream);
     const body = wireApi === 'responses'
       ? { model, input: input.input || input.messages || [], stream }
@@ -118,7 +129,13 @@ export class ModelGateway {
       if (input.previousResponseId) body.previous_response_id = String(input.previousResponseId);
       if (input.conversationId) body.conversation = String(input.conversationId);
       if (input.background === true) body.background = true;
-      if (input.reasoningSummary) body.reasoning = { summary: String(input.reasoningSummary) };
+      const reasoningEffort = normalizeReasoningEffort(input.reasoningEffort);
+      if (input.reasoningSummary || reasoningEffort) {
+        body.reasoning = {
+          ...(input.reasoningSummary ? { summary: String(input.reasoningSummary) } : {}),
+          ...(reasoningEffort ? { effort: reasoningEffort } : {}),
+        };
+      }
       if (input.maxOutputTokens !== undefined) body.max_output_tokens = positiveInteger(input.maxOutputTokens, 'maxOutputTokens');
       if (input.metadata && typeof input.metadata === 'object') body.metadata = structuredClone(input.metadata);
       if (Array.isArray(input.tools)) body.tools = structuredClone(input.tools);
@@ -127,7 +144,11 @@ export class ModelGateway {
     } else if (input.maxOutputTokens !== undefined) {
       body.max_tokens = positiveInteger(input.maxOutputTokens, 'maxOutputTokens');
     }
-    return { providerId, wireApi, url, headers, body, method: 'POST', capabilities };
+    if (wireApi !== 'responses') {
+      if (Array.isArray(input.tools)) body.tools = structuredClone(input.tools);
+      if (input.toolChoice !== undefined) body.tool_choice = structuredClone(input.toolChoice);
+    }
+    return { providerId, wireApi, url, urls, headers, body, method: 'POST', capabilities };
   }
 
   #headers(provider) {
@@ -145,12 +166,17 @@ export class ModelGateway {
     const abort = () => controller.abort(signal?.reason || new Error('model_aborted'));
     signal?.addEventListener('abort', abort, { once: true });
     try {
-      return await this.fetchImpl(request.url, {
-        method: request.method || 'POST',
-        headers: request.headers,
-        ...(request.method === 'GET' ? {} : { body: JSON.stringify(request.body || {}) }),
-        signal: controller.signal,
-      });
+      const urls = Array.isArray(request.urls) && request.urls.length ? request.urls : [request.url];
+      for (const [index, url] of urls.entries()) {
+        const response = await this.fetchImpl(url, {
+          method: request.method || 'POST',
+          headers: request.headers,
+          ...(request.method === 'GET' ? {} : { body: JSON.stringify(request.body || {}) }),
+          signal: controller.signal,
+        });
+        if (![404, 405].includes(response.status) || index === urls.length - 1) return response;
+      }
+      throw new ModelGatewayError('MODEL_REQUEST_FAILED', 'Model request did not produce a response.', 502);
     } catch (error) {
       if (controller.signal.aborted) throw new ModelGatewayError('MODEL_REQUEST_ABORTED', 'Model request was aborted or timed out.', 504, error);
       throw new ModelGatewayError('MODEL_REQUEST_FAILED', 'Model request failed.', 502, error);
@@ -208,6 +234,7 @@ function normalizeCapabilities(value, wireApi, supportsStreaming) {
     statefulResponses: wireApi === 'responses' && declared.statefulResponses !== false,
     conversationState: wireApi === 'responses' && declared.conversationState === true,
     reasoningSummary: wireApi === 'responses' && declared.reasoningSummary === true,
+    reasoningEffort: wireApi === 'responses' && declared.reasoningEffort !== false,
     structuredOutputs: declared.structuredOutputs === true,
     tools: declared.tools !== false,
     maxContextTokens: Number.isFinite(Number(declared.maxContextTokens)) ? Math.max(0, Math.floor(Number(declared.maxContextTokens))) : 0,
@@ -222,11 +249,23 @@ function validateCapabilities(input, capabilities, wireApi, stream) {
   if (input.previousResponseId && !capabilities.statefulResponses) unsupported.push('previous_response_id');
   if (input.conversationId && !capabilities.conversationState) unsupported.push('conversation');
   if (input.reasoningSummary && !capabilities.reasoningSummary) unsupported.push('reasoning_summary');
+  if (input.reasoningEffort && !capabilities.reasoningEffort) unsupported.push('reasoning_effort');
   if (Array.isArray(input.tools) && input.tools.length && !capabilities.tools) unsupported.push('tools');
-  if (wireApi !== 'responses' && (input.background || input.previousResponseId || input.conversationId || input.reasoningSummary)) unsupported.push('responses_state');
+  if (wireApi !== 'responses' && (input.background || input.previousResponseId || input.conversationId || input.reasoningSummary || input.reasoningEffort)) unsupported.push('responses_state');
   if (unsupported.length) {
     throw new ModelGatewayError('MODEL_CAPABILITY_UNSUPPORTED', `Provider does not support: ${[...new Set(unsupported)].join(', ')}.`, 400);
   }
+}
+
+function normalizeReasoningEffort(value) {
+  if (value === undefined || value === null || value === '') return '';
+  const effort = String(value).trim().toLowerCase();
+  if (['none', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) return effort;
+  throw new ModelGatewayError(
+    'MODEL_REASONING_EFFORT_INVALID',
+    'Reasoning effort must be none, low, medium, high, xhigh, or max.',
+    400,
+  );
 }
 
 function classifyProviderError(message, status) {
@@ -250,4 +289,19 @@ function positiveInteger(value, name) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) throw new ModelGatewayError('MODEL_PARAMETER_INVALID', `${name} must be a positive integer.`, 400);
   return Math.floor(number);
+}
+
+function modelEndpointCandidates({ providerId, baseUrl }, wireApi) {
+  const endpoint = wireApi === 'responses' ? 'responses' : 'chat/completions';
+  const direct = `${baseUrl}/${endpoint}`;
+  let pathname = '';
+  try {
+    pathname = new URL(baseUrl).pathname.toLowerCase();
+  } catch {
+    return [direct];
+  }
+  if (pathname.endsWith('/v1')) return [direct];
+  return ['relay', 'custom'].includes(String(providerId || '').toLowerCase())
+    ? [`${baseUrl}/v1/${endpoint}`, direct]
+    : [direct];
 }

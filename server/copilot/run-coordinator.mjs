@@ -132,6 +132,10 @@ export class RunCoordinator {
     if (!run || TERMINAL.has(run.status)) return false;
     const now = this.now().toISOString();
     this.store.upsertRun({ ...run, status: 'cancelled', completedAt: now, updatedAt: now });
+    if (run.turnId) {
+      const turn = this.store.getTurn(run.turnId);
+      if (turn) this.store.upsertTurn({ ...turn, status: 'cancelled', updatedAt: now });
+    }
     return true;
   }
 
@@ -163,15 +167,15 @@ export class RunCoordinator {
       tasks,
       planRevision: Number(value.planRevision || state.run.planRevision),
       startedAt: state.run.startedAt,
-      provider: state.run.provider,
-      model: state.run.model,
-      responseId: state.run.responseId,
-      previousResponseId: state.run.previousResponseId,
-      responseCursor: state.run.responseCursor,
-      background: state.run.background,
-      goal: state.turn?.goal,
-      mode: state.turn?.mode,
-      contract: state.turn?.contract,
+      provider: value.provider || state.run.provider,
+      model: value.model || state.run.model,
+      responseId: value.responseId || state.run.responseId,
+      previousResponseId: value.previousResponseId || state.run.previousResponseId,
+      responseCursor: value.responseCursor || state.run.responseCursor,
+      background: value.background ?? state.run.background,
+      goal: value.goal ?? state.turn?.goal,
+      mode: value.mode ?? state.turn?.mode,
+      contract: value.contract ?? state.turn?.contract,
     });
   }
 

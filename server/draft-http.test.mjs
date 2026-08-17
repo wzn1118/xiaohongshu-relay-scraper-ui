@@ -1080,6 +1080,72 @@ test('candidate profile attachments are imported only from the profile bound to 
   assert.equal(calls.length, 1);
 });
 
+test('quality checks use the bound full profile and current generation evidence ids', async (t) => {
+  const profileId = '0123456789abcdef';
+  const profileCalls = [];
+  const checkerCalls = [];
+  const fullProfile = {
+    name: '完整候选人',
+    experiences: [{
+      id: 'exp-verified-1',
+      organization: 'Example Lab',
+      title: 'Data project',
+      results: ['Built a report'],
+    }],
+  };
+  const fixture = await startFixture(t, {
+    profileId,
+    profileStore: {
+      get: async (id) => {
+        profileCalls.push(id);
+        return { id, ...fullProfile };
+      },
+    },
+    draftQualityChecker: async (payload) => {
+      checkerCalls.push(structuredClone(payload));
+      return qualityReport();
+    },
+  });
+  const initial = (await fixture.getResults()).body.items[0];
+  const saved = await fixture.post('draft', {
+    noteId: NOTE_ID,
+    draftId: initial.draftVersion.draftId,
+    baseVersion: initial.draftVersion.version,
+    outreach: initial.outreach,
+    generation: {
+      runId: 'quality-profile-run',
+      promptVersion: 'quality-profile-v1',
+      model: 'fixture-model',
+      provider: 'fixture',
+      profileSnapshotId: profileId,
+      targetRole: '规范化产品运营实习生',
+      usedEvidenceIds: ['exp-verified-1'],
+      capabilityMatches: ['岗位职责：用户研究；证据 exp-verified-1：可迁移价值'],
+      sourceHash: 'a'.repeat(64),
+      status: 'validated',
+    },
+  });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+
+  const checked = await fixture.post('draft/quality', {
+    noteId: NOTE_ID,
+    draftId: saved.body.draftVersion.draftId,
+    version: saved.body.draftVersion.version,
+    contentHash: saved.body.draftVersion.contentHash,
+  });
+  assert.equal(checked.status, 200, JSON.stringify(checked.body));
+  assert.deepEqual(profileCalls, [profileId]);
+  assert.equal(checkerCalls.length, 1);
+  assert.equal(checkerCalls[0].candidateProfile.name, '完整候选人');
+  assert.deepEqual(checkerCalls[0].candidateProfile.experiences, fullProfile.experiences);
+  assert.deepEqual(checkerCalls[0].draft.used_evidence_ids, ['exp-verified-1']);
+  assert.deepEqual(checkerCalls[0].draft.capability_matches, [
+    '岗位职责：用户研究；证据 exp-verified-1：可迁移价值',
+  ]);
+  assert.equal(checkerCalls[0].record.job_card.role_name, '规范化产品运营实习生');
+  assert.equal(checkerCalls[0].sourceHash, 'a'.repeat(64));
+});
+
 test('attachment selection changes stale current quality without creating a draft version', async (t) => {
   const fixture = await startFixture(t);
   const initial = (await fixture.getResults()).body.items[0];
@@ -1479,6 +1545,7 @@ test('quality recheck binds the exact saved version and hash to a resolvable rep
     version: saved.body.draftVersion.version,
     contentHash: saved.body.draftVersion.contentHash,
     aiSessionId: 'quality-session-001',
+    evaluationMode: 'deterministic_strict',
     applicationContext,
   });
   assert.equal(checked.status, 200);
@@ -1493,6 +1560,7 @@ test('quality recheck binds the exact saved version and hash to a resolvable rep
   assert.deepEqual(checkerCalls[0].payload.draft, edited);
   assert.deepEqual(checkerCalls[0].payload.applicationContext, applicationContext);
   assert.deepEqual(checkerCalls[0].payload.record.applicationContext, applicationContext);
+  assert.equal(checkerCalls[0].payload.evaluationMode, 'deterministic_strict');
   assert.equal(checkerCalls[0].payload.threshold, 90);
   assert.equal(checkerCalls[0].payload.attachmentContext.count, 0);
   assert.equal(checkerCalls[0].payload.attachmentContext.attachments.length, 0);
@@ -2434,6 +2502,7 @@ test('generation writeback saves a validated draft and provenance metadata', asy
       generation: {
         profileSnapshotId: 'profile-snapshot-1',
         usedEvidenceIds: ['e-ai'],
+        capabilityMatches: ['岗位职责：数据分析；证据 e-ai：可迁移价值'],
         status: 'validated',
       },
     }],
@@ -2447,6 +2516,9 @@ test('generation writeback saves a validated draft and provenance metadata', asy
   assert.equal(state[NOTE_ID].generation.runId, 'generation-run-1');
   assert.equal(state[NOTE_ID].generation.profileSnapshotId, 'profile-snapshot-1');
   assert.deepEqual(state[NOTE_ID].generation.usedEvidenceIds, ['e-ai']);
+  assert.deepEqual(state[NOTE_ID].generation.capabilityMatches, [
+    '岗位职责：数据分析；证据 e-ai：可迁移价值',
+  ]);
 });
 
 test('generation writeback reports a version conflict without overwriting a newer draft', async (t) => {

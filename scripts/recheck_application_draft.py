@@ -13,7 +13,10 @@ from ai_application_workflow import (
     _merge_feedback,
     _rubric_for_score,
 )
+from cover_letter_rewriter import _candidate_evidence
 from evidence_claim_validator import validate_generated_claims
+from job_role_title import normalize_role_title
+from codex_runtime_outreach import _subject_rule
 
 
 MAX_INPUT_BYTES = 2 * 1024 * 1024
@@ -57,23 +60,45 @@ def _role_from_record(record: dict[str, Any]) -> dict[str, Any]:
     job_card = _object(record.get("job_card"))
     media = _object(record.get("media"))
     media_analysis = _object(media.get("analysis"))
+    raw_role_name = str(job_card.get("role_name") or record.get("title") or "").strip()
+    quality_subject_rule = _object(record.get("qualitySubjectRule"))
+    subject_rule = _subject_rule(record)
+    subject_fields = _text_list(quality_subject_rule.get("fields"))
+    subject_rule_detected = bool(quality_subject_rule.get("detected", subject_rule.get("detected")))
     return {
-        "role_name": str(job_card.get("role_name") or record.get("title") or "").strip(),
+        "role_name": normalize_role_title(raw_role_name) or raw_role_name,
         "responsibilities": _object_list(application.get("responsibilities")),
         "requirements": _object_list(application.get("requirements")),
         "application_routes": _object_list(application.get("application_routes")),
         "capabilities": _object_list(record.get("job_capabilities")),
         "image_analysis": media_analysis,
+        "subject_rule_detected": subject_rule_detected,
+        "subject_requires_candidate_name": (
+            "candidateName" in subject_fields if subject_rule_detected else True
+        ),
     }
 
 
-def _candidate_profile(payload: dict[str, Any], record: dict[str, Any]) -> dict[str, str]:
+def _candidate_profile(payload: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     source = _object(payload.get("candidateProfile"))
     if not source:
         source = _object(record.get("candidateProfile"))
     if not source:
         source = _object(record.get("candidate_application"))
-    return {str(key): str(value or "").strip() for key, value in source.items()}
+    normalized = dict(source)
+    for key in (
+        "name",
+        "school",
+        "degree",
+        "major",
+        "phoneWeChat",
+        "email",
+        "availabilityDays",
+        "internshipDuration",
+    ):
+        if key in normalized:
+            normalized[key] = str(normalized.get(key) or "").strip()
+    return normalized
 
 
 def _draft_with_grounding(record: dict[str, Any], draft: dict[str, Any]) -> dict[str, Any]:
@@ -110,8 +135,8 @@ def evaluate_payload(
         raise ValueError("record and draft must be JSON objects")
 
     role = _role_from_record(record)
-    evidence = _object_list(record.get("fit_evidence"))
     candidate_profile = _candidate_profile(payload, record)
+    evidence = _candidate_evidence(record, candidate_profile)
     checked_draft = _draft_with_grounding(record, draft)
     attachment_context = _attachment_context(payload, record)
     current_source_hash = _application_copy_source_hash(record, candidate_profile, evidence)
@@ -125,23 +150,6 @@ def evaluate_payload(
     legacy_source_hash_inferred = not bool(stored_source_hash)
     source_review_required = bool(stored_source_hash and stored_source_hash != current_source_hash)
     threshold = _threshold(payload, record)
-    if attachment_context is None:
-        evaluation = _object(_evaluate(
-            provider_factory(),
-            role,
-            evidence,
-            checked_draft,
-            candidate_profile,
-        ))
-    else:
-        evaluation = _object(_evaluate(
-            provider_factory(),
-            role,
-            evidence,
-            checked_draft,
-            candidate_profile,
-            attachment_context,
-        ))
     human_quality = _human_quality_dimensions(
         checked_draft,
         role,
@@ -169,6 +177,34 @@ def evaluate_payload(
             ["岗位或候选人证据已变化，当前保存的投递文案需要重新复核"],
         )
 
+    evaluation_mode = str(payload.get("evaluationMode") or "ai_plus_deterministic").strip().lower()
+    if evaluation_mode == "deterministic_strict":
+        strict_score = 100 if not deterministic else 89
+        evaluation = {
+            "score": strict_score,
+            "rubric": _rubric_for_score(strict_score),
+            "strengths": ["已执行长度、结构、岗位匹配、证据绑定、事实声明和来源版本门禁"],
+            "problems": list(deterministic),
+            "rewrite_instructions": list(deterministic),
+        }
+    elif attachment_context is None:
+        evaluation = _object(_evaluate(
+            provider_factory(),
+            role,
+            evidence,
+            checked_draft,
+            candidate_profile,
+        ))
+    else:
+        evaluation = _object(_evaluate(
+            provider_factory(),
+            role,
+            evidence,
+            checked_draft,
+            candidate_profile,
+            attachment_context,
+        ))
+
     try:
         score = min(100, max(0, int(evaluation.get("score", 0))))
     except (TypeError, ValueError):
@@ -192,10 +228,10 @@ def evaluate_payload(
 
     claim_validation = validate_generated_claims(
         record,
+        profile=candidate_profile,
         candidate_profile={**_object(record.get("candidate_application")), **candidate_profile},
         draft=checked_draft,
     )
-    model_passed = score >= threshold
     if not claim_validation["hardFactsPassed"]:
         invalid_claims = [
             item["text"]
@@ -210,6 +246,10 @@ def evaluate_payload(
         )
         problems = _merge_feedback(problems, [claim_problem])
         instructions = _merge_feedback(instructions, [claim_problem])
+        score = min(score, 89)
+        rubric_values = _rubric_for_score(score)
+
+    model_passed = score >= threshold
 
     return {
         "score": score,
@@ -229,6 +269,7 @@ def evaluate_payload(
         "sourceHashStatus": "changed" if source_review_required else ("legacy_inferred" if legacy_source_hash_inferred else "current"),
         "sourceReviewRequired": source_review_required,
         "legacySourceHashInferred": legacy_source_hash_inferred,
+        "evaluationMode": evaluation_mode,
     }
 
 

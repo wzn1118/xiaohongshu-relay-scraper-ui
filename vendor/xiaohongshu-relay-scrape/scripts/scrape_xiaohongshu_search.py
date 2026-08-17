@@ -1,5 +1,6 @@
 import argparse
 import csv
+import errno
 import hashlib
 import hmac
 import io
@@ -1695,7 +1696,18 @@ def write_text_atomically(output_path: pathlib.Path, text: str, *, encoding: str
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, output_path)
+        attempts = 8
+        for attempt in range(attempts):
+            try:
+                os.replace(temporary, output_path)
+                break
+            except OSError as error:
+                retryable = error.errno in {errno.EACCES, errno.EPERM, errno.EBUSY} or getattr(
+                    error, "winerror", None
+                ) in {5, 32}
+                if not retryable or attempt + 1 >= attempts:
+                    raise
+                time.sleep(min(0.05 * (2**attempt), 0.8))
     finally:
         temporary.unlink(missing_ok=True)
 

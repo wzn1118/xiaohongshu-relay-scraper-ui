@@ -17,6 +17,11 @@ docs/RESUME_EVIDENCE.md
 .env.*
 !.env.example
 !.env.production.example
+smtp-config.json
+smtp-send-state.json
+smtp-*-report.json
+.codex-*/
+outputs/
 .cloudflared/
 *.token
 *.pem

@@ -2,6 +2,9 @@ import { mkdir } from 'node:fs/promises';
 import { accessSync, constants } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const WINDOWS_BROWSER_CANDIDATES = [
   ['PROGRAMFILES', 'Google\\Chrome\\Application\\chrome.exe'],
@@ -178,7 +181,11 @@ export function resolveManagedBrowserProfileDir(baseDir, profile = 'openclaw') {
 }
 
 export function resolveBrowserExecutable(configured = process.env.XHS_BROWSER_PATH) {
-  const candidates = [configured].filter(Boolean);
+  const candidates = [
+    configured,
+    path.join(PROJECT_ROOT, 'runtime', 'browser', 'chrome.exe'),
+    path.join(PROJECT_ROOT, 'runtime', 'browser', 'msedge.exe'),
+  ].filter(Boolean);
   if (process.platform === 'win32') {
     for (const [variable, suffix] of WINDOWS_BROWSER_CANDIDATES) {
       const value = process.env[variable];

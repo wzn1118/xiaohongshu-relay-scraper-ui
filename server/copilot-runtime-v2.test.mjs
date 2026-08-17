@@ -1,24 +1,56 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 
 import { createCopilotProductionStore } from './copilot/production-store.mjs';
 import { createRunCoordinator } from './copilot/run-coordinator.mjs';
 
-test('schema v2 migrates in place and preserves existing production records', async (t) => {
+test('schema v4 migrates a v3 MCP database in place and binds existing Grants to snapshot hashes', async (t) => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'copilot-migration-v2-'));
-  let store = createCopilotProductionStore({ rootDir });
-  t.after(async () => { store?.close(); await rm(rootDir, { recursive: true, force: true }); });
-  store.upsertSnapshot({ jobId: 'job-1', snapshotId: 'job-r1', revision: 1, manifest: { count: 3 } });
-  const filePath = store.filePath;
-  store.close();
+  const filePath = path.join(rootDir, 'copilot', 'copilot-state.sqlite');
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const legacy = new DatabaseSync(filePath);
+  const manifest = JSON.stringify({ count: 3 });
+  const manifestHash = crypto.createHash('sha256').update(manifest).digest('hex');
+  legacy.exec(`
+    CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);
+    INSERT INTO schema_migrations VALUES (1, 'legacy-production-state', '2026-01-01T00:00:00.000Z');
+    INSERT INTO schema_migrations VALUES (2, 'durable-agent-runtime', '2026-01-01T00:00:00.000Z');
+    INSERT INTO schema_migrations VALUES (3, 'mcp-access-plane', '2026-01-01T00:00:00.000Z');
+    CREATE TABLE snapshots (
+      job_id TEXT NOT NULL, snapshot_id TEXT NOT NULL, revision INTEGER NOT NULL,
+      manifest_json TEXT NOT NULL, manifest_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL, PRIMARY KEY (job_id, snapshot_id)
+    );
+    CREATE TABLE mcp_grants (
+      grant_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, owner TEXT NOT NULL,
+      conversation_id TEXT NOT NULL, job_id TEXT NOT NULL, snapshot_id TEXT NOT NULL,
+      mode TEXT NOT NULL, scopes_json TEXT NOT NULL DEFAULT '[]',
+      allowed_tools_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT NOT NULL DEFAULT '',
+      last_used_at TEXT NOT NULL DEFAULT '', metadata_json TEXT NOT NULL DEFAULT '{}'
+    );
+  `);
+  legacy.prepare('INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run('job-1', 'job-r1', 1, manifest, manifestHash, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+  legacy.prepare('INSERT INTO mcp_grants VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run('grant-1', 'hash-1', 'owner-1', 'conversation-1', 'job-1', 'job-r1', 'application', '[]', '[]', 'active', '2026-01-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z', '', '', '{}');
+  legacy.close();
 
-  store = createCopilotProductionStore({ filePath });
-  assert.equal(store.describe().schemaVersion, 2);
-  assert.equal(store.getSnapshot('job-1', 'job-r1').manifest.count, 3);
-});
+  let store = createCopilotProductionStore({ filePath });
+  t.after(async () => { store?.close(); await rm(rootDir, { recursive: true, force: true }); });
+  assert.equal(store.describe().schemaVersion, 4);
+    assert.equal(store.getSnapshot('job-1', 'job-r1').manifest.count, 3);
+    assert.equal(store.getMcpGrant('grant-1').manifestHash, manifestHash);
+    assert.deepEqual(store.getMcpGrant('grant-1').allowedResources, []);
+    const toolRunColumns = store.database.prepare('PRAGMA table_info(mcp_tool_runs)').all()
+      .map((column) => column.name);
+    assert.equal(toolRunColumns.includes('action_hash'), true);
+  });
 
 test('run coordinator persists plan, checkpoints, attempts, pause and resume', async (t) => {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), 'copilot-run-v2-'));

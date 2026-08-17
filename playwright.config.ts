@@ -49,6 +49,7 @@ export default defineConfig({
       env: {
         HOST: '127.0.0.1',
         PORT: apiPort,
+        XHS_MCP_ENABLED: 'false',
         XHS_SERVER_DATA_DIR: path.join(serverDataRoot, 'jobs'),
         XHS_PROFILE_DATA_DIR: path.join(serverDataRoot, 'profiles'),
       },

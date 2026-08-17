@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "today-you-applied": {
+      "command": "C:\\today-you-applied-public-release\\mcp-stdio.cmd",
+      "env": {
+        "XHS_MCP_URL": "http://127.0.0.1:4328/mcp",
+        "XHS_MCP_TOKEN_FILE": "C:\\secure\\today-you-applied-mcp-grant.token"
+      }
+    }
+  }
+}
