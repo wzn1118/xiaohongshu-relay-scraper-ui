@@ -1,6 +1,6 @@
 # 一键下载与运行
 
-这个仓库提供经过 CI 实测的 Windows 一键启动包。发布包不包含本机数据、登录态、密钥、`.env`、运行日志或依赖缓存。
+这个仓库提供经过 CI 实测的 Windows 与 macOS 独立解压运行包。发布包不包含本机数据、登录态、密钥、`.env`、运行日志或依赖缓存。
 
 ## Windows 10/11
 
@@ -34,14 +34,36 @@ Get-Content .\xiaohongshu-relay-scraper-ui-one-click-windows.zip.sha256
 
 ## macOS / Linux
 
-系统需要 Node.js 22+、npm 和 Python 3.11+。解压后在项目根目录执行：
+### macOS 独立 ZIP
+
+1. 在 GitHub Releases 下载 `xiaohongshu-relay-scraper-ui-one-click-macos.zip` 和同名 `.sha256` 文件。
+2. 在终端校验下载文件：
+
+   ```bash
+   shasum -a 256 xiaohongshu-relay-scraper-ui-one-click-macos.zip
+   cat xiaohongshu-relay-scraper-ui-one-click-macos.zip.sha256
+   ```
+
+   两处哈希值必须一致。
+3. 将 ZIP **完整解压**到可写目录，不要直接在压缩包预览中运行。
+4. 系统需要预先安装 Node.js 22+、npm、Python 3.11+ 和 Chrome 或 Edge。Apple Silicon 与 Intel Mac 均使用同一个 ZIP，首次运行会按当前 Mac 架构安装 Node/Python 依赖。
+5. 在解压后的项目根目录执行：
 
 ```bash
 chmod +x start-linux-macos.sh scripts/*.sh
 ./start-linux-macos.sh
 ```
 
-首次启动会执行确定性依赖安装和生产构建。系统运行时需要由操作系统包管理器预先安装。
+首次启动会执行确定性依赖安装和生产构建。该发布物是独立的 macOS 解压运行 ZIP，不是 `.dmg` 或拖拽安装的 `.app`。
+
+### Linux
+
+Linux 使用同一套源码启动入口，但当前 GitHub Release 只发布经 macOS runner 验收的 macOS ZIP。Linux 用户需要预先安装 Node.js 22+、npm 和 Python 3.11+，然后在项目根目录执行：
+
+```bash
+chmod +x start-linux-macos.sh scripts/*.sh
+./start-linux-macos.sh
+```
 
 ## 故障排查
 
@@ -64,5 +86,5 @@ chmod +x start-linux-macos.sh scripts/*.sh
 3. 在全新临时目录解压；
 4. 重新执行 Node/Python 依赖安装和生产构建；
 5. 启动实际服务并验证 `/api/health`；
-6. 生成 SHA-256 校验文件并上传 Actions artifact；
-7. 对 `v*` 标签创建可直接下载的 GitHub Release。
+6. 生成 Windows 和 macOS 各自的 SHA-256 校验文件并上传 Actions artifact；
+7. 对 `v*` 标签创建包含两个独立 ZIP 的 GitHub Release。

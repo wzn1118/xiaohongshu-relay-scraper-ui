@@ -1,6 +1,6 @@
 # 小红书 Relay 数据工作台
 
-本项目提供小红书 Relay 采集、数据管理、报告生成和 Data Copilot 工作台。仓库已提供 Windows 一键启动器和自动验证的 GitHub Release 发布链路。
+本项目提供小红书 Relay 采集、数据管理、报告生成和 Data Copilot 工作台。GitHub Release 会生成彼此独立的 Windows 与 macOS 解压运行包，并在发布前自动验证安装、构建和健康接口。
 
 ## 下载后直接运行
 
@@ -14,7 +14,9 @@
 
 ### macOS / Linux
 
-预先安装 Node.js 22+、npm 和 Python 3.11+，然后执行：
+从 GitHub Releases 下载独立的 `xiaohongshu-relay-scraper-ui-one-click-macos.zip` 和同名 `.sha256` 文件。该 ZIP 不包含 Windows 便携运行时、运行数据、浏览器 Profile 或密钥；Apple Silicon 与 Intel Mac 会在首次启动时按本机架构安装依赖。
+
+预先安装 Node.js 22+、npm、Python 3.11+ 和 Chrome 或 Edge，完整解压后执行：
 
 ```bash
 chmod +x start-linux-macos.sh scripts/*.sh
@@ -56,7 +58,14 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/one-clic
 npm run package:github-release
 ```
 
-每次推送 `main` 后，`Release` 工作流会从 Git 已提交文件创建净化 ZIP，在全新目录重新安装、构建、启动并检查 `/api/health`。`v*` 标签会自动发布 GitHub Release 和 SHA-256 校验文件。
+在 macOS 上本地生成并验收 macOS ZIP：
+
+```bash
+sh scripts/package-github-release-macos.sh
+sh scripts/verify-github-release-macos.sh --archive-path deliverables/xiaohongshu-relay-scraper-ui-one-click-macos.zip
+```
+
+每次推送 `main` 后，`Release` 工作流会从 Git 已提交文件创建 Windows 和 macOS 两个净化 ZIP，在全新目录重新安装、构建、启动并检查 `/api/health`。`v*` 标签会把两个 ZIP 及各自的 SHA-256 校验文件一起上传到 GitHub Release。
 
 ## 首次使用
 

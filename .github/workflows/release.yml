@@ -56,18 +56,75 @@ jobs:
             ${{ steps.package.outputs.checksum }}
           if-no-files-found: error
           retention-days: 30
+
+  one-click-macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install build prerequisites
+        run: |
+          npm ci --no-audit --no-fund
+          python3 -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Build repository checkout
+        run: npm run build
+      - name: Install Chromium for the macOS open test
+        run: npx playwright install chromium
+      - name: Create sanitized macOS archive
+        run: |
+          archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip"
+          sh scripts/package-github-release-macos.sh --output-path "$archive" --source-ref HEAD
+      - name: Verify clean macOS archive installation and health
+        run: |
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip" \
+            --port 65432 \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-open-smoke.png"
+      - name: Upload verified macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaohongshu-relay-scraper-ui-one-click-macos-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip.sha256
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-open-smoke.png
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [one-click-windows, one-click-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: xiaohongshu-relay-scraper-ui-one-click-*
+          merge-multiple: true
       - name: Publish tag as GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          $tag = '${{ github.ref_name }}'
-          $archive = '${{ steps.package.outputs.archive }}'
-          $checksum = '${{ steps.package.outputs.checksum }}'
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $archive $checksum --clobber
-          } else {
-            gh release create $tag $archive $checksum --verify-tag --generate-notes --title $tag
-          }
+          set -euo pipefail
+          assets=(release-assets/*.zip release-assets/*.zip.sha256)
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --verify-tag --generate-notes --title "$TAG"
+          fi
