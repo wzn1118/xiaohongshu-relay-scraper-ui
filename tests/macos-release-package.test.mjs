@@ -26,11 +26,14 @@ test('macOS GitHub Release package has separate build, verification, and publish
   assert.match(packageScript, /node_modules\|dist\|data\|runtime/);
   assert.match(packageScript, /grep -Ev '\\\.example\$'/);
   assert.match(packageScript, /scripts\/verify-github-release-macos\.sh/);
+  assert.match(packageScript, /Start-App\.command/);
+  assert.match(packageScript, /chmod 755/);
   assert.doesNotMatch(packageScript, /\(\?:/);
 
   assert.match(verifierScript, /unzip -q/);
-  assert.match(verifierScript, /npm ci --no-audit --no-fund/);
-  assert.match(verifierScript, /pip install --disable-pip-version-check -r requirements\.txt/);
+  assert.match(verifierScript, /exec \.\/Start-App\.command --no-browser --port/);
+  assert.match(verifierScript, /launcherFirstRun/);
+  assert.doesNotMatch(verifierScript, /exec node server\/index\.mjs/);
   assert.match(verifierScript, /api\/health/);
   assert.match(verifierScript, /XHS_MCP_ENABLED=false/);
   assert.match(verifierScript, /chromium\.launch\(\{ headless: true \}\)/);
@@ -50,7 +53,9 @@ test('macOS GitHub Release package has separate build, verification, and publish
   assert.match(workflow, new RegExp(macosArchivePattern));
 
   assert.match(readme, new RegExp(macosArchivePattern));
+  assert.match(readme, /Start-App\.command/);
   assert.match(launchGuide, new RegExp(macosArchivePattern));
+  assert.match(launchGuide, /Start-App\.command/);
   assert.match(oneClickScript, /export "\$env_key=\$env_value"/);
 });
 
@@ -66,6 +71,9 @@ test('macOS release shell scripts pass POSIX shell syntax validation', async (co
     const result = spawnSync(shell, ['-n', path.join(repositoryRoot, 'scripts', script)], { encoding: 'utf8' });
     assert.equal(result.status, 0, result.stderr || result.stdout);
   }
+
+  const finderLauncher = spawnSync(shell, ['-n', path.join(repositoryRoot, 'Start-App.command')], { encoding: 'utf8' });
+  assert.equal(finderLauncher.status, 0, finderLauncher.stderr || finderLauncher.stdout);
 });
 
 test('POSIX one-click launcher loads unquoted environment values containing spaces', async (context) => {

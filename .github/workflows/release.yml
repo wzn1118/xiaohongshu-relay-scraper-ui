@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -27,7 +27,7 @@ jobs:
           cache: npm
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: "3.13"
           cache: pip
       - name: Install build prerequisites
         shell: pwsh
@@ -70,7 +70,7 @@ jobs:
           cache: npm
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: "3.13"
           cache: pip
       - name: Install build prerequisites
         run: |
@@ -84,7 +84,7 @@ jobs:
         run: |
           archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip"
           sh scripts/package-github-release-macos.sh --output-path "$archive" --source-ref HEAD
-      - name: Verify clean macOS archive installation and health
+      - name: Open the clean archive through the macOS Finder launcher
         run: |
           sh scripts/verify-github-release-macos.sh \
             --archive-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip" \

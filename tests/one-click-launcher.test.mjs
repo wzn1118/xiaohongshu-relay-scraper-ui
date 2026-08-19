@@ -18,6 +18,7 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   const mcpClient = JSON.parse(await readFile(path.join(repositoryRoot, 'config', 'mcp-client.example.json'), 'utf8'));
   const mcpPackage = JSON.parse(await readFile(path.join(repositoryRoot, 'MCP_PACKAGE_INFO.json'), 'utf8'));
   const unix = await readFile(path.join(repositoryRoot, 'start-linux-macos.sh'), 'utf8');
+  const macosFinder = await readFile(path.join(repositoryRoot, 'Start-App.command'), 'utf8');
   const oneClick = await readFile(path.join(repositoryRoot, 'scripts', 'one-click.ps1'), 'utf8');
   const competitionLauncher = await readFile(path.join(repositoryRoot, 'scripts', 'start-competition-windows.ps1'), 'utf8');
   const bootstrap = await readFile(path.join(repositoryRoot, 'scripts', 'bootstrap.ps1'), 'utf8');
@@ -49,6 +50,8 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   assert.equal(mcpPackage.credentialsIncluded, false);
   assert.match(unix, /scripts\/one-click\.sh/);
   assert.match(unix, /"\$@"/);
+  assert.match(macosFinder, /start-linux-macos\.sh/);
+  assert.match(macosFinder, /"\$@"/);
   assert.match(oneClick, /ensure-windows-prerequisites\.ps1/);
   assert.match(bootstrap, /ensure-windows-prerequisites\.ps1/);
   assert.match(prerequisites, /OpenJS\.NodeJS\.LTS/);

@@ -88,6 +88,7 @@ assert_required_file() {
 for required_file in \
   README.md \
   ONE_CLICK_START.md \
+  Start-App.command \
   start-linux-macos.sh \
   scripts/one-click.sh \
   scripts/bootstrap.sh \
@@ -102,6 +103,14 @@ for required_file in \
 do
   assert_required_file "$required_file"
 done
+
+chmod 755 \
+  "$staged_project/Start-App.command" \
+  "$staged_project/start-linux-macos.sh" \
+  "$staged_project/scripts/one-click.sh" \
+  "$staged_project/scripts/bootstrap.sh" \
+  "$staged_project/scripts/package-github-release-macos.sh" \
+  "$staged_project/scripts/verify-github-release-macos.sh"
 
 # macOS uses ditto for its native ZIP behavior. The fallback keeps local Linux
 # and WSL packaging available for release rehearsal.
@@ -121,6 +130,7 @@ entry_names=$(unzip -Z1 "$resolved_output_path")
 for required_file in \
   README.md \
   ONE_CLICK_START.md \
+  Start-App.command \
   start-linux-macos.sh \
   scripts/one-click.sh \
   scripts/bootstrap.sh \

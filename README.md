@@ -16,11 +16,13 @@
 
 从 GitHub Releases 下载独立的 `xiaohongshu-relay-scraper-ui-one-click-macos.zip` 和同名 `.sha256` 文件。该 ZIP 不包含 Windows 便携运行时、运行数据、浏览器 Profile 或密钥；Apple Silicon 与 Intel Mac 会在首次启动时按本机架构安装依赖。
 
-预先安装 Node.js 22+、npm、Python 3.11+ 和 Chrome 或 Edge，完整解压后执行：
+预先安装 Node.js 22+、npm、Python 3.11+ 和 Chrome 或 Edge。完整解压后，在 Finder 中双击 `Start-App.command`；首次运行会安装依赖、构建、启动服务并打开浏览器。
+
+也可以从终端启动：
 
 ```bash
-chmod +x start-linux-macos.sh scripts/*.sh
-./start-linux-macos.sh
+chmod +x Start-App.command
+./Start-App.command
 ```
 
 ## 本地开发
@@ -65,7 +67,7 @@ sh scripts/package-github-release-macos.sh
 sh scripts/verify-github-release-macos.sh --archive-path deliverables/xiaohongshu-relay-scraper-ui-one-click-macos.zip
 ```
 
-每次推送 `main` 后，`Release` 工作流会从 Git 已提交文件创建 Windows 和 macOS 两个净化 ZIP，在全新目录重新安装、构建、启动并检查 `/api/health`。`v*` 标签会把两个 ZIP 及各自的 SHA-256 校验文件一起上传到 GitHub Release。
+每次推送 `main` 后，`Release` 工作流会从 Git 已提交文件创建 Windows 和 macOS 两个净化 ZIP。macOS 验收会在全新目录从 `Start-App.command` 完成首次安装、构建和启动，再用 Chromium 打开实际页面并检查渲染与脚本错误。`v*` 标签会把两个 ZIP 及各自的 SHA-256 校验文件一起上传到 GitHub Release。
 
 ## 首次使用
 

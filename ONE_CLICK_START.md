@@ -45,13 +45,15 @@ Get-Content .\xiaohongshu-relay-scraper-ui-one-click-windows.zip.sha256
    ```
 
    两处哈希值必须一致。
+
 3. 将 ZIP **完整解压**到可写目录，不要直接在压缩包预览中运行。
 4. 系统需要预先安装 Node.js 22+、npm、Python 3.11+ 和 Chrome 或 Edge。Apple Silicon 与 Intel Mac 均使用同一个 ZIP，首次运行会按当前 Mac 架构安装 Node/Python 依赖。
-5. 在解压后的项目根目录执行：
+5. 在 Finder 中双击解压后根目录的 `Start-App.command`。终端窗口需要在使用期间保持打开，程序启动后会自动打开浏览器。
+6. 也可以在项目根目录从终端执行：
 
 ```bash
-chmod +x start-linux-macos.sh scripts/*.sh
-./start-linux-macos.sh
+chmod +x Start-App.command
+./Start-App.command
 ```
 
 首次启动会执行确定性依赖安装和生产构建。该发布物是独立的 macOS 解压运行 ZIP，不是 `.dmg` 或拖拽安装的 `.app`。
@@ -84,7 +86,8 @@ chmod +x start-linux-macos.sh scripts/*.sh
 1. 从 Git 已提交文件生成净化 ZIP；
 2. 拒绝 `.env`、数据、登录态、运行时、依赖缓存和日志进入发布包；
 3. 在全新临时目录解压；
-4. 重新执行 Node/Python 依赖安装和生产构建；
-5. 启动实际服务并验证 `/api/health`；
-6. 生成 Windows 和 macOS 各自的 SHA-256 校验文件并上传 Actions artifact；
-7. 对 `v*` 标签创建包含两个独立 ZIP 的 GitHub Release。
+4. 在 macOS 上从解压包内可双击的 `Start-App.command` 执行首次依赖安装、生产构建和启动；
+5. 用 Chromium 打开实际页面，检查可见内容、交互控件和页面脚本错误；
+6. 验证 `/api/health`，并保留打开后的页面截图；
+7. 生成 Windows 和 macOS 各自的 SHA-256 校验文件并上传 Actions artifact；
+8. 对 `v*` 标签创建包含两个独立 ZIP 的 GitHub Release。

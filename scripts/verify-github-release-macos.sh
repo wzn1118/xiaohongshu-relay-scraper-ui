@@ -5,8 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: scripts/verify-github-release-macos.sh --archive-path PATH [options]
 
-Extract a macOS GitHub Release archive into a fresh directory, perform its
-first-run dependency installation and build, then verify its live health API.
+Extract a macOS GitHub Release archive into a fresh directory, launch it through
+the Finder-facing Start-App.command entry, then verify the live UI.
 
 Options:
   --port PORT                Local verification port. Defaults to 65432.
@@ -72,14 +72,13 @@ command -v node >/dev/null 2>&1 || { echo 'Node.js is required.' >&2; exit 2; }
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/xhs-macos-release-verify.XXXXXX")
 extract_root="$temporary_root/extract"
 runtime_root="$temporary_root/runtime"
-stdout_log="$temporary_root/server.out.log"
-stderr_log="$temporary_root/server.err.log"
-server_pid=''
+launcher_log="$temporary_root/launcher.log"
+launcher_pid=''
 
 cleanup() {
-  if [ -n "$server_pid" ] && kill -0 "$server_pid" >/dev/null 2>&1; then
-    kill "$server_pid" >/dev/null 2>&1 || true
-    wait "$server_pid" >/dev/null 2>&1 || true
+  if [ -n "$launcher_pid" ] && kill -0 "$launcher_pid" >/dev/null 2>&1; then
+    kill "$launcher_pid" >/dev/null 2>&1 || true
+    wait "$launcher_pid" >/dev/null 2>&1 || true
   fi
   rm -rf "$temporary_root"
 }
@@ -96,6 +95,10 @@ for candidate in "$extract_root"/*; do
   fi
 done
 [ -n "$project_root" ] || { echo 'The release archive does not contain a project root with package.json.' >&2; exit 1; }
+[ -x "$project_root/Start-App.command" ] || {
+  echo 'The extracted Finder launcher is missing or is not executable: Start-App.command' >&2
+  exit 1
+}
 
 check_output=$(cd "$project_root" && sh scripts/one-click.sh --check-only --no-browser --port "$port")
 printf '%s\n' "$check_output"
@@ -110,13 +113,6 @@ if payload.get("bootstrapRequired") is not True:
     raise SystemExit("A clean source release must require first-run bootstrap.")
 '
 
-(
-  cd "$project_root"
-  npm ci --no-audit --no-fund
-  "$python_bin" -m pip install --disable-pip-version-check -r requirements.txt
-  npm run build
-)
-
 export HOST=127.0.0.1
 export PORT="$port"
 export PYTHON_BIN="$python_bin"
@@ -128,17 +124,16 @@ export XHS_COPILOT_WORKSPACE_ROOT="$project_root"
 
 (
   cd "$project_root"
-  exec node server/index.mjs
-) >"$stdout_log" 2>"$stderr_log" &
-server_pid=$!
+  exec ./Start-App.command --no-browser --port "$port"
+) >"$launcher_log" 2>&1 &
+launcher_pid=$!
 health_url="http://127.0.0.1:$port/api/health"
 healthy=false
 attempt=0
 while [ "$attempt" -lt 180 ]; do
-  if ! kill -0 "$server_pid" >/dev/null 2>&1; then
-    echo 'Extracted release server exited before becoming healthy.' >&2
-    [ -f "$stdout_log" ] && { echo '--- release smoke stdout ---' >&2; tail -n 80 "$stdout_log" >&2; }
-    [ -f "$stderr_log" ] && { echo '--- release smoke stderr ---' >&2; tail -n 80 "$stderr_log" >&2; }
+  if ! kill -0 "$launcher_pid" >/dev/null 2>&1; then
+    echo 'The extracted Start-App.command launcher exited before the application became healthy.' >&2
+    [ -f "$launcher_log" ] && { echo '--- Finder launcher output ---' >&2; tail -n 120 "$launcher_log" >&2; }
     exit 1
   fi
   if "$python_bin" - "$health_url" <<'PY' >/dev/null 2>&1
@@ -160,9 +155,33 @@ PY
 done
 
 if [ "$healthy" != true ]; then
-  echo "Extracted release did not become healthy: $health_url" >&2
-  [ -f "$stdout_log" ] && { echo '--- release smoke stdout ---' >&2; tail -n 80 "$stdout_log" >&2; }
-  [ -f "$stderr_log" ] && { echo '--- release smoke stderr ---' >&2; tail -n 80 "$stderr_log" >&2; }
+  echo "Start-App.command did not produce a healthy application: $health_url" >&2
+  [ -f "$launcher_log" ] && { echo '--- Finder launcher output ---' >&2; tail -n 120 "$launcher_log" >&2; }
+  exit 1
+fi
+
+grep -Fq 'First run detected. Installing dependencies and building the application...' "$launcher_log" || {
+  echo 'Start-App.command did not exercise the clean first-run bootstrap path.' >&2
+  tail -n 120 "$launcher_log" >&2
+  exit 1
+}
+
+launcher_ready=false
+attempt=0
+while [ "$attempt" -lt 60 ]; do
+  if grep -Fq "Application is ready: http://127.0.0.1:$port" "$launcher_log"; then
+    launcher_ready=true
+    break
+  fi
+  if ! kill -0 "$launcher_pid" >/dev/null 2>&1; then
+    break
+  fi
+  attempt=$((attempt + 1))
+  sleep 0.5
+done
+if [ "$launcher_ready" != true ]; then
+  echo 'Start-App.command did not report that the application was ready.' >&2
+  tail -n 120 "$launcher_log" >&2
   exit 1
 fi
 
@@ -216,5 +235,5 @@ JS
   printf '%s\n' "$browser_smoke_result"
 fi
 
-printf '{"archive":"%s","projectRoot":"%s","healthUrl":"%s","service":"xiaohongshu-relay-scraper","ok":true,"cleanBootstrap":true,"browserSmoke":%s}\n' \
+printf '{"archive":"%s","projectRoot":"%s","launchEntry":"Start-App.command","launcherExecutable":true,"launcherFirstRun":true,"healthUrl":"%s","service":"xiaohongshu-relay-scraper","ok":true,"cleanBootstrap":true,"browserSmoke":%s}\n' \
   "$resolved_archive_path" "$project_root" "$health_url" "$browser_smoke_result"
