@@ -43,12 +43,16 @@ test('macOS GitHub Release package has separate build, verification, and publish
 
   assert.match(workflow, /one-click-macos:/);
   assert.match(workflow, /runs-on: macos-latest/);
+  assert.match(workflow, /verify-macos-intel:/);
+  assert.match(workflow, /runs-on: macos-15-intel/);
+  assert.match(workflow, /Download the Apple Silicon job's verified ZIP/);
+  assert.match(workflow, /Open the same ZIP through the Intel macOS Finder launcher/);
   assert.match(workflow, /package-github-release-macos\.sh/);
   assert.match(workflow, /verify-github-release-macos\.sh/);
   assert.match(workflow, /--browser-smoke/);
   assert.match(workflow, /macos-open-smoke\.png/);
   assert.match(workflow, /publish-release:/);
-  assert.match(workflow, /needs: \[one-click-windows, one-click-macos\]/);
+  assert.match(workflow, /needs: \[one-click-windows, one-click-macos, verify-macos-intel\]/);
   assert.match(workflow, /actions\/download-artifact@v4/);
   assert.match(workflow, new RegExp(macosArchivePattern));
 

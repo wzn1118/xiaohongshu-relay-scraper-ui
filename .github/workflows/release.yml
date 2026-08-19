@@ -102,9 +102,48 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  verify-macos-intel:
+    needs: one-click-macos
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install verification prerequisites
+        run: |
+          npm ci --no-audit --no-fund
+          python3 -m pip install --disable-pip-version-check -r requirements.txt
+          npx playwright install chromium
+      - name: Download the Apple Silicon job's verified ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: xiaohongshu-relay-scraper-ui-one-click-macos-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-package
+      - name: Open the same ZIP through the Intel macOS Finder launcher
+        run: |
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$RUNNER_TEMP/macos-package/xiaohongshu-relay-scraper-ui-one-click-macos.zip" \
+            --port 65433 \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png"
+      - name: Upload Intel macOS open evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-open-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png
+          if-no-files-found: error
+          retention-days: 30
+
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [one-click-windows, one-click-macos]
+    needs: [one-click-windows, one-click-macos, verify-macos-intel]
     runs-on: ubuntu-latest
     steps:
       - name: Download verified release assets
