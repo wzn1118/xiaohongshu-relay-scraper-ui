@@ -1270,7 +1270,7 @@ test('restores a conversation and supports approval, stop, retry, and mobile pan
   await expect(dialog.locator('.data-copilot-conversation')).toBeVisible()
   await dialog.getByRole('button', { name: '折叠 Data Copilot' }).click()
   await expect(dialog).toBeHidden()
-  await page.getByRole('button', { name: '打开数据 Copilot' }).click()
+  await page.getByRole('button', { name: '打开旧版数据助手' }).click()
   await expect(dialog).toBeVisible()
 })
 

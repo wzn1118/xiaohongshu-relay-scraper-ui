@@ -298,10 +298,13 @@ const codexRuntimeCompatibility = createCodexRuntimeCompatibility({
   runtimeRoot: config.codexDesktopRuntimeDir,
   baselinePath: config.codexRuntimeBaselinePath,
 });
-const codexRuntimeStatus = await codexRuntimeCompatibility.inspect();
-if (!codexRuntimeStatus.ready) {
-  console.warn(`Codex browser runtime is not compatible: ${codexRuntimeStatus.errors.map((entry) => entry.code).join(', ') || 'unknown error'}`);
-}
+void codexRuntimeCompatibility.inspect().then((runtimeStatus) => {
+  if (!runtimeStatus.ready) {
+    console.warn(`Codex browser runtime is not compatible: ${runtimeStatus.errors.map((entry) => entry.code).join(', ') || 'unknown error'}`);
+  }
+}).catch((error) => {
+  console.error(`Codex browser runtime inspection failed: ${error?.message || error}`);
+});
 const codexProtocolEvidence = await loadCodexProtocolEvidence({ root: config.codexProtocolEvidenceRoot });
 if (codexProtocolEvidence.state !== 'ready') {
   console.warn(`Codex protocol evidence is unavailable under ${config.codexProtocolEvidenceRoot}; capabilities remain unknown.`);

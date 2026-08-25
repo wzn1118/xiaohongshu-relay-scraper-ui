@@ -778,7 +778,7 @@ test('保存失败不离开、不丢文本', async ({ page }) => {
 })
 
 test('保存完成前再次切换不会抢占正在处理的目标', async ({ page }) => {
-  const state = await mockApi(page, { saveDelayMs: 1_500 })
+  const state = await mockApi(page, { saveDelayMs: 5_000 })
   await dirtyGreeting(page, ' 保存中切换')
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
   await page.getByRole('button', { name: '历史' }).click()

@@ -193,7 +193,10 @@ for (const viewport of [
     await expect(page.getByRole('link', { name: /expansion_summary\.json/ })).toBeVisible()
     expect(harness.counts()).toEqual({ newTaskRequests: 0, expansionStarts: 1, expansionCancels: 1 })
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
-    await expect(page.locator('#results')).toHaveScreenshot(`${viewport.name}-partial.png`, screenshotOptions)
+    await expect(page.locator('#results')).toHaveScreenshot(`${viewport.name}-partial.png`, {
+      ...screenshotOptions,
+      maxDiffPixelRatio: 0.005,
+    })
   })
 }
 

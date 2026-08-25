@@ -1936,7 +1936,7 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .rail-settings { display: none; }
   .topbar { min-height: 0; padding: 9px 12px 10px; align-items: stretch; position: relative; overflow: hidden; }
   .topbar-leading { width: 100%; min-width: 0; flex-direction: column; align-items: stretch; gap: 8px; }
-  .product-title { min-height: 31px; min-width: 0; padding-right: 42px; align-items: center; }
+  .product-title { min-height: 31px; min-width: 0; padding-right: 82px; align-items: center; }
   .product-title h1 { min-width: 0; margin: 0; font-size: 19px; line-height: 1.25; white-space: normal; overflow-wrap: anywhere; }
   .product-title-context { display: none; }
   .product-title .eyebrow, .version, .relay-indicator span, .topbar .icon-button { display: none; }
@@ -1945,7 +1945,8 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .workspace-label-long { display: none; }
   .workspace-label-short { display: inline; }
   .topbar-status { display: flex; position: absolute; top: 8px; right: 12px; }
-  .topbar-status > :not(.copilot-launch-button) { display: none; }
+  .topbar-status > :not(.copilot-launch-button):not(.legacy-copilot-launch) { display: none; }
+  .topbar .legacy-copilot-launch { display: grid; }
   .copilot-launch-button { width: 34px; padding: 0; }
   .copilot-launch-button span { display: none; }
   .notice { margin: 10px 10px 0; }

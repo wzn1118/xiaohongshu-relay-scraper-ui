@@ -6664,7 +6664,7 @@ function App() {
             title={codexRuntimeStatus?.modelBridge?.lastError?.message || `Model gateway retries ${codexModelHealth?.reliability?.retryAttempts || 0} times before surfacing an upstream failure`}
           >
             {codexRuntimeStatus?.modelBridge?.configured
-              ? `API ${codexRuntimeStatus.modelBridge.upstream?.model || codexRuntimeStatus.backend.modelProvider?.model || 'ready'} · ${codexRuntimeStatus.backend.dynamicMcp?.tools || 0} MCP tools · ${codexModelState}${codexModelP95 == null ? '' : ` · P95 ${Math.round(codexModelP95)}ms`} · ${codexRuntimeStatus.modelBridge.completed}/${codexRuntimeStatus.modelBridge.requests} turns`
+              ? `API ${codexRuntimeStatus.modelBridge.upstream?.model || codexRuntimeStatus.backend.modelProvider?.model || 'ready'} · ${codexRuntimeStatus.backend.dynamicMcp?.tools || 0} MCP tools${codexModelP95 == null ? '' : ` · P95 ${Math.round(codexModelP95)}ms`} · ${codexRuntimeStatus.modelBridge.completed}/${codexRuntimeStatus.modelBridge.requests} turns`
               : 'Checking Codex API'}
           </span>
           <div className="codex-browser-actions">
@@ -6696,7 +6696,7 @@ function App() {
             <span><strong>{codexProductWorkspace?.source?.name || '产品源码工作区'}</strong><small>{codexProductWorkspace?.source ? '可读写源码 · 默认工作区' : codexProductError || '正在同步工作区'}</small></span>
           </div>
           <div className="codex-product-context-facts">
-            {codexRuntimeStatus?.modelBridge?.configured && <span className={`${codexModelState === 'ready' ? 'is-active' : ''} codex-product-runtime-state`} title={codexRuntimeStatus.modelBridge.lastError?.message || 'Remote API model and dynamically loaded MCP tools'}><Cpu size={13} /><span>API {codexRuntimeStatus.modelBridge.upstream?.model || codexRuntimeStatus.backend.modelProvider?.model || 'ready'} · {codexModelState} · {codexRuntimeStatus.backend.dynamicMcp?.tools || 0} tools</span></span>}
+            {codexRuntimeStatus?.modelBridge?.configured && <span className={`${codexModelState === 'ready' ? 'is-active' : ''} codex-product-runtime-state`} title={codexRuntimeStatus.modelBridge.lastError?.message || 'Remote API model and dynamically loaded MCP tools'}><Cpu size={13} /><span>API {codexRuntimeStatus.modelBridge.upstream?.model || codexRuntimeStatus.backend.modelProvider?.model || 'ready'} · {codexRuntimeStatus.backend.dynamicMcp?.tools || 0} tools</span></span>}
               <span><Clock3 size={13} />历史 {codexProductWorkspace?.history?.length ?? 0}</span>
             <span><Network size={13} />MCP {codexProductIntegration?.mcp?.embedded?.length ?? 0} 服务 · {codexProductIntegration?.mcp?.localInstall?.includes?.length ?? 0} 工具</span>
             {codexProductActiveJob && <>
