@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { resolve } from 'node:path';
 import test from 'node:test';
 
 import { createCodexNativeMirrorSourceService } from './codex-native-mirror-source-service.mjs';
@@ -8,10 +9,11 @@ test('launches an isolated Chromium app with automatic Codex window capture', as
   const spawns = [];
   const terminated = [];
   const removed = [];
+  const browserPath = resolve('.test-fixtures', 'browser', 'msedge.exe');
   const service = createCodexNativeMirrorSourceService({
     platform: 'win32',
     env: { LOCALAPPDATA: 'C:\\LocalAppData' },
-    browserPath: 'C:\\Browser\\msedge.exe',
+    browserPath,
     pathExists: () => true,
     spawnProcess: (command, args, options) => {
       const child = new EventEmitter();
@@ -34,7 +36,7 @@ test('launches an isolated Chromium app with automatic Codex window capture', as
 
   assert.equal(launched.pid, 4321);
   assert.equal(service.status().activeSources, 1);
-  assert.equal(spawns[0].command, 'C:\\Browser\\msedge.exe');
+  assert.equal(spawns[0].command, browserPath);
   assert.ok(spawns[0].args.includes('--auto-select-desktop-capture-source=ChatGPT'));
   assert.ok(spawns[0].args.includes('--disable-background-timer-throttling'));
   assert.ok(spawns[0].args.some((value) => value.startsWith('--app=http://127.0.0.1:4337/')));
@@ -49,7 +51,7 @@ test('launches an isolated Chromium app with automatic Codex window capture', as
 test('rejects non-loopback source URLs before launching a browser', async () => {
   const service = createCodexNativeMirrorSourceService({
     platform: 'win32',
-    browserPath: 'C:\\Browser\\msedge.exe',
+    browserPath: resolve('.test-fixtures', 'browser', 'msedge.exe'),
     pathExists: () => true,
     spawnProcess: () => { throw new Error('must not spawn'); },
   });

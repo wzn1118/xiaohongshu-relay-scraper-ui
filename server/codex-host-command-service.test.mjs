@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
+import { resolve } from 'node:path';
 import test from 'node:test';
 
 import { createCodexHostCommandService } from './codex-host-command-service.mjs';
 
 test('executes typed host recipes through one shared command handler', async () => {
   const sent = [];
+  const workspaceRoot = resolve('.test-fixtures', 'workspace', 'project');
   const service = createCodexHostCommandService({
-    config: { workspaceRoot: 'C:\\workspace\\project' },
+    config: { workspaceRoot },
     codexBrowserService: {
       send: async (message, context) => sent.push({ message, context }),
     },
@@ -29,7 +31,7 @@ test('executes typed host recipes through one shared command handler', async () 
     commandId: 'fetch-1',
     message: { type: 'fetch', requestId: 'request-1', url: 'vscode://codex/active-workspace-roots' },
   });
-  assert.deepEqual(JSON.parse(fetched.events[0].bodyJsonString), ['C:\\workspace\\project']);
+  assert.deepEqual(JSON.parse(fetched.events[0].bodyJsonString), [workspaceRoot]);
   assert.deepEqual(service.observedMessageTypes(), ['persisted-atom-update', 'persisted-atom-sync-request', 'fetch']);
   assert.equal(sent.length, 3);
   assert.equal(service.status().capabilities.recipes.find((recipe) => recipe.id === 'fetch').state, 'implemented');
@@ -112,8 +114,8 @@ test('rejects invalid command ids before forwarding', async () => {
 });
 
 test('hydrates the Codex sidebar with the product source and historical task workspaces', async () => {
-  const sourceRoot = 'C:\\workspace\\project';
-  const historyRoot = 'C:\\workspace\\data\\jobs\\task-a';
+  const sourceRoot = resolve('.test-fixtures', 'workspace', 'project');
+  const historyRoot = resolve('.test-fixtures', 'workspace', 'data', 'jobs', 'task-a');
   const workspaceService = {
     status: () => ({ available: true, historyProjects: 1 }),
     developerInstructions: () => 'Use the product MCP and edit the source workspace.',
@@ -161,8 +163,8 @@ test('hydrates the Codex sidebar with the product source and historical task wor
 });
 
 test('starts an interactive browser-owned task in the selected product workspace', async () => {
-  const sourceRoot = 'C:\\workspace\\product';
-  const historyRoot = 'C:\\workspace\\data\\jobs\\task-a';
+  const sourceRoot = resolve('.test-fixtures', 'workspace', 'product');
+  const historyRoot = resolve('.test-fixtures', 'workspace', 'data', 'jobs', 'task-a');
   const requests = [];
   const workspaceService = {
     developerInstructions: () => 'Use the product MCP.',
@@ -203,7 +205,7 @@ test('starts an interactive browser-owned task in the selected product workspace
 });
 
 test('starts a writable browser-owned task in the product source workspace', async () => {
-  const sourceRoot = 'C:\\workspace\\product';
+  const sourceRoot = resolve('.test-fixtures', 'workspace', 'product');
   const requests = [];
   const service = createCodexHostCommandService({
     config: { workspaceRoot: sourceRoot },
