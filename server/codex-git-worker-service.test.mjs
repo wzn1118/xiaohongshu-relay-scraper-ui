@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -398,7 +398,8 @@ test('creates, inspects, removes, and prunes managed worktrees through the brows
 });
 
 async function createRepository() {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-git-worker-'));
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'codex-git-worker-'));
+  const root = await realpath(temporaryRoot);
   await git(root, ['init']);
   await git(root, ['config', 'user.email', 'codex-worker@example.invalid']);
   await git(root, ['config', 'user.name', 'Codex Worker Test']);
