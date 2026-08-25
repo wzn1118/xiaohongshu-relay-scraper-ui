@@ -1,0 +1,57 @@
+:root {
+  font-family: Inter, "Segoe UI", Arial, sans-serif;
+  color: #f2f2f2;
+  background: #111;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+button { font: inherit; letter-spacing: 0; }
+
+.mirror-shell { width: 100%; height: 100%; display: grid; grid-template-rows: 48px minmax(0, 1fr); background: #111; }
+.mirror-toolbar { min-width: 0; padding: 0 10px 0 14px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #343434; background: #202020; }
+.mirror-brand { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.mirror-mark, .mirror-empty-mark { display: grid; place-items: center; border: 1px solid #777; color: #fff; font-family: Consolas, monospace; font-weight: 800; }
+.mirror-mark { width: 20px; height: 20px; font-size: 11px; }
+.mirror-brand strong { font-size: 12px; white-space: nowrap; }
+.mirror-brand > span:last-child { color: #9a9a9a; font-size: 10px; white-space: nowrap; }
+.mirror-metrics { min-width: 0; display: flex; align-items: center; gap: 9px; padding-left: 12px; border-left: 1px solid #414141; color: #9faaa5; font: 700 10px/1.2 Consolas, monospace; white-space: nowrap; }
+.mirror-metrics span { font-variant-numeric: tabular-nums; }
+.mirror-state { min-width: 0; margin-left: auto; display: flex; align-items: center; gap: 7px; color: #b7b7b7; font-size: 10px; font-weight: 700; }
+.mirror-state span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#state-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #aa7a25; }
+body[data-state="connected"] #state-dot { background: #36a679; }
+body[data-state="error"] #state-dot { background: #d55966; }
+.mirror-actions { display: flex; align-items: center; gap: 4px; }
+.mirror-actions button { height: 30px; padding: 0 10px; border: 1px solid #4a4a4a; border-radius: 4px; background: #2a2a2a; color: #ddd; font-size: 10px; font-weight: 700; }
+.mirror-actions button:hover { border-color: #777; background: #373737; color: #fff; }
+.mirror-actions button:disabled { color: #707070; cursor: default; }
+#select-window { border-color: #3b7f68; background: #275f4e; color: #e2fff4; }
+#toggle-control { border-color: #6f6a3b; background: #504b24; color: #fff6c8; }
+body[data-control="enabled"] #toggle-control { border-color: #3b7f68; background: #275f4e; color: #e2fff4; }
+.mirror-stage { position: relative; min-width: 0; min-height: 0; display: grid; place-items: center; overflow: hidden; background: #0b0b0b; }
+#mirror-video, #mirror-relay-canvas { grid-area: 1 / 1; width: 100%; height: 100%; background: #0b0b0b; touch-action: none; user-select: none; }
+#mirror-video { object-fit: contain; }
+#mirror-relay-canvas { display: none; object-fit: contain; }
+body[data-role="viewer"][data-transport="wss-relay"] #mirror-video { display: none; }
+body[data-role="viewer"][data-transport="wss-relay"] #mirror-relay-canvas { display: block; }
+body[data-role="viewer"][data-control="enabled"] #mirror-video,
+body[data-role="viewer"][data-control="enabled"] #mirror-relay-canvas { cursor: default; }
+.mirror-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 9px; color: #d6d6d6; pointer-events: none; }
+.mirror-empty-mark { width: 42px; height: 42px; border-color: #555; font-size: 17px; }
+.mirror-empty strong { font-size: 15px; letter-spacing: 0; }
+.mirror-empty small { color: #808080; font-size: 10px; }
+body[data-playing="true"] .mirror-empty { display: none; }
+
+@media (max-width: 900px) {
+  .mirror-metrics { display: none; }
+}
+
+@media (max-width: 680px) {
+  .mirror-shell { grid-template-rows: 44px minmax(0, 1fr); }
+  .mirror-toolbar { gap: 6px; padding-inline: 8px; }
+  .mirror-brand > span:last-child, .mirror-brand strong { display: none; }
+  .mirror-actions button { width: 32px; padding: 0; overflow: hidden; color: transparent; }
+  .mirror-actions button::first-letter { color: #ddd; }
+}

@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 
 const serverDir = path.dirname(fileURLToPath(import.meta.url));
+const workspaceRoot = path.resolve(serverDir, '..');
 const runnerPath =
   process.env.XHS_RUNNER_PATH ||
   path.resolve(serverDir, '..', 'scripts', 'run_project_workflow.py');
@@ -30,6 +31,45 @@ const smtpOAuthTenant = normalizeMicrosoftTenant(process.env.SMTP_OAUTH_TENANT);
 export const config = Object.freeze({
   host,
   port: readPort(process.env.PORT, 4317),
+  workspaceRoot,
+  codexDesktopRuntimeDir: path.resolve(
+    process.env.XHS_CODEX_DESKTOP_RUNTIME_DIR
+      || path.join(workspaceRoot, 'output', 'codex-desktop-runtime-55d9fb967596'),
+  ),
+  codexDesktopUserDataDir: String(process.env.XHS_CODEX_DESKTOP_USER_DATA_DIR || '').trim(),
+  codexWorktreeRoot: path.resolve(
+    process.env.XHS_CODEX_WORKTREE_ROOT
+      || path.join(dataDir, '..', 'codex-worktrees'),
+  ),
+  codexBrowserSqliteHome: path.resolve(
+    process.env.XHS_CODEX_SQLITE_HOME
+      || path.join(dataDir, '..', 'codex-browser', String(readPort(process.env.PORT, 4317))),
+  ),
+  codexRuntimeBaselinePath: path.resolve(
+    process.env.XHS_CODEX_RUNTIME_BASELINE_PATH
+      || path.join(workspaceRoot, 'output', 'codex-runtimes', 'known-good.json'),
+  ),
+  codexProtocolEvidenceRoot: path.resolve(
+    process.env.XHS_CODEX_PROTOCOL_EVIDENCE_ROOT
+      || path.join(workspaceRoot, 'output', 'codex-web-runtime-probe'),
+  ),
+  codexMirrorIceServers: readJsonArray(process.env.XHS_CODEX_MIRROR_ICE_SERVERS_JSON, 'XHS_CODEX_MIRROR_ICE_SERVERS_JSON'),
+  codexTurnUrls: readJsonArray(process.env.XHS_CODEX_TURN_URLS_JSON, 'XHS_CODEX_TURN_URLS_JSON'),
+  codexTurnSharedSecret: String(process.env.XHS_CODEX_TURN_SHARED_SECRET || ''),
+  codexTurnCredentialTtlSeconds: readInt(process.env.XHS_CODEX_TURN_CREDENTIAL_TTL_SECONDS, 600, 60, 3600),
+  codexDeviceGatewayStatePath: path.resolve(
+    process.env.XHS_CODEX_DEVICE_GATEWAY_STATE_PATH || path.join(dataDir, '..', 'codex-relay', 'devices.json'),
+  ),
+  codexDeviceGatewayAuditPath: path.resolve(
+    process.env.XHS_CODEX_DEVICE_GATEWAY_AUDIT_PATH || path.join(dataDir, '..', 'codex-relay', 'audit.jsonl'),
+  ),
+  codexDeviceGatewayHeartbeatSeconds: readInt(process.env.XHS_CODEX_DEVICE_GATEWAY_HEARTBEAT_SECONDS, 15, 5, 60),
+  codexConnectAllowedOrigins: readConnectorOrigins(process.env.XHS_CODEX_CONNECT_ALLOWED_ORIGINS),
+  codexConnectConnectorVersion: String(process.env.XHS_CODEX_CONNECTOR_VERSION || '1.2.18').trim() || '1.2.18',
+  codexConnectInstallerPath: path.resolve(
+    process.env.XHS_CODEX_CONNECTOR_INSTALLER_PATH
+      || path.join(workspaceRoot, 'output', 'codex-local-connector-1.2.18.zip'),
+  ),
   mcpEnabled: readBoolean(process.env.XHS_MCP_ENABLED, true),
   mcpHost,
   mcpPort: readPort(process.env.XHS_MCP_PORT, 4328),
@@ -172,6 +212,35 @@ function readInt(value, fallback, min, max) {
 function readBoolean(value, fallback = false) {
   if (value === undefined || value === '') return fallback;
   return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function readJsonArray(value, name) {
+  if (value === undefined || value === '') return Object.freeze([]);
+  let parsed;
+  try {
+    parsed = JSON.parse(String(value));
+  } catch {
+    throw new Error(`${name} must contain a valid JSON array.`);
+  }
+  if (!Array.isArray(parsed)) throw new Error(`${name} must contain a JSON array.`);
+  return Object.freeze(parsed.slice(0, 8));
+}
+
+function readConnectorOrigins(value) {
+  if (value === undefined || value === '') return Object.freeze([]);
+  const origins = String(value).split(',').map((item) => item.trim()).filter(Boolean).map((item) => {
+    let parsed;
+    try {
+      parsed = new URL(item);
+    } catch {
+      throw new Error('XHS_CODEX_CONNECT_ALLOWED_ORIGINS must contain comma-separated HTTP(S) origins.');
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+      throw new Error('XHS_CODEX_CONNECT_ALLOWED_ORIGINS must contain HTTP(S) origins without paths.');
+    }
+    return parsed.origin;
+  });
+  return Object.freeze([...new Set(origins)]);
 }
 
 function normalizeCopilotApprovalMode(value, fallback = 'required') {

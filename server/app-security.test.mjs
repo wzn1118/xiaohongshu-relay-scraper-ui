@@ -7,6 +7,9 @@ import { normalizeAuthOrigin } from './config.mjs';
 function createSecurityFixture({
   authRequired = true,
   sessionUser: sessionOverride,
+  codexRelayService,
+  codexDeviceGatewayService,
+  codexNativeMirrorService,
 } = {}) {
   const loginCalls = [];
   const mcpCalls = [];
@@ -81,9 +84,214 @@ function createSecurityFixture({
         return { grant: { grantId: 'grant-1' }, token: 'one-time-token' };
       },
     },
+    codexRelayService,
+    codexDeviceGatewayService,
+    codexNativeMirrorService,
   });
   return { app, loginCalls, mcpCalls, copilotMcpCalls, copilotSecurityContexts };
 }
+
+test('remote Native Mirror launches on the owned device and its role token works without a browser login', async () => {
+  const calls = [];
+  const mirror = {
+    createSession: (value) => {
+      calls.push(['create', value]);
+      return {
+        session: { id: 'mirror-12345678', deviceId: value.deviceId, mode: 'nativeMirror', state: 'waiting' },
+        source: { role: 'source', token: 'source-token-0123456789' },
+        viewer: { role: 'viewer', token: 'viewer-token-0123456789' },
+        rtcConfiguration: { iceServers: [] },
+      };
+    },
+    launchRemoteSource: (sessionId, credentials, value) => {
+      calls.push(['launch', sessionId, credentials, value]);
+      return { delivered: true, session: { id: sessionId, deviceId: 'dev-remote', mode: 'nativeMirror', state: 'waiting', remote: true } };
+    },
+    getSession: (sessionId, credentials) => {
+      calls.push(['get', sessionId, credentials]);
+      return { session: { id: sessionId }, rtcConfiguration: { iceServers: [] } };
+    },
+    closeSession: () => ({ closed: true }),
+    status: () => ({ available: true }),
+  };
+  const { server, origin } = await startFixture({ codexNativeMirrorService: mirror });
+  try {
+    const createdResponse = await fetch(`${origin}/api/codex-native-mirror/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: 'xhs_session=test', Origin: 'https://hegelsalon.example.com' },
+      body: JSON.stringify({ deviceId: 'dev-remote', remote: true }),
+    });
+    assert.equal(createdResponse.status, 201);
+    assert.equal(calls[0][1].ownerId, 'owner@example.com');
+    const sourceUrl = new URL(calls[1][3].sourceUrl);
+    assert.equal(sourceUrl.origin, 'https://hegelsalon.example.com');
+    assert.equal(new URLSearchParams(sourceUrl.hash.slice(1)).get('remote'), '1');
+
+    const roleRequest = await fetch(`${origin}/api/codex-native-mirror/sessions/mirror-12345678`, {
+      headers: {
+        'X-Codex-Mirror-Role': 'source',
+        'X-Codex-Mirror-Token': 'source-token-0123456789',
+      },
+    });
+    assert.equal(roleRequest.status, 200);
+    assert.equal(calls.at(-1)[0], 'get');
+
+    const noToken = await fetch(`${origin}/api/codex-native-mirror/sessions/mirror-12345678`);
+    assert.equal(noToken.status, 401);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Codex device pairing uses browser ownership while claims and heartbeats use device credentials', async () => {
+  const calls = [];
+  const gateway = {
+    status: () => ({ transport: 'outbound-websocket', pairedDevices: 1, onlineDevices: 1 }),
+    createPairingIntent: (value) => {
+      calls.push(['intent', value]);
+      return { pairingIntent: { id: 'pair-00000001', code: 'ABCDEFGH', expiresAt: '2026-08-18T08:05:00.000Z' } };
+    },
+    claimPairing: async (value) => {
+      calls.push(['claim', value]);
+      return { device: { id: 'dev-00000001' }, credentials: { deviceToken: 'returned-once' } };
+    },
+    heartbeat: async (deviceId, token, value) => {
+      calls.push(['heartbeat', deviceId, token, value]);
+      return { id: deviceId, online: true };
+    },
+    revokeDevice: async (deviceId, value) => {
+      calls.push(['revoke', deviceId, value]);
+      return { revoked: true, deviceId };
+    },
+  };
+  const relay = {
+    status: async () => ({}),
+    listDevices: ({ ownerId }) => [{ id: 'local-device', ownerId }],
+  };
+  const { server, origin } = await startFixture({ codexRelayService: relay, codexDeviceGatewayService: gateway });
+  try {
+    const unauthenticated = await fetch(`${origin}/api/codex-relay/pairing-intents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://hegelsalon.example.com' },
+      body: '{}',
+    });
+    assert.equal(unauthenticated.status, 401);
+
+    const intent = await fetch(`${origin}/api/codex-relay/pairing-intents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: 'xhs_session=test', Origin: 'https://hegelsalon.example.com' },
+      body: JSON.stringify({ requestedRole: 'controller' }),
+    });
+    assert.equal(intent.status, 201);
+    assert.equal(calls[0][1].ownerId, 'owner@example.com');
+    const intentBody = await intent.json();
+    assert.equal(intentBody.gateway.websocketUrl, 'wss://hegelsalon.example.com/v1/device-tunnel');
+
+    const claim = await fetch(`${origin}/api/codex-relay/device-claims`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairingIntentId: 'pair-00000001', code: 'ABCDEFGH' }),
+    });
+    assert.equal(claim.status, 201);
+    assert.equal(calls[1][0], 'claim');
+
+    const heartbeat = await fetch(`${origin}/api/codex-relay/devices/dev-00000001/heartbeat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer device-token' },
+      body: JSON.stringify({ codex: { running: true } }),
+    });
+    assert.equal(heartbeat.status, 200);
+    assert.deepEqual(calls[2].slice(0, 3), ['heartbeat', 'dev-00000001', 'device-token']);
+
+    const revoke = await fetch(`${origin}/api/codex-relay/devices/dev-00000001`, {
+      method: 'DELETE',
+      headers: { Cookie: 'xhs_session=test', Origin: 'https://hegelsalon.example.com' },
+    });
+    assert.equal(revoke.status, 200);
+    assert.equal(calls[3][2].ownerId, 'owner@example.com');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('local connector control-plane routes create a signed launch and permit only the matching one-time claim', async () => {
+  const calls = [];
+  const gateway = {
+    createPairingIntent: (value) => {
+      calls.push(['intent', value]);
+      return { pairingIntent: { id: 'pair-00000001', code: 'ABCDEFGH', expiresAt: new Date(Date.now() + 5 * 60_000).toISOString() } };
+    },
+    claimPairing: async (value) => {
+      calls.push(['claim', value]);
+      return { device: { id: 'dev-00000001', name: 'This Windows device', online: false }, credentials: { deviceToken: 'returned-once' } };
+    },
+    getDevice: () => ({ id: 'dev-00000001', name: 'This Windows device', online: false, codex: { running: false } }),
+    listDevices: () => [],
+    sendConnectorCommand: (_deviceId, value) => {
+      calls.push(['connector-command', value]);
+      return { delivered: true, sentAt: new Date().toISOString() };
+    },
+    revokeDevice: async () => ({ revoked: true }),
+  };
+  const relay = { status: async () => ({}), listDevices: () => [] };
+  const { server, origin } = await startFixture({ codexRelayService: relay, codexDeviceGatewayService: gateway });
+  try {
+    const createdResponse = await fetch(`${origin}/api/codex-connect/intents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: 'xhs_session=test', Origin: 'https://hegelsalon.example.com' },
+      body: JSON.stringify({ deviceName: 'This Windows device' }),
+    });
+    assert.equal(createdResponse.status, 201);
+    const created = await createdResponse.json();
+    const launch = new URL(created.launchUrl);
+    assert.equal(launch.protocol, 'codex-local:');
+    assert.equal(launch.searchParams.get('origin'), 'https://hegelsalon.example.com');
+    assert.equal(calls[0][1].ownerId, 'owner@example.com');
+
+    const claimResponse = await fetch(`${origin}/api/codex-connect/intents/${created.intent.id}/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        origin: launch.searchParams.get('origin'),
+        code: launch.searchParams.get('code'),
+        nonce: launch.searchParams.get('nonce'),
+        signature: launch.searchParams.get('sig'),
+        deviceName: 'This Windows device',
+      }),
+    });
+    assert.equal(claimResponse.status, 201);
+    assert.equal(calls[1][0], 'claim');
+
+    const statusResponse = await fetch(`${origin}/api/codex-connect/intents/${created.intent.id}`, {
+      headers: { Cookie: 'xhs_session=test' },
+    });
+    assert.equal(statusResponse.status, 200);
+    assert.equal((await statusResponse.json()).intent.state, 'paired');
+
+    const secondClaim = await fetch(`${origin}/api/codex-connect/intents/${created.intent.id}/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        origin: launch.searchParams.get('origin'),
+        code: launch.searchParams.get('code'),
+        nonce: launch.searchParams.get('nonce'),
+        signature: launch.searchParams.get('sig'),
+      }),
+    });
+    assert.equal(secondClaim.status, 410);
+    assert.equal((await secondClaim.json()).error.code, 'CODEX_CONNECT_INTENT_CONSUMED');
+
+    const rollbackResponse = await fetch(`${origin}/api/codex-connect/devices/dev-00000001/rollback`, {
+      method: 'POST',
+      headers: { Cookie: 'xhs_session=test', Origin: 'https://hegelsalon.example.com' },
+    });
+    assert.equal(rollbackResponse.status, 202);
+    assert.equal((await rollbackResponse.json()).operation, 'rollback');
+    assert.equal(calls.at(-1)[1].operation, 'rollback');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
 
 async function startFixture(options = {}) {
   const fixture = createSecurityFixture(options);
@@ -181,6 +389,20 @@ test('state-changing auth routes reject a foreign Origin, including login and lo
       body: '{}',
     });
     assert.equal(protectedWrite.status, 403);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('trusted loopback Origin can use local browser control routes', async () => {
+  const { server, origin } = await startFixture();
+  try {
+    const response = await fetch(`${origin}/api/auth/logout`, {
+      method: 'POST',
+      headers: { Origin: origin, Cookie: 'xhs_session=test' },
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).authenticated, false);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -357,6 +579,25 @@ test('public HTTP requests from a trusted proxy redirect to the configured HTTPS
     });
     assert.equal(foreignHost.statusCode, 200);
     assert.equal(foreignHost.headers.location, undefined);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('Native Mirror alone may open the authenticated loopback input WebSocket', async () => {
+  const { server } = await startFixture();
+  try {
+    const mirror = await requestFixture(server, {
+      path: '/codex-native-mirror.html',
+      headers: { Host: 'hegelsalon.example.com', 'X-Forwarded-Proto': 'https' },
+    });
+    assert.match(mirror.headers['content-security-policy'], /connect-src[^;]*ws:\/\/127\.0\.0\.1:\*/);
+
+    const codex = await requestFixture(server, {
+      path: '/codex/',
+      headers: { Host: 'hegelsalon.example.com', 'X-Forwarded-Proto': 'https' },
+    });
+    assert.doesNotMatch(codex.headers['content-security-policy'], /ws:\/\/127\.0\.0\.1/);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

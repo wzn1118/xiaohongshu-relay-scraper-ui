@@ -184,7 +184,7 @@ function gatewaySession(session, wireApi) {
   if (source.conversationId) request.conversationId = String(source.conversationId);
   if (source.background === true) request.background = true;
   if (source.reasoningSummary) request.reasoningSummary = String(source.reasoningSummary);
-  if (wireApi === 'responses' && source.reasoningEffort) request.reasoningEffort = String(source.reasoningEffort);
+  if (source.reasoningEffort) request.reasoningEffort = String(source.reasoningEffort);
   if (source.store !== undefined) request.store = Boolean(source.store);
   return request;
 }

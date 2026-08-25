@@ -250,8 +250,12 @@ export function dataCopilotReasoningEffortsForModel(
   model: string,
   wireApi?: DataCopilotModel['wireApi'],
 ): readonly DataCopilotReasoningEffort[] {
-  if (wireApi !== 'responses') return []
-  return /^gpt-5\.6(?:-|$)/iu.test(model.trim())
+  const normalizedModel = model.trim()
+  const supportsReasoning = wireApi === 'responses'
+    || (wireApi === 'chat_completions'
+      && /^(?:gpt-5(?:[.-]|$)|o[134](?:[.-]|$)|codex(?:[.-]|$))/iu.test(normalizedModel))
+  if (!supportsReasoning) return []
+  return /^gpt-5\.6(?:-|$)/iu.test(normalizedModel)
     ? DATA_COPILOT_REASONING_EFFORTS
     : DATA_COPILOT_DEFAULT_REASONING_EFFORTS
 }

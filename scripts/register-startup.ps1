@@ -3,6 +3,7 @@ param(
     [switch]$Remove,
     [string]$TaskName = 'HegelSalon Relay Watchdog',
     [string]$EnvFile = '',
+    [string]$TurnEnvFile = '',
     [string]$Hostname = 'relay.hegelsalon.com',
     [string]$McpHostname = 'mcp.hegelsalon.com',
     [string]$TunnelName = 'hegelsalon-relay',
@@ -47,6 +48,10 @@ $argumentParts = @(
 if ($EnvFile) {
     $resolvedEnv = if ([IO.Path]::IsPathRooted($EnvFile)) { [IO.Path]::GetFullPath($EnvFile) } else { [IO.Path]::GetFullPath((Join-Path $root $EnvFile)) }
     $argumentParts += @('-EnvFile', (Quote-TaskArgument $resolvedEnv))
+}
+if ($TurnEnvFile) {
+    $resolvedTurnEnv = if ([IO.Path]::IsPathRooted($TurnEnvFile)) { [IO.Path]::GetFullPath($TurnEnvFile) } else { [IO.Path]::GetFullPath((Join-Path $root $TurnEnvFile)) }
+    $argumentParts += @('-TurnEnvFile', (Quote-TaskArgument $resolvedTurnEnv))
 }
 if ($TunnelTokenFile) {
     $resolvedToken = if ([IO.Path]::IsPathRooted($TunnelTokenFile)) { [IO.Path]::GetFullPath($TunnelTokenFile) } else { [IO.Path]::GetFullPath((Join-Path $root $TunnelTokenFile)) }

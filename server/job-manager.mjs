@@ -213,7 +213,7 @@ export class JobManager {
         changed = true;
       }
     }
-    for (const job of this.jobs) {
+      for (const job of this.jobs) {
       if (!TERMINAL.has(job.status)) continue;
       try {
         if (await this.#materializeCheckpointApplications(job)) changed = true;

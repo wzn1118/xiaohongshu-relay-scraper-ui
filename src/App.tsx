@@ -31,11 +31,13 @@ import {
   LoaderCircle,
   Mail,
   Maximize2,
+  Monitor,
   MessageSquare,
   MessagesSquare,
   Network,
   Copy,
   Cpu,
+  Database,
   Pause,
   Paperclip,
   PanelLeftClose,
@@ -45,6 +47,7 @@ import {
   RotateCcw,
   Save,
   Search,
+  Share2,
   Settings2,
   ShieldAlert,
   ShieldCheck,
@@ -64,7 +67,7 @@ import {
   X,
 } from 'lucide-react'
 import { api } from './api'
-import type { ApiError } from './api'
+import type { ApiError, CodexBrowserStatus, CodexConnectIntent, CodexNativeMirrorSession, CodexProductIntegration, CodexProductWorkspaceSnapshot, CodexRelayDevice, CodexRelayStatus, XhsContextStatus } from './api'
 import { draftContentHash } from './draft-state.mjs'
 import { AudienceAiPanel } from './AudienceAiPanel'
 import { BodyImportPanel } from './BodyImportPanel'
@@ -1762,6 +1765,220 @@ function App() {
   const [jobConnectionState, setJobConnectionState] = useState<WorkflowConnectionState>('offline')
   const [jobLastEventAt, setJobLastEventAt] = useState<string | null>(null)
   const [dataCopilotOpen, setDataCopilotOpen] = useState(false)
+  const [codexBrowserOpen, setCodexBrowserOpen] = useState(false)
+  const [codexRelayStatus, setCodexRelayStatus] = useState<CodexRelayStatus | null>(null)
+  const [codexRuntimeStatus, setCodexRuntimeStatus] = useState<CodexBrowserStatus | null>(null)
+  const [codexRelayError, setCodexRelayError] = useState('')
+  const [codexRelayDevices, setCodexRelayDevices] = useState<CodexRelayDevice[]>([])
+  const [codexSelectedDeviceId, setCodexSelectedDeviceId] = useState('')
+  const [codexPairingIntent, setCodexPairingIntent] = useState<CodexConnectIntent | null>(null)
+  const [codexPairingLoading, setCodexPairingLoading] = useState(false)
+  const [codexPairingError, setCodexPairingError] = useState('')
+  const [codexContextStatus, setCodexContextStatus] = useState<XhsContextStatus | null>(null)
+  const [codexContextError, setCodexContextError] = useState('')
+  const [codexContextSyncing, setCodexContextSyncing] = useState(false)
+  const [codexProductWorkspace, setCodexProductWorkspace] = useState<CodexProductWorkspaceSnapshot | null>(null)
+  const [codexProductIntegration, setCodexProductIntegration] = useState<CodexProductIntegration | null>(null)
+  const [codexProductError, setCodexProductError] = useState('')
+  const [codexPresentationMode, setCodexPresentationMode] = useState<'semantic' | 'mirror'>('semantic')
+  const [codexMirrorSession, setCodexMirrorSession] = useState<CodexNativeMirrorSession | null>(null)
+  const [codexMirrorFrameUrl, setCodexMirrorFrameUrl] = useState('')
+  const [codexMirrorLoading, setCodexMirrorLoading] = useState(false)
+  const [codexMirrorError, setCodexMirrorError] = useState('')
+  const [codexShareLoading, setCodexShareLoading] = useState(false)
+  const [codexShareError, setCodexShareError] = useState('')
+  const [codexFrameReady, setCodexFrameReady] = useState(false)
+
+  useEffect(() => {
+    const current = codexMirrorSession
+    if (!current || !codexBrowserOpen) return undefined
+    let cancelled = false
+    const refresh = () => {
+      void api.getCodexNativeMirror(current.session.id, 'viewer', current.viewer.token)
+        .then((result) => {
+          if (cancelled) return
+          setCodexMirrorSession((active) => active?.session.id === result.session.id
+            ? { ...active, session: result.session }
+            : active)
+        })
+        .catch((error: ApiError) => {
+          if (cancelled) return
+          setCodexMirrorError(error.message || 'Native Mirror status could not be refreshed.')
+        })
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 1_500)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [codexBrowserOpen, codexMirrorSession?.session.id])
+  useEffect(() => {
+    if (!codexBrowserOpen) return undefined
+    let cancelled = false
+    const refresh = () => {
+      void api.codexRelayDevices().then(({ devices }) => {
+        if (cancelled) return
+        const nextDevices = Array.isArray(devices) ? devices : []
+        setCodexRelayDevices(nextDevices)
+        setCodexSelectedDeviceId((current) => (
+          current && nextDevices.some((device) => device.id === current)
+            ? current
+            : nextDevices[0]?.id || ''
+        ))
+      }).catch((error: ApiError) => {
+        if (!cancelled) setCodexRelayError(error.message || 'Paired device refresh failed.')
+      })
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 5_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [codexBrowserOpen])
+  useEffect(() => {
+    if (!codexBrowserOpen) return undefined
+    let cancelled = false
+    const refresh = () => {
+      void api.codexBrowserStatus().then((status) => {
+        if (!cancelled) setCodexRuntimeStatus(status)
+      }).catch(() => {
+        if (!cancelled) setCodexRuntimeStatus(null)
+      })
+    }
+    refresh()
+    void api.codexModelProbe().then(refresh).catch(refresh)
+    const timer = window.setInterval(refresh, 2_500)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [codexBrowserOpen])
+  useEffect(() => {
+    const current = codexPairingIntent
+    if (!codexBrowserOpen || !current || !['waiting_for_connector', 'paired'].includes(current.intent.state)) return undefined
+    let cancelled = false
+    let refreshing = false
+    const refresh = () => {
+      if (refreshing) return
+      refreshing = true
+      void api.getCodexConnectIntent(current.intent.id)
+        .then((result) => {
+          if (cancelled) return
+          setCodexPairingIntent((active) => {
+            if (!active || active.intent.id !== current.intent.id) return active
+            return active.intent.state === result.intent.state
+              && active.intent.deviceId === result.intent.deviceId
+              ? active
+              : { ...active, intent: result.intent }
+          })
+          if (result.intent.state === 'connected' && result.intent.deviceId) {
+            void api.codexRelayDevices().then(({ devices }) => {
+              if (cancelled) return
+              setCodexRelayDevices(Array.isArray(devices) ? devices : [])
+              setCodexSelectedDeviceId(result.intent.deviceId || '')
+            }).catch((error: ApiError) => {
+              if (!cancelled) setCodexRelayError(error.message || 'Connected device refresh failed.')
+            })
+          }
+        })
+        .catch((error: ApiError) => {
+          if (!cancelled) setCodexPairingError(error.message || 'Connection status could not be refreshed.')
+        })
+        .finally(() => { refreshing = false })
+    }
+    refresh()
+    const timer = window.setInterval(refresh, 2_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [codexBrowserOpen, codexPairingIntent?.intent.id, codexPairingIntent?.intent.state])
+  const selectedCodexDevice = useMemo(() => (
+    codexRelayDevices.find((device) => device.id === codexSelectedDeviceId)
+      || (codexRelayStatus?.device?.id === codexSelectedDeviceId ? codexRelayStatus.device : null)
+      || codexRelayStatus?.device
+      || null
+  ), [codexRelayDevices, codexRelayStatus, codexSelectedDeviceId])
+  const codexRemoteDeviceSelected = Boolean(
+    selectedCodexDevice
+      && codexRelayStatus?.device?.id
+      && selectedCodexDevice.id !== codexRelayStatus.device.id,
+  )
+  const codexSemanticFrameUrl = useMemo(() => {
+    const url = new URL('/codex/', window.location.origin)
+    if (codexRemoteDeviceSelected && selectedCodexDevice) url.searchParams.set('deviceId', selectedCodexDevice.id)
+    else {
+      url.searchParams.delete('deviceId')
+      // Keep the product's embedded session local; standalone pages may discover a connector.
+      url.searchParams.set('embedded', '1')
+    }
+    return url.toString()
+  }, [codexRemoteDeviceSelected, selectedCodexDevice])
+  useEffect(() => {
+    if (!codexBrowserOpen || codexPresentationMode !== 'semantic') {
+      setCodexFrameReady(false)
+      return undefined
+    }
+    setCodexFrameReady(false)
+    const onCodexReady = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin || event.source === window || event.data?.type !== 'codex-browser-ready') return
+      setCodexFrameReady(true)
+    }
+    window.addEventListener('message', onCodexReady)
+    return () => window.removeEventListener('message', onCodexReady)
+  }, [codexBrowserOpen, codexPresentationMode, codexSemanticFrameUrl])
+  const codexMirrorStatusLabel = useMemo(() => {
+    const session = codexMirrorSession?.session
+    if (!session) return ''
+    const inputP95 = codexRelayStatus?.modes?.nativeMirror?.input?.metrics?.p95Ms
+    const inputQuality = Number.isFinite(inputP95) ? ` · input P95 ${Math.round(Number(inputP95))} ms` : ''
+    if (session.sourceLaunch?.state === 'error') return `Native Mirror · ${session.sourceLaunch.message || 'remote source launch failed'}`
+    if (session.connectionError) return `Native Mirror · connection ${session.connectionError}`
+    if (session.remote && session.sourceLaunch?.state === 'requested') return 'Native Mirror · starting source on paired device'
+    if (!session.inputTarget) return session.remote
+      ? 'Native Mirror · select the Codex window on the paired device'
+      : 'Native Mirror · select a Codex window'
+    if (session.inputMode === 'input-only') return `Native Mirror · interactive input ready · ${session.inputTarget.label || 'Codex window'}${inputQuality}`
+    if (!session.sourceConnected) return 'Native Mirror · source disconnected'
+    if (!session.viewerConnected) return 'Native Mirror · waiting for viewer'
+    if (!session.peerConnected) return session.remote && codexRelayStatus?.ice?.turnConfigured === false
+      ? 'Native Mirror · connecting direct media · TURN not configured'
+      : 'Native Mirror · connecting media'
+    if (!session.controlConnected) return 'Native Mirror · connecting control channel'
+    if (session.connectionPath === 'relay') return `Native Mirror · interactive control ready · TURN relay${inputQuality}`
+    if (session.connectionPath === 'direct') return `Native Mirror · interactive control ready · direct peer${inputQuality}`
+    return 'Native Mirror · interactive control ready · detecting path'
+  }, [codexMirrorSession, codexRelayStatus?.ice?.turnConfigured, codexRelayStatus?.modes?.nativeMirror?.input?.metrics?.p95Ms])
+  const codexMirrorControlReady = Boolean(
+    codexMirrorSession?.session.inputTarget
+      && codexMirrorSession.session.sourceConnected
+      && codexMirrorSession.session.viewerConnected
+      && codexMirrorSession.session.controlConnected,
+  )
+  const codexPairingStatusLabel = useMemo(() => {
+    switch (codexPairingIntent?.intent.state) {
+      case 'connected': return 'Connected'
+      case 'paired': return 'Paired - starting'
+      case 'expired': return 'Expired'
+      default: return 'Waiting for connector'
+    }
+  }, [codexPairingIntent?.intent.state])
+  const codexProductActiveJob = useMemo(() => {
+    const workspaceJob = codexProductWorkspace?.activeJobId
+      ? jobs.find((job) => job.id === codexProductWorkspace.activeJobId)
+      : null
+    return workspaceJob || activeJob
+  }, [activeJob, codexProductWorkspace?.activeJobId, jobs])
+  const codexProductArtifactCount = codexProductActiveJob
+    ? codexProductActiveJob.artifactCount ?? codexProductActiveJob.artifacts?.length ?? 0
+    : 0
+  const codexModelHealth = codexRuntimeStatus?.modelBridge?.health
+  const codexModelState = codexRuntimeStatus?.modelBridge?.configured
+    ? codexModelHealth?.state || 'unknown'
+    : 'unconfigured'
+  const codexModelP95 = codexModelHealth?.latency?.p95Ms
   const [historyScope, setHistoryScope] = useState<HistoryScope>('all')
   const [historyPage, setHistoryPage] = useState(1)
   const [historyPageSize, setHistoryPageSize] = useState(50)
@@ -2790,6 +3007,12 @@ function App() {
     return session
   }
 
+  const restoreRemoteAiSession = async (): Promise<AiSession> => {
+    const provider = providers.find((item) => !item.local && item.configured && (!item.requiresKey || item.hasApiKey))
+    if (!provider) throw new Error('数据 Copilot 需要已配置的远端 API；本地 Qwen 不作为爬虫控制模型。')
+    return restoreAiSession(provider)
+  }
+
   const configureAi = async () => {
     setConfiguringAi(true)
     setNotice(null)
@@ -3536,6 +3759,41 @@ function App() {
     if (['queued', 'resuming', 'running'].includes(job.status)) connectJob(job)
   }, [connectJob])
 
+  useEffect(() => {
+    if (!codexBrowserOpen) return undefined
+    let cancelled = false
+    const refreshProductBinding = async () => {
+      try {
+        const [workspace, nextJobs] = await Promise.all([api.codexProductWorkspaces(), api.jobs()])
+        if (cancelled) return
+        setCodexProductWorkspace(workspace)
+        setJobs(nextJobs)
+        const codexRequestedJob = nextJobs.find((job) => {
+          const latestAttempt = job.attempts?.at(-1)
+          return latestAttempt?.requestedBy === 'codex_product_mcp'
+            && ['queued', 'resuming', 'running'].includes(job.status)
+        })
+        if (codexRequestedJob) {
+          setActiveJob((current) => current?.id === codexRequestedJob.id || !current ? codexRequestedJob : current)
+          if (['queued', 'resuming', 'running'].includes(codexRequestedJob.status)) connectJob(codexRequestedJob)
+        }
+      } catch (error) {
+        if (!cancelled) setCodexProductError((error as ApiError).message || 'Product workspace sync failed.')
+      }
+    }
+    void refreshProductBinding()
+    void api.codexProductIntegration().then((integration) => {
+      if (!cancelled) setCodexProductIntegration(integration)
+    }).catch((error: ApiError) => {
+      if (!cancelled) setCodexProductError(error.message || 'Codex integration manifest failed.')
+    })
+    const timer = window.setInterval(() => void refreshProductBinding(), 2_500)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [codexBrowserOpen, connectJob])
+
   const reconcileActionAfterTransportError = useCallback(async (
     job: Job,
     action: () => Promise<Job>,
@@ -3587,8 +3845,11 @@ function App() {
       setNotice('续跑必须通过原任务恢复入口执行。')
       return null
     }
-    if (payload.analysisMode === 'general' && !payload.checkOnly && !sessionHint) {
-      setNotice('内容模式需要先连接 AI 模型，正文、图片和动态栏目才会进入同一次分析。')
+    const requiresAiSession = payload.analysisMode === 'general' || payload.useCodexRuntime
+    if (requiresAiSession && !payload.checkOnly && !sessionHint) {
+      setNotice(payload.analysisMode === 'job'
+        ? '已选择通过 API 生成求职信，请先连接智能分析服务。'
+        : '内容模式需要先连接 AI 模型，正文、图片和动态栏目才会进入同一次分析。')
       switchWorkflowScreen('setup')
       return null
     }
@@ -3603,7 +3864,7 @@ function App() {
         searchSort: 'latest',
         maxAgeDays: payload.maxAgeDays,
         limit: 0,
-        aiSessionId: sessionHint?.id || payload.aiSessionId || null,
+        aiSessionId: requiresAiSession ? sessionHint?.id || payload.aiSessionId || null : null,
       }
       if (payload.checkOnly) {
         const report = await api.preflight(latestPayload)
@@ -3621,7 +3882,7 @@ function App() {
         job = await api.createJob(effectivePayload)
       } catch (error) {
         const apiError = error as Error & { code?: string }
-        if (apiError.code !== 'AI_SESSION_EXPIRED' || !sessionHint || !latestPayload.aiSessionId) throw error
+        if (apiError.code !== 'AI_SESSION_EXPIRED' || !requiresAiSession || !sessionHint || !latestPayload.aiSessionId) throw error
         setLogs((current) => [...current, `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] AI 会话已过期，正在自动重连...`])
         const session = await api.createAiSession({
           provider: sessionHint.provider,
@@ -4431,9 +4692,19 @@ function App() {
     request.candidateProfile.email,
   ].every((value) => value.trim())
   const backgroundReady = Boolean(request.profileId && activeProfile)
+  const requiresAiSession = request.analysisMode === 'general' || request.useCodexRuntime
   const readinessChecks = [
-    { label: 'AI 会话', ready: Boolean(aiSession), detail: aiSession ? `${selectedProvider?.label || providerId} · ${aiSession.model}` : '等待连接' },
+    ...(requiresAiSession ? [
+      { label: 'AI 会话', ready: Boolean(aiSession), detail: aiSession ? `${selectedProvider?.label || providerId} · ${aiSession.model}` : '等待连接' },
+    ] : []),
     ...(request.analysisMode === 'job' ? [
+      {
+        label: '求职信生成',
+        ready: true,
+        detail: request.useCodexRuntime
+          ? `使用 API${aiSession ? ` · ${selectedProvider?.label || providerId}` : '，等待连接'}`
+          : '仅采集岗位，可在结果页按需使用 API 重写',
+      },
       { label: '背景记忆', ready: backgroundReady, detail: activeProfile?.display_name || '请选择档案' },
       { label: '候选人资料', ready: candidateReady, detail: candidateReady ? '必填字段完整' : '姓名、学校、专业、邮箱' },
     ] : []),
@@ -4987,22 +5258,33 @@ function App() {
     mode: dataCopilotMode,
     snapshotId: dataCopilotSnapshotId,
     aiSessionId: aiSession?.id,
+    renewAiSession: async () => {
+      const session = await restoreRemoteAiSession()
+      return session.id
+    },
     allowedScopes: ['*'],
   }), [activeJob?.id, aiSession?.id, dataCopilotMode, dataCopilotSnapshotId])
-  const dataCopilotModels = useMemo<DataCopilotModel[]>(() => aiSession ? [{
+  const dataCopilotModels = useMemo<DataCopilotModel[]>(() => aiSession && aiSession.provider !== 'local_qwen' ? [{
     id: aiSession.id,
     label: aiSession.model,
     provider: aiSession.provider,
     supportsTools: true,
     supportsAttachments: true,
     wireApi: aiSession.wireApi,
-    supportsReasoningEffort: aiSession.wireApi === 'responses',
+    supportsReasoningEffort: dataCopilotReasoningEffortsForModel(aiSession.model, aiSession.wireApi).length > 0,
     reasoningEfforts: dataCopilotReasoningEffortsForModel(aiSession.model, aiSession.wireApi),
   }] : [], [aiSession])
+  const dataCopilotProviders = useMemo(
+    () => providers.filter((provider) => provider.id !== 'local_qwen'),
+    [providers],
+  )
   const discoverDataCopilotModels = async (
     input: Pick<DataCopilotModelConnectionInput, 'provider' | 'apiKey' | 'baseUrl'>,
   ) => api.discoverAiModels(input)
   const connectDataCopilotModel = async (input: DataCopilotModelConnectionInput): Promise<DataCopilotModel> => {
+    if (input.provider === 'local_qwen') {
+      throw new Error('数据 Copilot 需要远端 API；本地 Qwen 不用于爬虫控制。')
+    }
     const session = await api.createAiSession(input)
     rememberAiSession(session)
     setNotice(`${session.model} 已连接，可在数据 Copilot 中直接使用。`)
@@ -5013,7 +5295,7 @@ function App() {
       supportsTools: true,
       supportsAttachments: true,
       wireApi: session.wireApi,
-      supportsReasoningEffort: session.wireApi === 'responses',
+      supportsReasoningEffort: dataCopilotReasoningEffortsForModel(session.model, session.wireApi).length > 0,
       reasoningEfforts: dataCopilotReasoningEffortsForModel(session.model, session.wireApi),
     }
   }
@@ -5051,7 +5333,6 @@ function App() {
       },
     ]
   }, [activeJob, audienceResults?.totals.comments, audienceResults?.totals.users, currentArtifacts.length, discoveredCount, workspaceMode])
-
   const contactOcr = results?.contactResolution
   const contactOcrAfter = contactOcr?.report?.after
   const contactOcrQueue = contactOcr?.report?.queue
@@ -5134,6 +5415,83 @@ function App() {
         },
       } satisfies Record<WorkflowScreen, { eyebrow: string; title: string; description: string; state: string }>)[currentWorkflowScreen]
 
+  const closeCodexNativeMirror = () => {
+    const current = codexMirrorSession
+    if (current) {
+      void api.closeCodexNativeMirror(current.session.id, 'viewer', current.viewer.token).catch(() => {})
+    }
+    setCodexMirrorSession(null)
+    setCodexMirrorFrameUrl('')
+    setCodexMirrorError('')
+    setCodexPresentationMode('semantic')
+  }
+
+  const selectCodexDevice = (deviceId: string) => {
+    closeCodexNativeMirror()
+    setCodexSelectedDeviceId(deviceId)
+    setCodexRelayError('')
+  }
+
+  const createCodexPairing = () => {
+    if (codexPairingLoading) return
+    setCodexPairingLoading(true)
+    setCodexPairingError('')
+    void api.createCodexConnectIntent({
+      deviceName: 'This Windows device',
+      requestedRole: 'controller',
+      ...(codexRemoteDeviceSelected ? { replaceDeviceId: selectedCodexDevice?.id } : {}),
+    })
+      .then((created) => {
+        setCodexPairingIntent(created)
+        window.location.assign(created.launchUrl)
+      })
+      .catch((error: ApiError) => setCodexPairingError(error.message || 'Pairing intent could not be created.'))
+      .finally(() => setCodexPairingLoading(false))
+  }
+
+  const shareCodexSession = () => {
+    if (codexShareLoading) return
+    setCodexShareLoading(true)
+    setCodexShareError('')
+    void api.createCodexRelayShareInvite(selectedCodexDevice?.id || codexRelayStatus?.device?.id)
+      .then((created) => copyText(created.shareUrl))
+      .catch((error: ApiError) => setCodexShareError(error.message || 'Session share link could not be created.'))
+      .finally(() => setCodexShareLoading(false))
+  }
+
+  const revokeSelectedCodexDevice = () => {
+    if (!selectedCodexDevice || !codexRemoteDeviceSelected) return
+    void api.revokeCodexRelayDevice(selectedCodexDevice.id).then(() => {
+      closeCodexNativeMirror()
+      setCodexRelayDevices((current) => current.filter((device) => device.id !== selectedCodexDevice.id))
+      setCodexSelectedDeviceId(codexRelayStatus?.device?.id || '')
+      setCodexPairingError('')
+    }).catch((error: ApiError) => setCodexPairingError(error.message || 'The paired device could not be revoked.'))
+  }
+
+  const openCodexNativeMirror = () => {
+    if (codexMirrorLoading) return
+    setCodexMirrorLoading(true)
+    setCodexMirrorError('')
+    void api.createCodexNativeMirror(
+      selectedCodexDevice?.id || codexRelayStatus?.device?.id,
+      codexRemoteDeviceSelected,
+      !codexRemoteDeviceSelected,
+    ).then((created) => {
+      const viewerFragment = new URLSearchParams({
+        sessionId: created.session.id,
+        role: created.viewer.role,
+        token: created.viewer.token,
+      })
+      setCodexMirrorSession(created)
+      setCodexMirrorFrameUrl(`/codex-native-mirror.html?v=20260819-local-capture-1#${viewerFragment}`)
+      setCodexPresentationMode('mirror')
+      void api.codexRelayStatus().then(setCodexRelayStatus).catch(() => {})
+    }).catch((error: ApiError) => {
+      setCodexMirrorError(error.message || 'Native Mirror session could not be created.')
+    }).finally(() => setCodexMirrorLoading(false))
+  }
+
   if (authLoading) {
     return <main className="auth-shell"><section className="auth-card"><LoaderCircle className="spin" size={24} /><span>正在检查登录状态…</span></section></main>
   }
@@ -5208,13 +5566,42 @@ function App() {
           <div className="topbar-status">
             <button
               type="button"
-              className="copilot-launch-button"
+              className="copilot-launch-button codex-browser-launch"
+              title="在当前浏览器中打开完整 Codex"
+              aria-haspopup="dialog"
+              onClick={() => {
+                setCodexBrowserOpen(true)
+                setCodexRelayError('')
+                setCodexContextError('')
+                void api.codexRelayStatus()
+                  .then((status) => setCodexRelayStatus(status))
+                  .catch((error: ApiError) => {
+                    setCodexRelayStatus(null)
+                    setCodexRelayError(error.message || 'Local Relay status check failed.')
+                  })
+                void api.codexBrowserStatus().then(setCodexRuntimeStatus).catch(() => setCodexRuntimeStatus(null))
+                void api.xhsContextStatus()
+                  .then((status) => {
+                    setCodexContextStatus(status)
+                  })
+                  .catch((error: ApiError) => {
+                    setCodexContextStatus(null)
+                    setCodexContextError(error.message || 'Local context status check failed.')
+                  })
+              }}
+            >
+              <SquareTerminal size={16} />
+              <span>Codex</span>
+            </button>
+            <button
+              type="button"
+              className="icon-button legacy-copilot-launch"
               disabled={!activeJob}
-              title={!activeJob ? '请先选择任务' : !aiSession ? '打开历史会话（发送前需连接 AI 模型）' : '打开数据 Copilot'}
+              title={!activeJob ? '选择任务后可打开旧版数据助手' : '打开旧版数据助手（回退）'}
+              aria-label="打开旧版数据助手"
               onClick={() => setDataCopilotOpen(true)}
             >
               <MessagesSquare size={16} />
-              <span>数据助手</span>
             </button>
             <div className={`relay-indicator ${relayReady ? 'ready' : relayConnecting ? 'connecting' : 'offline'}`}>
               {relayReady ? <Wifi size={17} /> : relayConnecting ? <LoaderCircle className="spin" size={17} /> : <WifiOff size={17} />}
@@ -5566,6 +5953,35 @@ function App() {
                   <div className="input-shell"><Search size={18} /><input value={request.keyword} onChange={(event) => updateRequest('keyword', event.target.value)} required placeholder="输入小红书搜索关键词" /></div>
                 </label>
 
+                {workspaceMode === 'job' && <section className="field cover-letter-generation-field" aria-labelledby="cover-letter-generation-label">
+                  <span id="cover-letter-generation-label">求职信生成方式</span>
+                  <div className="segmented" role="group" aria-label="求职信生成方式">
+                    <button
+                      type="button"
+                      className={request.useCodexRuntime ? 'selected' : ''}
+                      aria-pressed={request.useCodexRuntime}
+                      onClick={() => updateRequest('useCodexRuntime', true)}
+                    >
+                      <WandSparkles size={15} />使用 API 生成
+                    </button>
+                    <button
+                      type="button"
+                      className={!request.useCodexRuntime ? 'selected' : ''}
+                      aria-pressed={!request.useCodexRuntime}
+                      onClick={() => updateRequest('useCodexRuntime', false)}
+                    >
+                      <FileText size={15} />仅采集岗位
+                    </button>
+                  </div>
+                  <small className="field-help">
+                    {request.useCodexRuntime
+                      ? aiSession
+                        ? `将通过当前 API（${selectedProvider?.label || providerId} · ${aiSession.model}）为匹配岗位生成并校验求职信。`
+                        : '请先在“智能分析服务”连接 API；连接后才会开始生成求职信。'
+                      : '本次不会请求 AI API，只采集并结构化岗位信息；任务完成后可在岗位详情中选择 API 重写求职信。'}
+                  </small>
+                </section>}
+
                 <div className="field range-field">
                   <span>采集范围</span>
                   <div className="sort-policy full-coverage" role="status" aria-label="范围内发现多少采集多少">
@@ -5630,7 +6046,6 @@ function App() {
                     <label className="field"><span>页面超时 ms</span><input type="number" min="1000" max="120000" step="1000" value={request.gotoTimeoutMs} onChange={(event) => updateRequest('gotoTimeoutMs', Number(event.target.value))} /></label>
                     <label className="field"><span>安全验证等待 s</span><input type="number" min="60" max="86400" step="60" value={request.securityVerificationTimeoutSeconds} onChange={(event) => updateRequest('securityVerificationTimeoutSeconds', Number(event.target.value))} /></label>
                     <label className="field"><span>Codex 单批数量</span><input type="number" min="1" max="20" value={request.codexBatchSize} onChange={(event) => updateRequest('codexBatchSize', Number(event.target.value))} /></label>
-                    <Toggle checked={request.analysisMode === 'general' || request.useCodexRuntime} onChange={(value) => request.analysisMode === 'job' && updateRequest('useCodexRuntime', value)} label={request.analysisMode === 'general' ? 'AI 动态内容模块' : 'AI 文案与评分'} description={request.analysisMode === 'general' ? '根据关键词、正文和图片逐链接生成栏目' : '逐链接写作、评分并自动重写'} />
                     <Toggle checked={request.noAutoAttach} onChange={(value) => updateRequest('noAutoAttach', value)} label="禁用自动附加" description="保持现有浏览器会话" />
                     <Toggle checked={request.skipPostprocess} onChange={(value) => updateRequest('skipPostprocess', value)} label="跳过结构化导出" description="仅保留原始抓取结果" />
                   </div>
@@ -5655,7 +6070,7 @@ function App() {
                 </div>
 
                 <div className="form-actions">
-                  <button className="primary-button" type="submit" disabled={submitting || !request.keyword.trim() || !aiSession || (request.analysisMode === 'job' && (!backgroundReady || !candidateReady))}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Play size={18} fill="currentColor" />}开始采集并分析</button>
+                  <button className="primary-button" type="submit" disabled={submitting || !request.keyword.trim() || (requiresAiSession && !aiSession) || (request.analysisMode === 'job' && (!backgroundReady || !candidateReady))}>{submitting ? <LoaderCircle className="spin" size={18} /> : <Play size={18} fill="currentColor" />}{request.analysisMode === 'job' ? request.useCodexRuntime ? '开始采集并生成求职信' : '开始采集岗位' : '开始采集并分析'}</button>
                   <button className="secondary-button" type="button" disabled={submitting} onClick={() => void runJob({ ...request, checkOnly: true })}><Activity size={18} />只检查连接</button>
                 </div>
               </form>
@@ -6190,13 +6605,143 @@ function App() {
           </div>
         </main>
       </div>
+      {codexBrowserOpen && <section className="codex-browser-surface" role="dialog" aria-modal="true" aria-label="Codex 浏览器工作台">
+        <header className="codex-browser-toolbar">
+          <div className="codex-browser-title"><SquareTerminal size={17} /><strong>Codex</strong><span>{codexProductWorkspace?.source?.name || '产品源码工作区'}</span></div>
+          <div className="codex-device-control">
+            <Monitor size={14} />
+            <select
+              aria-label="Codex device"
+              value={selectedCodexDevice?.id || ''}
+              onChange={(event) => selectCodexDevice(event.target.value)}
+            >
+              {codexRelayDevices.map((device) => <option key={device.id} value={device.id}>{device.name}{device.online ? '' : ' (offline)'}</option>)}
+            </select>
+            <button type="button" title="Pair Windows device" aria-label="Pair Windows device" disabled={codexPairingLoading} onClick={createCodexPairing}>
+              {codexPairingLoading ? <LoaderCircle className="spin" size={14} /> : <KeyRound size={14} />}
+            </button>
+            {codexRemoteDeviceSelected && <button type="button" title="Revoke paired device" aria-label="Revoke paired device" onClick={revokeSelectedCodexDevice}><Trash2 size={14} /></button>}
+            <button type="button" title="Copy one-click session link" aria-label="Copy one-click session link" disabled={codexShareLoading} onClick={shareCodexSession}>
+              {codexShareLoading ? <LoaderCircle className="spin" size={14} /> : <Share2 size={14} />}
+            </button>
+          </div>
+          <div className="codex-presentation-switch" role="group" aria-label="Codex presentation mode">
+            <button
+              type="button"
+              className={codexPresentationMode === 'semantic' ? 'selected' : ''}
+              aria-pressed={codexPresentationMode === 'semantic'}
+              title="Semantic Session"
+              onClick={closeCodexNativeMirror}
+            ><SquareTerminal size={14} /><span>Session</span></button>
+            <button
+              type="button"
+              className={codexPresentationMode === 'mirror' ? 'selected' : ''}
+              aria-pressed={codexPresentationMode === 'mirror'}
+              disabled={codexMirrorLoading || selectedCodexDevice?.online === false || codexRelayStatus?.modes?.nativeMirror?.available === false}
+              title={codexRemoteDeviceSelected
+                ? `Remote Native Mirror · paired Windows device · interactive control${codexRelayStatus?.ice?.turnConfigured === false ? ' · direct path only until TURN is configured' : ''}`
+                : 'Native Mirror · selected window · interactive control'}
+              onClick={openCodexNativeMirror}
+            >{codexMirrorLoading ? <LoaderCircle className="spin" size={14} /> : <Monitor size={14} />}<span>Mirror</span></button>
+          </div>
+          <span className={`codex-relay-state ${codexPresentationMode === 'mirror'
+            ? (codexMirrorError ? 'error' : codexMirrorControlReady ? 'ready' : 'checking')
+            : (codexRelayStatus?.adapter?.state === 'compatible' ? 'ready' : codexRelayError ? 'error' : 'checking')}`}>
+            {codexMirrorError
+              || (codexPresentationMode === 'mirror' && codexMirrorSession
+                ? `${selectedCodexDevice?.name || 'This Windows device'} - ${codexMirrorStatusLabel}`
+                : codexRelayStatus?.adapter?.state === 'compatible'
+                  ? `${selectedCodexDevice?.name || codexRelayStatus.device?.name || 'local device'} - ${selectedCodexDevice?.online === false ? 'offline' : 'semantic session ready'}`
+                  : codexRelayError || 'Checking local Relay')}
+          </span>
+          <span className={`codex-context-state ${codexContextStatus ? 'ready' : codexContextError ? 'error' : 'checking'}`}>
+            {codexContextStatus
+              ? `${codexContextStatus.bundles} bundles · ${codexContextStatus.records} records · ${codexContextStatus.indexMode}`
+              : codexContextError || 'Checking local context'}
+          </span>
+          <span
+            className={`codex-context-state ${codexModelState === 'ready' ? 'ready' : codexModelState === 'degraded' ? 'error' : 'checking'}`}
+            title={codexRuntimeStatus?.modelBridge?.lastError?.message || `Model gateway retries ${codexModelHealth?.reliability?.retryAttempts || 0} times before surfacing an upstream failure`}
+          >
+            {codexRuntimeStatus?.modelBridge?.configured
+              ? `API ${codexRuntimeStatus.modelBridge.upstream?.model || codexRuntimeStatus.backend.modelProvider?.model || 'ready'} · ${codexRuntimeStatus.backend.dynamicMcp?.tools || 0} MCP tools · ${codexModelState}${codexModelP95 == null ? '' : ` · P95 ${Math.round(codexModelP95)}ms`} · ${codexRuntimeStatus.modelBridge.completed}/${codexRuntimeStatus.modelBridge.requests} turns`
+              : 'Checking Codex API'}
+          </span>
+          <div className="codex-browser-actions">
+            <button
+              type="button"
+              disabled={codexPresentationMode === 'mirror' || !activeJob || codexContextSyncing}
+              title={activeJob ? '将当前任务同步到本机 Codex 上下文' : '选择任务后可同步本机上下文'}
+              aria-label="同步当前任务到本机 Codex 上下文"
+              onClick={() => {
+                if (!activeJob || codexContextSyncing) return
+                setCodexContextSyncing(true)
+                setCodexContextError('')
+                void api.createXhsContextBundle(activeJob.id, activeJob.keyword || undefined)
+                  .then(() => api.xhsContextStatus())
+                  .then((status) => setCodexContextStatus(status))
+                  .catch((error: ApiError) => setCodexContextError(error.message || 'Context sync failed.'))
+                  .finally(() => setCodexContextSyncing(false))
+              }}
+            >
+              {codexContextSyncing ? <LoaderCircle className="spin" size={16} /> : <Database size={16} />}
+            </button>
+            <a href={codexPresentationMode === 'mirror' ? codexMirrorFrameUrl : '/codex/'} target="_blank" rel="noreferrer" title="在新标签页打开" aria-label="在新标签页打开 Codex"><ExternalLink size={16} /></a>
+            <button type="button" title="关闭" aria-label="关闭 Codex" onClick={() => { closeCodexNativeMirror(); setCodexBrowserOpen(false) }}><X size={17} /></button>
+          </div>
+        </header>
+        <div className="codex-product-context-strip" role="status" aria-live="polite">
+          <div className="codex-product-workspace-summary">
+            <Code2 size={15} />
+            <span><strong>{codexProductWorkspace?.source?.name || '产品源码工作区'}</strong><small>{codexProductWorkspace?.source ? '可读写源码 · 默认工作区' : codexProductError || '正在同步工作区'}</small></span>
+          </div>
+          <div className="codex-product-context-facts">
+            {codexRuntimeStatus?.modelBridge?.configured && <span className={`${codexModelState === 'ready' ? 'is-active' : ''} codex-product-runtime-state`} title={codexRuntimeStatus.modelBridge.lastError?.message || 'Remote API model and dynamically loaded MCP tools'}><Cpu size={13} /><span>API {codexRuntimeStatus.modelBridge.upstream?.model || codexRuntimeStatus.backend.modelProvider?.model || 'ready'} · {codexModelState} · {codexRuntimeStatus.backend.dynamicMcp?.tools || 0} tools</span></span>}
+              <span><Clock3 size={13} />历史 {codexProductWorkspace?.history?.length ?? 0}</span>
+            <span><Network size={13} />MCP {codexProductIntegration?.mcp?.embedded?.length ?? 0} 服务 · {codexProductIntegration?.mcp?.localInstall?.includes?.length ?? 0} 工具</span>
+            {codexProductActiveJob && <>
+              <span className="is-active codex-product-task-name" title={`${codexProductActiveJob.keyword || '未命名任务'} · ${codexProductActiveJob.id}`}><Activity size={13} />任务 {codexProductActiveJob.keyword || codexProductActiveJob.id.slice(-8)}</span>
+              <StatusPill status={codexProductActiveJob.status} />
+              <span className="codex-product-task-results"><Archive size={13} />结果 {codexProductArtifactCount}</span>
+            </>}
+          </div>
+          <div className="codex-product-context-actions">
+            <a href={api.codexProductSourceArchiveUrl()} download title="下载不含凭据的产品源码快照" aria-label="下载产品源码快照"><Download size={14} /></a>
+            <button type="button" title="复制本机 Codex 集成命令" aria-label="复制本机 Codex 集成命令" disabled={!codexProductIntegration} onClick={() => codexProductIntegration && void copyText(codexProductIntegration.mcp.localInstall.command)}><Copy size={14} /></button>
+            <button type="button" title="回到产品查看任务结果" aria-label="回到产品查看任务结果" disabled={!activeJob} onClick={() => { closeCodexNativeMirror(); setCodexBrowserOpen(false); switchWorkflowScreen('workspace') }}><Eye size={14} /></button>
+          </div>
+        </div>
+        {(codexPairingIntent || codexPairingError) && <aside className="codex-pairing-popover" aria-label="Codex device pairing">
+          <header><span><KeyRound size={15} /><strong>Pair Windows device</strong></span><button type="button" title="Close pairing" aria-label="Close pairing" onClick={() => { setCodexPairingIntent(null); setCodexPairingError('') }}><X size={14} /></button></header>
+          {codexPairingIntent && <>
+            <div className={`codex-pairing-code is-${codexPairingIntent.intent.state}`}><small>Secure one-click connection</small><strong>{codexPairingStatusLabel}</strong></div>
+            <dl><div><dt>Expires</dt><dd>{new Date(codexPairingIntent.intent.expiresAt).toLocaleTimeString()}</dd></div><div><dt>Connector</dt><dd>{codexPairingIntent.connector.protocol} {codexPairingIntent.connector.version}</dd></div></dl>
+            <div className="codex-pairing-actions">
+              <button className="codex-pairing-copy" type="button" title="Open the signed one-click connector link" disabled={codexPairingIntent.intent.state === 'connected' || codexPairingIntent.intent.state === 'expired'} onClick={() => window.location.assign(codexPairingIntent.launchUrl)}><Monitor size={14} />{codexPairingIntent.intent.state === 'connected' ? 'Windows device connected' : codexPairingIntent.intent.state === 'expired' ? 'Connection expired' : 'Connect this Windows device'}</button>
+              <a className="codex-pairing-download" href={codexPairingIntent.installerUrl} title="Download the Windows connector installer"><Download size={14} />Install connector</a>
+            </div>
+          </>}
+          {codexPairingError && <p role="alert"><CircleAlert size={14} />{codexPairingError}</p>}
+        </aside>}
+        {codexShareError && <p className="codex-share-error" role="alert"><CircleAlert size={14} />{codexShareError}</p>}
+        <iframe
+          className="codex-browser-frame"
+          src={codexPresentationMode === 'mirror' ? codexMirrorFrameUrl : codexSemanticFrameUrl}
+          title={codexPresentationMode === 'mirror' ? 'Codex Native Mirror' : 'Codex'}
+          allow={codexPresentationMode === 'mirror' ? 'autoplay; fullscreen' : 'clipboard-read; clipboard-write'}
+        />
+        {codexPresentationMode === 'semantic' && !codexFrameReady && <div className="codex-browser-loading" role="status" aria-live="polite">
+          <LoaderCircle className="spin" size={18} />
+          <span><strong>正在启动 Codex 工作区</strong><small>正在加载项目源码、历史任务和 MCP；首次打开可能需要几秒钟。</small></span>
+        </div>}
+      </section>}
       <DataCopilotPanel
         key={`${activeJob?.id || 'unbound'}:${dataCopilotMode}`}
         open={dataCopilotOpen && Boolean(activeJob)}
         transport={dataCopilotTransport}
         models={dataCopilotModels}
         defaultModelId={aiSession?.id}
-        modelProviders={providers}
+        modelProviders={dataCopilotProviders}
         defaultModelProviderId={providerId}
         onDiscoverModels={discoverDataCopilotModels}
         onConnectModel={connectDataCopilotModel}

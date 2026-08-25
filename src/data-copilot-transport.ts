@@ -29,6 +29,7 @@ export type DataCopilotTransportOptions = {
   mode: 'application' | 'research'
   snapshotId: string
   aiSessionId?: string
+  renewAiSession?: () => Promise<string | undefined>
   apiBaseUrl?: string
   allowedScopes?: string[]
 }
@@ -111,22 +112,34 @@ export function createDataCopilotTransport(
     },
 
     async sendMessage(input) {
-      const payload = await requestJson(
-        route(`/${encodeURIComponent(input.sessionId)}/messages`),
-        {
+      const path = route(`/${encodeURIComponent(input.sessionId)}/messages`)
+      const idempotencyKey = createIdempotencyKey('message')
+      const buildBody = (modelId: string) => JSON.stringify({
+        content: input.content,
+        aiSessionId: modelId,
+        workspaceMode: input.workspaceMode || 'ask',
+        ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+        attachmentIds: input.attachmentIds,
+        contextSourceIds: input.contextSourceIds,
+        ...publicWorkspaceBinding(input),
+        idempotencyKey,
+      })
+      let payload: unknown
+      try {
+        payload = await requestJson(path, {
           method: 'POST',
-          body: JSON.stringify({
-            content: input.content,
-            aiSessionId: input.modelId || options.aiSessionId || '',
-            workspaceMode: input.workspaceMode || 'ask',
-            ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
-            attachmentIds: input.attachmentIds,
-            contextSourceIds: input.contextSourceIds,
-            ...publicWorkspaceBinding(input),
-            idempotencyKey: createIdempotencyKey('message'),
-          }),
-        },
-      )
+          body: buildBody(input.modelId || options.aiSessionId || ''),
+        })
+      } catch (error) {
+        const typed = error as Error & { code?: string }
+        if (typed.code !== 'AI_SESSION_EXPIRED' || !options.renewAiSession) throw error
+        const renewedId = await options.renewAiSession()
+        if (!renewedId) throw error
+        payload = await requestJson(path, {
+          method: 'POST',
+          body: buildBody(renewedId),
+        })
+      }
       return mapSendResult(payload, input.sessionId)
     },
 

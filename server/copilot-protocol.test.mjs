@@ -163,10 +163,11 @@ test('model gateway normalizes chat-completion responses and request metadata', 
     },
     providers: { primary: { baseUrl: 'https://models.example/v1', apiKey: 'token' } },
   });
-  const result = await gateway.complete({ provider: 'primary', model: 'model-1', messages: [{ role: 'user', content: 'question' }] });
+  const result = await gateway.complete({ provider: 'primary', model: 'gpt-5.1-codex', messages: [{ role: 'user', content: 'question' }], reasoningEffort: 'high' });
   assert.equal(result.text, 'answer');
   assert.equal(request.url, 'https://models.example/v1/chat/completions');
-  assert.equal(request.body.model, 'model-1');
+  assert.equal(request.body.model, 'gpt-5.1-codex');
+  assert.equal(request.body.reasoning_effort, 'high');
   assert.equal(request.headers.Authorization, 'Bearer token');
 });
 

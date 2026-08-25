@@ -254,6 +254,41 @@ test('relay model discovery explains authentication failures without trying anot
   assert.deepEqual(calls, ['https://gateway.example/v1/models']);
 });
 
+test('browser Codex control provider selects a configured remote API and never selects Qwen', async () => {
+  const store = new AiSessionStore();
+  await store.create({
+    provider: 'qwen',
+    apiKey: 'qwen-secret',
+    baseUrl: 'https://qwen.example/v1',
+    model: 'qwen-plus',
+    wireApi: 'chat_completions',
+  });
+  assert.throws(
+    () => store.controlProvider('qwen'),
+    (error) => error.code === 'CODEX_CONTROL_API_REQUIRED',
+  );
+
+  await store.create({
+    provider: 'relay',
+    apiKey: 'relay-secret',
+    baseUrl: 'https://relay.example/v1',
+    model: 'gpt-5.6-sol',
+    wireApi: 'chat_completions',
+  });
+  const control = store.controlProvider('qwen');
+  assert.deepEqual(control, {
+    provider: 'relay',
+    apiKey: 'relay-secret',
+    baseUrl: 'https://relay.example/v1',
+    model: 'gpt-5.6-sol',
+    wireApi: 'chat_completions',
+  });
+  const status = store.controlProviderStatus('qwen');
+  assert.equal(status.configured, true);
+  assert.equal(status.provider, 'relay');
+  assert.equal('apiKey' in status, false);
+});
+
 test('AI session probe executes a real chat completion without exposing credentials', async () => {
   const calls = [];
   const store = new AiSessionStore({

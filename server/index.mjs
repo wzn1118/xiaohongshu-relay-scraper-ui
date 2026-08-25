@@ -43,6 +43,24 @@ import { createToolExecutionBroker } from './copilot/tool-execution-broker.mjs';
 import { createSubagentRuntime } from './copilot/subagent-runtime.mjs';
 import { createUnifiedToolRegistry } from './copilot/unified-tool-registry.mjs';
 import { createProjectWorkspaceService } from './copilot/project-workspace-service.mjs';
+import { createCodexDesktopService } from './codex-desktop-service.mjs';
+import { createCodexBrowserService } from './codex-browser-service.mjs';
+import { createCodexRuntimeCompatibility } from './codex-runtime-compatibility.mjs';
+import { loadCodexProtocolEvidence } from './codex-protocol-evidence.mjs';
+import { createCodexRelayService } from './codex-relay-service.mjs';
+import { createCodexHostCommandService } from './codex-host-command-service.mjs';
+import { createCodexHostRpcService } from './codex-host-rpc-service.mjs';
+import { createCodexNativeMirrorService } from './codex-native-mirror-service.mjs';
+import { createCodexNativeMirrorSourceService } from './codex-native-mirror-source-service.mjs';
+import { createCodexNativeMirrorInputChannel } from './codex-native-mirror-input-channel.mjs';
+import { createCodexNativeMirrorRelayChannel } from './codex-native-mirror-relay-channel.mjs';
+import { createCodexNativeInputService } from './codex-native-input-service.mjs';
+import { createCodexDeviceGatewayService } from './codex-device-gateway-service.mjs';
+import { createCodexProductService } from './codex-product-service.mjs';
+import { createCodexProductWorkspaceService } from './codex-product-workspace-service.mjs';
+import { createCodexModelBridgeService } from './codex-model-bridge-service.mjs';
+import { createCodexIceService } from './codex-ice-service.mjs';
+import { XhsContextService } from './xhs-context-service.mjs';
 import { createAuthStore } from './auth-store.mjs';
 
 const diagnostics = createDiagnostics({ filePath: config.diagnosticsPath });
@@ -271,7 +289,123 @@ const relaySupervisor = createRelaySupervisor({
   connectTimeoutMs: config.relayConnectTimeoutMs,
   playwrightTimeoutMs: config.relayPlaywrightTimeoutMs,
 });
-const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relaySupervisor, dataLifecycle, diagnostics, audienceAiService: audienceAi, dataCopilotService: dataCopilot, mcpAccessService: mcpAccess, authStore }));
+const codexDesktop = createCodexDesktopService({
+  runtimeRoot: config.codexDesktopRuntimeDir,
+  workspaceRoot: config.workspaceRoot,
+  userDataDirectory: config.codexDesktopUserDataDir,
+});
+const codexRuntimeCompatibility = createCodexRuntimeCompatibility({
+  runtimeRoot: config.codexDesktopRuntimeDir,
+  baselinePath: config.codexRuntimeBaselinePath,
+});
+const codexRuntimeStatus = await codexRuntimeCompatibility.inspect();
+if (!codexRuntimeStatus.ready) {
+  console.warn(`Codex browser runtime is not compatible: ${codexRuntimeStatus.errors.map((entry) => entry.code).join(', ') || 'unknown error'}`);
+}
+const codexProtocolEvidence = await loadCodexProtocolEvidence({ root: config.codexProtocolEvidenceRoot });
+if (codexProtocolEvidence.state !== 'ready') {
+  console.warn(`Codex protocol evidence is unavailable under ${config.codexProtocolEvidenceRoot}; capabilities remain unknown.`);
+}
+const xhsContext = new XhsContextService({
+  rootDir: path.join(copilotRoot, 'xhs-context'),
+});
+const codexProductWorkspace = createCodexProductWorkspaceService({
+  manager,
+  workspaceRoot: config.workspaceRoot,
+  productName: '小红书 Relay Scraper 产品源码',
+});
+const codexProduct = createCodexProductService({
+  manager,
+  xhsContextService: xhsContext,
+  workspaceService: codexProductWorkspace,
+  profileStore,
+  token: xhsContext.localToken,
+});
+const codexModelBridge = createCodexModelBridgeService({ aiSessions });
+const codexControlApi = aiSessions.controlProviderStatus();
+const codexBrowser = createCodexBrowserService({
+  executablePath: path.join(config.codexDesktopRuntimeDir, 'app', 'resources', 'codex.exe'),
+  workspaceRoot: config.workspaceRoot,
+  sqliteHome: config.codexBrowserSqliteHome,
+  protocolEvidence: codexProtocolEvidence,
+  modelProvider: codexControlApi.configured ? {
+    id: 'xhs_product_api',
+    name: 'Xiaohongshu Product API',
+    baseUrl: `http://127.0.0.1:${Number(config.port) || 4317}/api/codex-model/v1`,
+    model: codexControlApi.model,
+    apiKey: codexModelBridge.token,
+    apiKeyEnvVar: 'XHS_CODEX_MODEL_BRIDGE_TOKEN',
+  } : null,
+  dynamicToolHandler: async ({ server, tool, arguments: args }) => {
+    if (server === 'codex-product') return { handled: true, value: await codexProduct.callTool(tool, args) };
+    if (server === 'xhs-context') return { handled: true, value: await xhsContext.callTool(tool, args) };
+    return { handled: false };
+  },
+  contextMcps: [
+    {
+      name: 'xhs-context',
+      url: `http://127.0.0.1:${Number(config.port) || 4317}/api/xhs-context/mcp`,
+      token: xhsContext.localToken,
+      bearerTokenEnvVar: 'XHS_CONTEXT_TOKEN',
+    },
+    {
+      name: 'codex-product',
+      url: `http://127.0.0.1:${Number(config.port) || 4317}/api/codex-product/mcp`,
+      token: xhsContext.localToken,
+      bearerTokenEnvVar: 'CODEX_PRODUCT_TOKEN',
+    },
+  ],
+});
+const codexIce = createCodexIceService({
+  staticIceServers: config.codexMirrorIceServers,
+  turnUrls: config.codexTurnUrls,
+  turnSharedSecret: config.codexTurnSharedSecret,
+  credentialTtlSeconds: config.codexTurnCredentialTtlSeconds,
+});
+const codexDeviceGateway = createCodexDeviceGatewayService({
+  statePath: config.codexDeviceGatewayStatePath,
+  auditPath: config.codexDeviceGatewayAuditPath,
+  heartbeatSeconds: config.codexDeviceGatewayHeartbeatSeconds,
+});
+await codexDeviceGateway.initialize();
+const codexNativeInput = createCodexNativeInputService();
+const codexNativeMirrorSource = createCodexNativeMirrorSourceService();
+const codexNativeMirror = createCodexNativeMirrorService({
+  iceService: codexIce,
+  inputService: codexNativeInput,
+  remoteInputService: codexDeviceGateway,
+  localSourceService: codexNativeMirrorSource,
+});
+const codexNativeMirrorInputChannel = createCodexNativeMirrorInputChannel({
+  mirrorService: codexNativeMirror,
+});
+const codexNativeMirrorRelayChannel = createCodexNativeMirrorRelayChannel({
+  mirrorService: codexNativeMirror,
+});
+const codexRelay = createCodexRelayService({
+  codexDesktopService: codexDesktop,
+  codexBrowserService: codexBrowser,
+  nativeMirrorService: codexNativeMirror,
+  deviceGatewayService: codexDeviceGateway,
+  iceService: codexIce,
+  workspaceRoot: config.workspaceRoot,
+});
+const codexHostCommands = createCodexHostCommandService({
+  config,
+  codexBrowserService: codexBrowser,
+  relayService: codexRelay,
+  workspaceService: codexProductWorkspace,
+});
+const codexHostRpc = createCodexHostRpcService({
+  relayService: codexRelay,
+  commandService: codexHostCommands,
+  allowedOrigin: config.authOrigin,
+});
+const server = http.createServer(createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relaySupervisor, dataLifecycle, diagnostics, audienceAiService: audienceAi, dataCopilotService: dataCopilot, codexDesktopService: codexDesktop, codexBrowserService: codexBrowser, codexProductService: codexProduct, codexProductWorkspaceService: codexProductWorkspace, codexModelBridgeService: codexModelBridge, codexRelayService: codexRelay, codexHostCommandService: codexHostCommands, codexHostRpcService: codexHostRpc, codexRuntimeCompatibility, codexNativeMirrorService: codexNativeMirror, codexDeviceGatewayService: codexDeviceGateway, xhsContextService: xhsContext, mcpAccessService: mcpAccess, authStore }));
+codexDeviceGateway.attachServer(server);
+codexNativeMirrorInputChannel.attachServer(server);
+codexNativeMirrorRelayChannel.attachServer(server);
+codexHostRpc.attachServer(server);
 const mcpServer = config.mcpEnabled ? http.createServer(mcpGateway.handler) : null;
 mcpServer?.listen(config.mcpPort, config.mcpHost, () => {
   diagnostics.record('mcp_server_started', { status: 'ready', host: config.mcpHost, port: config.mcpPort });
@@ -280,12 +414,18 @@ mcpServer?.listen(config.mcpPort, config.mcpHost, () => {
 server.listen(config.port, config.host, () => {
   diagnostics.record('server_started', { status: 'ready' });
   console.log(`Xiaohongshu relay scraper API listening at http://${config.host}:${config.port}`);
+  void codexBrowser.start().catch((error) => {
+    diagnostics.record('codex_browser_warmup_failed', {
+      status: 'degraded',
+      error: String(error?.message || error),
+    });
+    console.error(`Codex browser warmup failed: ${error?.message || error}`);
+  });
   relaySupervisor.start();
   void dataLifecycle.cleanupExpired({ dryRun: false }).catch((error) => {
     console.error(`Retention cleanup failed: ${error?.message || error}`);
   });
 });
-
 const retentionTimer = setInterval(() => {
   void dataLifecycle.cleanupExpired({ dryRun: false }).catch((error) => {
     console.error(`Retention cleanup failed: ${error?.message || error}`);
@@ -307,17 +447,32 @@ async function shutdown(signal) {
   relaySupervisor.stop();
   try {
     const shutdownErrors = [];
-    try { await copilotMcpClients.close(); } catch (error) { shutdownErrors.push(error); }
-    try { await mcpGateway.close(); } catch (error) { shutdownErrors.push(error); }
-    try { await audienceAi.close(); } catch (error) { shutdownErrors.push(error); }
-    try { await manager.shutdown(); } catch (error) { shutdownErrors.push(error); }
-    try { await copilotSubagents.close(); } catch (error) { shutdownErrors.push(error); }
-    try { await dataCopilot.close(); } catch (error) { shutdownErrors.push(error); }
-    try { await copilotExecutionWorker.close({ timeoutMs: 8_000 }); } catch (error) { shutdownErrors.push(error); }
-    try { await copilotToolBroker.close({ timeoutMs: 8_000 }); } catch (error) { shutdownErrors.push(error); }
-    try { copilotExecutionHandlers.close(); } catch (error) { shutdownErrors.push(error); }
-    try { copilotExecutionDispatcher.close(); } catch (error) { shutdownErrors.push(error); }
-    try { copilotProductionStore.close(); } catch (error) { shutdownErrors.push(error); }
+    const closeComponent = async (name, close) => {
+      try {
+        await close();
+      } catch (error) {
+        shutdownErrors.push(new Error(`${name}: ${error?.message || error}`, { cause: error }));
+      }
+    };
+    await closeComponent('codexNativeMirrorInputChannel', () => codexNativeMirrorInputChannel.close());
+    await closeComponent('codexNativeMirrorRelayChannel', () => codexNativeMirrorRelayChannel.close());
+    await closeComponent('codexHostRpc', () => codexHostRpc.close());
+    await closeComponent('copilotMcpClients', () => copilotMcpClients.close());
+    await closeComponent('mcpGateway', () => mcpGateway.close());
+    await closeComponent('audienceAi', () => audienceAi.close());
+    await closeComponent('manager', () => manager.shutdown());
+    await closeComponent('copilotSubagents', () => copilotSubagents.close());
+    await closeComponent('dataCopilot', () => dataCopilot.close());
+    await closeComponent('xhsContext', () => xhsContext.close());
+    await closeComponent('codexBrowser', () => codexBrowser.close());
+    await closeComponent('codexNativeMirror', () => codexNativeMirror.close());
+    await closeComponent('codexNativeInput', () => codexNativeInput.close());
+    await closeComponent('codexDeviceGateway', () => codexDeviceGateway.close());
+    await closeComponent('copilotExecutionWorker', () => copilotExecutionWorker.close({ timeoutMs: 8_000 }));
+    await closeComponent('copilotToolBroker', () => copilotToolBroker.close({ timeoutMs: 8_000 }));
+    await closeComponent('copilotExecutionHandlers', () => copilotExecutionHandlers.close());
+    await closeComponent('copilotExecutionDispatcher', () => copilotExecutionDispatcher.close());
+    await closeComponent('copilotProductionStore', () => copilotProductionStore.close());
     await diagnostics.flush();
     if (shutdownErrors.length) throw shutdownErrors[0];
     clearTimeout(forcedExit);

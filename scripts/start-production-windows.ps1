@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$EnvFile = '',
+    [string]$TurnEnvFile = '',
     [string]$Hostname = 'relay.hegelsalon.com',
     [string]$McpHostname = 'mcp.hegelsalon.com',
     [string]$TunnelName = 'hegelsalon-relay',
@@ -43,6 +44,71 @@ function Import-ProductionEnv {
     $existing = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
     if ($existing) { Import-HegelSalonDotEnv -Path @($existing) -Override }
     return $existing
+}
+
+function Import-ProductionTurnEnv {
+    param([string]$Path)
+    $candidates = @()
+    if ($Path) { $candidates += Get-AbsoluteInputPath $Path }
+    $candidates += Join-Path $root '.runtime\codex-turn\product-turn.env'
+    $existing = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if ($Path -and -not $existing) {
+        throw "TURN environment file is missing: $(Get-AbsoluteInputPath $Path)"
+    }
+    if ($existing) { Import-HegelSalonDotEnv -Path @($existing) -Override }
+    return $existing
+}
+
+function Assert-ProductionTurnConfiguration {
+    $turnUrlsRaw = [string]$env:XHS_CODEX_TURN_URLS_JSON
+    $sharedSecret = [string]$env:XHS_CODEX_TURN_SHARED_SECRET
+    $hasTurnUrlsValue = -not [string]::IsNullOrWhiteSpace($turnUrlsRaw)
+    $hasSharedSecret = -not [string]::IsNullOrWhiteSpace($sharedSecret)
+
+    if (-not $hasTurnUrlsValue -and -not $hasSharedSecret) {
+        return $false
+    }
+    if (-not $hasTurnUrlsValue -or -not $hasSharedSecret) {
+        throw 'TURN configuration is incomplete. XHS_CODEX_TURN_URLS_JSON and XHS_CODEX_TURN_SHARED_SECRET must be configured together.'
+    }
+
+    try {
+        $turnUrls = $turnUrlsRaw | ConvertFrom-Json
+    } catch {
+        throw "XHS_CODEX_TURN_URLS_JSON must be a valid JSON array: $($_.Exception.Message)"
+    }
+    if ($turnUrls -isnot [array] -or $turnUrls.Count -lt 1 -or $turnUrls.Count -gt 8) {
+        throw 'XHS_CODEX_TURN_URLS_JSON must contain from one to eight TURN URLs.'
+    }
+    foreach ($turnUrl in $turnUrls) {
+        if ($turnUrl -isnot [string] -or [string]::IsNullOrWhiteSpace($turnUrl) -or $turnUrl.Length -gt 2048 -or $turnUrl -notmatch '^(?i:turns?):') {
+            throw 'XHS_CODEX_TURN_URLS_JSON contains an invalid TURN URL.'
+        }
+    }
+    if ($sharedSecret.Length -lt 32 -or $sharedSecret.Length -gt 256 -or $sharedSecret -match '[\r\n]') {
+        throw 'XHS_CODEX_TURN_SHARED_SECRET must contain 32 to 256 characters without line breaks.'
+    }
+
+    $staticIceRaw = [string]$env:XHS_CODEX_MIRROR_ICE_SERVERS_JSON
+    if (-not [string]::IsNullOrWhiteSpace($staticIceRaw)) {
+        try {
+            $staticIce = $staticIceRaw | ConvertFrom-Json
+        } catch {
+            throw "XHS_CODEX_MIRROR_ICE_SERVERS_JSON must be a valid JSON array: $($_.Exception.Message)"
+        }
+        if ($staticIce -isnot [array] -or $staticIce.Count -gt 8) {
+            throw 'XHS_CODEX_MIRROR_ICE_SERVERS_JSON must contain at most eight entries.'
+        }
+    }
+
+    $ttlRaw = [string]$env:XHS_CODEX_TURN_CREDENTIAL_TTL_SECONDS
+    if (-not [string]::IsNullOrWhiteSpace($ttlRaw)) {
+        $ttl = 0
+        if (-not [int]::TryParse($ttlRaw, [ref]$ttl) -or $ttl -lt 60 -or $ttl -gt 3600) {
+            throw 'XHS_CODEX_TURN_CREDENTIAL_TTL_SECONDS must be an integer from 60 to 3600.'
+        }
+    }
+    return $true
 }
 
 function Get-ExecutablePath {
@@ -190,7 +256,10 @@ function Start-Origin {
     try {
         $process = Start-Process -FilePath (Get-ExecutablePath $node) -ArgumentList @('server/index.mjs') -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
         Set-Content -LiteralPath (Get-HegelSalonPidFile $Environment.RuntimeRoot) -Value ([string]$process.Id) -Encoding ASCII
-        for ($attempt = 0; $attempt -lt 120; $attempt++) {
+        # A release can contain a large persisted job history. Recovery and
+        # checkpoint projection must finish before health is declared, but the
+        # launcher should allow that bounded work to complete.
+        for ($attempt = 0; $attempt -lt 600; $attempt++) {
             if ($process.HasExited) {
                 $details = if (Test-Path -LiteralPath $stderr) { (Get-Content -LiteralPath $stderr -Tail 40) -join [Environment]::NewLine } else { '' }
                 throw "Origin exited with code $($process.ExitCode). $details"
@@ -198,7 +267,7 @@ function Start-Origin {
             if ((Invoke-HegelSalonHealth -Port $Environment.Port) -and (Invoke-HegelSalonMcpHealth -Port $Environment.McpPort)) { return $process }
             Start-Sleep -Milliseconds 500
         }
-        throw "Origin or MCP did not become healthy within 60 seconds on ports $($Environment.Port)/$($Environment.McpPort)."
+        throw "Origin or MCP did not become healthy within 300 seconds on ports $($Environment.Port)/$($Environment.McpPort)."
     } catch {
         if ($process -and (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
@@ -351,6 +420,8 @@ function Stop-StartedProcesses {
 
 try {
     $loadedEnv = Import-ProductionEnv -Path $EnvFile
+    $loadedTurnEnv = Import-ProductionTurnEnv -Path $TurnEnvFile
+    $turnConfigured = Assert-ProductionTurnConfiguration
     Enable-BundledRuntime
     Initialize-HegelSalonProxyEnvironment
     $safeHost = Test-HegelSalonHostname $Hostname
@@ -369,7 +440,7 @@ try {
     if ($CheckOnly) {
         $defaultToken = Join-Path $env:USERPROFILE '.cloudflared\hegelsalon-relay.token'
         $configuredToken = if ($TunnelTokenFile) { Get-AbsoluteInputPath $TunnelTokenFile } elseif ($env:CLOUDFLARE_TUNNEL_TOKEN_FILE) { Get-AbsoluteInputPath $env:CLOUDFLARE_TUNNEL_TOKEN_FILE } else { $defaultToken }
-        [ordered]@{ ready = $true; origin = $environment.Origin; mcpOrigin = $environment.McpOrigin; publicOrigin = $environment.PublicOrigin; mcpPublicOrigin = $environment.McpPublicOrigin; hostname = $environment.Hostname; mcpHostname = $environment.McpPublicHostname; port = $environment.Port; mcpPort = $environment.McpPort; node = (Get-ExecutablePath $node); python = (Get-ExecutablePath $python); cloudflared = (Get-ExecutablePath $cloudflared); browser = if ($SkipBrowserRelayCheck) { $null } else { Get-ProductionBrowserPath }; browserRelaySkipped = [bool]$SkipBrowserRelayCheck; tunnelTokenReady = (Test-Path -LiteralPath $configuredToken -PathType Leaf); envFile = $loadedEnv } | ConvertTo-Json -Depth 4
+        [ordered]@{ ready = $true; origin = $environment.Origin; mcpOrigin = $environment.McpOrigin; publicOrigin = $environment.PublicOrigin; mcpPublicOrigin = $environment.McpPublicOrigin; hostname = $environment.Hostname; mcpHostname = $environment.McpPublicHostname; port = $environment.Port; mcpPort = $environment.McpPort; node = (Get-ExecutablePath $node); python = (Get-ExecutablePath $python); cloudflared = (Get-ExecutablePath $cloudflared); browser = if ($SkipBrowserRelayCheck) { $null } else { Get-ProductionBrowserPath }; browserRelaySkipped = [bool]$SkipBrowserRelayCheck; tunnelTokenReady = (Test-Path -LiteralPath $configuredToken -PathType Leaf); envFile = $loadedEnv; turnEnvFile = $loadedTurnEnv; turnConfigured = [bool]$turnConfigured } | ConvertTo-Json -Depth 4
         exit 0
     }
     $tokenPath = Resolve-TunnelTokenPath -RequestedPath $TunnelTokenFile
@@ -393,7 +464,7 @@ try {
     }
     $null = Wait-HttpHealth -Url "$($environment.PublicOrigin)/api/health" -TimeoutSeconds 90
     $null = Wait-McpHealth -Url "$($environment.McpPublicOrigin)/health" -TimeoutSeconds 90
-    $state = [ordered]@{ startedAt = (Get-Date).ToUniversalTime().ToString('o'); root = $root; hostname = $safeHost; publicUrl = $environment.PublicOrigin; origin = $environment.Origin; port = $environment.Port; mcpHostname = $safeMcpHost; mcpPublicUrl = $environment.McpPublicOrigin; mcpOrigin = $environment.McpOrigin; mcpPort = $environment.McpPort; serverPid = $serverProcess.Id; serverExecutable = (Get-ExecutablePath $node); relayPort = [int]$relayStatus.port; relayProfile = [string]$relayStatus.profile; relayReady = [bool]($relayStatus.running -and $relayStatus.cdpReady -and [int]$relayStatus.xiaohongshuTabs -ge 1); browserRelaySkipped = [bool]$SkipBrowserRelayCheck; tunnelPid = if ($tunnelProcess) { $tunnelProcess.Id } else { $null }; tunnelExecutable = if ($tunnelProcess) { Get-ExecutablePath $cloudflared } else { $null }; tunnelName = $TunnelName; tunnelMode = if ($tunnelProcess) { 'owned-token' } else { 'existing-managed-tunnel' }; metrics = if ($env:CLOUDFLARE_METRICS) { $env:CLOUDFLARE_METRICS } else { '127.0.0.1:20242' } }
+    $state = [ordered]@{ startedAt = (Get-Date).ToUniversalTime().ToString('o'); root = $root; hostname = $safeHost; publicUrl = $environment.PublicOrigin; origin = $environment.Origin; port = $environment.Port; mcpHostname = $safeMcpHost; mcpPublicUrl = $environment.McpPublicOrigin; mcpOrigin = $environment.McpOrigin; mcpPort = $environment.McpPort; serverPid = $serverProcess.Id; serverExecutable = (Get-ExecutablePath $node); relayPort = [int]$relayStatus.port; relayProfile = [string]$relayStatus.profile; relayReady = [bool]($relayStatus.running -and $relayStatus.cdpReady -and [int]$relayStatus.xiaohongshuTabs -ge 1); browserRelaySkipped = [bool]$SkipBrowserRelayCheck; turnConfigured = [bool]$turnConfigured; turnEnvFile = $loadedTurnEnv; tunnelPid = if ($tunnelProcess) { $tunnelProcess.Id } else { $null }; tunnelExecutable = if ($tunnelProcess) { Get-ExecutablePath $cloudflared } else { $null }; tunnelName = $TunnelName; tunnelMode = if ($tunnelProcess) { 'owned-token' } else { 'existing-managed-tunnel' }; metrics = if ($env:CLOUDFLARE_METRICS) { $env:CLOUDFLARE_METRICS } else { '127.0.0.1:20242' } }
     $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'production-state.json') -Encoding UTF8
     if (-not $SkipStartupRegistration) {
         $registrationParameters = @{
@@ -404,6 +475,7 @@ try {
             SkipInitialRun = $true
         }
         if ($loadedEnv) { $registrationParameters.EnvFile = $loadedEnv }
+        if ($loadedTurnEnv) { $registrationParameters.TurnEnvFile = $loadedTurnEnv }
         if ($tokenPath) { $registrationParameters.TunnelTokenFile = $tokenPath }
         if ($UseExistingTunnel) { $registrationParameters.UseExistingTunnel = $true }
         if ($SkipBrowserRelayCheck) { $registrationParameters.SkipBrowserRelayCheck = $true }
@@ -414,6 +486,7 @@ try {
     Write-Host "Local origin: $($environment.Origin)"
     Write-Host "Local MCP: $($environment.McpOrigin)/mcp"
     Write-Host "Public MCP: $($environment.McpPublicOrigin)/mcp"
+    Write-Host "TURN relay configured: $([bool]$turnConfigured)"
     Write-Host "State: $(Join-Path $runtimeRoot 'production-state.json')"
 } catch {
     Stop-StartedProcesses

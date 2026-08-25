@@ -231,6 +231,57 @@ export class AiSessionStore {
     return { ...session };
   }
 
+  controlProvider(preferredProvider = '') {
+    const preferred = String(preferredProvider || '').trim().toLowerCase();
+    const candidates = [...new Set([
+      preferred,
+      'relay',
+      'openai',
+      'codex',
+      'custom',
+      'deepseek',
+    ].filter(Boolean))];
+    for (const provider of candidates) {
+      if (provider === 'local_qwen' || provider === 'qwen') continue;
+      const definition = this.definitions[provider];
+      const saved = this.configurations.get(provider);
+      if (!definition || !saved?.apiKey || !saved?.baseUrl || !saved?.model) continue;
+      return {
+        provider,
+        apiKey: saved.apiKey,
+        baseUrl: saved.baseUrl,
+        model: saved.model,
+        wireApi: saved.wireApi || definition.wireApi,
+      };
+    }
+    const error = new Error('Configure a remote API provider before starting a browser Codex task.');
+    error.code = 'CODEX_CONTROL_API_REQUIRED';
+    error.status = 503;
+    throw error;
+  }
+
+  controlProviderStatus(preferredProvider = '') {
+    try {
+      const provider = this.controlProvider(preferredProvider);
+      return {
+        configured: true,
+        provider: provider.provider,
+        baseUrl: provider.baseUrl,
+        model: provider.model,
+        wireApi: provider.wireApi,
+      };
+    } catch (error) {
+      return {
+        configured: false,
+        provider: null,
+        baseUrl: null,
+        model: null,
+        wireApi: null,
+        code: error?.code || 'CODEX_CONTROL_API_REQUIRED',
+      };
+    }
+  }
+
   async probe(id) {
     const session = this.resolve(id);
     if (typeof this.fetchImpl !== 'function') throw probeFailure('AI inference is unavailable in this runtime.');

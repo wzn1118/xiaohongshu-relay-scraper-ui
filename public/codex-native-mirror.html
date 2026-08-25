@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Codex Native Mirror</title>
+    <link rel="stylesheet" href="/codex-native-mirror.css?v=20260819-relay-1" />
+  </head>
+  <body>
+    <main class="mirror-shell">
+      <header class="mirror-toolbar">
+        <div class="mirror-brand">
+          <span class="mirror-mark" aria-hidden="true">C</span>
+          <strong>Codex Native Mirror</strong>
+          <span id="role-label">Interactive viewer</span>
+        </div>
+        <div class="mirror-metrics" aria-label="Mirror performance">
+          <span id="path-metric">Path --</span>
+          <span id="rtt-metric">RTT --</span>
+          <span id="input-metric">Input --</span>
+          <span id="fps-metric">FPS --</span>
+        </div>
+        <div class="mirror-state" role="status" aria-live="polite">
+          <span id="state-dot"></span>
+          <span id="state-label">Connecting</span>
+        </div>
+        <div class="mirror-actions">
+          <button id="launch-codex" type="button" hidden>Launch Codex</button>
+          <button id="select-window" type="button" hidden>Select window</button>
+          <button id="toggle-control" type="button" hidden>Enable control</button>
+          <button id="fullscreen" type="button">Fullscreen</button>
+          <button id="stop" type="button">Stop</button>
+        </div>
+      </header>
+      <section class="mirror-stage">
+        <video id="mirror-video" tabindex="0" autoplay playsinline muted></video>
+        <canvas id="mirror-relay-canvas" tabindex="0" aria-label="Codex Mirror relay video"></canvas>
+        <div id="empty-state" class="mirror-empty">
+          <span class="mirror-empty-mark" aria-hidden="true">C</span>
+          <strong id="empty-title">Waiting for selected window</strong>
+          <small id="empty-detail">Select a Codex window to start the interactive mirror. If capture is unavailable, input-only control targets the Codex desktop window.</small>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/codex-native-mirror.js?v=20260819-relay-1"></script>
+  </body>
+</html>

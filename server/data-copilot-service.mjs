@@ -2430,11 +2430,18 @@ export class DataCopilotService {
       throw serviceError('COPILOT_AI_SESSION_UNAVAILABLE', 'The selected model session is unavailable.', 503);
     }
     const session = this.aiSessions.resolve(sessionId);
+    if (String(session.provider || '').trim().toLowerCase() === 'local_qwen') {
+      throw serviceError(
+        'COPILOT_REMOTE_API_REQUIRED',
+        'Crawler control requires a configured remote API model; the local Qwen runtime is not used for control.',
+        409,
+      );
+    }
     const resolved = normalizeSelectedModel(session);
     return {
       ...resolved,
       aiSessionId: sessionId,
-      ...(resolved.wireApi === 'responses' && preference.reasoningEffort
+      ...(sessionSupportsReasoningEffort(session, resolved) && preference.reasoningEffort
         ? { reasoningEffort: preference.reasoningEffort }
         : {}),
     };
@@ -3129,6 +3136,17 @@ function normalizeSelectedModel(value) {
   const reasoningEffort = normalizeReasoningEffort(value.reasoningEffort);
   if (reasoningEffort) result.reasoningEffort = reasoningEffort;
   return result;
+}
+
+function sessionSupportsReasoningEffort(session, selectedModel) {
+  const capabilities = session?.capabilities && typeof session.capabilities === 'object'
+    ? session.capabilities
+    : {};
+  if (capabilities.reasoningEffort === false) return false;
+  if (capabilities.reasoningEffort === true) return true;
+  if (selectedModel?.wireApi === 'responses') return true;
+  return selectedModel?.wireApi === 'chat_completions'
+    && /^(?:gpt-5(?:[.-]|$)|o[134](?:[.-]|$)|codex(?:[.-]|$))/iu.test(String(selectedModel?.model || ''));
 }
 
 function normalizeTitle(value, job) {

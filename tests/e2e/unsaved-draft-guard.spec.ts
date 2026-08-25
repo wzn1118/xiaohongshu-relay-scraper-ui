@@ -251,6 +251,7 @@ type ApiState = {
   qualityFails: boolean
   qualityPayloads: QualityRequest[]
   createdJobs: number
+  createdJobPayloads: Array<Record<string, unknown>>
   resumeRequests: number
   emailConfigured: boolean
   previewRequests: number
@@ -307,6 +308,7 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     qualityFails: false,
     qualityPayloads: [],
     createdJobs: 0,
+    createdJobPayloads: [],
     resumeRequests: 0,
     emailConfigured: false,
     previewRequests: 0,
@@ -343,6 +345,7 @@ async function mockApi(page: Page, overrides: Partial<ApiState> = {}) {
     if (path === '/api/jobs' && method === 'GET') return fulfillJson(route, jobs)
     if (path === '/api/jobs' && method === 'POST') {
       state.createdJobs += 1
+      state.createdJobPayloads.push(request.postDataJSON() as Record<string, unknown>)
       return fulfillJson(route, job('job-new', '新任务'))
     }
     if (path === '/api/relay/config') return fulfillJson(route, { port: 18800, profile: 'openclaw', autoConnect: true })
@@ -634,6 +637,49 @@ async function dirtyGreeting(page: Page, suffix = ' 本地修改') {
   await page.getByLabel('私信文案').fill(`${baseDraft.greeting}${suffix}`)
   await expect(page.getByRole('button', { name: '保存修改' })).toBeEnabled()
 }
+
+test('岗位任务可选择通过 API 生成求职信，并提交当前 API 会话', async ({ page }) => {
+  const state = await mockApi(page)
+  await expect.poll(() => state.aiSessionRequests).toBe(1)
+
+  await page.getByRole('button', { name: '新建' }).click()
+  const apiGeneration = page.getByRole('button', { name: '使用 API 生成' })
+  await expect(apiGeneration).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByText(/将通过当前 API（Codex · test-model）为匹配岗位生成并校验求职信/)).toBeVisible()
+
+  await page.getByPlaceholder('输入小红书搜索关键词').fill('AI 产品经理实习')
+  await page.getByRole('button', { name: '开始采集并生成求职信' }).click()
+  await expect.poll(() => state.createdJobs).toBe(1)
+  expect(state.createdJobPayloads).toHaveLength(1)
+  expect(state.createdJobPayloads[0]).toMatchObject({
+    analysisMode: 'job',
+    keyword: 'AI 产品经理实习',
+    useCodexRuntime: true,
+    aiSessionId: 'session-1',
+  })
+})
+
+test('岗位任务可选择仅采集，不向任务提交 AI 会话', async ({ page }) => {
+  const state = await mockApi(page)
+  await expect.poll(() => state.aiSessionRequests).toBe(1)
+
+  await page.getByRole('button', { name: '新建' }).click()
+  const collectionOnly = page.getByRole('button', { name: '仅采集岗位' })
+  await collectionOnly.click()
+  await expect(collectionOnly).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByText('本次不会请求 AI API，只采集并结构化岗位信息；任务完成后可在岗位详情中选择 API 重写求职信。')).toBeVisible()
+
+  await page.getByPlaceholder('输入小红书搜索关键词').fill('AI 产品经理实习')
+  await page.getByRole('button', { name: '开始采集岗位' }).click()
+  await expect.poll(() => state.createdJobs).toBe(1)
+  expect(state.createdJobPayloads).toHaveLength(1)
+  expect(state.createdJobPayloads[0]).toMatchObject({
+    analysisMode: 'job',
+    keyword: 'AI 产品经理实习',
+    useCodexRuntime: false,
+    aiSessionId: null,
+  })
+})
 
 test('脏稿在常用切换前默认保存并继续，正常流程不弹窗', async ({ page }) => {
   const state = await mockApi(page)

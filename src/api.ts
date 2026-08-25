@@ -26,6 +26,308 @@ export type JobExperienceActionResponse = {
   snapshot: WorkflowSnapshotV3 | null
 }
 
+export type CodexDesktopComponentStatus = {
+  ready: boolean
+  missing: string[]
+  executableReady?: boolean
+}
+
+export type CodexDesktopStatus = {
+  schemaVersion: 1
+  ready: boolean
+  supported: boolean
+  version: string
+  buildNumber: string
+  sourceAsarSha256: string
+  runtimeRoot: string
+  workspaceRoot: string
+  executablePath: string
+  provisionedAt: string | null
+  fileCount: number
+  totalBytes: number
+  components: {
+    frontend: CodexDesktopComponentStatus
+    host: CodexDesktopComponentStatus
+    backend: CodexDesktopComponentStatus
+  }
+  lastLaunch: {
+    pid: number | null
+    launchedAt: string
+    workspaceRoot: string
+  } | null
+}
+
+export type CodexDesktopLaunch = {
+  launched: true
+  mode: 'native'
+  version: string
+  buildNumber: string
+  runtimeRoot: string
+  executablePath: string
+  pid: number | null
+  launchedAt: string
+  workspaceRoot: string
+}
+
+export type CodexRelayStatus = {
+  schemaVersion: 1
+  relayVersion: string
+  transport: 'loopback-http'
+  inboundPublicPort: false
+  device: {
+    id: string
+    name: string
+    paired: boolean
+    pairedAt: string | null
+    lastSeenAt: string | null
+    transport: string
+    online: boolean
+    role: 'controller' | 'viewer'
+    capabilities: string[]
+    relayVersion: string
+    codexBuild: string
+    codex: { running: boolean; windowId: string }
+  }
+  adapter: {
+    contractVersion: string
+    state: 'compatible' | 'unavailable'
+    codexVersion: string
+    buildNumber: string
+    runtimeReady: boolean
+    browserAvailable: boolean
+  }
+  modes: {
+    semantic: { available: boolean; eventProtocol: string; activeSessions: number }
+    nativeMirror: {
+      available: boolean
+      state: string
+      reason?: string
+      transport?: string
+      capture?: string
+      selectedWindowOnly?: boolean
+      viewOnly?: boolean
+      inputEnabled?: boolean
+      input?: {
+        available?: boolean
+        transport?: string
+        state?: string
+        bridgeReady?: boolean
+        activeTargets?: number
+        pending?: number
+        metrics?: {
+          events?: number
+          bestEffortMoves?: number
+          acknowledged?: number
+          failed?: number
+          timeouts?: number
+          lastLatencyMs?: number | null
+          p50Ms?: number | null
+          p95Ms?: number | null
+          lastError?: string
+        }
+      }
+      clipboardEnabled?: boolean
+      activeSessions?: number
+    }
+  }
+  gateway: {
+    transport: string
+    pairedDevices: number
+    onlineDevices: number
+    activeConnections?: number
+    pendingPairingIntents?: number
+  }
+  ice: {
+    configuredServers: number
+    turnConfigured: boolean
+    crossNetworkReady?: boolean
+    connectivityMode?: 'direct-only' | 'direct-with-stun' | 'direct-with-relay-fallback'
+    turnCredentialMode: string
+    credentialTtlSeconds?: number
+  }
+}
+
+export type CodexRelayDevice = CodexRelayStatus['device']
+
+export type CodexPairingIntent = {
+  pairingIntent: {
+    id: string
+    code: string
+    expiresAt: string
+    requestedRole: 'controller' | 'viewer'
+    deviceName: string
+  }
+  gateway: {
+    websocketUrl: string
+    claimUrl: string
+  }
+}
+
+export type CodexConnectIntent = {
+  intent: {
+    id: string
+    state: 'waiting_for_connector' | 'paired' | 'connected' | 'expired'
+    expiresAt: string
+    requestedRole: 'controller' | 'viewer' | string
+    deviceName?: string
+    deviceId?: string
+    claimedAt?: string
+  }
+  launchUrl: string
+  connector: {
+    protocol: string
+    version: string
+  }
+  manifestUrl: string
+  installerUrl: string
+  statusUrl: string
+}
+
+export type CodexConnectIntentStatus = {
+  intent: CodexConnectIntent['intent']
+}
+
+export type CodexNativeMirrorSession = {
+  session: {
+    id: string
+    deviceId: string
+    createdAt: string
+    expiresAt: string
+    mode: 'nativeMirror'
+    remote?: boolean
+    state: 'waiting' | 'connected' | 'error'
+  sourceConnected: boolean
+  viewerConnected: boolean
+  peerConnected?: boolean
+  controlConnected?: boolean
+  connectionPath?: 'direct' | 'relay' | 'unknown'
+  connectionError?: string | null
+  transportDetails?: {
+    source: { localCandidateType: string; remoteCandidateType: string; protocol: string; relayUsed: boolean } | null
+    viewer: { localCandidateType: string; remoteCandidateType: string; protocol: string; relayUsed: boolean } | null
+  }
+  viewOnly: boolean
+  inputEnabled?: boolean
+  inputMode?: 'capture' | 'input-only' | null
+  inputTarget?: { label: string; width: number; height: number; updatedAt: string; delivery?: 'sendinput' | 'window-message' } | null
+  sourceLaunch?: { state: string; requestedAt?: string; updatedAt?: string; launchedAt?: string; message?: string; pid?: number | null; captureTitle?: string } | null
+  }
+  source: { role: 'source'; token: string }
+  viewer: { role: 'viewer'; token: string }
+  rtcConfiguration: { iceServers: Array<Record<string, unknown>> }
+}
+
+export type CodexRelayShareInvite = {
+  session: { id: string; mode: 'semantic'; deviceId: string }
+  invite: { sessionId: string; ticket: string; browserInstanceId: string; expiresAt: string; singleUse: true }
+  shareUrl: string
+}
+
+export type CodexProductWorkspaceProject = {
+  id: string
+  kind: 'source' | 'job-history' | string
+  name: string
+  description: string
+  createdAt: number
+  updatedAt: number
+  metadata: Record<string, unknown>
+}
+
+export type CodexProductWorkspaceSnapshot = {
+  schemaVersion: 1
+  source: CodexProductWorkspaceProject | null
+  history: CodexProductWorkspaceProject[]
+  activeJobId: string | null
+  generatedAt: string
+}
+
+export type CodexProductIntegration = {
+  schemaVersion: 1
+  workspace: CodexProductWorkspaceSnapshot
+  mcp: {
+    embedded: string[]
+    localInstall: {
+      command: string
+      bridgeScript: string
+      requiresLocalProduct: boolean
+      includes: string[]
+    }
+  }
+  launch: { workspaceRoot: string; endpoint: string }
+  sourceDownload: { path: string; format: 'tar.gz'; excludesSecrets: boolean }
+}
+
+export type CodexBrowserStatus = {
+  ready: boolean
+  backend: {
+    initialized: boolean
+    modelProvider?: { configured: boolean; id?: string; model?: string; wireApi?: string }
+    dynamicMcp?: { tools: number; calls: number; completed: number; failed: number }
+  }
+  modelBridge: {
+    configured: boolean
+    requests: number
+    completed: number
+    failed: number
+    upstream?: { configured: boolean; provider?: string; model?: string; wireApi?: string }
+    lastError?: { code: string; message: string; at: string } | null
+    health?: {
+      state: 'unconfigured' | 'unknown' | 'ready' | 'degraded'
+      inFlight: number
+      consecutiveFailures: number
+      lastSuccessAt: string | null
+      lastFailureAt: string | null
+      latency: { samples: number; lastMs: number | null; p50Ms: number | null; p95Ms: number | null }
+      reliability: { timeoutMs: number; retryAttempts: number; retryDelayMs: number; maxRetryDelayMs?: number; retryableStatuses?: Array<number | string> }
+      probes: {
+        total: number
+        failed: number
+        last: { ok: boolean; checkedAt: string; latencyMs: number | null; provider: string; model: string; response?: string; error?: { code: string; message: string; at: string } } | null
+      }
+    }
+  }
+}
+
+export type CodexModelProbe = {
+  ok: boolean
+  checkedAt: string
+  latencyMs: number
+  provider: string
+  model: string
+  response: string
+  health: NonNullable<CodexBrowserStatus['modelBridge']['health']>
+}
+
+export type XhsContextStatus = {
+  schemaVersion: 1
+  service: 'xhs-context'
+  rootDir: string
+  transport: 'loopback-http'
+  localOnly: true
+  indexMode: 'token-index' | 'fts5'
+  fts5Available: boolean
+  bundles: number
+  bytes: number
+  records: number
+  mcp: {
+    endpoint: string
+    credentialFile: string
+    header: string
+  }
+}
+
+export type XhsContextBundle = {
+  bundleId: string
+  sourceJobId: string
+  title: string
+  manifestHash: string
+  createdAt: string
+  bytes: number
+  fileCount: number
+  recordCount: number
+  indexMode: string
+}
+
 const AI_GENERATION_REQUEST_TIMEOUT_MS = 720_000
 
 async function request<T>(path: string, init?: RequestInit, timeoutMs?: number): Promise<T> {
@@ -78,6 +380,50 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs?: number):
 
 export const api = {
   health: () => request<Health>('/api/health'),
+  codexDesktopStatus: () => request<CodexDesktopStatus>('/api/codex-desktop/status'),
+  codexRelayStatus: () => request<CodexRelayStatus>('/api/codex-relay/status'),
+  codexBrowserStatus: () => request<CodexBrowserStatus>('/api/codex-browser/status'),
+  codexModelProbe: () => request<CodexModelProbe>('/api/codex-model/probe', { method: 'POST' }),
+  codexRelayDevices: () => request<{ devices: CodexRelayDevice[] }>('/api/codex-relay/devices'),
+  createCodexPairingIntent: (input: { deviceName?: string; requestedRole?: 'controller' | 'viewer' } = {}) => request<CodexPairingIntent>('/api/codex-relay/pairing-intents', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  }),
+  createCodexConnectIntent: (input: { deviceName?: string; requestedRole?: 'controller' | 'viewer'; replaceDeviceId?: string } = {}) => request<CodexConnectIntent>('/api/codex-connect/intents', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  }),
+  getCodexConnectIntent: (intentId: string) => request<CodexConnectIntentStatus>(`/api/codex-connect/intents/${encodeURIComponent(intentId)}`),
+  revokeCodexRelayDevice: (deviceId: string) => request<{ revoked: true; deviceId: string; revokedAt: string }>(`/api/codex-relay/devices/${encodeURIComponent(deviceId)}`, {
+    method: 'DELETE',
+  }),
+  createCodexNativeMirror: (deviceId?: string, remote = false, autoLaunchSource = !remote) => request<CodexNativeMirrorSession>('/api/codex-native-mirror/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ deviceId: deviceId || '', remote, autoLaunchSource }),
+  }),
+  getCodexNativeMirror: (sessionId: string, role: 'source' | 'viewer', token: string) => request<Pick<CodexNativeMirrorSession, 'session' | 'rtcConfiguration'>>(`/api/codex-native-mirror/sessions/${encodeURIComponent(sessionId)}`, {
+    headers: { 'X-Codex-Mirror-Role': role, 'X-Codex-Mirror-Token': token },
+  }),
+  createCodexRelayShareInvite: (deviceId?: string) => request<CodexRelayShareInvite>('/api/codex-relay/invites', {
+    method: 'POST',
+    body: JSON.stringify({ deviceId: deviceId || '' }),
+  }),
+  closeCodexNativeMirror: (sessionId: string, role: 'source' | 'viewer', token: string) => request<{ closed: true; sessionId: string }>(`/api/codex-native-mirror/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+    headers: { 'X-Codex-Mirror-Role': role, 'X-Codex-Mirror-Token': token },
+  }),
+  xhsContextStatus: () => request<XhsContextStatus>('/api/xhs-context/status'),
+  codexProductWorkspaces: () => request<CodexProductWorkspaceSnapshot>('/api/codex-product/workspaces'),
+  codexProductIntegration: () => request<CodexProductIntegration>('/api/codex-product/integration'),
+  codexProductSourceArchiveUrl: () => '/api/codex-product/source-archive',
+  createXhsContextBundle: (jobId: string, title?: string) => request<XhsContextBundle>('/api/xhs-context/bundles/from-job', {
+    method: 'POST',
+    body: JSON.stringify({ jobId, title }),
+  }),
+  launchCodexDesktop: () => request<CodexDesktopLaunch>('/api/codex-desktop/launch', {
+    method: 'POST',
+    body: '{}',
+  }),
   authMe: () => request<AuthSession>('/api/auth/me'),
   authLogin: (email: string, password: string) => request<AuthSession>('/api/auth/login', {
     method: 'POST',

@@ -78,6 +78,9 @@ async function fixture(t, { runCoordinator = null, modelRunBroker = null, subage
       if (id === 'ai-session-chat-001') {
         return { id, provider: 'openai_compatible', model: 'model-b', wireApi: 'chat_completions', apiKey: 'secret' };
       }
+      if (id === 'ai-session-chat-reasoning-001') {
+        return { id, provider: 'openai_compatible', model: 'gpt-5.1-codex', wireApi: 'chat_completions', apiKey: 'secret' };
+      }
       throw Object.assign(new Error('expired'), { code: 'AI_SESSION_EXPIRED', status: 401 });
     },
   };
@@ -177,6 +180,19 @@ test('reasoning effort is a persisted model setting reused by send and retry', a
   });
   assert.equal(unsupported.conversation.selectedModel.wireApi, 'chat_completions');
   assert.equal('reasoningEffort' in unsupported.conversation.selectedModel, false);
+
+  const compatibleChat = await create(service, {
+    aiSessionId: 'ai-session-chat-reasoning-001',
+    idempotencyKey: 'conversation-reasoning-chat-compatible-001',
+    selectedModel: { reasoningEffort: 'high' },
+  });
+  assert.deepEqual(compatibleChat.conversation.selectedModel, {
+    aiSessionId: 'ai-session-chat-reasoning-001',
+    provider: 'openai_compatible',
+    model: 'gpt-5.1-codex',
+    wireApi: 'chat_completions',
+    reasoningEffort: 'high',
+  });
 });
 
 test('workbench run controls require an explicit owning conversation', async (t) => {

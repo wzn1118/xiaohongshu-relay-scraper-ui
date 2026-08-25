@@ -1,4 +1,7 @@
 const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_RETRY_ATTEMPTS = 3;
+const DEFAULT_RETRY_DELAY_MS = 400;
+const MAX_RETRY_DELAY_MS = 5_000;
 
 export class ModelGatewayError extends Error {
   constructor(code, message, status = 502, cause = undefined) {
@@ -10,10 +13,12 @@ export class ModelGatewayError extends Error {
 }
 
 export class ModelGateway {
-  constructor({ fetchImpl = globalThis.fetch, now = () => new Date(), timeoutMs = DEFAULT_TIMEOUT_MS, providers = {} } = {}) {
+  constructor({ fetchImpl = globalThis.fetch, now = () => new Date(), timeoutMs = DEFAULT_TIMEOUT_MS, providers = {}, retryAttempts = DEFAULT_RETRY_ATTEMPTS, retryDelayMs = DEFAULT_RETRY_DELAY_MS } = {}) {
     this.fetchImpl = fetchImpl;
     this.now = now;
     this.timeoutMs = Math.max(1000, Number(timeoutMs) || DEFAULT_TIMEOUT_MS);
+    this.retryAttempts = Math.max(1, Math.min(5, Number(retryAttempts) || DEFAULT_RETRY_ATTEMPTS));
+    this.retryDelayMs = Math.max(0, Math.min(MAX_RETRY_DELAY_MS, Number(retryDelayMs) || DEFAULT_RETRY_DELAY_MS));
     this.providers = new Map(Object.entries(providers));
   }
 
@@ -27,7 +32,7 @@ export class ModelGateway {
   describeProvider(id) {
     const provider = this.providers.get(String(id || '').trim()) || {};
     const wireApi = provider.wireApi === 'responses' ? 'responses' : 'chat_completions';
-    const capabilities = normalizeCapabilities(provider.capabilities, wireApi, provider.supportsStreaming);
+    const capabilities = normalizeCapabilities(provider.capabilities, wireApi, provider.supportsStreaming, provider.model);
     return {
       id: String(id || '').trim(),
       wireApi,
@@ -35,6 +40,16 @@ export class ModelGateway {
       configured: Boolean(provider.baseUrl),
       supportsStreaming: capabilities.streaming,
       capabilities,
+    };
+  }
+
+  reliability() {
+    return {
+      timeoutMs: this.timeoutMs,
+      retryAttempts: this.retryAttempts,
+      retryDelayMs: this.retryDelayMs,
+      maxRetryDelayMs: MAX_RETRY_DELAY_MS,
+      retryableStatuses: [408, 409, 425, 429, '5xx'],
     };
   }
 
@@ -64,7 +79,7 @@ export class ModelGateway {
     const provider = { ...(this.providers.get(String(providerId || '').trim()) || {}), ...input };
     const wireApi = provider.wireApi === 'responses' ? 'responses' : 'chat_completions';
     if (wireApi !== 'responses') throw new ModelGatewayError('MODEL_CAPABILITY_UNSUPPORTED', 'Response cancellation requires the Responses wire API.', 400);
-    const capabilities = normalizeCapabilities(provider.capabilities, wireApi, provider.supportsStreaming);
+    const capabilities = normalizeCapabilities(provider.capabilities, wireApi, provider.supportsStreaming, provider.model);
     if (!capabilities.background) throw new ModelGatewayError('MODEL_CAPABILITY_UNSUPPORTED', 'This provider does not declare background response support.', 400);
     const baseUrl = String(provider.baseUrl || '').replace(/\/$/u, '');
     const id = String(responseId || '').trim();
@@ -112,7 +127,7 @@ export class ModelGateway {
     const providerId = String(input.provider || '').trim();
     const provider = { ...(this.providers.get(providerId) || {}), ...input };
     const wireApi = provider.wireApi === 'responses' ? 'responses' : 'chat_completions';
-    const capabilities = normalizeCapabilities(provider.capabilities, wireApi, provider.supportsStreaming);
+    const capabilities = normalizeCapabilities(provider.capabilities, wireApi, provider.supportsStreaming, provider.model);
     const baseUrl = String(provider.baseUrl || '').replace(/\/$/u, '');
     const model = String(provider.model || '').trim();
     if (!baseUrl || !model) throw new ModelGatewayError('MODEL_CONFIGURATION_INCOMPLETE', 'Model base URL and model are required.', 400);
@@ -141,8 +156,10 @@ export class ModelGateway {
       if (Array.isArray(input.tools)) body.tools = structuredClone(input.tools);
       if (input.toolChoice !== undefined) body.tool_choice = structuredClone(input.toolChoice);
       if (input.store !== undefined) body.store = Boolean(input.store);
-    } else if (input.maxOutputTokens !== undefined) {
-      body.max_tokens = positiveInteger(input.maxOutputTokens, 'maxOutputTokens');
+    } else {
+      const reasoningEffort = normalizeReasoningEffort(input.reasoningEffort);
+      if (reasoningEffort) body.reasoning_effort = reasoningEffort;
+      if (input.maxOutputTokens !== undefined) body.max_tokens = positiveInteger(input.maxOutputTokens, 'maxOutputTokens');
     }
     if (wireApi !== 'responses') {
       if (Array.isArray(input.tools)) body.tools = structuredClone(input.tools);
@@ -168,13 +185,22 @@ export class ModelGateway {
     try {
       const urls = Array.isArray(request.urls) && request.urls.length ? request.urls : [request.url];
       for (const [index, url] of urls.entries()) {
-        const response = await this.fetchImpl(url, {
-          method: request.method || 'POST',
-          headers: request.headers,
-          ...(request.method === 'GET' ? {} : { body: JSON.stringify(request.body || {}) }),
-          signal: controller.signal,
-        });
-        if (![404, 405].includes(response.status) || index === urls.length - 1) return response;
+        for (let attempt = 1; attempt <= this.retryAttempts; attempt += 1) {
+          const response = await this.fetchImpl(url, {
+            method: request.method || 'POST',
+            headers: request.headers,
+            ...(request.method === 'GET' ? {} : { body: JSON.stringify(request.body || {}) }),
+            signal: controller.signal,
+          });
+          const retryable = isRetryableStatus(response.status);
+          if (retryable && attempt < this.retryAttempts) {
+            await response.arrayBuffer().catch(() => {});
+            await sleep(retryDelay(response, this.retryDelayMs, attempt), controller.signal);
+            continue;
+          }
+          if (![404, 405].includes(response.status) || index === urls.length - 1) return response;
+          break;
+        }
       }
       throw new ModelGatewayError('MODEL_REQUEST_FAILED', 'Model request did not produce a response.', 502);
     } catch (error) {
@@ -226,15 +252,19 @@ async function readJson(response) {
 
 function gatewayError(message, status) { return classifyProviderError(message, status); }
 
-function normalizeCapabilities(value, wireApi, supportsStreaming) {
+function normalizeCapabilities(value, wireApi, supportsStreaming, model = '') {
   const declared = value && typeof value === 'object' ? value : {};
+  const supportsReasoningEffort = declared.reasoningEffort !== false
+    && (wireApi === 'responses'
+      || declared.reasoningEffort === true
+      || (wireApi === 'chat_completions' && reasoningModel(String(model || ''))));
   return {
     streaming: declared.streaming !== false && supportsStreaming !== false,
     background: wireApi === 'responses' && declared.background === true,
     statefulResponses: wireApi === 'responses' && declared.statefulResponses !== false,
     conversationState: wireApi === 'responses' && declared.conversationState === true,
     reasoningSummary: wireApi === 'responses' && declared.reasoningSummary === true,
-    reasoningEffort: wireApi === 'responses' && declared.reasoningEffort !== false,
+    reasoningEffort: supportsReasoningEffort,
     structuredOutputs: declared.structuredOutputs === true,
     tools: declared.tools !== false,
     maxContextTokens: Number.isFinite(Number(declared.maxContextTokens)) ? Math.max(0, Math.floor(Number(declared.maxContextTokens))) : 0,
@@ -251,10 +281,14 @@ function validateCapabilities(input, capabilities, wireApi, stream) {
   if (input.reasoningSummary && !capabilities.reasoningSummary) unsupported.push('reasoning_summary');
   if (input.reasoningEffort && !capabilities.reasoningEffort) unsupported.push('reasoning_effort');
   if (Array.isArray(input.tools) && input.tools.length && !capabilities.tools) unsupported.push('tools');
-  if (wireApi !== 'responses' && (input.background || input.previousResponseId || input.conversationId || input.reasoningSummary || input.reasoningEffort)) unsupported.push('responses_state');
+  if (wireApi !== 'responses' && (input.background || input.previousResponseId || input.conversationId || input.reasoningSummary)) unsupported.push('responses_state');
   if (unsupported.length) {
     throw new ModelGatewayError('MODEL_CAPABILITY_UNSUPPORTED', `Provider does not support: ${[...new Set(unsupported)].join(', ')}.`, 400);
   }
+}
+
+function reasoningModel(model) {
+  return /^(?:gpt-5(?:[.-]|$)|o[134](?:[.-]|$)|codex(?:[.-]|$))/iu.test(String(model || '').trim());
 }
 
 function normalizeReasoningEffort(value) {
@@ -283,6 +317,38 @@ function classifyProviderError(message, status) {
   const error = new ModelGatewayError(code, String(message), status);
   error.retryable = status === 408 || status === 409 || status === 429 || status >= 500;
   return error;
+}
+
+function isRetryableStatus(status) {
+  const value = Number(status);
+  return value === 408 || value === 409 || value === 425 || value === 429 || value >= 500;
+}
+
+function retryDelay(response, fallback, attempt) {
+  const retryAfter = Number(response?.headers?.get?.('retry-after'));
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min(MAX_RETRY_DELAY_MS, retryAfter * 1000);
+  return Math.min(MAX_RETRY_DELAY_MS, Math.max(0, fallback) * (2 ** Math.max(0, attempt - 1)));
+}
+
+async function sleep(milliseconds, signal) {
+  if (!milliseconds) return;
+  if (signal?.aborted) throw signal.reason || new Error('model_aborted');
+  await new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+    };
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, milliseconds);
+    const abort = () => {
+      cleanup();
+      reject(signal.reason || new Error('model_aborted'));
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
 }
 
 function positiveInteger(value, name) {

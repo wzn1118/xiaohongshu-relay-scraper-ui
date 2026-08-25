@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$EnvFile = '',
+    [string]$TurnEnvFile = '',
     [string]$Hostname = 'relay.hegelsalon.com',
     [string]$McpHostname = 'mcp.hegelsalon.com',
     [string]$TunnelName = 'hegelsalon-relay',
@@ -133,6 +134,7 @@ function Invoke-ProductionStart {
         '-SkipStartupRegistration'
     )
     if ($LoadedEnv) { $arguments += @('-EnvFile', $LoadedEnv) }
+    if ($TurnEnvFile) { $arguments += @('-TurnEnvFile', (Get-AbsoluteInputPath $TurnEnvFile)) }
     if ($TunnelTokenFile) { $arguments += @('-TunnelTokenFile', (Get-AbsoluteInputPath $TunnelTokenFile)) }
     if ($UseExistingTunnel) { $arguments += '-UseExistingTunnel' }
     if ($SkipBrowserRelayCheck) { $arguments += '-SkipBrowserRelayCheck' }
@@ -209,7 +211,7 @@ function Invoke-WatchdogPass {
             Write-WatchdogLog "public ingress degraded while local API/MCP remain healthy; restarting only the owned Cloudflare Tunnel"
             try {
                 Stop-HegelSalonTrackedTunnel -RuntimeRoot $runtimeRoot
-                Invoke-ProductionStart -LoadedEnv $loadedEnv -SkipBrowserRelayCheck
+                Invoke-ProductionStart -LoadedEnv $loadedEnv -SkipBrowserRelayCheck:$SkipBrowserRelayCheck
                 $restarted = $true
                 $tunnelRestarted = $true
             } catch {

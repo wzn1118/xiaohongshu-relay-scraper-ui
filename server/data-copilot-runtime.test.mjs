@@ -328,16 +328,21 @@ test('chat completion streams emit text and tool-call deltas while preserving th
       '[DONE]',
     ]),
   ], requests);
-  const { store, runtime, executions, events } = await fixture(t, { fetchImpl });
+  const { store, runtime, executions, events } = await fixture(t, {
+    fetchImpl,
+    sessionOverrides: { model: 'gpt-5.1-codex' },
+  });
 
   await runtime.start(REFERENCE, {
     content: 'Stream a grounded application count.',
     aiSessionId: 'ai-session-runtime-001',
+    reasoningEffort: 'high',
     idempotencyKey: 'message-runtime-chat-stream-001',
   });
   await waitForEvent(events, (event) => event.type === 'run.completed');
 
   assert.equal(requests.every((request) => request.stream === true), true);
+  assert.equal(requests[0].reasoning_effort, 'high');
   assert.deepEqual(executions.map((item) => item.name), ['records.query']);
   assert.equal(events.some((event) => event.type === 'tool.call.delta' && event.name === 'records.query'), true);
   assert.deepEqual(events.filter((event) => event.type === 'assistant.delta').map((event) => event.text), ['Found one ', 'Found one application.']);

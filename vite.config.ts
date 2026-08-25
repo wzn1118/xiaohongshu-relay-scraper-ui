@@ -10,12 +10,16 @@ export default defineConfig({
     host: '::',
     port: 5173,
     watch: {
-      // Playwright creates and removes this transient directory while tests run.
-      // Chokidar must not crash the dev server when that directory disappears.
-      ignored: ['**/.playwright-cli/**'],
+      // Generated artifacts include the complete Codex desktop runtime and must
+      // stay outside the frontend hot-reload graph.
+      ignored: ['**/.playwright-cli/**', '**/output/**'],
     },
     proxy: {
-      '/api': apiProxy,
+      '/api': { target: apiProxy, ws: true },
+      '/v1/device-tunnel': { target: apiProxy, ws: true },
+      // Keep the Codex app route proxied without hijacking the standalone
+      // Native Mirror assets (`/codex-native-mirror.*`).
+      '^/codex(?:/|$)': apiProxy,
     },
   },
 })

@@ -1497,8 +1497,10 @@ export async function callCopilotModel(fetchImpl, session, messages, toolDefinit
   const body = wireApi === 'responses'
     ? { model: session.model, input: toResponsesInput(messages), tools: wireTools, tool_choice: 'auto', stream: true }
     : { model: session.model, messages, tools: wireTools, tool_choice: 'auto', temperature: 0.1, stream: true };
-  if (wireApi === 'responses' && session.reasoningEffort) {
-    body.reasoning = { effort: normalizeReasoningEffort(session.reasoningEffort) };
+  if (session.reasoningEffort) {
+    const reasoningEffort = normalizeReasoningEffort(session.reasoningEffort);
+    if (wireApi === 'responses') body.reasoning = { effort: reasoningEffort };
+    else body.reasoning_effort = reasoningEffort;
   }
   const endpoints = modelEndpointCandidates(session, wireApi);
   const sendRequest = async (url, requestBody, accept = headers.Accept) => {

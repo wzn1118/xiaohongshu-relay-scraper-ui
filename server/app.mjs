@@ -74,6 +74,11 @@ import {
   resolveApplicationEmailSubject,
 } from './lib/application-email-draft.mjs';
 import { classifyApplicationSource } from './lib/application-source-disposition.mjs';
+import { createCodexHostCommandService } from './codex-host-command-service.mjs';
+import { createCodexConnectService } from './codex-connect-service.mjs';
+import { TOOL_DEFINITIONS as CODEX_PRODUCT_TOOL_DEFINITIONS } from './codex-product-service.mjs';
+import { TOOL_DEFINITIONS as XHS_CONTEXT_TOOL_DEFINITIONS } from './xhs-context-service.mjs';
+import { createCodexSourceArchive } from './codex-source-archive.mjs';
 
 const INTERNAL_COVER_LETTER_TOKEN = /(?<![\w])(?:exp|resume|evidence)[_-][A-Za-z0-9][A-Za-z0-9_-]{3,}(?![\w])/i;
 import {
@@ -213,7 +218,7 @@ export function contactOcrDrainState(state) {
   };
 }
 
-export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, coverLetterRewriter, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService, applicationContactOcrService, applicationContactResolutionService, dataCopilotService, mcpAccessService, authStore }) {
+export function createApp({ manager, config, aiSessions, profileStore, relayConfig, smtpConfig, mailSender, localModels, relayConnector = connectRelay, relayLoginOpener = openRelayLogin, relaySetup = setupRelayRuntime, relayRecoverer = recoverRelay, relaySupervisor, preflightService, dataLifecycle, mediaFetcher = globalThis.fetch, draftQualityChecker, coverLetterRewriter, deliveryStateWriter = writeDeliveryState, sendAuditAppender = appendSendAuditJournal, sendAuditReader = readSendAuditJournal, diagnostics, audienceAiService, applicationContactOcrService, applicationContactResolutionService, dataCopilotService, codexDesktopService, codexBrowserService, codexProductService, codexProductWorkspaceService, codexModelBridgeService, codexRelayService, codexHostCommandService, codexHostRpcService, codexRuntimeCompatibility, codexNativeMirrorService, codexDeviceGatewayService, codexConnectService, xhsContextService, mcpAccessService, authStore }) {
   const getRelayConfig = () => relayConfig?.get?.() || { ...DEFAULT_RELAY_CONFIG };
   const relayRuntime = relaySupervisor || createRelaySupervisor({
     getConfig: getRelayConfig,
@@ -241,6 +246,21 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     getRelayConfig,
   });
   const mediaDownloads = new Map();
+  const codexHostCommands = codexHostCommandService || createCodexHostCommandService({
+    config,
+    codexBrowserService,
+    relayService: codexRelayService,
+  });
+  const codexConnect = codexConnectService || (codexDeviceGatewayService?.createPairingIntent && codexDeviceGatewayService?.claimPairing
+    ? createCodexConnectService({
+      deviceGatewayService: codexDeviceGatewayService,
+      allowedOrigins: config.codexConnectAllowedOrigins?.length
+        ? config.codexConnectAllowedOrigins
+        : (config.authOrigin ? [config.authOrigin] : []),
+      connectorVersion: config.codexConnectConnectorVersion || '1.2.3',
+    })
+    : null);
+  let codexConnectInstallerCache = null;
   const deliveryAttachmentLimits = attachmentLimits(config);
   const checkDraftQuality = draftQualityChecker || createDraftQualityChecker({
     pythonBin: config.pythonBin || (process.platform === 'win32' ? 'python' : 'python3'),
@@ -575,6 +595,15 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       return json(res, originError.status, errorBody(originError.code, originError.message));
     }
     const url = new URL(req.url, 'http://localhost');
+    if (
+      url.pathname === '/codex'
+      || url.pathname.startsWith('/codex/')
+      || url.pathname === '/codex-native-mirror.html'
+      || url.pathname === '/codex-native-mirror.js'
+      || url.pathname === '/codex-native-mirror.css'
+    ) {
+      setCodexBrowserSecurityHeaders(req, res, config);
+    }
     const parts = url.pathname.split('/').filter(Boolean);
     const authUser = authStore?.authenticate(req) || null;
     const trustedCopilotLocal = isLoopbackAddress(req.socket?.remoteAddress)
@@ -582,11 +611,17 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
     const localOwnerActor = !authStore?.required && trustedCopilotLocal
       ? { id: 'local-owner', roles: ['owner'] }
       : null;
+    const noAuthPresentationOwner = !authStore?.required
+      && String(authUser?.email || '').trim().toLowerCase() === 'local'
+      && Array.isArray(authUser?.roles)
+      && authUser.roles.map((role) => String(role).toLowerCase()).includes('owner')
+      ? { id: 'local-owner', roles: ['owner'] }
+      : null;
     // In no-auth desktop mode the auth store exposes a presentation user with
     // an email but no stable actor id. Prefer the server-derived loopback
     // owner for Copilot authority, and retain email as an identity fallback
     // for authenticated stores that similarly omit an id field.
-    const copilotActor = localOwnerActor || authUser;
+    const copilotActor = localOwnerActor || noAuthPresentationOwner || authUser;
     const copilotRoles = Array.isArray(copilotActor?.roles)
       ? copilotActor.roles.map((role) => String(role).toLowerCase())
       : [];
@@ -597,6 +632,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         && config.copilotApprovalMode === 'never'
         && copilotRoles.includes('owner'),
     };
+    const codexOwnerId = String(copilotActor?.id || copilotActor?.email || localOwnerActor?.id || '').trim();
     res.once('finish', () => diagnostics?.record?.('http_request_completed', {
       requestId,
       method: req.method,
@@ -619,12 +655,18 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         authStore?.clearSession(res);
         return json(res, 200, { authenticated: false });
       }
-      const publicApiRoutes = new Set(['/api/auth/me', '/api/auth/login', '/api/auth/logout', '/api/health']);
-      if (authStore?.required && url.pathname.startsWith('/api/') && !publicApiRoutes.has(url.pathname)) {
+    const publicApiRoutes = new Set(['/api/auth/me', '/api/auth/login', '/api/auth/logout', '/api/health', '/api/xhs-context/mcp', '/api/codex-product/mcp', '/api/codex-model/v1/responses', '/api/codex-relay/device-claims', '/api/codex-connect/installer', '/api/codex-connect/manifest']);
+      const deviceCredentialRoute = req.method === 'POST' && /^\/api\/codex-relay\/devices\/[^/]+\/heartbeat$/u.test(url.pathname);
+      const codexConnectClaimRoute = req.method === 'POST' && /^\/api\/codex-connect\/intents\/[^/]+\/claim$/u.test(url.pathname);
+      const mirrorCredentialRoute = /^\/api\/codex-native-mirror\/sessions\/mirror-[A-Za-z0-9-]{8,140}(?:\/.*)?$/u.test(url.pathname)
+        && String(req.headers['x-codex-mirror-role'] || '').length > 0
+        && String(req.headers['x-codex-mirror-token'] || '').length > 0;
+      if (authStore?.required && url.pathname.startsWith('/api/') && !publicApiRoutes.has(url.pathname) && !deviceCredentialRoute && !codexConnectClaimRoute && !mirrorCredentialRoute) {
         if (!authUser) return json(res, 401, errorBody('AUTH_REQUIRED', '请先登录后再访问此功能。'));
         if (config.authOrigin && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
           const origin = String(req.headers.origin || '').trim();
-          if (origin && origin !== config.authOrigin) return json(res, 403, errorBody('CSRF_ORIGIN_REJECTED', '请求来源未通过校验。'));
+          const trustedLoopbackOrigin = trustedCopilotLocal && Boolean(loopbackOrigin(origin));
+          if (origin && origin !== config.authOrigin && !trustedLoopbackOrigin) return json(res, 403, errorBody('CSRF_ORIGIN_REJECTED', '请求来源未通过校验。'));
         }
       }
       if (req.method === 'GET' && url.pathname === '/api/diagnostics/bundle') {
@@ -658,6 +700,546 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
             ...mcpAccessService.status(),
           } : { enabled: false },
         });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/codex-desktop/status') {
+        if (!codexDesktopService?.status) {
+          return json(res, 503, errorBody('CODEX_DESKTOP_UNAVAILABLE', 'Codex desktop integration is unavailable.'));
+        }
+        return json(res, 200, await codexDesktopService.status());
+      }
+      if (req.method === 'POST' && url.pathname === '/api/codex-desktop/launch') {
+        if (!codexDesktopService?.launch) {
+          return json(res, 503, errorBody('CODEX_DESKTOP_UNAVAILABLE', 'Codex desktop integration is unavailable.'));
+        }
+        return json(res, 200, await codexDesktopService.launch());
+      }
+      if (url.pathname.startsWith('/api/xhs-context')) {
+        if (!xhsContextService) {
+          return json(res, 503, errorBody('XHS_CONTEXT_UNAVAILABLE', 'Local xhs-context is unavailable.'));
+        }
+        if (req.method === 'POST' && url.pathname === '/api/xhs-context/mcp') {
+          const authorization = String(req.headers.authorization || '');
+          const bearerToken = /^Bearer\s+(.+)$/i.exec(authorization)?.[1] || '';
+          xhsContextService.authorizeHttp(req, req.headers['x-xhs-context-token'] || bearerToken);
+          const response = await xhsContextService.handleMcpRequest(await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024)));
+          if (response === null) return noContent(res);
+          return json(res, 200, response);
+        }
+        if (req.method === 'GET' && url.pathname === '/api/xhs-context/status') {
+          return json(res, 200, {
+            ...xhsContextService.status(),
+            mcp: {
+              endpoint: `http://127.0.0.1:${Number(config.port) || 4317}/api/xhs-context/mcp`,
+              credentialFile: xhsContextService.tokenPath,
+              header: 'X-Xhs-Context-Token',
+              bearerTokenEnvVar: 'XHS_CONTEXT_TOKEN',
+            },
+          });
+        }
+        if (req.method === 'GET' && url.pathname === '/api/xhs-context/bundles') {
+          return json(res, 200, { bundles: xhsContextService.listBundles() });
+        }
+        if (req.method === 'POST' && url.pathname === '/api/xhs-context/bundles/from-job') {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const jobId = String(body?.jobId || '').trim();
+          const job = manager.getInternal(jobId);
+          if (!job) return json(res, 404, errorBody('JOB_NOT_FOUND', 'Job not found.'));
+          return json(res, 201, await xhsContextService.createBundleFromJob({
+            jobId,
+            outputDir: job.outputDir,
+            title: body?.title,
+          }));
+        }
+        const contextParts = url.pathname.split('/').filter(Boolean);
+        const bundleId = contextParts[3] || '';
+        if (contextParts[0] === 'api' && contextParts[1] === 'xhs-context' && contextParts[2] === 'bundles' && bundleId) {
+          if (req.method === 'GET' && contextParts.length === 4) return json(res, 200, xhsContextService.overview(bundleId));
+          if (req.method === 'POST' && contextParts[4] === 'search' && contextParts.length === 5) {
+            const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 256 * 1024));
+            return json(res, 200, xhsContextService.search(bundleId, body?.query, body));
+          }
+          if (req.method === 'POST' && contextParts[4] === 'verify' && contextParts.length === 5) return json(res, 200, xhsContextService.verify(bundleId));
+          if (req.method === 'GET' && contextParts[4] === 'records' && contextParts[5] && contextParts.length === 6) {
+            return json(res, 200, xhsContextService.openRecord(decodeURIComponent(contextParts[5])));
+          }
+          if (req.method === 'GET' && contextParts[4] === 'artifacts' && contextParts.length === 5) {
+            return json(res, 200, await xhsContextService.readArtifact(bundleId, url.searchParams.get('path') || ''));
+          }
+          if (req.method === 'POST' && contextParts[4] === 'aggregate' && contextParts.length === 5) {
+            return json(res, 200, xhsContextService.aggregate(bundleId, await readJsonBody(req, Math.min(config.maxBodyBytes, 256 * 1024))));
+          }
+          if (req.method === 'POST' && contextParts[4] === 'cite' && contextParts.length === 5) {
+            const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 256 * 1024));
+            return json(res, 200, xhsContextService.cite(bundleId, body?.recordIds));
+          }
+        }
+        return json(res, 404, errorBody('XHS_CONTEXT_ROUTE_NOT_FOUND', 'xhs-context route not found.'));
+      }
+      if (url.pathname.startsWith('/api/codex-product')) {
+        if (!codexProductService) return json(res, 503, errorBody('CODEX_PRODUCT_UNAVAILABLE', 'The Codex product integration is unavailable.'));
+        const productParts = url.pathname.split('/').filter(Boolean);
+        if (req.method === 'POST'
+          && productParts[0] === 'api'
+          && productParts[1] === 'codex-product'
+          && productParts[2] === 'workspaces'
+          && productParts[3]
+          && productParts[4] === 'threads'
+          && productParts.length === 5) {
+          if (!codexHostCommands?.startWorkspaceThread) {
+            return json(res, 503, errorBody('CODEX_WORKSPACE_THREAD_UNAVAILABLE', 'The Codex workspace task service is unavailable.'));
+          }
+          const projectId = safeDecodePathSegment(productParts[3]);
+          if (!projectId) return json(res, 400, errorBody('CODEX_WORKSPACE_ID_INVALID', 'Codex workspace id is invalid.'));
+          return json(res, 201, await codexHostCommands.startWorkspaceThread(projectId));
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-product/workspaces') {
+          return json(res, 200, codexProductWorkspaceService?.publicSnapshot?.() || { available: false, source: null, history: [] });
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-product/integration') {
+          const workspace = codexProductWorkspaceService?.publicSnapshot?.() || { available: false, source: null, history: [] };
+          return json(res, 200, {
+            schemaVersion: 1,
+            workspace,
+            mcp: {
+              embedded: ['xhs-context', 'codex-product'],
+              localInstall: {
+                command: 'powershell -ExecutionPolicy Bypass -File scripts/install-codex-product-mcp.ps1',
+                bridgeScript: 'scripts/codex-product-mcp-bridge.mjs',
+                requiresLocalProduct: true,
+                includes: [
+                  ...XHS_CONTEXT_TOOL_DEFINITIONS.map((tool) => `xhs-context.${tool.name}`),
+                  ...CODEX_PRODUCT_TOOL_DEFINITIONS.map((tool) => `codex-product.${tool.name}`),
+                ],
+              },
+            },
+            launch: {
+              workspaceRoot: config.workspaceRoot,
+              endpoint: '/api/codex-desktop/launch',
+            },
+            sourceDownload: {
+              path: '/api/codex-product/source-archive',
+              format: 'tar.gz',
+              excludesSecrets: true,
+            },
+          });
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-product/source-archive') {
+          const workspaceRoot = codexProductWorkspaceService?.workspaceRoot || config.workspaceRoot;
+          const archive = await createCodexSourceArchive({ workspaceRoot });
+          const release = () => void archive.release().catch(() => {});
+          res.once('close', release);
+          const stream = createReadStream(archive.archivePath);
+          stream.once('error', (error) => {
+            release();
+            res.destroy(error);
+          });
+          stream.once('end', release);
+          res.writeHead(200, {
+            'Content-Type': 'application/gzip',
+            'Content-Length': archive.size,
+            'Content-Disposition': `attachment; filename="${archive.fileName}"`,
+            'Cache-Control': 'no-store',
+          });
+          stream.pipe(res);
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/codex-product/mcp') {
+          const authorization = String(req.headers.authorization || '');
+          const bearerToken = /^Bearer\s+(.+)$/i.exec(authorization)?.[1] || '';
+          codexProductService.authorizeHttp(req, req.headers['x-codex-product-token'] || bearerToken);
+          const response = await codexProductService.handleMcpRequest(await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024)));
+          if (response === null) return noContent(res);
+          return json(res, 200, response);
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-product/status') return json(res, 200, codexProductService.status());
+        return json(res, 404, errorBody('CODEX_PRODUCT_ROUTE_NOT_FOUND', 'codex-product route not found.'));
+      }
+      if (url.pathname.startsWith('/api/codex-native-mirror')) {
+        if (!codexNativeMirrorService) {
+          return json(res, 503, errorBody('CODEX_MIRROR_UNAVAILABLE', 'Native Mirror signaling is unavailable.'));
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-native-mirror/status') {
+          return json(res, 200, codexNativeMirrorService.status());
+        }
+        if (req.method === 'POST' && url.pathname === '/api/codex-native-mirror/sessions') {
+          const body = await readJsonBody(req, config.maxBodyBytes);
+          const remote = body?.remote === true;
+          const autoLaunchSource = remote || body?.autoLaunchSource === true;
+          const created = codexNativeMirrorService.createSession({
+            deviceId: body?.deviceId,
+            remote,
+            ownerId: remote ? (codexOwnerId || 'local-owner') : '',
+          });
+          if (autoLaunchSource) {
+            const sourceUrl = new URL('/codex-native-mirror.html?v=20260819-local-capture-1', `${requestPublicProtocol(req, config)}://${requestPublicHost(req, config)}`);
+            sourceUrl.hash = new URLSearchParams({
+              sessionId: created.session.id,
+              role: created.source.role,
+              token: created.source.token,
+              remote: '1',
+              autostart: '1',
+              targetTitle: 'ChatGPT',
+              ...(!remote ? { sameHost: '1' } : {}),
+            }).toString();
+            try {
+              const launched = remote
+                ? await codexNativeMirrorService.launchRemoteSource(created.session.id, created.source, { sourceUrl: sourceUrl.toString() })
+                : await codexNativeMirrorService.launchLocalSource(created.session.id, created.source, {
+                    sourceUrl: sourceUrl.toString(),
+                    captureTitle: 'ChatGPT',
+                  });
+              created.session = launched.session;
+            } catch (error) {
+              codexNativeMirrorService.closeSession(created.session.id, created.source);
+              throw error;
+            }
+          }
+          return json(res, 201, created);
+        }
+        const mirrorParts = url.pathname.split('/').filter(Boolean);
+        const mirrorSessionId = mirrorParts[3] || '';
+        if (mirrorParts[0] === 'api' && mirrorParts[1] === 'codex-native-mirror' && mirrorParts[2] === 'sessions' && mirrorSessionId) {
+          const credentials = {
+            role: String(req.headers['x-codex-mirror-role'] || ''),
+            token: String(req.headers['x-codex-mirror-token'] || ''),
+          };
+          if (req.method === 'GET' && mirrorParts.length === 4) {
+            return json(res, 200, codexNativeMirrorService.getSession(mirrorSessionId, credentials));
+          }
+          if (req.method === 'DELETE' && mirrorParts.length === 4) {
+            return json(res, 200, codexNativeMirrorService.closeSession(mirrorSessionId, credentials));
+          }
+          if (req.method === 'POST' && mirrorParts[4] === 'input-target' && mirrorParts.length === 5) {
+            return json(res, 200, await codexNativeMirrorService.setInputTarget(
+              mirrorSessionId,
+              credentials,
+              await readJsonBody(req, Math.min(config.maxBodyBytes, 64 * 1024)),
+            ));
+          }
+          if (req.method === 'POST' && mirrorParts[4] === 'input' && mirrorParts.length === 5) {
+            return json(res, 202, await codexNativeMirrorService.sendInput(
+              mirrorSessionId,
+              credentials,
+              await readJsonBody(req, Math.min(config.maxBodyBytes, 32 * 1024)),
+            ));
+          }
+          if (mirrorParts[4] === 'signals' && mirrorParts.length === 5) {
+            if (req.method === 'GET') {
+              return json(res, 200, codexNativeMirrorService.listSignals(mirrorSessionId, {
+                ...credentials,
+                after: url.searchParams.get('after') || 0,
+              }));
+            }
+            if (req.method === 'POST') {
+              return json(res, 202, codexNativeMirrorService.postSignal(mirrorSessionId, {
+                ...credentials,
+                ...await readJsonBody(req, Math.min(config.maxBodyBytes, 768 * 1024)),
+              }));
+            }
+          }
+        }
+        return json(res, 404, errorBody('CODEX_MIRROR_ROUTE_NOT_FOUND', 'Native Mirror route not found.'));
+      }
+      if (url.pathname.startsWith('/api/codex-connect')) {
+        if (!codexConnect) return json(res, 503, errorBody('CODEX_CONNECT_UNAVAILABLE', 'The local connector control plane is unavailable.'));
+        if (req.method === 'GET' && url.pathname === '/api/codex-connect/manifest') {
+          const installer = await describeCodexConnectInstaller(config.codexConnectInstallerPath, codexConnectInstallerCache);
+          codexConnectInstallerCache = installer.cache;
+          return json(res, 200, codexConnect.manifest({
+            installerUrl: installer.available ? '/api/codex-connect/installer' : '',
+            installerAvailable: installer.available,
+            installerSha256: installer.sha256,
+          }));
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-connect/installer') {
+          const installer = await describeCodexConnectInstaller(config.codexConnectInstallerPath, codexConnectInstallerCache);
+          codexConnectInstallerCache = installer.cache;
+          if (!installer.available) {
+            return json(res, 404, errorBody('CODEX_CONNECT_INSTALLER_UNAVAILABLE', 'The local connector installer has not been packaged.'));
+          }
+          res.writeHead(200, {
+            'Content-Type': 'application/zip',
+            'Content-Length': installer.size,
+            'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(installer.path))}`,
+            ...(installer.sha256 ? { 'X-Checksum-Sha256': installer.sha256 } : {}),
+          });
+          return createReadStream(installer.path).pipe(res);
+        }
+        if (req.method === 'POST' && url.pathname === '/api/codex-connect/intents') {
+          if (!codexOwnerId) return json(res, 401, errorBody('AUTH_REQUIRED', 'A signed-in owner is required to connect a local device.'));
+          const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 64 * 1024));
+          const origin = `${requestPublicProtocol(req, config)}://${requestPublicHost(req, config)}`;
+          const created = codexConnect.createIntent({ ...body, ownerId: codexOwnerId, origin });
+          return json(res, 201, {
+            ...created,
+            manifestUrl: '/api/codex-connect/manifest',
+            installerUrl: '/api/codex-connect/installer',
+            statusUrl: `/api/codex-connect/intents/${encodeURIComponent(created.intent.id)}`,
+          });
+        }
+        const connectParts = url.pathname.split('/').filter(Boolean);
+        const connectIntentId = connectParts[3] || '';
+        if (connectParts[0] === 'api' && connectParts[1] === 'codex-connect' && connectParts[2] === 'intents' && connectIntentId) {
+          if (req.method === 'GET' && connectParts.length === 4) {
+            if (!codexOwnerId) return json(res, 401, errorBody('AUTH_REQUIRED', 'A signed-in owner is required to read a connection intent.'));
+            return json(res, 200, codexConnect.getIntent(connectIntentId, { ownerId: codexOwnerId }));
+          }
+          if (req.method === 'POST' && connectParts[4] === 'claim' && connectParts.length === 5) {
+            return json(res, 201, await codexConnect.claimIntent(connectIntentId, await readJsonBody(req, Math.min(config.maxBodyBytes, 128 * 1024))));
+          }
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-connect/devices') {
+          if (!codexOwnerId) return json(res, 401, errorBody('AUTH_REQUIRED', 'A signed-in owner is required to list connected devices.'));
+          return json(res, 200, { devices: codexConnect.listDevices({ ownerId: codexOwnerId }) });
+        }
+        const connectDeviceId = connectParts[3] || '';
+        if (connectParts[0] === 'api' && connectParts[1] === 'codex-connect' && connectParts[2] === 'devices' && connectDeviceId) {
+          if (!codexOwnerId) return json(res, 401, errorBody('AUTH_REQUIRED', 'A signed-in owner is required to manage a connected device.'));
+          if (req.method === 'GET' && connectParts[4] === 'health' && connectParts.length === 5) {
+            return json(res, 200, codexConnect.getDeviceHealth(connectDeviceId, { ownerId: codexOwnerId }));
+          }
+          if (req.method === 'POST' && connectParts[4] === 'reconnect' && connectParts.length === 5) {
+            return json(res, 202, codexConnect.reconnectDevice(connectDeviceId, { ownerId: codexOwnerId }));
+          }
+          if (req.method === 'POST' && connectParts[4] === 'repair' && connectParts.length === 5) {
+            return json(res, 202, codexConnect.repairDevice(connectDeviceId, { ownerId: codexOwnerId }));
+          }
+          if (req.method === 'POST' && connectParts[4] === 'rollback' && connectParts.length === 5) {
+            return json(res, 202, codexConnect.rollbackDevice(connectDeviceId, { ownerId: codexOwnerId }));
+          }
+          if (req.method === 'POST' && connectParts[4] === 'revoke' && connectParts.length === 5) {
+            return json(res, 200, await codexConnect.revokeDevice(connectDeviceId, { ownerId: codexOwnerId }));
+          }
+        }
+        return json(res, 404, errorBody('CODEX_CONNECT_ROUTE_NOT_FOUND', 'Local connector route not found.'));
+      }
+      if (url.pathname.startsWith('/api/codex-relay')) {
+        if (!codexRelayService) {
+          return json(res, 503, errorBody('CODEX_RELAY_UNAVAILABLE', 'Local Codex Relay is unavailable.'));
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-relay/status') {
+          return json(res, 200, {
+            ...await codexRelayService.status(),
+            hostRpc: codexHostRpcService?.status?.() || { available: false, protocol: 'codex-host-rpc.v1' },
+          });
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-relay/gateway/status') {
+          if (!codexDeviceGatewayService) return json(res, 503, errorBody('CODEX_GATEWAY_UNAVAILABLE', 'The device gateway is unavailable.'));
+          return json(res, 200, codexDeviceGatewayService.status());
+        }
+        if (req.method === 'GET' && url.pathname === '/api/codex-relay/devices') {
+          return json(res, 200, { devices: codexRelayService.listDevices({ ownerId: codexOwnerId || 'local-owner' }) });
+        }
+        if (req.method === 'POST' && url.pathname === '/api/codex-relay/pair') {
+          return json(res, 201, { device: codexRelayService.pair(await readJsonBody(req, config.maxBodyBytes)) });
+        }
+        if (req.method === 'POST' && url.pathname === '/api/codex-relay/pairing-intents') {
+          if (!codexDeviceGatewayService) return json(res, 503, errorBody('CODEX_GATEWAY_UNAVAILABLE', 'The device gateway is unavailable.'));
+          if (!codexOwnerId) return json(res, 401, errorBody('AUTH_REQUIRED', 'A signed-in owner is required to create a pairing intent.'));
+          const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 64 * 1024));
+          const created = codexDeviceGatewayService.createPairingIntent({
+            ...body,
+            ownerId: codexOwnerId,
+          });
+          const protocol = requestPublicProtocol(req, config);
+          const gatewayHost = requestPublicHost(req, config);
+          return json(res, 201, {
+            ...created,
+            gateway: {
+              websocketUrl: `${protocol === 'https' ? 'wss' : 'ws'}://${gatewayHost}/v1/device-tunnel`,
+              claimUrl: `${protocol}://${gatewayHost}/api/codex-relay/device-claims`,
+            },
+          });
+        }
+        if (req.method === 'POST' && url.pathname === '/api/codex-relay/device-claims') {
+          if (!codexDeviceGatewayService) return json(res, 503, errorBody('CODEX_GATEWAY_UNAVAILABLE', 'The device gateway is unavailable.'));
+          return json(res, 201, await codexDeviceGatewayService.claimPairing(
+            await readJsonBody(req, Math.min(config.maxBodyBytes, 128 * 1024)),
+          ));
+        }
+        const deviceParts = url.pathname.split('/').filter(Boolean);
+        const pairedDeviceId = deviceParts[3] || '';
+        if (deviceParts[0] === 'api' && deviceParts[1] === 'codex-relay' && deviceParts[2] === 'devices' && pairedDeviceId) {
+          if (!codexDeviceGatewayService) return json(res, 503, errorBody('CODEX_GATEWAY_UNAVAILABLE', 'The device gateway is unavailable.'));
+          if (req.method === 'POST' && deviceParts[4] === 'heartbeat' && deviceParts.length === 5) {
+            const authorization = String(req.headers.authorization || '');
+            const deviceToken = /^Bearer\s+(.+)$/i.exec(authorization)?.[1] || String(req.headers['x-codex-device-token'] || '');
+            return json(res, 200, await codexDeviceGatewayService.heartbeat(
+              pairedDeviceId,
+              deviceToken,
+              await readJsonBody(req, Math.min(config.maxBodyBytes, 128 * 1024)),
+            ));
+          }
+          if (req.method === 'DELETE' && deviceParts.length === 4) {
+            if (!codexOwnerId) return json(res, 401, errorBody('AUTH_REQUIRED', 'A signed-in owner is required to revoke a device.'));
+            return json(res, 200, await codexDeviceGatewayService.revokeDevice(pairedDeviceId, { ownerId: codexOwnerId }));
+          }
+        }
+        if (req.method === 'POST' && url.pathname === '/api/codex-relay/sessions') {
+          return json(res, 201, codexRelayService.createSession({
+            ...await readJsonBody(req, config.maxBodyBytes),
+            ownerId: codexOwnerId || 'local-owner',
+          }));
+        }
+        if (req.method === 'POST' && url.pathname === '/api/codex-relay/invites') {
+          const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 64 * 1024));
+          const invite = codexRelayService.createShareInvite({
+            deviceId: body?.deviceId,
+            ownerId: codexOwnerId || 'local-owner',
+          });
+          const shareUrl = new URL('/codex/', `${requestPublicProtocol(req, config)}://${requestPublicHost(req, config)}`);
+          shareUrl.searchParams.set('relaySessionId', invite.invite.sessionId);
+          shareUrl.searchParams.set('relayTicket', invite.invite.ticket);
+          shareUrl.searchParams.set('relayBrowserInstanceId', invite.invite.browserInstanceId);
+          return json(res, 201, { ...invite, shareUrl: shareUrl.toString() });
+        }
+        const relayParts = url.pathname.split('/').filter(Boolean);
+        const relaySessionId = relayParts[3] || '';
+        if (relayParts[0] === 'api' && relayParts[1] === 'codex-relay' && relayParts[2] === 'sessions' && relaySessionId) {
+          if (req.method === 'POST' && relayParts[4] === 'connect' && relayParts.length === 5) {
+            return json(res, 200, codexRelayService.connect(relaySessionId, await readJsonBody(req, config.maxBodyBytes)));
+          }
+          if (req.method === 'GET' && relayParts.length === 4) {
+            return json(res, 200, codexRelayService.getSession(relaySessionId, {
+              connectionToken: codexRelayConnectionToken(req),
+            }));
+          }
+          if (req.method === 'DELETE' && relayParts.length === 4) {
+            return json(res, 200, codexRelayService.closeSession(relaySessionId, {
+              connectionToken: codexRelayConnectionToken(req),
+            }));
+          }
+          if (req.method === 'POST' && relayParts[4] === 'lease' && relayParts[5] === 'renew' && relayParts.length === 6) {
+            const body = await readJsonBody(req, config.maxBodyBytes);
+            return json(res, 200, codexRelayService.renewLease(relaySessionId, {
+              ...body,
+              connectionToken: codexRelayConnectionToken(req, body),
+            }));
+          }
+          if (req.method === 'POST' && relayParts[4] === 'lease' && relayParts[5] === 'release' && relayParts.length === 6) {
+            const body = await readJsonBody(req, config.maxBodyBytes);
+            return json(res, 200, codexRelayService.releaseLease(relaySessionId, {
+              ...body,
+              connectionToken: codexRelayConnectionToken(req, body),
+            }));
+          }
+          if (req.method === 'GET' && relayParts[4] === 'events' && relayParts.length === 5) {
+            return json(res, 200, codexRelayService.listEvents(relaySessionId, {
+              connectionToken: codexRelayConnectionToken(req),
+              after: url.searchParams.get('after') || 0,
+              limit: url.searchParams.get('limit') || 30,
+            }));
+          }
+          if (req.method === 'POST' && relayParts[4] === 'stream-ticket' && relayParts.length === 5) {
+            const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 64 * 1024));
+            return json(res, 201, {
+              ticket: codexRelayService.issueStreamTicket(relaySessionId, {
+                ...body,
+                connectionToken: codexRelayConnectionToken(req, body),
+              }),
+            });
+          }
+          if (req.method === 'POST' && relayParts[4] === 'messages' && relayParts.length === 5) {
+            const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));
+            const message = body?.message && typeof body.message === 'object' ? body.message : body;
+            const result = await codexHostCommands.sendRelay(relaySessionId, {
+              ...body,
+              message,
+              connectionToken: codexRelayConnectionToken(req, body),
+            });
+            return json(res, 200, result);
+          }
+          if (req.method === 'POST' && relayParts[4] === 'worker-messages' && relayParts.length === 5) {
+            const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));
+            const result = await codexHostCommands.sendWorkerRelay(relaySessionId, {
+              ...body,
+              connectionToken: codexRelayConnectionToken(req, body),
+            });
+            return json(res, 200, result);
+          }
+        }
+        return json(res, 404, errorBody('CODEX_RELAY_ROUTE_NOT_FOUND', 'Codex Relay route not found.'));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/codex-browser/status') {
+        const webviewRoot = codexWebviewRoot(config);
+        const runtime = codexRuntimeCompatibility?.status?.() || { state: 'legacy', ready: true };
+        const staticReady = Boolean(await safeStaticFile(webviewRoot, path.join(webviewRoot, 'index.html')));
+        const ready = staticReady && runtime.ready !== false;
+        return json(res, ready ? 200 : 503, {
+          ready,
+          mode: 'browser',
+          version: runtime.desktop?.version || '26.803.81509',
+          buildNumber: runtime.desktop?.buildNumber || '6415',
+          workspaceRoot: config.workspaceRoot,
+          webviewRoot,
+          runtime,
+          backend: codexBrowserService?.status?.() || { running: false, initialized: false, pid: null },
+          modelBridge: codexModelBridgeService?.status?.() || { configured: false },
+          product: codexProductService?.status?.() || { service: 'codex-product', available: false },
+          observedMessageTypes: codexHostCommands.observedMessageTypes(),
+          hostCommands: codexHostCommands.status(),
+        });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/codex-model/v1/responses') {
+        if (!codexModelBridgeService?.responses) {
+          return json(res, 503, errorBody('CODEX_MODEL_BRIDGE_UNAVAILABLE', 'The Codex model bridge is unavailable.'));
+        }
+        const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 16 * 1024 * 1024));
+        const result = await codexModelBridgeService.responses(body, {
+          authorization: req.headers.authorization,
+          remoteAddress: req.socket?.remoteAddress,
+        });
+        if (!result.stream) return json(res, 200, result.body);
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        });
+        for await (const event of result.events) {
+          res.write(`event: ${String(event?.type || 'message')}\n`);
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/codex-model/probe') {
+        if (!codexModelBridgeService?.probe) {
+          return json(res, 503, errorBody('CODEX_MODEL_BRIDGE_UNAVAILABLE', 'The Codex model bridge is unavailable.'));
+        }
+        return json(res, 200, await codexModelBridgeService.probe());
+      }
+      if (req.method === 'GET' && url.pathname === '/api/codex-browser/events') {
+        const after = Number(url.searchParams.get('after') || 0);
+        if (!Number.isSafeInteger(after) || after < 0) {
+          return json(res, 400, errorBody('CODEX_BROWSER_CURSOR_INVALID', 'Codex browser event cursor is invalid.'));
+        }
+        const sessionId = String(url.searchParams.get('sessionId') || '').trim();
+        const events = (codexBrowserService?.listEvents?.({ after, sessionId }) || []).slice(0, 30);
+        return json(res, 200, {
+          events,
+          cursor: events.at(-1)?.sequence ?? after,
+        });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/codex-browser/messages') {
+        const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));
+        const message = body?.message && typeof body.message === 'object' ? body.message : body;
+        const sessionId = String(body?.sessionId || '').trim();
+        return json(res, 200, await codexHostCommands.sendLegacy({
+          sessionId,
+          commandId: body?.commandId,
+          message,
+        }));
+      }
+      if (req.method === 'POST' && url.pathname === '/api/codex-browser/worker-messages') {
+        const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));
+        return json(res, 200, await codexHostCommands.sendWorkerLegacy({
+          sessionId: String(body?.sessionId || '').trim(),
+          commandId: body?.commandId,
+          workerId: body?.workerId,
+          message: body?.message,
+        }));
       }
       if (await handleMcpManagementRequest({
         req,
@@ -1907,6 +2489,29 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         }
       }
       if (url.pathname.startsWith('/api/')) return json(res, 404, errorBody('NOT_FOUND', 'Endpoint not found.'));
+      if ((req.method === 'GET' || req.method === 'HEAD') && (url.pathname === '/codex' || url.pathname.startsWith('/codex/'))) {
+        if (url.pathname === '/codex') {
+          res.writeHead(302, { Location: '/codex/' });
+          return res.end();
+        }
+        const runtime = codexRuntimeCompatibility?.status?.();
+        if (runtime && runtime.ready === false) {
+          return json(res, 503, errorBody(
+            'CODEX_BROWSER_RUNTIME_INCOMPATIBLE',
+            'Codex browser runtime is not compatible with the active known-good baseline.',
+            { runtime },
+          ));
+        }
+        try {
+          if (await serveCodexWebview(req, res, config, url.pathname, codexRuntimeCompatibility)) return;
+        } catch (error) {
+          if (String(error?.code || '').startsWith('CODEX_RUNTIME_')) {
+            return json(res, 503, errorBody('CODEX_BROWSER_RUNTIME_INCOMPATIBLE', 'Codex browser runtime changed after compatibility inspection.'));
+          }
+          throw error;
+        }
+        return json(res, 404, errorBody('CODEX_BROWSER_ASSET_NOT_FOUND', 'Codex browser asset not found.'));
+      }
       if ((req.method === 'GET' || req.method === 'HEAD') && await serveSpa(req, res, config.staticDir, url.pathname)) return;
       return json(res, 404, errorBody('NOT_FOUND', 'Endpoint not found.'));
     } catch (error) {
@@ -1942,6 +2547,12 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       }
       if (String(error.code || '').startsWith('EMAIL_RECIPIENT_EVIDENCE_')) {
         return json(res, Number(error.status || 400), errorBody(error.code, error.message));
+      }
+      if (String(error.code || '').startsWith('XHS_CONTEXT_')) {
+        return json(res, Number(error.status || 400), {
+          ...errorBody(error.code, error.message),
+          ...(error.details !== undefined ? { details: error.details } : {}),
+        });
       }
       if (error instanceof ValidationError) return json(res, 400, errorBody('VALIDATION_ERROR', error.message, error.details));
       if (error.code === 'DRAFT_VERSION_CONFLICT') {
@@ -2056,6 +2667,27 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         return json(res, 500, errorBody(error.code, error.message));
       }
       if (error instanceof SyntaxError) return json(res, 400, errorBody('INVALID_JSON', 'Request body must contain valid JSON.'));
+      if (String(error.code || '').startsWith('CODEX_DESKTOP_')) {
+        return json(res, Number(error.status || 500), errorBody(error.code, error.message, error.details));
+      }
+      if (String(error.code || '').startsWith('CODEX_RELAY_')) {
+        return json(res, Number(error.status || 500), errorBody(error.code, error.message, error.details));
+      }
+      if (String(error.code || '').startsWith('CODEX_CONNECT')) {
+        return json(res, Number(error.status || 500), errorBody(error.code, error.message, error.details));
+      }
+      if (String(error.code || '').startsWith('CODEX_MIRROR_')) {
+        return json(res, Number(error.status || 500), errorBody(error.code, error.message, error.details));
+      }
+      if (
+        String(error.code || '').startsWith('CODEX_GATEWAY_')
+        || String(error.code || '').startsWith('CODEX_DEVICE_')
+        || String(error.code || '').startsWith('CODEX_PAIRING_')
+        || String(error.code || '').startsWith('CODEX_TURN_')
+        || String(error.code || '').startsWith('CODEX_ICE_')
+      ) {
+        return json(res, Number(error.status || 500), errorBody(error.code, error.message, error.details));
+      }
       if (error.code === 'ENOENT' || /Path escapes/.test(error.message)) {
         return json(res, 404, errorBody('ARTIFACT_NOT_FOUND', 'Artifact not found.'));
       }
@@ -6414,7 +7046,10 @@ function validateRequestOrigin(req, config = {}, { preflight = false } = {}) {
   const expectedOrigin = String(config.authOrigin || '').trim();
   if (!expectedOrigin) return null;
   const origin = String(req.headers.origin || '').trim();
-  if (origin && origin !== expectedOrigin) {
+  const trustedLoopbackOrigin = isLoopbackAddress(req.socket?.remoteAddress)
+    && isLoopbackHost(req.headers.host)
+    && Boolean(loopbackOrigin(origin));
+  if (origin && origin !== expectedOrigin && !trustedLoopbackOrigin) {
     return { status: 403, code: 'CSRF_ORIGIN_REJECTED', message: 'Request origin is not allowed.' };
   }
   const fetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
@@ -6468,6 +7103,34 @@ function resolveSecurePublicRedirect(req, config = {}) {
   }
 }
 
+function requestPublicProtocol(req, config = {}) {
+  try {
+    const configured = new URL(String(config.authOrigin || ''));
+    if (configured.protocol === 'https:' || configured.protocol === 'http:') return configured.protocol.slice(0, -1);
+  } catch {
+    // Local deployments do not require a configured public origin.
+  }
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  if (forwardedProto === 'https' || req.socket?.encrypted) return 'https';
+  return 'http';
+}
+
+function requestPublicHost(req, config = {}) {
+  try {
+    const configured = new URL(String(config.authOrigin || ''));
+    if (configured.host) return configured.host;
+  } catch {
+    // Local deployments use the request host.
+  }
+  const forwardedHost = String(req.headers['x-forwarded-host'] || '')
+    .split(',')[0]
+    .trim();
+  return forwardedHost || String(req.headers.host || '').trim();
+}
+
 function setSecurityHeaders(res, config = {}, requestOrigin = '') {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -6489,7 +7152,7 @@ function setSecurityHeaders(res, config = {}, requestOrigin = '') {
     "script-src 'self' https://static.cloudflareinsights.com",
     "connect-src 'self' https: wss:",
   ].join('; '));
-  res.setHeader('Permissions-Policy', 'accelerometer=(), autoplay=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()');
+  res.setHeader('Permissions-Policy', 'accelerometer=(), autoplay=(self), camera=(), display-capture=(self), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()');
   const defaultDevOrigin = 'http://127.0.0.1:5173';
   const allowedOrigin = configuredOrigin || (config.authRequired === true ? '' : defaultDevOrigin);
   if (allowedOrigin && (!requestOrigin || requestOrigin === allowedOrigin)) {
@@ -6515,6 +7178,29 @@ function noContent(res) {
 
 function errorBody(code, message, details) {
   return { message, error: { code, message, ...(details?.length ? { details } : {}) } };
+}
+
+async function describeCodexConnectInstaller(filePath, previous = null) {
+  const resolved = String(filePath || '').trim();
+  if (!resolved) return { available: false, cache: null };
+  try {
+    const details = await stat(resolved);
+    if (!details.isFile()) return { available: false, cache: null };
+    if (previous?.path === resolved && previous.size === details.size && previous.modifiedAtMs === details.mtimeMs) {
+      return { ...previous, available: true, cache: previous };
+    }
+    const sha256 = createHash('sha256').update(await readFile(resolved)).digest('hex');
+    const cache = {
+      path: resolved,
+      size: details.size,
+      modifiedAtMs: details.mtimeMs,
+      sha256,
+    };
+    return { ...cache, available: true, cache };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { available: false, cache: null };
+    throw error;
+  }
 }
 
 function audienceAiHttpStatus(code) {
@@ -6553,6 +7239,191 @@ function isAudienceAiRouteParts(parts) {
     && parts[4] === 'posts'
     && Boolean(parts[5])
     && (parts[6] === 'ai' || ['comments', 'users'].includes(parts[6]));
+}
+
+function codexWebviewRoot(config) {
+  return path.join(
+    config.codexDesktopRuntimeDir || path.join(config.projectRoot || process.cwd(), 'output', 'codex-desktop-runtime-55d9fb967596'),
+    'app',
+    'resources',
+    'app-unpacked',
+    'webview',
+  );
+}
+
+function codexRelayConnectionToken(req, body = null) {
+  const header = req.headers['x-codex-relay-connection'];
+  if (typeof header === 'string' && header.trim()) return header.trim();
+  if (Array.isArray(header) && typeof header[0] === 'string' && header[0].trim()) return header[0].trim();
+  return typeof body?.connectionToken === 'string' ? body.connectionToken : '';
+}
+
+function setCodexBrowserSecurityHeaders(req, res, config = {}) {
+  const allowLoopbackDevFrame = config.authRequired !== true
+    && isLoopbackAddress(req.socket?.remoteAddress)
+    && isLoopbackHost(req.headers.host);
+  const loopbackFrameOrigin = allowLoopbackDevFrame
+    ? loopbackOrigin(req.headers.referer)
+    : '';
+  if (allowLoopbackDevFrame) res.removeHeader('X-Frame-Options');
+  else res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  const frameAncestors = `frame-ancestors 'self'${loopbackFrameOrigin ? ` ${loopbackFrameOrigin}` : ''}`;
+  const requestPath = new URL(String(req.url || '/'), 'http://localhost').pathname;
+  const mirrorLoopbackSources = requestPath === '/codex-native-mirror.html'
+    ? ' ws://127.0.0.1:* ws://localhost:* ws://[::1]:*'
+    : '';
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'none'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    frameAncestors,
+    "img-src 'self' app: blob: data: https:",
+    "child-src 'self' blob: https:",
+    "frame-src 'self' blob: https:",
+    "worker-src 'self' blob:",
+    "script-src 'self' 'wasm-unsafe-eval'",
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self' data:",
+    "media-src 'self' app: blob: data:",
+    `connect-src 'self' https: wss:${mirrorLoopbackSources}`,
+  ].join('; '));
+}
+
+function loopbackOrigin(value) {
+  try {
+    const origin = new URL(String(value || '')).origin;
+    return /^http:\/\/(?:127\.0\.0\.1|localhost):\d+$/u.test(origin) ? origin : '';
+  } catch {
+    return '';
+  }
+}
+
+async function serveCodexWebview(req, res, config, pathname, codexRuntimeCompatibility = null) {
+  const root = codexWebviewRoot(config);
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname.slice('/codex/'.length));
+  } catch {
+    return false;
+  }
+  const relative = decoded.replace(/^\/+/, '').replaceAll('/', path.sep);
+  const requested = relative === 'browser-host.js'
+    ? path.join(config.projectRoot || config.workspaceRoot || process.cwd(), 'public', 'codex-browser-host.js')
+    : path.resolve(root, relative || 'index.html');
+  const allowedRoot = relative === 'browser-host.js'
+    ? path.join(config.projectRoot || config.workspaceRoot || process.cwd(), 'public')
+    : root;
+  try {
+    assertPathInside(allowedRoot, requested);
+  } catch {
+    return false;
+  }
+  const file = await safeStaticFile(allowedRoot, requested);
+  if (!file) return false;
+  const isIndex = path.basename(file.absolute).toLowerCase() === 'index.html';
+  if (isIndex) {
+    const source = await readFile(file.absolute, 'utf8');
+    const marker = '<script type="module"';
+    const injection = '<link rel="icon" href="data:,">\n    <script src="/codex/browser-host.js"></script>\n    ';
+    const html = source.includes(marker) ? source.replace(marker, `${injection}${marker}`) : source;
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Length': Buffer.byteLength(html),
+      'Cache-Control': 'no-cache',
+    });
+    if (req.method === 'HEAD') return res.end();
+    res.end(html);
+    return true;
+  }
+  const isBrowserAppInitial = path.basename(file.absolute) === 'app-initial-KpqQCW_k.js';
+  if (isBrowserAppInitial || codexRuntimeCompatibility?.status?.().patchAssets?.some((entry) => entry.kind === 'app-initial' && path.resolve(entry.file).toLowerCase() === path.resolve(file.absolute).toLowerCase())) {
+    const source = await readFile(file.absolute, 'utf8');
+    const runtimeTransform = codexRuntimeCompatibility?.transform?.(file.absolute, source);
+    if (runtimeTransform?.ok === false) {
+      const error = new Error(runtimeTransform.errorMessage || 'Codex browser runtime patch anchor changed.');
+      error.code = runtimeTransform.errorCode || 'CODEX_RUNTIME_PATCH_ANCHOR_CHANGED';
+      throw error;
+    }
+    if (runtimeTransform?.matched) {
+      const browserSource = runtimeTransform.source;
+      res.writeHead(200, {
+        'Content-Type': 'text/javascript; charset=utf-8',
+        'Content-Length': Buffer.byteLength(browserSource),
+        'Cache-Control': 'no-cache',
+      });
+      if (req.method === 'HEAD') return res.end();
+      res.end(browserSource);
+      return true;
+    }
+    const desktopConnect = 'async function J8e(){Y8e=q8e(),Am=await Y8e.services,Am.clientCoordination!=null&&h8e(Am.clientCoordination),Am.terminal!=null&&G3e(Am.terminal),Am.devboxService}';
+    const browserConnect = 'async function J8e(){Am={localThreadCatalog:null,threadProjectAssignments:{setAssignment:async()=>{}},clientCoordination:null,terminal:null,devboxService:null,startup:null,requestUserInputAutoResolution:{setConversationPresented(){},recordConversationActivity(){},snooze(){}},appInfo:{get:async()=>({appVersion:"26.803.81509",version:"26.803.81509",buildNumber:"6415",buildFlavor:"prod"})}}}';
+    if (!source.includes(desktopConnect)) {
+      const error = new Error('Codex app-initial startup anchor was not found.');
+      error.code = 'CODEX_RUNTIME_PATCH_ANCHOR_CHANGED';
+      throw error;
+    }
+    const browserSource = source.replace(desktopConnect, browserConnect);
+    res.writeHead(200, {
+      'Content-Type': 'text/javascript; charset=utf-8',
+      'Content-Length': Buffer.byteLength(browserSource),
+      'Cache-Control': 'no-cache',
+    });
+    if (req.method === 'HEAD') return res.end();
+    res.end(browserSource);
+    return true;
+  }
+  const isBrowserAppMain = path.basename(file.absolute) === 'app-main-CCNMdQcy.js';
+  if (isBrowserAppMain || codexRuntimeCompatibility?.status?.().patchAssets?.some((entry) => entry.kind === 'app-main' && path.resolve(entry.file).toLowerCase() === path.resolve(file.absolute).toLowerCase())) {
+    const source = await readFile(file.absolute, 'utf8');
+    const runtimeTransform = codexRuntimeCompatibility?.transform?.(file.absolute, source);
+    if (runtimeTransform?.ok === false) {
+      const error = new Error(runtimeTransform.errorMessage || 'Codex browser runtime patch anchor changed.');
+      error.code = runtimeTransform.errorCode || 'CODEX_RUNTIME_PATCH_ANCHOR_CHANGED';
+      throw error;
+    }
+    if (runtimeTransform?.matched) {
+      const browserSource = runtimeTransform.source;
+      res.writeHead(200, {
+        'Content-Type': 'text/javascript; charset=utf-8',
+        'Content-Length': Buffer.byteLength(browserSource),
+        'Cache-Control': 'no-cache',
+      });
+      if (req.method === 'HEAD') return res.end();
+      res.end(browserSource);
+      return true;
+    }
+    const browserSource = source
+      .replace('await V(),await ne(),u(),', 'await V(),ne().catch(()=>{}),u(),')
+      .replace(
+        'let e=G||K||l.startup==null?void 0:Promise.resolve(l.startup.whenReady());',
+        'let e=G||K||l==null||l.startup==null?void 0:Promise.resolve(l.startup.whenReady());',
+      )
+      .replaceAll('l.startup', 'l?.startup');
+    if (browserSource === source) {
+      const error = new Error('Codex app-main startup anchors were not found.');
+      error.code = 'CODEX_RUNTIME_PATCH_ANCHOR_CHANGED';
+      throw error;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/javascript; charset=utf-8',
+      'Content-Length': Buffer.byteLength(browserSource),
+      'Cache-Control': 'no-cache',
+    });
+    if (req.method === 'HEAD') return res.end();
+    res.end(browserSource);
+    return true;
+  }
+  const cacheControl = /[\\/]assets[\\/]/.test(file.absolute)
+    ? 'public, max-age=31536000, immutable'
+    : 'no-cache';
+  res.writeHead(200, {
+    'Content-Type': mimeType(file.absolute),
+    'Content-Length': file.size,
+    'Cache-Control': cacheControl,
+  });
+  if (req.method === 'HEAD') return res.end();
+  createReadStream(file.absolute).pipe(res);
+  return true;
 }
 
 async function serveSpa(req, res, staticDir, pathname) {
@@ -6604,12 +7475,15 @@ function mimeType(file) {
     '.css': 'text/css; charset=utf-8',
     '.html': 'text/html; charset=utf-8',
     '.ico': 'image/x-icon',
+    '.avif': 'image/avif',
     '.jpeg': 'image/jpeg',
     '.jpg': 'image/jpeg',
     '.js': 'text/javascript; charset=utf-8',
     '.json': 'application/json; charset=utf-8',
     '.png': 'image/png',
+    '.map': 'application/json; charset=utf-8',
     '.svg': 'image/svg+xml',
+    '.wasm': 'application/wasm',
     '.webp': 'image/webp',
     '.woff2': 'font/woff2',
   })[path.extname(file).toLowerCase()] || 'application/octet-stream';

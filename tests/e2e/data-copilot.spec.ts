@@ -24,6 +24,7 @@ type MockState = {
   sseBody?: string
   aiProviders: Record<string, unknown>[]
   modelDiscoveryBaseUrl?: string
+  modelDiscoveryModels?: string[]
   modelDiscoveryBodies: Record<string, unknown>[]
   aiSessionBodies: Record<string, unknown>[]
   mcpRequests: { method: string; path: string; body: Record<string, unknown> }[]
@@ -31,6 +32,7 @@ type MockState = {
   workspaceToolStatus: 'completed' | 'running' | 'cancelled'
   workspaceBranch: string
   workspaceToolExecutions: Record<string, { toolName: string; input: Record<string, unknown> }>
+  codexLaunches: number
 }
 
 function job(revision: number) {
@@ -123,6 +125,20 @@ async function installApi(page: Page, state: MockState) {
     const method = request.method()
 
     if (path === '/api/health') return json(route, { ok: true, runnerAvailable: true, emailDelivery: { configured: false } })
+    if (path === '/api/codex-desktop/launch' && method === 'POST') {
+      state.codexLaunches += 1
+      return json(route, {
+        launched: true,
+        mode: 'native',
+        version: '26.803.81509',
+        buildNumber: '6415',
+        runtimeRoot: 'C:\\workspace\\output\\codex-desktop-runtime-55d9fb967596',
+        executablePath: 'C:\\workspace\\output\\codex-desktop-runtime-55d9fb967596\\app\\ChatGPT.exe',
+        pid: 3210,
+        launchedAt: now,
+        workspaceRoot: 'C:\\workspace',
+      })
+    }
     if (path === `/api/jobs/${jobId}/media` || path === `/api/jobs/${historicalJobId}/media`) {
       if (path === `/api/jobs/${historicalJobId}/media` && url.searchParams.get('url')?.includes('expired-cover')) {
         return route.fulfill({ status: 410, contentType: 'text/plain', body: 'expired' })
@@ -145,7 +161,7 @@ async function installApi(page: Page, state: MockState) {
       return json(route, {
         provider: body.provider,
         baseUrl: state.modelDiscoveryBaseUrl || body.baseUrl,
-        models: ['relay-model-a', 'relay-model-b'],
+        models: state.modelDiscoveryModels || ['relay-model-a', 'relay-model-b'],
         fetchedAt: now,
       })
     }
@@ -535,6 +551,7 @@ function baseState(overrides: Partial<MockState> = {}): MockState {
     workspaceToolStatus: 'completed',
     workspaceBranch: 'main',
     workspaceToolExecutions: {},
+    codexLaunches: 0,
     ...overrides,
   }
 }
@@ -592,7 +609,117 @@ function projectWorkspaceToolEvents(status: MockState['workspaceToolStatus']) {
   return events
 }
 
-test('renders the Codex-style workspace across desktop and mobile panes', async ({ page }) => {
+test('opens the complete Codex surface directly inside the browser', async ({ page }) => {
+  test.setTimeout(120_000)
+  const state = baseState()
+  await installApi(page, state)
+  await page.route('**/api/codex-browser/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ready: true,
+        backend: {
+          initialized: true,
+          modelProvider: { configured: true, id: 'xhs_product_api', model: 'gpt-5.6-sol', wireApi: 'responses' },
+          dynamicMcp: { tools: 70, calls: 2, completed: 2, failed: 0 },
+        },
+        modelBridge: {
+          configured: true,
+          requests: 3,
+          completed: 3,
+          failed: 0,
+          upstream: { configured: true, provider: 'relay', model: 'gpt-5.6-sol', wireApi: 'chat_completions' },
+        },
+      }),
+    })
+  })
+  await page.route('**/api/codex-relay/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        adapter: { state: 'compatible' },
+        device: { id: 'local', name: 'This Windows device', online: true },
+        modes: { nativeMirror: { available: true } },
+        ice: { turnConfigured: true },
+      }),
+    })
+  })
+  await page.route('**/api/xhs-context/status', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        schemaVersion: 1,
+        service: 'xhs-context',
+        rootDir: 'C:/fixture/context',
+        transport: 'loopback-http',
+        localOnly: true,
+        indexMode: 'token-index',
+        fts5Available: false,
+        bundles: 4,
+        bytes: 1024,
+        records: 128,
+        mcp: { endpoint: 'http://127.0.0.1/api/xhs-context/mcp', credentialFile: 'fixture', header: 'X-Xhs-Context-Token' },
+      }),
+    })
+  })
+  await page.route('**/api/codex-product/integration', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        schemaVersion: 1,
+        workspace: { schemaVersion: 1, source: null, history: [], activeJobId: null, generatedAt: now },
+        mcp: { embedded: ['xhs-context', 'codex-product'], localInstall: { command: 'fixture', bridgeScript: 'fixture', requiresLocalProduct: true, includes: Array.from({ length: 26 }, (_, index) => `tool-${index}`) } },
+        launch: { workspaceRoot: 'C:/fixture', endpoint: '/api/codex-desktop/launch' },
+        sourceDownload: { path: '/api/codex-product/source-archive', format: 'tar.gz', excludesSecrets: true },
+      }),
+    })
+  })
+  await page.route('**/codex/**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      body: '<!doctype html><html><body><main data-testid="codex-runtime">Codex browser runtime</main></body></html>',
+    })
+  })
+  await page.goto('/', { waitUntil: 'commit' })
+
+  const launchButton = page.getByRole('button', { name: 'Codex' })
+  await expect(launchButton).toBeVisible({ timeout: 60_000 })
+  await expect(launchButton).toBeEnabled()
+  await page.screenshot({ path: 'output/playwright/codex-entry-desktop.png', fullPage: true })
+  await launchButton.click()
+  const surface = page.getByRole('dialog', { name: 'Codex 浏览器工作台' })
+  await expect(surface).toBeVisible()
+  await expect(page.frameLocator('iframe[title="Codex"]').getByTestId('codex-runtime')).toBeVisible()
+  await expect(surface.getByText('API gpt-5.6-sol · 70 MCP tools · 3/3 turns')).toBeVisible()
+  await page.screenshot({ path: 'output/playwright/codex-surface-desktop.png', fullPage: true })
+  await expect(page.getByRole('link', { name: '在新标签页打开 Codex' })).toHaveAttribute('href', '/codex/')
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(surface).toBeVisible()
+  const mobileRuntime = surface.getByText('API gpt-5.6-sol · 70 tools')
+  const mobileContextActions = surface.locator('.codex-product-context-actions')
+  const mobileDesktopFacts = surface.locator('.codex-product-context-facts > span:not(.codex-product-runtime-state)')
+  await expect(mobileRuntime).toBeVisible()
+  await expect(surface.locator('.codex-product-workspace-summary')).toBeHidden()
+  await expect(mobileDesktopFacts).toHaveCount(5)
+  expect(await mobileDesktopFacts.evaluateAll((nodes) => nodes.every((node) => getComputedStyle(node).display === 'none'))).toBe(true)
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+  await expect.poll(async () => {
+    const runtimeBox = await mobileRuntime.boundingBox()
+    const actionsBox = await mobileContextActions.boundingBox()
+    return Boolean(runtimeBox && actionsBox && runtimeBox.x + runtimeBox.width <= actionsBox.x)
+  }).toBe(true)
+  await page.screenshot({ path: 'output/playwright/codex-entry-mobile.png', fullPage: true })
+  await page.getByRole('button', { name: '关闭 Codex' }).click()
+  await expect(surface).toBeHidden()
+})
+
+test('renders the legacy data assistant across desktop and mobile panes', async ({ page }) => {
   const state = baseState()
   await installApi(page, state)
   await page.goto('/')
@@ -1506,6 +1633,46 @@ test('connects and selects an AI model from inside Data Copilot', async ({ page 
     wireApi: 'chat_completions',
   })
   await expect(copilot.getByText('relay-secret')).toHaveCount(0)
+})
+
+test('enables and persists reasoning effort for a compatible Chat Completions model', async ({ page }) => {
+  const state = baseState({
+    sessions: [conversation(sessionId, 'idle')],
+    aiProviders: [{
+      id: 'relay',
+      label: 'API 中转站（OpenAI 兼容）',
+      baseUrl: '',
+      model: '',
+      models: [],
+      requiresKey: true,
+      wireApi: 'chat_completions',
+      configured: false,
+      hasApiKey: false,
+      relay: true,
+    }],
+    modelDiscoveryModels: ['gpt-5.1-codex'],
+  })
+  await installApi(page, state)
+  await page.goto('/')
+  await page.getByRole('button', { name: '数据助手' }).click()
+
+  const copilot = page.getByRole('dialog', { name: '数据 Copilot' })
+  await copilot.getByRole('button', { name: '连接 AI 模型' }).click()
+  const connector = copilot.getByRole('dialog', { name: '连接 AI 模型' })
+  await connector.getByLabel('API Base URL').fill('https://relay.example.test/v1')
+  await connector.getByLabel('API Key').fill('relay-secret')
+  await connector.getByRole('button', { name: '检测模型' }).click()
+  await expect(connector.getByLabel('模型 ID')).toHaveValue('gpt-5.1-codex')
+  await connector.getByRole('button', { name: '连接并使用' }).click()
+  await expect(connector).toBeHidden()
+
+  const reasoningEffort = copilot.getByLabel('推理强度')
+  await expect(reasoningEffort).toBeEnabled()
+  await reasoningEffort.selectOption('high')
+  await expect(reasoningEffort).toHaveValue('high')
+  await expect.poll(() => state.sessionSettingsBodies.at(-1)).toEqual({
+    selectedModel: { aiSessionId, reasoningEffort: 'high' },
+  })
 })
 
 test('keeps the saved credential URL when discovery normalizes the endpoint', async ({ page }) => {
