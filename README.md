@@ -10,7 +10,7 @@
 2. 完整解压 ZIP。
 3. 双击 `start-windows.cmd`。
 
-内置 Codex 版下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows.zip`，完整解压后双击 `Start-Codex-App.cmd`。该启动器会启用包内 Codex 页面，并由项目依赖自动安装匹配 Windows 架构的 Codex app-server。
+内置 Codex 版下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows-x64.zip`，完整解压后双击 `Start-Codex-App.cmd`。该包自带经过 PE x64 头与 SHA-256 校验的 Codex app-server，不会借用 Linux 或 macOS runtime。
 
 第一次运行会自动检查并安装 Node.js、Python 和 Chrome，随后安装依赖、构建并启动应用。详细步骤、哈希校验和故障排查见 [一键启动指南](ONE_CLICK_START.md)。
 
@@ -20,7 +20,7 @@
 
 预先安装 Node.js 22+、npm、Python 3.11+ 和 Chrome 或 Edge。完整解压后，在 Finder 中双击 `Start-App.command`；首次运行会安装依赖、构建、启动服务并打开浏览器。
 
-内置 Codex 版下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip`，在 Finder 中双击 `Start-Codex-App.command`。同一个 ZIP 会在 Apple Silicon 与 Intel Mac 上分别安装匹配架构的 Codex app-server，并完成 `/codex/` 页面打开验收。
+内置 Codex 版必须按处理器下载：Apple Silicon 使用 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-arm64.zip`，Intel 使用 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-x64.zip`。两份 ZIP 都从 `Start-Codex-App.command` 启动，并分别携带经过 Mach-O 架构与 SHA-256 校验的 Codex app-server。
 
 也可以从终端启动：
 
@@ -70,17 +70,17 @@ npm run package:github-release:codex
 ```bash
 sh scripts/package-github-release-macos.sh
 sh scripts/verify-github-release-macos.sh --archive-path deliverables/xiaohongshu-relay-scraper-ui-one-click-macos.zip
-sh scripts/package-github-release-macos-codex.sh
-sh scripts/verify-github-release-macos.sh --archive-path deliverables/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip --launch-entry Start-Codex-App.command --require-codex-built-in --browser-smoke
+sh scripts/package-github-release-macos-codex.sh --architecture arm64
+sh scripts/verify-github-release-macos.sh --archive-path deliverables/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-arm64.zip --launch-entry Start-Codex-App.command --require-codex-built-in --expected-architecture arm64 --browser-smoke
 ```
 
-每次推送 `main` 后，`Release` 工作流会创建四个净化 ZIP。内置 Codex 版会在临时 `CODEX_HOME` 中初始化包内 app-server，调用 `thread/list`，再用 Chromium 打开 `/codex/`。`v*` 标签只有在 Windows、Apple Silicon 和 Intel Mac 全部通过后，才会上传四个 ZIP 及各自的 SHA-256 校验文件。
+每次推送 `main` 后，`Release` 工作流会分别在 Windows x64、macOS arm64 与 macOS x64 runner 上构建对应的内置 Codex 包。验收会在临时 `CODEX_HOME` 中初始化包内 app-server，调用 `thread/list`，再用 Chromium 打开 `/codex/`。`v*` 标签只有三种目标都通过后才会上传；JSON 证据只记录相对接口、架构、哈希和结果，不记录临时绝对路径或用户状态。
 
 ## 首次使用
 
 - 小红书采集需要在受管浏览器中完成一次登录。
 - Data Copilot 的模型接口按使用环境配置，不随发布包分发凭据。
-- `.env`、用户数据、浏览器资料、Cookie、日志和本地运行时不会进入 GitHub 发布包。
+- `.env`、用户数据、浏览器资料、Cookie、日志和本机 runtime 不会进入 GitHub 发布包；内置版只额外携带 manifest 声明的目标平台 Codex executable。
 
 ## 常用入口
 

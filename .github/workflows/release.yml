@@ -43,7 +43,7 @@ jobs:
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-one-click-windows.zip'
-          $codexArchive = Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows.zip'
+          $codexArchive = Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows-x64.zip'
           ./scripts/package-github-release.ps1 -OutputPath $archive -SourceRef HEAD
           ./scripts/package-github-release-codex.ps1 -OutputPath $codexArchive -SourceRef HEAD
           "archive=$archive" >> $env:GITHUB_OUTPUT
@@ -55,7 +55,7 @@ jobs:
         run: ./scripts/verify-github-release.ps1 -ArchivePath '${{ steps.package.outputs.archive }}' -Port 65431
       - name: Open the built-in Codex Windows archive
         shell: pwsh
-        run: ./scripts/verify-github-release.ps1 -ArchivePath '${{ steps.package.outputs.codex_archive }}' -Port 65434 -LaunchEntry 'Start-Codex-App.cmd' -RequireCodexBuiltIn -BrowserSmoke -ScreenshotPath (Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-codex-windows-open-smoke.png')
+        run: ./scripts/verify-github-release.ps1 -ArchivePath '${{ steps.package.outputs.codex_archive }}' -Port 65434 -LaunchEntry 'Start-Codex-App.cmd' -RequireCodexBuiltIn -ExpectedArchitecture x64 -BrowserSmoke -ScreenshotPath (Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-codex-windows-x64-smoke.png') -EvidencePath (Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-codex-windows-x64-evidence.json')
       - name: Upload verified one-click package
         uses: actions/upload-artifact@v4
         with:
@@ -65,12 +65,13 @@ jobs:
             ${{ steps.package.outputs.checksum }}
             ${{ steps.package.outputs.codex_archive }}
             ${{ steps.package.outputs.codex_checksum }}
-            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-windows-open-smoke.png
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-windows-x64-smoke.png
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-windows-x64-evidence.json
           if-no-files-found: error
           retention-days: 30
 
   one-click-macos:
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -95,9 +96,7 @@ jobs:
       - name: Create sanitized macOS archives
         run: |
           archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip"
-          codex_archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip"
           sh scripts/package-github-release-macos.sh --output-path "$archive" --source-ref HEAD
-          sh scripts/package-github-release-macos-codex.sh --output-path "$codex_archive" --source-ref HEAD
       - name: Open the clean archive through the macOS Finder launcher
         run: |
           sh scripts/verify-github-release-macos.sh \
@@ -105,15 +104,6 @@ jobs:
             --port 65432 \
             --browser-smoke \
             --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-open-smoke.png"
-      - name: Open the built-in Codex macOS archive
-        run: |
-          sh scripts/verify-github-release-macos.sh \
-            --archive-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip" \
-            --port 65434 \
-            --launch-entry Start-Codex-App.command \
-            --require-codex-built-in \
-            --browser-smoke \
-            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-codex-macos-open-smoke.png"
       - name: Upload verified macOS package
         uses: actions/upload-artifact@v4
         with:
@@ -122,15 +112,21 @@ jobs:
             ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip
             ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip.sha256
             ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-open-smoke.png
-            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip
-            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip.sha256
-            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-macos-open-smoke.png
           if-no-files-found: error
           retention-days: 30
 
-  verify-macos-intel:
-    needs: one-click-macos
-    runs-on: macos-15-intel
+  codex-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: arm64
+            runner: macos-15
+            port: 65434
+          - architecture: x64
+            runner: macos-15-intel
+            port: 65435
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -147,40 +143,45 @@ jobs:
           npm ci --no-audit --no-fund
           python3 -m pip install --disable-pip-version-check -r requirements.txt
           npx playwright install chromium
-      - name: Download the Apple Silicon job's verified ZIP
-        uses: actions/download-artifact@v4
-        with:
-          name: xiaohongshu-relay-scraper-ui-one-click-macos-${{ github.sha }}
-          path: ${{ runner.temp }}/macos-package
-      - name: Open the same ZIP through the Intel macOS Finder launcher
+      - name: Assert the macOS runner architecture
+        run: |
+          expected='${{ matrix.architecture }}'
+          actual=$(uname -m)
+          [ "$actual" = "$expected" ] || { [ "$expected" = x64 ] && [ "$actual" = x86_64 ]; }
+      - name: Package the native built-in Codex runtime
+        run: |
+          archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-${{ matrix.architecture }}.zip"
+          sh scripts/package-github-release-macos-codex.sh \
+            --output-path "$archive" \
+            --archive-root "xiaohongshu-relay-scraper-ui-codex-built-in-macos-${{ matrix.architecture }}" \
+            --architecture '${{ matrix.architecture }}' \
+            --source-ref HEAD
+      - name: Unpack, launch, and smoke the built-in Codex package
         run: |
           sh scripts/verify-github-release-macos.sh \
-            --archive-path "$RUNNER_TEMP/macos-package/xiaohongshu-relay-scraper-ui-one-click-macos.zip" \
-            --port 65433 \
-            --browser-smoke \
-            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png"
-      - name: Open the same built-in Codex ZIP on Intel macOS
-        run: |
-          sh scripts/verify-github-release-macos.sh \
-            --archive-path "$RUNNER_TEMP/macos-package/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip" \
-            --port 65435 \
+            --archive-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-${{ matrix.architecture }}.zip" \
+            --port '${{ matrix.port }}' \
             --launch-entry Start-Codex-App.command \
             --require-codex-built-in \
+            --expected-architecture '${{ matrix.architecture }}' \
             --browser-smoke \
-            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-codex-macos-intel-open-smoke.png"
-      - name: Upload Intel macOS open evidence
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-codex-macos-${{ matrix.architecture }}-smoke.png" \
+            --evidence-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-codex-macos-${{ matrix.architecture }}-evidence.json"
+      - name: Upload architecture-specific macOS package and evidence
         uses: actions/upload-artifact@v4
         with:
-          name: macos-intel-open-evidence-${{ github.sha }}
+          name: xiaohongshu-relay-scraper-ui-one-click-codex-macos-${{ matrix.architecture }}-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png
-            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-macos-intel-open-smoke.png
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-${{ matrix.architecture }}.zip
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-${{ matrix.architecture }}.zip.sha256
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-macos-${{ matrix.architecture }}-smoke.png
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-macos-${{ matrix.architecture }}-evidence.json
           if-no-files-found: error
           retention-days: 30
 
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [one-click-windows, one-click-macos, verify-macos-intel]
+    needs: [one-click-windows, one-click-macos, codex-macos]
     runs-on: ubuntu-latest
     steps:
       - name: Download verified release assets

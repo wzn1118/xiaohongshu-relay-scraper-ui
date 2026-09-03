@@ -7,7 +7,10 @@ param(
     [string]$LaunchEntry = '',
     [switch]$RequireCodexBuiltIn,
     [switch]$BrowserSmoke,
-    [string]$ScreenshotPath = ''
+    [string]$ScreenshotPath = '',
+    [ValidateSet('x64', 'arm64')]
+    [string]$ExpectedArchitecture = 'x64',
+    [string]$EvidencePath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +22,7 @@ $stdoutLog = Join-Path $temporaryRoot 'server.out.log'
 $stderrLog = Join-Path $temporaryRoot 'server.err.log'
 $server = $null
 $applicationPid = $null
+$temporaryEnvPath = $null
 $savedEnvironment = @{}
 
 function Save-EnvironmentValue {
@@ -44,6 +48,9 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $projectRoot 'CODEX_BUILT_IN_START.md') -PathType Leaf)) {
             throw 'The Codex edition marker is missing.'
         }
+        $runtimeCheck = @(& (Get-Command node -ErrorAction Stop).Source (Join-Path $projectRoot 'scripts\codex-runtime-artifact.mjs') --mode verify --project-root $projectRoot --platform win32 --architecture $ExpectedArchitecture 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Bundled Windows Codex runtime verification failed: $($runtimeCheck -join [Environment]::NewLine)" }
+        $runtimeEvidence = (($runtimeCheck | Out-String).Trim() | ConvertFrom-Json)
     }
 
     $checkOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'scripts\one-click.ps1') -CheckOnly -NoBrowser -SkipBrowserRelayCheck -Port $Port 2>&1)
@@ -80,6 +87,13 @@ try {
     Save-EnvironmentValue -Name 'XHS_COPILOT_WORKSPACE_ROOT' -Value $projectRoot
     Save-EnvironmentValue -Name 'CODEX_HOME' -Value (Join-Path $runtimeRoot 'codex-home')
     Save-EnvironmentValue -Name 'XHS_CODEX_SQLITE_HOME' -Value (Join-Path $runtimeRoot 'codex-sqlite')
+    $temporaryEnvPath = Join-Path $projectRoot '.env'
+    @(
+        'HOST=127.0.0.1'
+        "PORT=$Port"
+        'XHS_MCP_ENABLED=false'
+        "XHS_MCP_PORT=$([int]$Port + 1)"
+    ) | Set-Content -LiteralPath $temporaryEnvPath -Encoding ascii
 
     if ($LaunchEntry) {
         $launcherPath = Join-Path $projectRoot $LaunchEntry
@@ -143,10 +157,12 @@ try {
         }
     }
 
-    [ordered]@{
-        archive = $archive
-        projectRoot = $projectRoot
-        healthUrl = $healthUrl
+    $evidence = [ordered]@{
+        schemaVersion = 1
+        archive = [IO.Path]::GetFileName($archive)
+        platform = 'win32'
+        architecture = $ExpectedArchitecture
+        healthPath = '/api/health'
         service = $health.service
         ok = $health.ok
         cleanBootstrap = $true
@@ -155,8 +171,18 @@ try {
         codexProvider = if ($codexProvider) { $codexProvider.id } else { $null }
         codexBackendInitialized = if ($codexStatus) { [bool]$codexStatus.backend.initialized } else { $false }
         codexPresentation = if ($codexStatus) { $codexStatus.presentation } else { $null }
-        screenshotPath = if ($resolvedScreenshotPath) { $resolvedScreenshotPath } else { $null }
-    } | ConvertTo-Json
+        runtime = if ($runtimeEvidence) { $runtimeEvidence } else { $null }
+        codexStatusPath = if ($RequireCodexBuiltIn) { '/api/codex-browser/status' } else { $null }
+        codexPage = if ($RequireCodexBuiltIn) { '/codex/' } else { $null }
+        screenshot = if ($resolvedScreenshotPath) { [IO.Path]::GetFileName($resolvedScreenshotPath) } else { $null }
+    }
+    $evidenceJson = $evidence | ConvertTo-Json -Depth 6
+    if ($EvidencePath) {
+        $resolvedEvidencePath = [IO.Path]::GetFullPath($EvidencePath)
+        New-Item -ItemType Directory -Path (Split-Path -Parent $resolvedEvidencePath) -Force | Out-Null
+        [IO.File]::WriteAllText($resolvedEvidencePath, "$evidenceJson`n", (New-Object Text.UTF8Encoding($false)))
+    }
+    $evidenceJson
 } catch {
     if (Test-Path -LiteralPath $stdoutLog) {
         Write-Host '--- release smoke stdout ---'
@@ -191,5 +217,8 @@ try {
     }
     if (Test-Path -LiteralPath $temporaryRoot) {
         Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($temporaryEnvPath -and (Test-Path -LiteralPath $temporaryEnvPath)) {
+        Remove-Item -LiteralPath $temporaryEnvPath -Force -ErrorAction SilentlyContinue
     }
 }
