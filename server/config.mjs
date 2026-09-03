@@ -51,9 +51,7 @@ export const config = Object.freeze({
   ),
   codexBrowserSqliteHome: path.resolve(
     process.env.XHS_CODEX_SQLITE_HOME
-      || (codexHome && existsSync(path.join(codexHome, 'sqlite'))
-        ? path.join(codexHome, 'sqlite')
-        : path.join(dataDir, '..', 'codex-browser', String(readPort(process.env.PORT, 4317)))),
+      || path.join(dataDir, '..', 'codex-browser', String(readPort(process.env.PORT, 4317))),
   ),
   codexRuntimeBaselinePath: path.resolve(
     process.env.XHS_CODEX_RUNTIME_BASELINE_PATH
