@@ -223,6 +223,67 @@ export class CodexHostCommandService {
     };
   }
 
+  async workflow({
+    action = 'snapshot',
+    cwd,
+    source = 'uncommitted',
+    files = [],
+    snapshotGeneration,
+    includeUntrackedFiles = true,
+    confirm = false,
+    commandId,
+    threadId,
+    turnId,
+  } = {}) {
+    const normalizedAction = String(action || 'snapshot').trim();
+    const methodByAction = {
+      snapshot: 'review-summary',
+      diff: 'review-diff',
+      apply: 'apply-review-section-changes',
+      rollback: 'apply-review-section-changes',
+    };
+    const method = methodByAction[normalizedAction];
+    if (!method) throw hostCommandError('CODEX_WORKFLOW_ACTION_INVALID', 'Unsupported Codex workflow action.', 400);
+    if (['apply', 'rollback'].includes(normalizedAction) && confirm !== true) {
+      throw hostCommandError('CODEX_WORKFLOW_CONFIRMATION_REQUIRED', 'A workflow mutation requires explicit confirmation.', 400);
+    }
+    const requestId = normalizeCommandId(commandId) || `workflow-${this._nowMs()}`;
+    const params = {
+      cwd: cwd || this.config.workspaceRoot || this.config.projectRoot,
+      source,
+      includeUntrackedFiles: includeUntrackedFiles !== false,
+      ...(Array.isArray(files) ? { files } : {}),
+      ...(Number.isFinite(Number(snapshotGeneration)) ? { snapshotGeneration: Number(snapshotGeneration) } : {}),
+      ...(normalizedAction === 'apply' ? { action: 'stage' } : {}),
+      ...(normalizedAction === 'rollback' ? { action: 'revert' } : {}),
+    };
+    return this._executeOnce(`workflow:${String(params.cwd || '')}`, commandId, async () => {
+      const result = await this.workerService.handleMessage('git', {
+        type: 'worker-request',
+        workerId: 'git',
+        request: { id: requestId, method, params },
+      }, { sessionId: 'codex-workflow' });
+      const response = result?.messages?.[0]?.response?.result;
+      if (!response || response.type === 'error') {
+        const error = hostCommandError(
+          response?.error?.code || 'CODEX_WORKFLOW_FAILED',
+          response?.error?.message || 'Codex workflow action failed.',
+          409,
+        );
+        error.details = response?.error || null;
+        throw error;
+      }
+      return {
+        action: normalizedAction,
+        ...(response.value && typeof response.value === 'object' ? response.value : { value: response.value }),
+        linkage: {
+          ...(String(threadId || '').trim() ? { threadId: String(threadId).trim() } : {}),
+          ...(String(turnId || '').trim() ? { turnId: String(turnId).trim() } : {}),
+        },
+      };
+    });
+  }
+
   hostEvents(message) {
     return hostEventsForMessage(message, this.config, this.state);
   }
