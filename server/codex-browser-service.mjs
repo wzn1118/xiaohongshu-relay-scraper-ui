@@ -248,6 +248,23 @@ export function createCodexBrowserService({
       .map(({ sequence: eventSequence, message }) => ({ sequence: eventSequence, message }));
   }
 
+  function readEvents({ after = 0, sessionId = null, limit = 30 } = {}) {
+    const cursor = Number.isSafeInteger(Number(after)) && Number(after) >= 0 ? Number(after) : 0;
+    const boundedLimit = Number.isSafeInteger(Number(limit))
+      ? Math.min(250, Math.max(1, Number(limit)))
+      : 30;
+    const oldestCursor = events[0]?.sequence ?? sequence + 1;
+    const resetRequired = cursor > sequence || cursor < oldestCursor - 1;
+    const page = resetRequired ? [] : listEvents({ after: cursor, sessionId }).slice(0, boundedLimit);
+    return {
+      events: page,
+      cursor: page.at(-1)?.sequence ?? cursor,
+      oldestCursor,
+      throughCursor: sequence,
+      resetRequired,
+    };
+  }
+
   function status() {
     return {
       ...transport.status(),
@@ -267,7 +284,7 @@ export function createCodexBrowserService({
     await transport.close();
   }
 
-  return { start, send, request, listEvents, status, close, transport, adapter };
+  return { start, send, request, listEvents, readEvents, status, close, transport, adapter };
 }
 
 function uniqueNamespace(serverName, used) {

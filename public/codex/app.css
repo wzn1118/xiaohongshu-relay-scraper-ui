@@ -29,6 +29,9 @@ header small { color: #6b7280; }
 .message { max-width: 82%; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; padding: 10px 12px; border-radius: 6px; background: #f2f3f5; }
 .message.user { margin-left: auto; background: #e9f1ff; }
 .message.event { max-width: 100%; font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; color: #555b65; background: #f7f7f8; }
+.message.error { max-width: 100%; color: #9f2f27; background: #fff0ee; border: 1px solid #f0c4bf; }
+.message.streaming::after { content: ''; display: inline-block; width: 5px; height: 1em; margin-left: 4px; vertical-align: text-bottom; background: currentColor; animation: cursor-blink 1s steps(2, start) infinite; }
+@keyframes cursor-blink { 50% { opacity: 0; } }
 #composer { border-top: 1px solid #e2e4e8; padding: 16px max(20px, calc((100% - 860px) / 2)) 20px; }
 textarea { width: 100%; resize: vertical; min-height: 88px; max-height: 240px; border: 1px solid #c8ccd2; border-radius: 6px; padding: 12px; background: #fff; color: inherit; }
 .composer-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; min-height: 44px; }
@@ -47,4 +50,5 @@ textarea { width: 100%; resize: vertical; min-height: 88px; max-height: 240px; b
   .message { background: #292b2f; }
   .message.user { background: #213752; }
   .message.event { background: #25272b; color: #c2c7cf; }
+  .message.error { color: #ffb4ab; background: #402522; border-color: #70443f; }
 }
