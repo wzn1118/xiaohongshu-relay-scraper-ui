@@ -680,7 +680,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         return json(res, 200, {
           ok: true,
           service: 'xiaohongshu-relay-scraper',
-          version: '3.0.0',
+          version: '3.1.0',
           runnerAvailable: config.runnerAvailable,
           timestamp: new Date().toISOString(),
           pid: process.pid,
@@ -1162,9 +1162,19 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       }
       if (req.method === 'GET' && url.pathname === '/api/codex-browser/status') {
         const webviewRoot = codexWebviewRoot(config);
+        const bundledWebviewRoot = codexBundledWebviewRoot(config);
         const runtime = codexRuntimeCompatibility?.status?.() || { state: 'legacy', ready: true };
-        const staticReady = Boolean(await safeStaticFile(webviewRoot, path.join(webviewRoot, 'index.html')));
-        const ready = staticReady && runtime.ready !== false;
+        const desktopStaticReady = Boolean(await safeStaticFile(webviewRoot, path.join(webviewRoot, 'index.html')));
+        const bundledStaticReady = config.codexBuiltInEdition === true
+          && Boolean(await safeStaticFile(bundledWebviewRoot, path.join(bundledWebviewRoot, 'index.html')));
+        const staticReady = desktopStaticReady || bundledStaticReady;
+        const ready = staticReady && (bundledStaticReady || runtime.ready !== false);
+        const effectiveRuntime = bundledStaticReady ? {
+          state: 'ready',
+          ready: true,
+          source: 'bundled-npm',
+          package: '@openai/codex',
+        } : runtime;
         return json(res, ready ? 200 : 503, {
           ready,
           mode: 'browser',
@@ -1172,13 +1182,22 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           buildNumber: runtime.desktop?.buildNumber || '6415',
           workspaceRoot: config.workspaceRoot,
           webviewRoot,
-          runtime,
+          presentation: bundledStaticReady ? 'bundled' : 'desktop-webview',
+          runtime: effectiveRuntime,
+          desktopRuntime: runtime,
           backend: codexBrowserService?.status?.() || { running: false, initialized: false, pid: null },
           modelBridge: codexModelBridgeService?.status?.() || { configured: false },
           product: codexProductService?.status?.() || { service: 'codex-product', available: false },
           observedMessageTypes: codexHostCommands.observedMessageTypes(),
           hostCommands: codexHostCommands.status(),
         });
+      }
+      if (req.method === 'POST' && url.pathname === '/api/codex-browser/request') {
+        const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));
+        const method = String(body?.method || '').trim();
+        const allowed = new Set(['thread/list', 'thread/read', 'thread/start', 'thread/resume', 'turn/start', 'turn/interrupt', 'model/list']);
+        if (!allowed.has(method)) return json(res, 400, errorBody('CODEX_BROWSER_METHOD_INVALID', 'Codex browser request method is not allowed.'));
+        return json(res, 200, await codexBrowserService.request(method, body?.params && typeof body.params === 'object' ? body.params : {}));
       }
       if (req.method === 'POST' && url.pathname === '/api/codex-model/v1/responses') {
         if (!codexModelBridgeService?.responses) {
@@ -2495,6 +2514,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           return res.end();
         }
         const runtime = codexRuntimeCompatibility?.status?.();
+        if (config.codexBuiltInEdition === true && await serveBundledCodexWebview(req, res, config, url.pathname)) return;
         if (runtime && runtime.ready === false) {
           return json(res, 503, errorBody(
             'CODEX_BROWSER_RUNTIME_INCOMPATIBLE',
@@ -7249,6 +7269,42 @@ function codexWebviewRoot(config) {
     'app-unpacked',
     'webview',
   );
+}
+
+function codexBundledWebviewRoot(config) {
+  return path.join(config.projectRoot || config.workspaceRoot || process.cwd(), 'public', 'codex');
+}
+
+async function serveBundledCodexWebview(req, res, config, pathname) {
+  const root = codexBundledWebviewRoot(config);
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname.slice('/codex/'.length));
+  } catch {
+    return false;
+  }
+  const relative = decoded.replace(/^\/+/, '').replaceAll('/', path.sep);
+  const requested = path.resolve(root, relative || 'index.html');
+  try {
+    assertPathInside(root, requested);
+  } catch {
+    return false;
+  }
+  const file = await safeStaticFile(root, requested);
+  if (!file) return false;
+  const contentType = requested.endsWith('.js')
+    ? 'text/javascript; charset=utf-8'
+    : requested.endsWith('.css')
+      ? 'text/css; charset=utf-8'
+      : 'text/html; charset=utf-8';
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': file.size,
+    'Cache-Control': requested.endsWith('index.html') ? 'no-cache' : 'public, max-age=300',
+  });
+  if (req.method === 'HEAD') return res.end();
+  createReadStream(file.absolute).pipe(res);
+  return true;
 }
 
 function codexRelayConnectionToken(req, body = null) {

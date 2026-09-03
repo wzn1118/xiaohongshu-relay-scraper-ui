@@ -5555,7 +5555,7 @@ function App() {
             <div className="product-title">
               <span className="eyebrow">{workspaceMode === 'general' ? '内容研究工作台' : applicationView === 'batch' ? '批量投递工作台' : '岗位信息与投递管理'}</span>
               <h1><span>今天你投了吗？</span><span className="product-title-context">{workspaceMode === 'general' ? '｜内容研究工作台' : applicationView === 'batch' ? '｜批量投递工作台' : '｜岗位与投递'}</span></h1>
-              <span className="version">v3.0</span>
+              <span className="version">v3.1</span>
             </div>
             <nav className="workspace-switcher" aria-label="切换工作台">
               <button type="button" aria-label="岗位投递" className={workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={15} /><span className="workspace-label-long">岗位投递</span><span className="workspace-label-short" aria-hidden="true">岗位</span></button>

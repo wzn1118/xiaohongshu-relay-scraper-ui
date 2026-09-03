@@ -1,7 +1,7 @@
 {
   "name": "xiaohongshu-relay-scraper-ui",
   "private": true,
-  "version": "3.0.0",
+  "version": "3.1.0",
   "type": "module",
   "scripts": {
     "dev": "concurrently -k -n api,web -c yellow,cyan \"node server/index.mjs\" \"vite\"",
@@ -39,6 +39,7 @@
     "provision:hegelsalon:relay": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/provision-hegelsalon-relay-tunnel.ps1 -Apply",
     "package:production": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows-production.ps1",
     "package:github-release": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/package-github-release.ps1",
+    "package:github-release:codex": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/package-github-release-codex.ps1",
     "backup:production": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/backup-hegelsalon.ps1",
     "restore:production": "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/restore-hegelsalon.ps1",
     "provision:auth": "node scripts/provision-auth.mjs",
@@ -68,6 +69,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
+    "@openai/codex": "0.147.0-alpha.6.6",
     "busboy": "^1.6.0",
     "lucide-react": "^0.468.0",
     "nodemailer": "^9.0.3",

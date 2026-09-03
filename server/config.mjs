@@ -37,6 +37,8 @@ export const config = Object.freeze({
       || path.join(workspaceRoot, 'output', 'codex-desktop-runtime-55d9fb967596'),
   ),
   codexDesktopUserDataDir: String(process.env.XHS_CODEX_DESKTOP_USER_DATA_DIR || '').trim(),
+  codexExecutablePath: String(process.env.XHS_CODEX_EXECUTABLE || '').trim(),
+  codexBuiltInEdition: readBoolean(process.env.XHS_CODEX_BUILT_IN_EDITION, false),
   codexWorktreeRoot: path.resolve(
     process.env.XHS_CODEX_WORKTREE_ROOT
       || path.join(dataDir, '..', 'codex-worktrees'),

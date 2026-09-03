@@ -1,6 +1,6 @@
 # 小红书 Relay 数据工作台
 
-本项目提供小红书 Relay 采集、数据管理、报告生成和 Data Copilot 工作台。GitHub Release 会生成彼此独立的 Windows 与 macOS 解压运行包，并在发布前自动验证安装、构建和健康接口。
+本项目提供小红书 Relay 采集、数据管理、报告生成和 Data Copilot 工作台。GitHub Release 同时生成普通版与内置 Codex 版的 Windows、macOS 独立解压包，并在发布前真实启动和打开页面。
 
 ## 下载后直接运行
 
@@ -10,6 +10,8 @@
 2. 完整解压 ZIP。
 3. 双击 `start-windows.cmd`。
 
+内置 Codex 版下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows.zip`，完整解压后双击 `Start-Codex-App.cmd`。该启动器会启用包内 Codex 页面，并由项目依赖自动安装匹配 Windows 架构的 Codex app-server。
+
 第一次运行会自动检查并安装 Node.js、Python 和 Chrome，随后安装依赖、构建并启动应用。详细步骤、哈希校验和故障排查见 [一键启动指南](ONE_CLICK_START.md)。
 
 ### macOS / Linux
@@ -17,6 +19,8 @@
 从 GitHub Releases 下载独立的 `xiaohongshu-relay-scraper-ui-one-click-macos.zip` 和同名 `.sha256` 文件。该 ZIP 不包含 Windows 便携运行时、运行数据、浏览器 Profile 或密钥；发布前，同一个 ZIP 会分别在 Apple Silicon 与 Intel Mac 运行器上从 `Start-App.command` 完成冷启动和页面打开验收。
 
 预先安装 Node.js 22+、npm、Python 3.11+ 和 Chrome 或 Edge。完整解压后，在 Finder 中双击 `Start-App.command`；首次运行会安装依赖、构建、启动服务并打开浏览器。
+
+内置 Codex 版下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip`，在 Finder 中双击 `Start-Codex-App.command`。同一个 ZIP 会在 Apple Silicon 与 Intel Mac 上分别安装匹配架构的 Codex app-server，并完成 `/codex/` 页面打开验收。
 
 也可以从终端启动：
 
@@ -58,6 +62,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/one-clic
 
 ```powershell
 npm run package:github-release
+npm run package:github-release:codex
 ```
 
 在 macOS 上本地生成并验收 macOS ZIP：
@@ -65,9 +70,11 @@ npm run package:github-release
 ```bash
 sh scripts/package-github-release-macos.sh
 sh scripts/verify-github-release-macos.sh --archive-path deliverables/xiaohongshu-relay-scraper-ui-one-click-macos.zip
+sh scripts/package-github-release-macos-codex.sh
+sh scripts/verify-github-release-macos.sh --archive-path deliverables/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip --launch-entry Start-Codex-App.command --require-codex-built-in --browser-smoke
 ```
 
-每次推送 `main` 后，`Release` 工作流会从 Git 已提交文件创建 Windows 和 macOS 两个净化 ZIP。macOS 验收会让 Apple Silicon 与 Intel 运行器下载同一个 ZIP，在全新目录从 `Start-App.command` 完成首次安装、构建和启动，再用 Chromium 打开实际页面并检查渲染与脚本错误。`v*` 标签只有在两个 Mac 架构都通过后，才会把两个平台 ZIP 及各自的 SHA-256 校验文件上传到 GitHub Release。
+每次推送 `main` 后，`Release` 工作流会创建四个净化 ZIP。内置 Codex 版会在临时 `CODEX_HOME` 中初始化包内 app-server，调用 `thread/list`，再用 Chromium 打开 `/codex/`。`v*` 标签只有在 Windows、Apple Silicon 和 Intel Mac 全部通过后，才会上传四个 ZIP 及各自的 SHA-256 校验文件。
 
 ## 首次使用
 

@@ -45,6 +45,7 @@ import { createUnifiedToolRegistry } from './copilot/unified-tool-registry.mjs';
 import { createProjectWorkspaceService } from './copilot/project-workspace-service.mjs';
 import { createCodexDesktopService } from './codex-desktop-service.mjs';
 import { createCodexBrowserService } from './codex-browser-service.mjs';
+import { resolveCodexAppServerCommand } from './codex-runtime-resolver.mjs';
 import { createCodexRuntimeCompatibility } from './codex-runtime-compatibility.mjs';
 import { loadCodexProtocolEvidence } from './codex-protocol-evidence.mjs';
 import { createCodexRelayService } from './codex-relay-service.mjs';
@@ -326,8 +327,15 @@ const codexProduct = createCodexProductService({
 });
 const codexModelBridge = createCodexModelBridgeService({ aiSessions });
 const codexControlApi = aiSessions.controlProviderStatus();
+const codexAppServerCommand = resolveCodexAppServerCommand({
+  workspaceRoot: config.workspaceRoot,
+  desktopRuntimeRoot: config.codexDesktopRuntimeDir,
+  executableOverride: config.codexExecutablePath,
+  preferBundled: config.codexBuiltInEdition,
+});
 const codexBrowser = createCodexBrowserService({
-  executablePath: path.join(config.codexDesktopRuntimeDir, 'app', 'resources', 'codex.exe'),
+  executablePath: codexAppServerCommand.executablePath,
+  executableArgs: codexAppServerCommand.executableArgs,
   workspaceRoot: config.workspaceRoot,
   sqliteHome: config.codexBrowserSqliteHome,
   protocolEvidence: codexProtocolEvidence,
@@ -417,13 +425,15 @@ mcpServer?.listen(config.mcpPort, config.mcpHost, () => {
 server.listen(config.port, config.host, () => {
   diagnostics.record('server_started', { status: 'ready' });
   console.log(`Xiaohongshu relay scraper API listening at http://${config.host}:${config.port}`);
-  void codexBrowser.start().catch((error) => {
-    diagnostics.record('codex_browser_warmup_failed', {
-      status: 'degraded',
-      error: String(error?.message || error),
+  if (config.codexBuiltInEdition) {
+    void codexBrowser.start().catch((error) => {
+      diagnostics.record('codex_browser_warmup_failed', {
+        status: 'degraded',
+        error: String(error?.message || error),
+      });
+      console.error(`Codex browser warmup failed: ${error?.message || error}`);
     });
-    console.error(`Codex browser warmup failed: ${error?.message || error}`);
-  });
+  }
   relaySupervisor.start();
   void dataLifecycle.cleanupExpired({ dryRun: false }).catch((error) => {
     console.error(`Retention cleanup failed: ${error?.message || error}`);

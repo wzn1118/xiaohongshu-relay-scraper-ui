@@ -3,7 +3,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ArchivePath,
     [ValidateRange(1024, 65535)]
-    [int]$Port = 65431
+    [int]$Port = 65431,
+    [string]$LaunchEntry = '',
+    [switch]$RequireCodexBuiltIn,
+    [switch]$BrowserSmoke,
+    [string]$ScreenshotPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +18,7 @@ $runtimeRoot = Join-Path $temporaryRoot 'runtime'
 $stdoutLog = Join-Path $temporaryRoot 'server.out.log'
 $stderrLog = Join-Path $temporaryRoot 'server.err.log'
 $server = $null
+$applicationPid = $null
 $savedEnvironment = @{}
 
 function Save-EnvironmentValue {
@@ -31,6 +36,15 @@ try {
         Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'package.json') -PathType Leaf } |
         Select-Object -First 1 -ExpandProperty FullName
     if (-not $projectRoot) { throw 'The release archive does not contain a project root with package.json.' }
+    if ($LaunchEntry -and [IO.Path]::GetFileName($LaunchEntry) -ne $LaunchEntry) {
+        throw 'LaunchEntry must be a root-level file name.'
+    }
+    if ($RequireCodexBuiltIn) {
+        if ($LaunchEntry -ne 'Start-Codex-App.cmd') { throw 'The Codex edition must use Start-Codex-App.cmd.' }
+        if (-not (Test-Path -LiteralPath (Join-Path $projectRoot 'CODEX_BUILT_IN_START.md') -PathType Leaf)) {
+            throw 'The Codex edition marker is missing.'
+        }
+    }
 
     $checkOutput = @(& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'scripts\one-click.ps1') -CheckOnly -NoBrowser -SkipBrowserRelayCheck -Port $Port 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "One-click prerequisite check failed: $($checkOutput -join [Environment]::NewLine)" }
@@ -43,6 +57,7 @@ try {
     $node = Get-Command node -ErrorAction Stop
     $pythonName = if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { 'python' }
     $python = Get-Command $pythonName -ErrorAction Stop
+    Save-EnvironmentValue -Name 'NPM_CONFIG_CACHE' -Value (Join-Path $runtimeRoot 'npm-cache')
 
     Push-Location $projectRoot
     try {
@@ -63,8 +78,16 @@ try {
     Save-EnvironmentValue -Name 'XHS_PROFILE_DATA_DIR' -Value (Join-Path $runtimeRoot 'profiles')
     Save-EnvironmentValue -Name 'XHS_BROWSER_DATA_DIR' -Value (Join-Path $runtimeRoot 'browser')
     Save-EnvironmentValue -Name 'XHS_COPILOT_WORKSPACE_ROOT' -Value $projectRoot
+    Save-EnvironmentValue -Name 'CODEX_HOME' -Value (Join-Path $runtimeRoot 'codex-home')
+    Save-EnvironmentValue -Name 'XHS_CODEX_SQLITE_HOME' -Value (Join-Path $runtimeRoot 'codex-sqlite')
 
-    $server = Start-Process -FilePath $node.Source -ArgumentList @('server/index.mjs') -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
+    if ($LaunchEntry) {
+        $launcherPath = Join-Path $projectRoot $LaunchEntry
+        if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) { throw "Release launcher is missing: $LaunchEntry" }
+        $server = Start-Process -FilePath $launcherPath -ArgumentList @('-NoBrowser', '-Port', [string]$Port) -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
+    } else {
+        $server = Start-Process -FilePath $node.Source -ArgumentList @('server/index.mjs') -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog -PassThru
+    }
     $healthUrl = "http://127.0.0.1:$Port/api/health"
     $healthy = $false
     for ($attempt = 0; $attempt -lt 180; $attempt++) {
@@ -80,6 +103,46 @@ try {
     }
     if (-not $healthy) { throw "Extracted release did not become healthy: $healthUrl" }
 
+    $codexProvider = $null
+    if ($RequireCodexBuiltIn) {
+        $providers = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ai/providers" -TimeoutSec 10
+        foreach ($provider in $providers) {
+            if ($provider.id -eq 'codex') { $codexProvider = $provider; break }
+        }
+        if (-not $codexProvider) { throw 'The built-in Codex provider is missing.' }
+        if ($codexProvider.wireApi -ne 'responses' -or $codexProvider.bundled -ne $true) {
+            throw 'The built-in Codex provider contract is invalid.'
+        }
+        $codexStatus = $null
+        for ($attempt = 0; $attempt -lt 180; $attempt++) {
+            try {
+                $codexStatus = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/codex-browser/status" -TimeoutSec 2
+                if ($codexStatus.ready -eq $true -and $codexStatus.presentation -eq 'bundled' -and $codexStatus.backend.initialized -eq $true) {
+                    break
+                }
+            } catch { }
+            Start-Sleep -Milliseconds 500
+        }
+        if ($codexStatus.ready -ne $true -or $codexStatus.presentation -ne 'bundled' -or $codexStatus.backend.initialized -ne $true) {
+            throw 'The bundled Codex app-server or browser presentation is not ready.'
+        }
+        $threadListBody = @{ method = 'thread/list'; params = @{ limit = 3; useStateDbOnly = $true } } | ConvertTo-Json -Depth 4 -Compress
+        Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$Port/api/codex-browser/request" -ContentType 'application/json' -Body $threadListBody -TimeoutSec 30 | Out-Null
+        $codexPage = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/codex/" -TimeoutSec 20 -UseBasicParsing
+        if ($codexPage.StatusCode -ne 200 -or $codexPage.Content -notmatch '<title>Codex</title>') {
+            throw 'The bundled Codex page did not open.'
+        }
+        if ($BrowserSmoke) {
+            if (-not $ScreenshotPath) { $ScreenshotPath = Join-Path $temporaryRoot 'codex-windows-open-smoke.png' }
+            $resolvedScreenshotPath = [IO.Path]::GetFullPath($ScreenshotPath)
+            New-Item -ItemType Directory -Path (Split-Path -Parent $resolvedScreenshotPath) -Force | Out-Null
+            & $node.Source (Join-Path $projectRoot 'scripts\verify-release-browser.mjs') --url "http://127.0.0.1:$Port/codex/" --screenshot-path $resolvedScreenshotPath --require-codex-built-in
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resolvedScreenshotPath -PathType Leaf)) {
+                throw 'The bundled Codex browser smoke test failed.'
+            }
+        }
+    }
+
     [ordered]@{
         archive = $archive
         projectRoot = $projectRoot
@@ -87,6 +150,12 @@ try {
         service = $health.service
         ok = $health.ok
         cleanBootstrap = $true
+        launchEntry = if ($LaunchEntry) { $LaunchEntry } else { 'node server/index.mjs' }
+        codexBuiltIn = [bool]$RequireCodexBuiltIn
+        codexProvider = if ($codexProvider) { $codexProvider.id } else { $null }
+        codexBackendInitialized = if ($codexStatus) { [bool]$codexStatus.backend.initialized } else { $false }
+        codexPresentation = if ($codexStatus) { $codexStatus.presentation } else { $null }
+        screenshotPath = if ($resolvedScreenshotPath) { $resolvedScreenshotPath } else { $null }
     } | ConvertTo-Json
 } catch {
     if (Test-Path -LiteralPath $stdoutLog) {
@@ -99,8 +168,23 @@ try {
     }
     throw
 } finally {
-    if ($server -and -not $server.HasExited) {
-        & taskkill.exe /PID $server.Id /T /F *> $null
+    if (Test-Path -LiteralPath $stdoutLog) {
+        $launcherOutput = Get-Content -LiteralPath $stdoutLog -Raw -ErrorAction SilentlyContinue
+        if ($launcherOutput -match 'Application will keep running in the background \(PID (\d+)\)') {
+            $applicationPid = [int]$Matches[1]
+        }
+    }
+    if (-not $applicationPid) {
+        try {
+            $applicationPid = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop |
+                Select-Object -First 1 -ExpandProperty OwningProcess
+        } catch { }
+    }
+    foreach ($processId in @($applicationPid, $(if ($server) { $server.Id }))) {
+        if (-not $processId) { continue }
+        try {
+            Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" -ArgumentList @('/PID', [string]$processId, '/T', '/F') -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue | Out-Null
+        } catch { }
     }
     foreach ($name in $savedEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')

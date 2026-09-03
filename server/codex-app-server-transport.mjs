@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { mkdirSync } from 'node:fs';
 
@@ -9,6 +9,7 @@ const INITIALIZATION_TIMEOUT_MS = 60_000;
 
 export function createCodexAppServerTransport({
   executablePath,
+  executableArgs = [],
   workspaceRoot,
   sqliteHome = process.env.XHS_CODEX_SQLITE_HOME || path.join(os.tmpdir(), 'xiaohongshu-relay-codex-sqlite'),
   contextMcp = null,
@@ -105,6 +106,7 @@ export function createCodexAppServerTransport({
       let process = null;
       try {
         mkdirSync(sqliteHome, { recursive: true });
+        if (globalThis.process.env.CODEX_HOME) mkdirSync(globalThis.process.env.CODEX_HOME, { recursive: true });
         const appServerArgs = [
           '-c',
           'features.code_mode_host=true',
@@ -118,7 +120,7 @@ export function createCodexAppServerTransport({
         };
         for (const server of configuredContextMcps) environment[server.bearerTokenEnvVar] = server.token;
         if (configuredModelProvider) environment[configuredModelProvider.apiKeyEnvVar] = configuredModelProvider.apiKey;
-        process = spawnProcess(executablePath, appServerArgs, {
+        process = spawnProcess(executablePath, [...executableArgs, ...appServerArgs], {
           cwd: workspaceRoot,
           env: environment,
           windowsHide: true,
@@ -193,6 +195,8 @@ export function createCodexAppServerTransport({
       initialized,
       pid: child?.pid || null,
       appServerVersion,
+      executablePath,
+      executableArgs: [...executableArgs],
       stderrTail: stderrTail.slice(-10),
       contextMcp: configuredContextMcps[0] ? {
         configured: true,
@@ -217,7 +221,27 @@ export function createCodexAppServerTransport({
     initialized = false;
     appServerVersion = '';
     if (!process) return;
-    terminateProcess(process);
+    const exited = new Promise((resolve) => process.once('exit', resolve));
+    try { process.stdin.end(); } catch { /* process is already closing */ }
+
+    if (globalThis.process.platform === 'win32' && process.spawnfile && Number.isInteger(process.pid)) {
+      spawnSync('taskkill.exe', ['/PID', String(process.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      await Promise.race([exited, delay(2_000)]);
+      return;
+    }
+
+    // A real app-server uses SQLite and needs a short window to flush after EOF.
+    // Test doubles do not expose spawnfile, so terminate them immediately.
+    const exitedGracefully = process.spawnfile
+      ? await Promise.race([exited.then(() => true), delay(1_000).then(() => false)])
+      : false;
+    if (!exitedGracefully) {
+      try { process.kill(); } catch { /* process has already exited */ }
+      await Promise.race([exited, delay(2_000)]);
+    }
   }
 
   return Object.freeze({ start, request, sendRaw, onMessage, onConnection, status, close });
@@ -231,6 +255,10 @@ export function createCodexAppServerTransport({
     try { process.stdin.end(); } catch { /* process is already closing */ }
     try { process.kill(); } catch { /* process has already exited */ }
   }
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 export function normalizeContextMcp(value) {

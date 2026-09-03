@@ -1,6 +1,13 @@
 # 一键下载与运行
 
-这个仓库提供经过 CI 实测的 Windows 与 macOS 独立解压运行包。发布包不包含本机数据、登录态、密钥、`.env`、运行日志或依赖缓存。
+这个仓库提供经过 CI 实测的普通版与内置 Codex 版 Windows、macOS 独立解压运行包。发布包不包含本机数据、登录态、密钥、`.env`、运行日志或依赖缓存。
+
+## 内置 Codex 版
+
+- Windows：下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows.zip`，完整解压后双击 `Start-Codex-App.cmd`。
+- macOS：下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip`，完整解压后双击 `Start-Codex-App.command`。
+- 首次启动的 `npm ci` 会自动安装与当前 Windows、Apple Silicon 或 Intel 架构匹配的 Codex app-server，无需预装 Codex CLI。
+- 发布验收会确认 app-server 初始化、`thread/list` 调用、`/codex/` 页面渲染和交互控件。
 
 ## Windows 10/11
 
@@ -91,4 +98,4 @@ chmod +x start-linux-macos.sh scripts/*.sh
 6. 在两个 Mac 架构上用 Chromium 打开实际页面，检查可见内容、交互控件和页面脚本错误；
 7. 验证 `/api/health`，并保留打开后的页面截图；
 8. 生成 Windows 和 macOS 各自的 SHA-256 校验文件并上传 Actions artifact；
-9. 对 `v*` 标签创建包含两个独立 ZIP 的 GitHub Release。
+9. 对 `v*` 标签创建包含普通 Windows、普通 macOS、内置 Codex Windows、内置 Codex macOS 四个独立 ZIP 的 GitHub Release。

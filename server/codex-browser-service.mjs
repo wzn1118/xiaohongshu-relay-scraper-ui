@@ -8,6 +8,7 @@ const MAX_EVENTS = 10_000;
 
 export function createCodexBrowserService({
   executablePath,
+  executableArgs = [],
   workspaceRoot,
   sqliteHome = process.env.XHS_CODEX_SQLITE_HOME || path.join(os.tmpdir(), 'xiaohongshu-relay-codex-sqlite'),
   contextMcp = null,
@@ -31,6 +32,7 @@ export function createCodexBrowserService({
   const pendingRequests = new Map();
   const transport = createCodexAppServerTransport({
     executablePath,
+    executableArgs,
     workspaceRoot,
     sqliteHome,
     contextMcps: configuredContextMcps,

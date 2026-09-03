@@ -4,6 +4,7 @@ param(
     [switch]$CheckOnly,
     [switch]$SkipBrowserRelayCheck,
     [switch]$EnableMcp,
+    [switch]$CodexBuiltIn,
     [ValidateRange(0, 65535)]
     [int]$Port = 0,
     [ValidateRange(0, 65535)]
@@ -29,6 +30,7 @@ function Enable-BundledRuntime {
 }
 
 Initialize-HegelSalonProxyEnvironment
+if ($CodexBuiltIn) { $env:XHS_CODEX_BUILT_IN_EDITION = '1' }
 
 function Import-DotEnv {
     param([string]$Path)

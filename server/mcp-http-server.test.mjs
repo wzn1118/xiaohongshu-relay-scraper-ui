@@ -49,7 +49,7 @@ test('Streamable HTTP MCP performs official initialize, list, call, and session 
 
   const health = await fetch(`http://127.0.0.1:${port}/health`).then((response) => response.json());
   assert.equal(health.ok, true);
-  assert.equal(health.version, '3.0.0');
+  assert.equal(health.version, '3.1.0');
   assert.equal(health.publicShowcase.mode, 'anonymous-read-only-showcase');
 
   const untrustedHost = await request(port, '/health', { Host: 'attacker.invalid' });

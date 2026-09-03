@@ -36,17 +36,26 @@ jobs:
           python -m pip install --disable-pip-version-check -r requirements.txt
       - name: Build repository checkout
         run: npm run build
-      - name: Create sanitized one-click archive
+      - name: Install Chromium for the Windows open test
+        run: npx playwright install chromium
+      - name: Create sanitized one-click archives
         id: package
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-one-click-windows.zip'
+          $codexArchive = Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows.zip'
           ./scripts/package-github-release.ps1 -OutputPath $archive -SourceRef HEAD
+          ./scripts/package-github-release-codex.ps1 -OutputPath $codexArchive -SourceRef HEAD
           "archive=$archive" >> $env:GITHUB_OUTPUT
           "checksum=$archive.sha256" >> $env:GITHUB_OUTPUT
+          "codex_archive=$codexArchive" >> $env:GITHUB_OUTPUT
+          "codex_checksum=$codexArchive.sha256" >> $env:GITHUB_OUTPUT
       - name: Verify clean archive installation and health
         shell: pwsh
         run: ./scripts/verify-github-release.ps1 -ArchivePath '${{ steps.package.outputs.archive }}' -Port 65431
+      - name: Open the built-in Codex Windows archive
+        shell: pwsh
+        run: ./scripts/verify-github-release.ps1 -ArchivePath '${{ steps.package.outputs.codex_archive }}' -Port 65434 -LaunchEntry 'Start-Codex-App.cmd' -RequireCodexBuiltIn -BrowserSmoke -ScreenshotPath (Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-codex-windows-open-smoke.png')
       - name: Upload verified one-click package
         uses: actions/upload-artifact@v4
         with:
@@ -54,6 +63,9 @@ jobs:
           path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.codex_archive }}
+            ${{ steps.package.outputs.codex_checksum }}
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-windows-open-smoke.png
           if-no-files-found: error
           retention-days: 30
 
@@ -80,10 +92,12 @@ jobs:
         run: npm run build
       - name: Install Chromium for the macOS open test
         run: npx playwright install chromium
-      - name: Create sanitized macOS archive
+      - name: Create sanitized macOS archives
         run: |
           archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip"
+          codex_archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip"
           sh scripts/package-github-release-macos.sh --output-path "$archive" --source-ref HEAD
+          sh scripts/package-github-release-macos-codex.sh --output-path "$codex_archive" --source-ref HEAD
       - name: Open the clean archive through the macOS Finder launcher
         run: |
           sh scripts/verify-github-release-macos.sh \
@@ -91,6 +105,15 @@ jobs:
             --port 65432 \
             --browser-smoke \
             --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-open-smoke.png"
+      - name: Open the built-in Codex macOS archive
+        run: |
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip" \
+            --port 65434 \
+            --launch-entry Start-Codex-App.command \
+            --require-codex-built-in \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-codex-macos-open-smoke.png"
       - name: Upload verified macOS package
         uses: actions/upload-artifact@v4
         with:
@@ -99,6 +122,9 @@ jobs:
             ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip
             ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip.sha256
             ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-open-smoke.png
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip.sha256
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-macos-open-smoke.png
           if-no-files-found: error
           retention-days: 30
 
@@ -133,11 +159,22 @@ jobs:
             --port 65433 \
             --browser-smoke \
             --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png"
+      - name: Open the same built-in Codex ZIP on Intel macOS
+        run: |
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$RUNNER_TEMP/macos-package/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip" \
+            --port 65435 \
+            --launch-entry Start-Codex-App.command \
+            --require-codex-built-in \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-codex-macos-intel-open-smoke.png"
       - name: Upload Intel macOS open evidence
         uses: actions/upload-artifact@v4
         with:
           name: macos-intel-open-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png
+          path: |
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-macos-intel-open-smoke.png
           if-no-files-found: error
           retention-days: 30
 

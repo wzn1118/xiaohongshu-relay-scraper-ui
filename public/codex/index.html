@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex</title>
+    <link rel="stylesheet" href="/codex/app.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside>
+        <div class="brand"><strong>Codex</strong><span id="runtime-state">连接中</span></div>
+        <button id="new-thread" type="button">新建任务</button>
+        <nav id="thread-list" aria-label="任务列表"></nav>
+      </aside>
+      <main>
+        <header>
+          <div><strong id="thread-title">新任务</strong><small id="runtime-version"></small></div>
+          <button id="refresh" type="button">刷新</button>
+        </header>
+        <section id="messages" aria-live="polite">
+          <div class="empty">输入任务开始使用 Codex</div>
+        </section>
+        <form id="composer">
+          <textarea id="prompt" rows="4" placeholder="向 Codex 发送任务" required></textarea>
+          <div class="composer-actions">
+            <span id="send-state"></span>
+            <button id="send" type="submit">发送</button>
+          </div>
+        </form>
+      </main>
+    </div>
+    <script type="module" src="/codex/app.js"></script>
+  </body>
+</html>
