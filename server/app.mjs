@@ -257,6 +257,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       allowedOrigins: config.codexConnectAllowedOrigins?.length
         ? config.codexConnectAllowedOrigins
         : (config.authOrigin ? [config.authOrigin] : []),
+      localRelayOrigin: config.codexConnectLocalRelayOrigin || `http://127.0.0.1:${Number(config.port) || 4317}`,
       connectorVersion: config.codexConnectConnectorVersion || '1.2.3',
     })
     : null);
@@ -1481,7 +1482,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (!body || typeof body !== 'object' || Array.isArray(body)) {
           throw new ValidationError('Request body must be a JSON object.');
         }
-        const { idempotencyKey, ...runBody } = body;
+        const { idempotencyKey, autoPauseActive, ...runBody } = body;
+        if (autoPauseActive !== undefined && typeof autoPauseActive !== 'boolean') {
+          throw new ValidationError('autoPauseActive must be a boolean when provided.');
+        }
         const params = validateRunRequest(runBody);
         if (params.checkOnly) return json(res, 200, await readiness.run(params));
         const resumeScope = legacyResumeScope(params);
@@ -1508,7 +1512,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
               requestedBy: 'legacy_jobs_api',
               ...(resumeCheckpointJobIds.length ? { resumeCheckpointJobIds } : {}),
             })
-          : await manager.start(params);
+          : await manager.start(params, {
+              pauseActive: autoPauseActive !== false,
+            });
         return json(res, 202, job);
       }
       if (req.method === 'POST' && url.pathname === '/api/body-imports') {

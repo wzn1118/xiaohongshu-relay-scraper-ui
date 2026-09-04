@@ -21,7 +21,7 @@ test('connector maintenance honors an explicit allowed control-plane origin', ()
 test('connector packaging supports the public deployment and local production origin', async () => {
   const packaging = await readFile(new URL('../scripts/package-codex-local-connector.ps1', import.meta.url), 'utf8');
   const installation = await readFile(new URL('../scripts/install-local-connector-package.ps1', import.meta.url), 'utf8');
-  assert.match(packaging, /@\('https:\/\/relay\.hegelsalon\.com', 'http:\/\/127\.0\.0\.1:4327'\)/u);
+  assert.match(packaging, /@\('https:\/\/relay\.hegelsalon\.com', 'http:\/\/127\.0\.0\.1:4327', 'http:\/\/127\.0\.0\.1:4317'\)/u);
   assert.match(installation, /AllowedOrigin = @\(\$AllowedOrigin\)/u);
   assert.doesNotMatch(installation, /powershell\.exe @installerArgs/u);
 });

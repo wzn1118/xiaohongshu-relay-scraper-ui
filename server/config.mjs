@@ -16,6 +16,11 @@ const dataDir = path.resolve(process.env.XHS_SERVER_DATA_DIR || path.join(server
 const authRoot = path.resolve(process.env.XHS_AUTH_DATA_DIR || path.join(dataDir, '..', 'auth'));
 const authRequired = readBoolean(process.env.XHS_AUTH_REQUIRED, process.env.NODE_ENV === 'production');
 const host = String(process.env.HOST || '127.0.0.1').trim() || '127.0.0.1';
+const port = readPort(process.env.PORT, 4317);
+const codexConnectLocalRelayOrigin = normalizeHttpOrigin(
+  process.env.XHS_CODEX_LOCAL_RELAY_ORIGIN || `http://${localHostForUrl(host)}:${port}`,
+  'XHS_CODEX_LOCAL_RELAY_ORIGIN',
+);
 const defaultCopilotApprovalMode = process.env.NODE_ENV === 'production' || !isLoopbackAppHost(host)
   ? 'required'
   : 'never';
@@ -36,7 +41,7 @@ const detectedCodexExecutable = [
 
 export const config = Object.freeze({
   host,
-  port: readPort(process.env.PORT, 4317),
+  port,
   workspaceRoot,
   codexDesktopRuntimeDir: path.resolve(
     process.env.XHS_CODEX_DESKTOP_RUNTIME_DIR
@@ -51,7 +56,7 @@ export const config = Object.freeze({
   ),
   codexBrowserSqliteHome: path.resolve(
     process.env.XHS_CODEX_SQLITE_HOME
-      || path.join(dataDir, '..', 'codex-browser', String(readPort(process.env.PORT, 4317))),
+      || path.join(dataDir, '..', 'codex-browser', String(port)),
   ),
   codexRuntimeBaselinePath: path.resolve(
     process.env.XHS_CODEX_RUNTIME_BASELINE_PATH
@@ -73,6 +78,7 @@ export const config = Object.freeze({
   ),
   codexDeviceGatewayHeartbeatSeconds: readInt(process.env.XHS_CODEX_DEVICE_GATEWAY_HEARTBEAT_SECONDS, 15, 5, 60),
   codexConnectAllowedOrigins: readConnectorOrigins(process.env.XHS_CODEX_CONNECT_ALLOWED_ORIGINS),
+  codexConnectLocalRelayOrigin,
   codexConnectConnectorVersion: String(process.env.XHS_CODEX_CONNECTOR_VERSION || '1.2.18').trim() || '1.2.18',
   codexConnectInstallerPath: path.resolve(
     process.env.XHS_CODEX_CONNECTOR_INSTALLER_PATH
@@ -206,6 +212,32 @@ export const config = Object.freeze({
   relayConnectTimeoutMs: readInt(process.env.XHS_RELAY_CONNECT_TIMEOUT_MS, 25_000, 1_000, 120_000),
   relayPlaywrightTimeoutMs: readInt(process.env.XHS_RELAY_PLAYWRIGHT_TIMEOUT_MS, 60_000, 1_000, 180_000),
 });
+
+function localHostForUrl(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized === '0.0.0.0' || normalized === '::') return '127.0.0.1';
+  return normalized === '::1' ? '[::1]' : normalized;
+}
+
+function normalizeHttpOrigin(value, name) {
+  let parsed;
+  try {
+    parsed = new URL(String(value || ''));
+  } catch {
+    throw new Error(`${name} must be a valid HTTP(S) origin.`);
+  }
+  if (
+    !['http:', 'https:'].includes(parsed.protocol)
+    || parsed.username
+    || parsed.password
+    || parsed.pathname !== '/'
+    || parsed.search
+    || parsed.hash
+  ) {
+    throw new Error(`${name} must be an HTTP(S) origin without credentials, path, query, or fragment.`);
+  }
+  return parsed.origin;
+}
 
 function readPort(value, fallback) {
   return readInt(value, fallback, 1, 65535);
