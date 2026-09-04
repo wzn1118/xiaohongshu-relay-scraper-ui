@@ -84,6 +84,35 @@ def grounded_draft() -> dict:
 
 
 class EvidenceClaimValidatorTests(unittest.TestCase):
+    def test_fit_evidence_project_label_handles_completion_particle(self) -> None:
+        record = {
+            "note_id": "fit-project-1",
+            "title": "内容运营实习生",
+            "body": "招聘内容运营实习生。",
+            "job_card": {"role_name": "内容运营实习生"},
+            "fit_evidence": [{
+                "id": "fit-project-evidence",
+                "label": "曼彻斯特大学转专业咨询项目",
+                "detail": "完成曼彻斯特大学转专业咨询项目",
+            }],
+        }
+        profile = {"candidate_application": {"name": "王梓楠"}}
+
+        result = validate_generated_claims(
+            record,
+            profile,
+            profile["candidate_application"],
+            {"cover_letter": "我完成了曼彻斯特大学转专业咨询项目。"},
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertTrue(any(
+            claim["claimType"] == "project"
+            and claim["text"] == "曼彻斯特大学转专业咨询项目"
+            and claim["validationStatus"] == "valid"
+            for claim in result["claims"]
+        ))
+
     def test_supported_hard_facts_bind_to_exact_spans_and_offsets(self) -> None:
         record = fixture_record()
         profile = fixture_profile()
@@ -174,6 +203,49 @@ class EvidenceClaimValidatorTests(unittest.TestCase):
                 for claim in result["claims"]
             ), text)
 
+    def test_known_person_is_extracted_from_a_long_candidate_introduction(self) -> None:
+        profile = fixture_profile()
+        draft = {
+            "cover_letter": "您好！我是远航大学数据分析专业硕士研究生林舟，申请数据分析实习生。",
+        }
+
+        result = validate_generated_claims(
+            fixture_record(), profile, profile["candidate_application"], draft,
+        )
+
+        self.assertEqual(result["status"], "passed")
+        person_claims = [
+            claim for claim in result["claims"] if claim["claimType"] == "person"
+        ]
+        self.assertTrue(any(claim["text"] == "林舟" for claim in person_claims))
+        self.assertFalse(any("硕士研究生" in claim["text"] for claim in person_claims))
+
+    def test_supported_numeric_paraphrase_and_quoted_job_do_not_create_false_claims(self) -> None:
+        record = fixture_record()
+        profile = fixture_profile()
+        draft = {
+            "greeting": "您好，我想应聘「数据分析实习生」。",
+            "email_body": "我推动转化率提升30.5%，负责社区冷启动与平台运营，完成2个分析看板。",
+        }
+
+        result = validate_generated_claims(
+            record,
+            profile,
+            profile["candidate_application"],
+            draft,
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertFalse(any(claim["text"].startswith("「") for claim in result["claims"]))
+        self.assertFalse(any(
+            claim["claimType"] == "project" and claim["text"] == "社区冷启动与平台"
+            for claim in result["claims"]
+        ))
+        self.assertTrue(any(
+            claim["claimType"] == "percentage" and claim["text"] == "30.5%"
+            for claim in result["claims"]
+        ))
+
     def test_model_derived_fields_and_match_scores_cannot_become_evidence(self) -> None:
         record = fixture_record()
         record["job_card"]["role_name"] = "虚构战略岗位"
@@ -194,6 +266,65 @@ class EvidenceClaimValidatorTests(unittest.TestCase):
         self.assertTrue(any(
             claim["text"] == "73" and claim["validationStatus"] == "failed"
             for claim in result["claims"]
+        ))
+
+    def test_verified_target_role_is_context_only_in_application_intent(self) -> None:
+        record = fixture_record()
+        profile = fixture_profile()
+        target_role = "\u6570\u636e\u7b56\u7565 / \u5206\u6790\u5b9e\u4e60\u751f"
+        record["job_card"]["role_name"] = target_role
+        record["qualitySourceDisposition"] = {
+            "status": "sendable",
+            "roleName": target_role,
+        }
+
+        application_intent = validate_generated_claims(
+            record,
+            profile,
+            profile["candidate_application"],
+            {"greeting": "\u60a8\u597d\uff0c\u6211\u7533\u8bf7\u6570\u636e\u7b56\u7565/\u5206\u6790\u5b9e\u4e60\u751f\u3002"},
+        )
+        self.assertEqual(application_intent["status"], "passed")
+        self.assertFalse(any(
+            claim["claimType"] == "job" and claim["text"] == target_role
+            for claim in application_intent["claims"]
+        ))
+
+        candidate_history = validate_generated_claims(
+            record,
+            profile,
+            profile["candidate_application"],
+            {"cover_letter": f"\u6211\u66fe\u62c5\u4efb{target_role}\u3002"},
+        )
+        self.assertEqual(candidate_history["status"], "failed")
+        self.assertTrue(any(
+            claim["claimType"] == "job"
+            and claim["text"] == target_role
+            and claim["validationStatus"] == "failed"
+            for claim in candidate_history["claims"]
+        ))
+
+    def test_generic_project_descriptor_is_not_treated_as_a_project_name(self) -> None:
+        profile = fixture_profile()
+        generic = validate_generated_claims(
+            fixture_record(),
+            profile,
+            profile["candidate_application"],
+            {"cover_letter": "\u6211\u63a8\u8fdb\u6e05\u6670\u3001\u6709\u5e8f\u7684\u9879\u76ee\u3002"},
+        )
+        self.assertEqual(generic["status"], "passed")
+        self.assertFalse(any(claim["claimType"] == "project" for claim in generic["claims"]))
+
+        fabricated = validate_generated_claims(
+            fixture_record(),
+            profile,
+            profile["candidate_application"],
+            {"cover_letter": "\u6211\u63a8\u8fdb\u661f\u56fe\u9879\u76ee\u3002"},
+        )
+        self.assertEqual(fabricated["status"], "failed")
+        self.assertTrue(any(
+            claim["claimType"] == "project" and claim["validationStatus"] == "failed"
+            for claim in fabricated["claims"]
         ))
 
     def test_subjective_proficiency_requires_human_review(self) -> None:

@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "servers": [
+    {
+      "id": "local-tools",
+      "label": "Local Tools MCP",
+      "enabled": false,
+      "transport": "stdio",
+      "command": "node",
+      "args": [
+        "path/to/mcp-server.mjs"
+      ],
+      "envKeys": [
+        "MCP_TOKEN"
+      ],
+      "readOnlyTools": [
+        "search"
+      ]
+    },
+    {
+      "id": "remote-tools",
+      "label": "Remote Tools MCP",
+      "enabled": false,
+      "transport": "streamable_http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "X-Client": "data-copilot"
+      },
+      "headerEnv": {
+        "Authorization": "MCP_AUTH_HEADER"
+      },
+      "readOnlyTools": [
+        "list_records"
+      ]
+    }
+  ]
+}

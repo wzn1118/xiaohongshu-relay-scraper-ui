@@ -17,6 +17,72 @@ from scripts.ai_provider_runtime import AIProvider, AIProviderError, run_with_tr
 
 
 class AiProviderRuntimeTests(unittest.TestCase):
+    def test_openai_compatible_plain_text_omits_json_controls(self) -> None:
+        provider = AIProvider(
+            provider="relay",
+            api_key="test-key",
+            base_url="https://api.example/v1",
+            model="gpt-5.6-sol",
+            wire_api="chat_completions",
+            timeout=30,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return json.dumps({
+                    "model": "gpt-5.6-sol",
+                    "choices": [{"message": {"content": "尊敬的招聘负责人：正文"}}],
+                }, ensure_ascii=False).encode("utf-8")
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", return_value=Response()) as open_url:
+            result = provider.generate_text("system", "user")
+
+        self.assertEqual(result, "尊敬的招聘负责人：正文")
+        payload = json.loads(open_url.call_args.args[0].data)
+        self.assertNotIn("response_format", payload)
+        self.assertNotIn("text", payload)
+        self.assertEqual(payload["messages"][0]["content"], "system")
+        self.assertEqual(provider.last_request_model, "gpt-5.6-sol")
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(request.get_header("Connection"), "close")
+        self.assertNotIn("Python-urllib", request.get_header("User-agent"))
+
+    def test_openai_compatible_text_json_omits_structured_output_controls(self) -> None:
+        provider = AIProvider(
+            provider="relay",
+            api_key="test-key",
+            base_url="https://api.example/v1",
+            model="gpt-5.6-sol",
+            wire_api="chat_completions",
+            timeout=30,
+        )
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"choices":[{"message":{"content":"```json\\n{\\"ok\\":true}\\n```"}}]}'
+
+        with patch("scripts.ai_provider_runtime.urllib.request.urlopen", return_value=Response()) as open_url:
+            result = provider.generate_json_from_text("system", "user")
+
+        self.assertEqual(result, {"ok": True})
+        payload = json.loads(open_url.call_args.args[0].data)
+        self.assertNotIn("response_format", payload)
+        self.assertEqual(payload["messages"][0]["content"], "system")
+        self.assertEqual(payload["model"], "gpt-5.6-sol")
+
     def test_openai_compatible_chat_request_includes_image_parts(self) -> None:
         provider = AIProvider(
             provider="openai",

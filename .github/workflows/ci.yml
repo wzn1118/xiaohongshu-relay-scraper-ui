@@ -8,7 +8,7 @@ jobs:
   verify:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -18,12 +18,36 @@ jobs:
           cache: npm
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: "3.13"
           cache: pip
       - run: npm ci
       - run: python -m pip install -r requirements.txt
       - run: npm run check
       - run: npm run audit:dependencies
+      - name: Install Chromium for the macOS package-open test
+        if: matrix.os == 'macos-latest'
+        run: npx playwright install chromium
+      - name: Open the clean package through the macOS Finder launcher
+        if: matrix.os == 'macos-latest'
+        run: |
+          archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip"
+          sh scripts/package-github-release-macos.sh --output-path "$archive" --source-ref HEAD
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$archive" \
+            --port 65432 \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-open-smoke.png"
+      - name: Upload macOS package-open evidence
+        if: matrix.os == 'macos-latest' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-package-open-evidence-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip.sha256
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-open-smoke.png
+          if-no-files-found: warn
+          retention-days: 7
 
   browser:
     runs-on: ubuntu-latest

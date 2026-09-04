@@ -14,6 +14,12 @@ from job_role_title import normalize_role_title  # noqa: E402
 
 
 class JobRoleTitleTests(unittest.TestCase):
+    def test_keeps_content_recommendation_intern_role(self) -> None:
+        self.assertEqual(
+            normalize_role_title("内容推荐实习生"),
+            "内容推荐实习生",
+        )
+
     def test_noisy_application_subject_becomes_role_only(self) -> None:
         self.assertEqual(
             normalize_role_title("应聘成都内容运营实习生/剪辑实习生招继任｜王梓楠"),

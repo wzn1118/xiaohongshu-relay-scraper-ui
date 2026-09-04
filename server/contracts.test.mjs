@@ -84,6 +84,22 @@ test('validateRunRequest accepts a bounded non-job research brief', () => {
   assert.equal(result.collectAudience, true);
 });
 
+test('raw general collection disables AI processing and emits the no-runtime runner flag', () => {
+  const result = validateRunRequest({
+    analysisMode: 'general',
+    keyword: 'raw collection',
+    skipPostprocess: true,
+    useCodexRuntime: true,
+  });
+  const args = buildRunnerArgs(result, path.resolve('output'));
+
+  assert.equal(result.skipPostprocess, true);
+  assert.equal(result.useCodexRuntime, false);
+  assert.ok(args.includes('--skip-postprocess'));
+  assert.ok(args.includes('--no-codex-runtime'));
+  assert.equal(args.includes('--codex-runtime'), false);
+});
+
 test('audience-only collection requires a general resume source', () => {
   const sourceId = '20260728034820-6b942873';
   const result = validateRunRequest({
@@ -191,7 +207,8 @@ test('buildRunnerArgs only emits the normalized whitelist', () => {
   assert.ok(args.includes('--complete-missing-only'));
   assert.ok(args.includes('--skip-postprocess'));
   assert.ok(args.includes('--no-auto-attach'));
-  assert.ok(args.includes('--codex-runtime'));
+  assert.ok(args.includes('--no-codex-runtime'));
+  assert.equal(args.includes('--codex-runtime'), false);
   assert.ok(args.includes('--no-collect-audience'));
   assert.equal(args[args.indexOf('--search-sort') + 1], 'latest');
   const tamperedArgs = buildRunnerArgs({ ...params, searchSort: 'comprehensive' }, path.resolve('output'));

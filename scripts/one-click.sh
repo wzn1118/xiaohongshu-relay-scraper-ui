@@ -23,10 +23,21 @@ done
 
 load_env() {
   if [ -f .env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    . ./.env
-    set +a
+    while IFS= read -r env_line || [ -n "$env_line" ]; do
+      env_line=$(printf '%s' "$env_line" | tr -d '\r')
+      case "$env_line" in ''|'#'*) continue ;; esac
+      env_key=${env_line%%=*}
+      env_value=${env_line#*=}
+      case "$env_key" in
+        ''|[0-9]*|*[!A-Za-z0-9_]*) echo "Invalid environment entry in .env: $env_key" >&2; exit 2 ;;
+        *) ;;
+      esac
+      case "$env_value" in
+        \"*\") env_value=${env_value#\"}; env_value=${env_value%\"} ;;
+        \'*\') env_value=${env_value#\'}; env_value=${env_value%\'} ;;
+      esac
+      export "$env_key=$env_value"
+    done < .env
   fi
   if [ -n "$PORT_OVERRIDE" ]; then PORT=$PORT_OVERRIDE; export PORT; fi
   PYTHON_BIN=${PYTHON_BIN:-python3}

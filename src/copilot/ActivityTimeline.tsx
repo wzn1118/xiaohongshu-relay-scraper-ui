@@ -1,4 +1,4 @@
-import { AlertTriangle, FileSearch, MessageSquareText, Wrench } from 'lucide-react'
+import { AlertTriangle, Bot, FileSearch, MessageSquareText, Wrench } from 'lucide-react'
 
 import type { WorkbenchActivity } from './workbench-types'
 
@@ -13,7 +13,7 @@ export function ActivityTimeline({ activities }: { activities: WorkbenchActivity
             <strong>{activity.title}</strong>
             <small>{activity.detail || '状态已更新'}</small>
           </span>
-          <time>{timeLabel(activity.occurredAt)}</time>
+          <time dateTime={activity.occurredAt}>{timeLabel(activity.occurredAt)}</time>
         </div>
       ))}
     </div>
@@ -21,6 +21,7 @@ export function ActivityTimeline({ activities }: { activities: WorkbenchActivity
 }
 
 function activityIcon(type: WorkbenchActivity['type']) {
+  if (type === 'agent') return <Bot size={13} aria-hidden="true" />
   if (type === 'tool') return <Wrench size={13} aria-hidden="true" />
   if (type === 'evidence') return <FileSearch size={13} aria-hidden="true" />
   if (type === 'error') return <AlertTriangle size={13} aria-hidden="true" />

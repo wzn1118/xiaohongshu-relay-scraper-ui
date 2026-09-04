@@ -1,0 +1,14 @@
+# Generated runtime configuration is written to .runtime/production.
+# Replace placeholders only when creating a manual config; never commit a
+# Cloudflare credential JSON or tunnel token.
+tunnel: TUNNEL_UUID
+credentials-file: C:/Users/USERNAME/.cloudflared/TUNNEL_UUID.json
+no-autoupdate: true
+ingress:
+  - hostname: relay.hegelsalon.com
+    service: http://127.0.0.1:4327
+    originRequest:
+      httpHostHeader: 127.0.0.1
+  - hostname: mcp.hegelsalon.com
+    service: http://127.0.0.1:4328
+  - service: http_status:404

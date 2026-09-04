@@ -58,6 +58,28 @@ test('resolver selects the batch requirement tool for all-job email format extra
   assert.ok(names.includes('applications.extract_email_requirements'));
 });
 
+test('workspace, exec, HTTP, and MCP intents surface their runtime adapters', () => {
+  const catalog = [
+    ...CATALOG,
+    tool('workspace.list', 'List workspace files'),
+    tool('workspace.read', 'Read a workspace file'),
+    tool('workspace.write', 'Write a workspace file'),
+    tool('exec.run', 'Run a command'),
+    tool('http.request', 'Call an HTTP API'),
+    tool('mcp.github.search-code', 'Search code with an MCP server'),
+  ];
+  const resolver = new CopilotCapabilityResolver({ maximumTools: 10, minimumTools: 6 });
+
+  const commandNames = resolver.resolve(catalog, { query: 'Run npm tests in this workspace.' }).map((item) => item.name);
+  assert.ok(commandNames.includes('workspace.list'));
+  assert.ok(commandNames.includes('workspace.read'));
+  assert.ok(commandNames.includes('exec.run'));
+
+  const integrationNames = resolver.resolve(catalog, { query: 'Call this API through HTTP and use the MCP tool server.' }).map((item) => item.name);
+  assert.ok(integrationNames.includes('http.request'));
+  assert.ok(integrationNames.includes('mcp.github.search-code'));
+});
+
 function tool(name, description) {
   return {
     name,

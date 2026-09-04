@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -26,6 +27,7 @@ import {
   Maximize2,
   MessageSquareText,
   Minimize2,
+  MoreHorizontal,
   Paperclip,
   PanelLeftClose,
   PanelLeftOpen,
@@ -36,6 +38,7 @@ import {
   RefreshCw,
   Search,
   Send,
+  ServerCog,
   Sparkles,
   Square,
   Trash2,
@@ -46,6 +49,7 @@ import {
 import type { AiModelDiscovery, AiProviderOption, ApplicationBatch } from './types'
 import { api } from './api'
 import {
+  DATA_COPILOT_DEFAULT_REASONING_EFFORTS,
   DataCopilotContextProvider,
   type DataCopilotAttachment,
   type DataCopilotCitation,
@@ -53,15 +57,23 @@ import {
   type DataCopilotContextSource,
   type DataCopilotMessageData,
   type DataCopilotModel,
+  type DataCopilotReasoningEffort,
   type DataCopilotRunStatus,
   type DataCopilotSession,
+  type DataCopilotSubagentRun,
   type DataCopilotTaskRecord,
   type DataCopilotTransport,
+  type DataCopilotWorkspaceBinding,
 } from './DataCopilotContext'
 import { DataCopilotContextBrowser } from './DataCopilotContextBrowser'
 import { DataCopilotMessage } from './DataCopilotMessage'
-import { AgentWorkbench } from './copilot/AgentWorkbench'
+import { CopilotMcpSettings } from './CopilotMcpSettings'
+import { CopilotProjectWorkspacePanel } from './CopilotProjectWorkspacePanel'
 import { DataCopilotQualityPanel } from './copilot/QualityPanel'
+import { ExecutionTimeline } from './copilot/ExecutionTimeline'
+import { TaskInspector, type TaskInspectorTab } from './copilot/TaskInspector'
+import { TaskRunHeader } from './copilot/TaskRunHeader'
+import { McpAccessPanel } from './McpAccessPanel'
 import { useCopilotEventProjection } from './copilot/useCopilotEventProjection'
 import './DataCopilotExperience.css'
 
@@ -72,6 +84,33 @@ type PendingFile = {
 
 type MobilePane = 'sessions' | 'conversation' | 'context'
 type WorkspaceMode = 'ask' | 'analyze' | 'build'
+
+function reasoningEffortsForModel(model?: DataCopilotModel): readonly DataCopilotReasoningEffort[] {
+  if (model?.reasoningEfforts?.length) return model.reasoningEfforts
+  return model?.supportsReasoningEffort === true
+    ? DATA_COPILOT_DEFAULT_REASONING_EFFORTS
+    : []
+}
+
+function reasoningEffortLabel(value: DataCopilotReasoningEffort) {
+  const labels: Record<DataCopilotReasoningEffort, string> = {
+    none: '关闭',
+    low: '低',
+    medium: '中',
+    high: '高',
+    xhigh: '极高',
+    max: '最大',
+  }
+  return labels[value]
+}
+
+function useStableEvent<Args extends unknown[]>(
+  callback: (...args: Args) => void,
+) {
+  const callbackRef = useRef(callback)
+  callbackRef.current = callback
+  return useCallback((...args: Args) => callbackRef.current(...args), [])
+}
 
 export type DataCopilotModelConnectionInput = {
   provider: AiProviderOption['id']
@@ -139,6 +178,22 @@ function toError(value: unknown) {
   return value instanceof Error ? value : new Error(String(value))
 }
 
+function sameWorkspaceBinding(
+  left: DataCopilotWorkspaceBinding | null,
+  right: DataCopilotWorkspaceBinding | null,
+) {
+  return left?.projectId === right?.projectId &&
+    left?.workspaceId === right?.workspaceId &&
+    left?.worktreeId === right?.worktreeId
+}
+
+function workspaceSessionMarker(
+  sessionId: string,
+  binding: DataCopilotWorkspaceBinding | null | undefined,
+) {
+  return [sessionId, binding?.projectId ?? '', binding?.workspaceId ?? '', binding?.worktreeId ?? ''].join('|')
+}
+
 function mergeMessages(
   current: DataCopilotMessageData[],
   incoming: DataCopilotMessageData[],
@@ -184,6 +239,24 @@ function mergeMessages(
 function mergeSession(current: DataCopilotSession[], incoming: DataCopilotSession) {
   const index = current.findIndex((session) => session.id === incoming.id)
   if (index === -1) return [incoming, ...current]
+  const previous = current[index]
+  const modelChanged = Boolean(incoming.modelId && incoming.modelId !== previous.modelId)
+  const next = [...current]
+  next[index] = {
+    ...incoming,
+    modelId: incoming.modelId ?? previous.modelId,
+    reasoningEffort: incoming.reasoningEffort ?? (modelChanged ? undefined : previous.reasoningEffort),
+    workspaceBinding: incoming.workspaceBinding ?? previous.workspaceBinding,
+  }
+  return next
+}
+
+function mergeSubagentRun(
+  current: DataCopilotSubagentRun[],
+  incoming: DataCopilotSubagentRun,
+) {
+  const index = current.findIndex((run) => run.runId === incoming.runId)
+  if (index === -1) return [...current, incoming]
   const next = [...current]
   next[index] = incoming
   return next
@@ -324,11 +397,18 @@ export function DataCopilotPanel({
 }: DataCopilotPanelProps) {
   const fallbackModelId = defaultModelId ?? models.find((model) => !model.disabled)?.id ?? ''
   const [panelWidth, setPanelWidth] = useState(defaultWidth)
-  const [fullscreen, setFullscreen] = useState(false)
+  const [fullscreen, setFullscreen] = useState(true)
   const [mobilePane, setMobilePane] = useState<MobilePane>('conversation')
   const [sessionsCollapsed, setSessionsCollapsed] = useState(false)
   const [contextCollapsed, setContextCollapsed] = useState(false)
+  const [inspectorTab, setInspectorTab] = useState<TaskInspectorTab>('context')
   const [qualityOpen, setQualityOpen] = useState(false)
+  const [mcpAccessOpen, setMcpAccessOpen] = useState(false)
+  const [mcpSettingsOpen, setMcpSettingsOpen] = useState(false)
+  const [projectWorkspaceOpen, setProjectWorkspaceOpen] = useState(false)
+  const [utilityMenuOpen, setUtilityMenuOpen] = useState(false)
+  const [projectWorkspaceSelection, setProjectWorkspaceSelection] =
+    useState<DataCopilotWorkspaceBinding | null>(null)
   const [modelConnectorOpen, setModelConnectorOpen] = useState(false)
   const [modelConnectorBusy, setModelConnectorBusy] = useState<'discover' | 'connect' | null>(null)
   const [modelConnectorStatus, setModelConnectorStatus] = useState<{
@@ -345,10 +425,13 @@ export function DataCopilotPanel({
   const [selectedContextTask, setSelectedContextTask] = useState<DataCopilotTaskRecord | null>(null)
   const [messagesBySession, setMessagesBySession] =
     useState<Record<string, DataCopilotMessageData[]>>(initialMessages)
+  const [subagentRunsBySession, setSubagentRunsBySession] =
+    useState<Record<string, DataCopilotSubagentRun[]>>({})
   const [selectedContextSourceIds, setSelectedContextSourceIds] =
     useState<string[]>(defaultContextSourceIds)
   const [modelId, setModelId] = useState(fallbackModelId)
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>('ask')
+  const [reasoningEffort, setReasoningEffort] = useState<DataCopilotReasoningEffort>('medium')
   const [composerValue, setComposerValue] = useState('')
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([])
   const [sessionQuery, setSessionQuery] = useState('')
@@ -367,6 +450,7 @@ export function DataCopilotPanel({
   const operationEpochRef = useRef(0)
   const resizeRef = useRef<{ x: number; width: number } | null>(null)
   const sendInFlightRef = useRef(false)
+  const workspaceSelectionSessionRef = useRef<string | null>(null)
   const selectedContextTaskRef = useRef<DataCopilotTaskRecord | null>(selectedContextTask)
   const onErrorRef = useRef(onError)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -376,6 +460,8 @@ export function DataCopilotPanel({
   const panelRef = useRef<HTMLElement>(null)
   const modelDialogRef = useRef<HTMLElement>(null)
   const modelReturnFocusRef = useRef<HTMLElement | null>(null)
+  const messageScrollFrameRef = useRef<number | null>(null)
+  const utilityMenuRef = useRef<HTMLDivElement>(null)
 
   const restoreModelFocus = useCallback(() => {
     window.requestAnimationFrame(() => modelReturnFocusRef.current?.focus())
@@ -473,6 +559,26 @@ export function DataCopilotPanel({
     onErrorRef.current = onError
   }, [onError])
 
+  useEffect(() => {
+    if (!utilityMenuOpen) return undefined
+
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (!utilityMenuRef.current?.contains(event.target as Node)) {
+        setUtilityMenuOpen(false)
+      }
+    }
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setUtilityMenuOpen(false)
+    }
+
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [utilityMenuOpen])
+
   const reportError = useCallback((value: unknown) => {
     const error = toError(value)
     setLocalError(error.message)
@@ -480,19 +586,96 @@ export function DataCopilotPanel({
     return error
   }, [])
 
+  const updateProjectWorkspaceSelection = useCallback((next: DataCopilotWorkspaceBinding | null) => {
+    setProjectWorkspaceSelection((current) => sameWorkspaceBinding(current, next) ? current : next)
+  }, [])
+
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
     [selectedSessionId, sessions],
   )
+  const selectedSessionWorkspaceMarker = selectedSession
+    ? workspaceSessionMarker(selectedSession.id, selectedSession.workspaceBinding)
+    : null
+  useEffect(() => {
+    if (!selectedSession || workspaceSelectionSessionRef.current === selectedSessionWorkspaceMarker) return
+    workspaceSelectionSessionRef.current = selectedSessionWorkspaceMarker
+    updateProjectWorkspaceSelection(selectedSession.workspaceBinding ?? null)
+  }, [selectedSession, selectedSessionWorkspaceMarker, updateProjectWorkspaceSelection])
   const activeMessages = selectedSessionId
     ? (messagesBySession[selectedSessionId] ?? [])
     : []
+  const activeSubagentRuns = selectedSessionId
+    ? (subagentRunsBySession[selectedSessionId] ?? [])
+    : []
+  // Streaming text is the foreground interaction. The inspector can trail it
+  // by a render so receipt aggregation and task projection never compete with
+  // the active conversation on every token frame.
+  const deferredInspectorMessages = useDeferredValue(activeMessages)
+  const deferredInspectorSubagentRuns = useDeferredValue(activeSubagentRuns)
+  const activeMessageTail = activeMessages.at(-1)
+  const activeMessageRevision = activeMessageTail
+    ? `${activeMessageTail.id}:${activeMessageTail.content.length}:${activeMessageTail.status ?? ''}`
+    : ''
   const effectiveStatus = isActiveStatus(runStatus)
     ? runStatus
     : (selectedSession?.status ?? runStatus)
   const running = isActiveStatus(effectiveStatus)
-  const workbenchProjection = useCopilotEventProjection(activeMessages, effectiveStatus)
+  const workbenchProjection = useCopilotEventProjection(
+    deferredInspectorMessages,
+    effectiveStatus,
+    deferredInspectorSubagentRuns,
+  )
+  useEffect(() => {
+    // Preserve the established data-context entry point until this conversation
+    // has an actual execution trace to inspect.
+    if (workbenchProjection.nodes.length > 0) {
+      setInspectorTab((current) => current === 'context' ? 'execution' : current)
+    }
+  }, [workbenchProjection.nodes.length])
   const selectedModel = models.find((model) => model.id === modelId)
+  const availableReasoningEfforts = reasoningEffortsForModel(selectedModel)
+  const supportsReasoningEffort = availableReasoningEfforts.length > 0
+  const effectiveReasoningEffort = supportsReasoningEffort
+    ? availableReasoningEfforts.includes(reasoningEffort)
+      ? reasoningEffort
+      : availableReasoningEfforts.includes('medium')
+        ? 'medium'
+        : availableReasoningEfforts[0]
+    : undefined
+  const persistSessionSettings = useCallback((nextModelId: string, nextReasoningEffort?: DataCopilotReasoningEffort) => {
+    if (!selectedSession || !transport.updateSessionSettings) return
+    void transport
+      .updateSessionSettings(selectedSession.id, {
+        modelId: nextModelId,
+        ...(nextReasoningEffort ? { reasoningEffort: nextReasoningEffort } : {}),
+      })
+      .then((session) => setSessions((current) => mergeSession(current, session)))
+      .catch(reportError)
+  }, [reportError, selectedSession, transport])
+  const selectModel = useCallback((nextModelId: string) => {
+    const nextModel = models.find((model) => model.id === nextModelId)
+    if (!nextModel || nextModel.disabled) return
+    const nextReasoningEfforts = reasoningEffortsForModel(nextModel)
+    const nextReasoningEffort = nextReasoningEfforts.includes(reasoningEffort)
+      ? reasoningEffort
+      : nextReasoningEfforts.includes('medium')
+        ? 'medium'
+        : nextReasoningEfforts[0]
+    setModelId(nextModelId)
+    if (nextReasoningEffort) setReasoningEffort(nextReasoningEffort)
+    persistSessionSettings(nextModelId, nextReasoningEffort)
+  }, [models, persistSessionSettings, reasoningEffort])
+  const selectReasoningEffort = useCallback((nextReasoningEffort: DataCopilotReasoningEffort) => {
+    if (!availableReasoningEfforts.includes(nextReasoningEffort)) return
+    setReasoningEffort(nextReasoningEffort)
+    persistSessionSettings(modelId, nextReasoningEffort)
+  }, [availableReasoningEfforts, modelId, persistSessionSettings])
+  useEffect(() => {
+    if (!effectiveReasoningEffort || reasoningEffort === effectiveReasoningEffort) return
+    setReasoningEffort(effectiveReasoningEffort)
+    persistSessionSettings(modelId, effectiveReasoningEffort)
+  }, [effectiveReasoningEffort, modelId, persistSessionSettings, reasoningEffort])
   const modelDraftProvider = modelProviders.find((provider) => provider.id === modelDraft.provider)
   const selectedContextMeta = useMemo(() => ({
     ...contextMeta,
@@ -504,12 +687,14 @@ export function DataCopilotPanel({
     snapshotId: selectedContextTask?.snapshotId || selectedSession?.snapshotId || contextMeta?.snapshotId,
     filters: selectedSession?.filters?.length ? selectedSession.filters : contextMeta?.filters,
   }), [contextMeta, selectedContextTask, selectedSession])
-  const usedTools = useMemo(
-    () => [...new Set(activeMessages.flatMap((message) =>
+  const usedTools = useMemo(() => [...new Set([
+    ...activeMessages.flatMap((message) =>
       (message.toolCalls ?? []).map((toolCall) => toolCall.name),
-    ))],
-    [activeMessages],
-  )
+    ),
+    ...activeSubagentRuns.flatMap((run) => run.tasks.flatMap((task) =>
+      task.tools.map((tool) => tool.toolName),
+    )),
+  ])], [activeMessages, activeSubagentRuns])
   const normalizedSessionQuery = sessionQuery.trim().toLocaleLowerCase()
   const filteredSessions = useMemo(
     () =>
@@ -535,19 +720,22 @@ export function DataCopilotPanel({
         : defaultTaskContextSourceIds(task.id),
     )
     setRunStatus(matchingSession?.status ?? 'idle')
+    updateProjectWorkspaceSelection(matchingSession?.workspaceBinding ?? null)
     setLocalError(null)
     if (globalThis.innerWidth > 680 && (panelWidth < 1080 || globalThis.innerWidth <= 1100)) {
       setContextCollapsed(true)
     }
-  }, [panelWidth, sessions])
+  }, [panelWidth, sessions, updateProjectWorkspaceSelection])
 
   const selectSession = useCallback((session: DataCopilotSession) => {
     const task = taskFromSession(session)
     selectedContextTaskRef.current = task
     setSelectedSessionId(session.id)
     setSelectedContextTask(task)
+    setInspectorTab('context')
+    updateProjectWorkspaceSelection(session.workspaceBinding ?? null)
     setMobilePane('conversation')
-  }, [])
+  }, [updateProjectWorkspaceSelection])
 
   const acceptSnapshotUpgrade = useCallback((session: DataCopilotSession) => {
     setSessions((current) => mergeSession(current, session))
@@ -559,8 +747,9 @@ export function DataCopilotPanel({
       ? session.contextSourceIds
       : defaultTaskContextSourceIds(session.jobId || ''))
     setRunStatus(session.status || 'idle')
+    updateProjectWorkspaceSelection(session.workspaceBinding ?? null)
     setLocalError(null)
-  }, [])
+  }, [updateProjectWorkspaceSelection])
 
   const leaveContextTask = useCallback(() => {
     selectedContextTaskRef.current = null
@@ -584,6 +773,7 @@ export function DataCopilotPanel({
     if (open) return
     loadedSessionIdsRef.current.clear()
     boundSessionIdRef.current = null
+    setMcpSettingsOpen(false)
   }, [open])
 
   useEffect(() => {
@@ -592,6 +782,7 @@ export function DataCopilotPanel({
     setSelectedContextSourceIds(
       selectedSession.contextSourceIds ?? defaultContextSourceIds,
     )
+    setReasoningEffort(selectedSession.reasoningEffort ?? 'medium')
     if (
       selectedSession.modelId &&
       models.some((model) => model.id === selectedSession.modelId && !model.disabled)
@@ -665,13 +856,25 @@ export function DataCopilotPanel({
   useEffect(() => {
     if (!open || !selectedSessionId || !transport.subscribe) return
     return transport.subscribe(selectedSessionId, {
-      onMessage: (message) => {
+      onMessages: (messages) => {
+        if (messages.length === 0) return
         setMessagesBySession((current) => ({
           ...current,
-          [selectedSessionId]: mergeMessages(current[selectedSessionId] ?? [], [message]),
+          [selectedSessionId]: mergeMessages(current[selectedSessionId] ?? [], messages),
         }))
       },
       onSession: (session) => setSessions((current) => mergeSession(current, session)),
+      onSubagentRuns: (runs) => {
+        if (runs.length === 0) return
+        setSubagentRunsBySession((current) => {
+          const next = { ...current }
+          for (const run of runs) {
+            const sessionId = run.conversationId || selectedSessionId
+            next[sessionId] = mergeSubagentRun(next[sessionId] ?? [], run)
+          }
+          return next
+        })
+      },
       onStatus: (status) => {
         setRunStatus(status)
         updateSessionStatus(selectedSessionId, status)
@@ -689,11 +892,20 @@ export function DataCopilotPanel({
   useEffect(() => {
     if (!open) return
     const area = messageAreaRef.current
-    if (!area || area.scrollHeight - area.scrollTop - area.clientHeight < 96) {
+    if (!area || area.scrollHeight - area.scrollTop - area.clientHeight >= 96) return
+    const scroll = () => {
+      messageScrollFrameRef.current = null
       messageEndRef.current?.scrollIntoView({ block: 'end' })
       setShowScrollToLatest(false)
     }
-  }, [activeMessages.length, open, selectedSessionId])
+    messageScrollFrameRef.current = window.requestAnimationFrame(scroll)
+    return () => {
+      if (messageScrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(messageScrollFrameRef.current)
+        messageScrollFrameRef.current = null
+      }
+    }
+  }, [activeMessageRevision, open, selectedSessionId])
 
   useEffect(() => {
     if (!open) return
@@ -719,7 +931,9 @@ export function DataCopilotPanel({
         if (modelConnectorOpen) {
           event.preventDefault()
           closeModelConnector()
-        } else if (fullscreen) setFullscreen(false)
+        } else if (projectWorkspaceOpen) setProjectWorkspaceOpen(false)
+        else if (mcpSettingsOpen) setMcpSettingsOpen(false)
+        else if (fullscreen) setFullscreen(false)
         else if (globalThis.innerWidth <= 680 && mobilePane !== 'conversation') setMobilePane('conversation')
         else if (!contextCollapsed) setContextCollapsed(true)
         else onClose()
@@ -752,7 +966,7 @@ export function DataCopilotPanel({
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [closeModelConnector, contextCollapsed, fullscreen, mobilePane, modelConnectorOpen, onClose, open])
+  }, [closeModelConnector, contextCollapsed, fullscreen, mcpSettingsOpen, mobilePane, modelConnectorOpen, onClose, open, projectWorkspaceOpen])
 
   useEffect(() => {
     const onPointerMove = (event: globalThis.PointerEvent) => {
@@ -787,7 +1001,7 @@ export function DataCopilotPanel({
     document.body.style.userSelect = 'none'
   }
 
-  const createSession = async () => {
+  const createSession = async (workspaceBinding = projectWorkspaceSelection) => {
     if (!modelId || creatingSession) return null
     if (!selectedContextTask) {
       reportError(new Error('请先从右侧历史采集记录中选择一个任务。'))
@@ -801,17 +1015,23 @@ export function DataCopilotPanel({
         selectedContextSourceIds,
         selectedContextTask.id,
       )
-      const session = await transport.createSession({
+      const createdSession = await transport.createSession({
         modelId,
+        ...(effectiveReasoningEffort ? { reasoningEffort: effectiveReasoningEffort } : {}),
         contextSourceIds,
         jobId: selectedContextTask.id,
         mode: selectedContextTask.mode,
         snapshotId: selectedContextTask.snapshotId,
+        ...(workspaceBinding ?? {}),
       })
+      const session = workspaceBinding && !createdSession.workspaceBinding
+        ? { ...createdSession, workspaceBinding }
+        : createdSession
       loadedSessionIdsRef.current.add(session.id)
       setSessions((current) => mergeSession(current, session))
       setMessagesBySession((current) => ({ ...current, [session.id]: [] }))
       setSelectedSessionId(session.id)
+      workspaceSelectionSessionRef.current = workspaceSessionMarker(session.id, workspaceBinding)
       setMobilePane('conversation')
       return session
     } catch (error) {
@@ -871,6 +1091,7 @@ export function DataCopilotPanel({
     sendInFlightRef.current = true
     setSubmitting(true)
     const messageContent = content || '请分析这些附件。'
+    const requestedWorkspaceBinding = projectWorkspaceSelection
     setLocalError(null)
 
     let session = selectedSession
@@ -882,12 +1103,22 @@ export function DataCopilotPanel({
       session = null
     }
     if (!session) {
-      session = await createSession()
+      session = await createSession(requestedWorkspaceBinding)
       if (!session) {
         sendInFlightRef.current = false
         setSubmitting(false)
         return
       }
+    }
+
+    const messageWorkspaceBinding = requestedWorkspaceBinding ?? session.workspaceBinding ?? null
+    if (
+      messageWorkspaceBinding &&
+      !sameWorkspaceBinding(session.workspaceBinding ?? null, messageWorkspaceBinding)
+    ) {
+      const boundSession = { ...session, workspaceBinding: messageWorkspaceBinding }
+      session = boundSession
+      setSessions((current) => mergeSession(current, boundSession))
     }
 
     const filesToUpload = directAction ? [] : pendingFiles
@@ -942,8 +1173,16 @@ export function DataCopilotPanel({
         content: messageContent,
         modelId,
         workspaceMode,
+        ...(effectiveReasoningEffort ? { reasoningEffort: effectiveReasoningEffort } : {}),
         attachmentIds: attachments.map((attachment) => attachment.id),
         contextSourceIds,
+        ...(messageWorkspaceBinding
+          ? {
+              projectId: messageWorkspaceBinding.projectId,
+              workspaceId: messageWorkspaceBinding.workspaceId,
+              worktreeId: messageWorkspaceBinding.worktreeId,
+            }
+          : {}),
       })
       if (operationEpoch !== operationEpochRef.current) return
       if (result.messages?.length) appendMessages(session.id, result.messages)
@@ -999,7 +1238,10 @@ export function DataCopilotPanel({
     setRunStatus('executing')
     updateSessionStatus(selectedSessionId, 'executing')
     try {
-      const result = await transport.retryMessage(selectedSessionId, message.id)
+      const result = await transport.retryMessage(selectedSessionId, message.id, {
+        modelId,
+        ...(effectiveReasoningEffort ? { reasoningEffort: effectiveReasoningEffort } : {}),
+      })
       if (operationEpoch !== operationEpochRef.current) return
       if (result.messages?.length) appendMessages(selectedSessionId, result.messages)
       if (result.session) setSessions((current) => mergeSession(current, result.session!))
@@ -1021,6 +1263,10 @@ export function DataCopilotPanel({
     const operationEpoch = ++operationEpochRef.current
     setLocalError(null)
     const nextStatus: DataCopilotRunStatus = approved ? 'executing' : 'paused'
+    if (approved) {
+      setInspectorTab('execution')
+      setMobilePane('context')
+    }
     setRunStatus(nextStatus)
     updateSessionStatus(selectedSessionId, nextStatus)
     setMessagesBySession((current) => ({
@@ -1114,6 +1360,7 @@ export function DataCopilotPanel({
   }
 
   const openContextPane = () => {
+    setInspectorTab('context')
     if (globalThis.innerWidth <= 680) setMobilePane('context')
     else setContextCollapsed(false)
   }
@@ -1144,11 +1391,23 @@ export function DataCopilotPanel({
     if (onOpenAttachment) onOpenAttachment(attachment)
     else if (attachment.url) window.open(attachment.url, '_blank', 'noopener,noreferrer')
   }
+  const handleMessageRetry = useStableEvent((message: DataCopilotMessageData) => {
+    void retryMessage(message)
+  })
+  const handleMessageAttachment = useStableEvent((attachment: DataCopilotAttachment) => {
+    openAttachment(attachment)
+  })
+  const handleMessageApproval = useStableEvent((message: DataCopilotMessageData, approved: boolean) => {
+    void confirmApproval(message, approved)
+  })
+  const handleMessageAction = useStableEvent((prompt: string) => {
+    void sendMessage(prompt)
+  })
 
   if (!open) return null
 
-  const railWidth = panelWidth < 1100 ? 220 : 244
-  const contextWidth = panelWidth < 1180 ? 320 : 360
+  const railWidth = panelWidth < 1100 ? 232 : 256
+  const contextWidth = panelWidth < 1180 ? 320 : 344
   const compactWorkspace = !fullscreen && panelWidth < 1080
   const panelPosition: CSSProperties = fullscreen
     ? { inset: 0, width: '100vw' }
@@ -1165,6 +1424,7 @@ export function DataCopilotPanel({
       <section
         ref={panelRef}
         className="data-copilot-panel"
+        data-layout="codex"
         data-mobile-pane={mobilePane}
         data-compact={compactWorkspace}
         data-sessions-collapsed={sessionsCollapsed}
@@ -1176,6 +1436,53 @@ export function DataCopilotPanel({
         role="dialog"
         tabIndex={-1}
       >
+        <style>{`
+          @keyframes data-copilot-spin{to{transform:rotate(360deg)}}
+          .data-copilot-mobile-nav{display:none!important}
+          .data-copilot-context-scrim{display:none}
+          .data-copilot-session-rail{grid-column:1}
+          .data-copilot-conversation{grid-column:2}
+          .data-copilot-panel[data-sessions-collapsed="true"] .data-copilot-session-rail{display:none!important}
+          .data-copilot-panel[data-sessions-collapsed="true"] .data-copilot-conversation{grid-column:1 / 3}
+            .data-copilot-panel[data-context-collapsed="true"] .data-copilot-context-pane{display:none!important}
+          .data-copilot-panel[data-compact="true"] .data-copilot-workspace{grid-template-columns:var(--copilot-rail-track) minmax(0,1fr)!important;position:relative}
+          .data-copilot-panel[data-compact="true"] .data-copilot-context-pane{position:absolute!important;z-index:6;top:0;right:0;bottom:0;width:min(420px,calc(100% - 56px));box-shadow:-12px 0 30px rgba(28,38,33,.13)}
+          .data-copilot-panel[data-compact="true"]:not([data-context-collapsed="true"]) .data-copilot-context-scrim{display:block;position:absolute;z-index:5;inset:0;border:0;background:rgba(32,37,34,.16);cursor:pointer}
+          @media(max-width:1100px){
+            .data-copilot-workspace{grid-template-columns:var(--copilot-rail-track) minmax(0,1fr)!important;position:relative}
+            .data-copilot-context-pane{position:absolute!important;z-index:6;top:0;right:0;bottom:0;width:min(420px,calc(100% - 56px));box-shadow:-12px 0 30px rgba(28,38,33,.13)}
+            .data-copilot-panel:not([data-context-collapsed="true"]) .data-copilot-context-scrim{display:block;position:absolute;z-index:5;inset:0;border:0;background:rgba(32,37,34,.16);cursor:pointer}
+          }
+          @media(max-width:680px){
+            .data-copilot-panel{width:100vw!important;max-width:100vw!important}
+            .data-copilot-resize-handle{display:none!important}
+            .data-copilot-brand-text{display:none!important}
+            .data-copilot-mobile-nav{display:grid!important}
+            .data-copilot-mobile-utility,.data-copilot-model-settings-button{display:none!important}
+            .data-copilot-topbar-actions{margin-left:auto!important;min-width:0!important;gap:2px!important}
+            .data-copilot-mobile-nav{gap:1px!important;padding:1px!important;border:1px solid #e3e3e7!important;border-radius:6px!important;background:#f7f7f8!important}
+            .data-copilot-mobile-nav button{width:26px!important;height:26px!important;border:0!important;border-radius:5px!important;background:transparent!important;color:#65656f!important}
+            .data-copilot-mobile-nav button[aria-pressed="true"]{background:#fff!important;color:#2563eb!important;box-shadow:0 1px 2px rgba(25,25,28,.1)!important}
+            .data-copilot-desktop-pane-button{display:none!important}
+            .data-copilot-model-control{min-width:0!important}
+            .data-copilot-model-select{width:78px!important}
+            .data-copilot-fullscreen-button{display:none!important}
+            .data-copilot-workspace{grid-template-columns:minmax(0,1fr)!important}
+            .data-copilot-context-scrim{display:none!important}
+            .data-copilot-session-rail,
+            .data-copilot-conversation,
+            .data-copilot-context-pane{display:none!important;grid-column:1!important;position:static!important;width:auto;box-shadow:none}
+            .data-copilot-panel[data-mobile-pane="sessions"] .data-copilot-session-rail{display:flex!important}
+            .data-copilot-panel[data-mobile-pane="conversation"] .data-copilot-conversation{display:grid!important}
+            .data-copilot-panel[data-mobile-pane="context"] .data-copilot-context-pane{display:grid!important}
+            .data-copilot-model-dialog-body{grid-template-columns:minmax(0,1fr)!important}
+            .data-copilot-model-dialog-body > *{grid-column:1!important}
+            .data-copilot-conversation-header-status{display:none!important}
+          }
+          @media(max-width:380px){
+            .data-copilot-model-select{width:70px!important}
+          }
+        `}</style>
         {!fullscreen ? (
           <div
             className="data-copilot-resize-handle"
@@ -1189,7 +1496,7 @@ export function DataCopilotPanel({
           />
         ) : null}
 
-        <header className="data-copilot-header" style={panelStyles.header}>
+        <header className="data-copilot-header data-copilot-topbar" style={panelStyles.header}>
           <div className="data-copilot-brand" style={panelStyles.brand}>
             <span className="data-copilot-brand-icon" style={panelStyles.brandIcon}>
               <Bot size={17} aria-hidden="true" />
@@ -1202,18 +1509,71 @@ export function DataCopilotPanel({
             </div>
           </div>
 
-          <div className="data-copilot-header-actions" style={panelStyles.headerActions}>
-            <button
-              className="data-copilot-icon-button data-copilot-quality-button"
-              type="button"
-              onClick={() => setQualityOpen(true)}
-              disabled={!selectedSession || !transport.loadQuality}
-              title="运行与质量"
-              aria-label="打开运行与质量"
-              style={panelStyles.headerButton}
-            >
-              <Gauge size={17} aria-hidden="true" />
-            </button>
+          <div className="data-copilot-header-actions data-copilot-topbar-actions" style={panelStyles.headerActions}>
+            <div className="data-copilot-utility-menu" ref={utilityMenuRef}>
+              <button
+                type="button"
+                className="data-copilot-utility-trigger"
+                aria-label="打开工具与连接"
+                aria-haspopup="true"
+                aria-expanded={utilityMenuOpen}
+                title="工具与连接"
+                onClick={() => setUtilityMenuOpen((open) => !open)}
+                style={panelStyles.headerButton}
+              >
+                <MoreHorizontal size={18} aria-hidden="true" />
+              </button>
+              {utilityMenuOpen ? (
+                <div className="data-copilot-utility-menu-popover" aria-label="工具与连接">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUtilityMenuOpen(false)
+                      setQualityOpen(true)
+                    }}
+                    disabled={!selectedSession || !transport.loadQuality}
+                    aria-label="打开运行与质量"
+                  >
+                    <Gauge size={16} aria-hidden="true" />
+                    <span>运行与质量</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUtilityMenuOpen(false)
+                      setMcpAccessOpen(true)
+                    }}
+                    disabled={!selectedSession}
+                    aria-label="打开 MCP 访问控制"
+                  >
+                    <KeyRound size={16} aria-hidden="true" />
+                    <span>MCP 访问控制</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUtilityMenuOpen(false)
+                      setMcpSettingsOpen(true)
+                    }}
+                    aria-label="打开本地工具与 MCP Server 设置"
+                  >
+                    <ServerCog size={16} aria-hidden="true" />
+                    <span>工具与 MCP Server</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUtilityMenuOpen(false)
+                      setProjectWorkspaceOpen(true)
+                    }}
+                    aria-label="打开项目与工作区"
+                  >
+                    <Layers3 size={16} aria-hidden="true" />
+                    <span>项目与工作区</span>
+                  </button>
+                </div>
+              ) : null}
+            </div>
             <div className="data-copilot-mobile-nav" style={panelStyles.mobileNav} role="group" aria-label="移动端面板">
               {([
                 ['sessions', '显示会话列表', '会话', <MessageSquareText key="sessions" size={15} aria-hidden="true" />],
@@ -1253,8 +1613,8 @@ export function DataCopilotPanel({
               className="data-copilot-icon-button data-copilot-desktop-pane-button"
               type="button"
               onClick={() => setContextCollapsed((value) => !value)}
-              title={contextCollapsed ? '展开数据上下文' : '收起数据上下文'}
-              aria-label={contextCollapsed ? '展开数据上下文' : '收起数据上下文'}
+              title={contextCollapsed ? '展开任务检查器' : '收起任务检查器'}
+              aria-label={contextCollapsed ? '展开任务检查器' : '收起任务检查器'}
               aria-pressed={!contextCollapsed}
               style={panelStyles.headerButton}
             >
@@ -1267,7 +1627,7 @@ export function DataCopilotPanel({
                   <select
                     className="data-copilot-model-select"
                     value={modelId}
-                    onChange={(event) => setModelId(event.target.value)}
+                    onChange={(event) => selectModel(event.target.value)}
                     disabled={running || submitting}
                     title="选择模型"
                     style={panelStyles.modelSelect}
@@ -1317,6 +1677,16 @@ export function DataCopilotPanel({
                 <Square size={14} fill="currentColor" aria-hidden="true" />
               </button>
             ) : null}
+            <button
+              className="data-copilot-icon-button data-copilot-close-button"
+              type="button"
+              onClick={onClose}
+              title="折叠"
+              aria-label="折叠 Data Copilot"
+              style={panelStyles.headerButton}
+            >
+              <PanelRightClose size={17} aria-hidden="true" />
+            </button>
             <button
               className="data-copilot-icon-button data-copilot-fullscreen-button"
               type="button"
@@ -1528,6 +1898,24 @@ export function DataCopilotPanel({
           onUpgrade={acceptSnapshotUpgrade}
         />
 
+        <McpAccessPanel
+          open={mcpAccessOpen}
+          conversationId={selectedSession?.id}
+          onClose={() => setMcpAccessOpen(false)}
+        />
+
+        <CopilotMcpSettings
+          open={mcpSettingsOpen}
+          onClose={() => setMcpSettingsOpen(false)}
+        />
+
+        <CopilotProjectWorkspacePanel
+          open={projectWorkspaceOpen}
+          onClose={() => setProjectWorkspaceOpen(false)}
+          selection={projectWorkspaceSelection}
+          onSelectionChange={updateProjectWorkspaceSelection}
+        />
+
         <div
           className="data-copilot-workspace"
           style={{
@@ -1541,9 +1929,9 @@ export function DataCopilotPanel({
             style={panelStyles.sessionRail}
             aria-label="Data Copilot 会话"
           >
-            <div className="data-copilot-session-header">
+            <div className="data-copilot-session-header data-copilot-session-rail-header" style={panelStyles.sessionRailHeader}>
               <div className="data-copilot-section-heading">
-                <strong>会话</strong>
+                <strong className="data-copilot-session-heading" style={panelStyles.sectionHeading}>会话</strong>
                 <span>{filteredSessions.length}</span>
               </div>
               <button
@@ -1561,17 +1949,18 @@ export function DataCopilotPanel({
                 )}
               </button>
             </div>
-            <label className="data-copilot-search-field">
+            <label className="data-copilot-search-field data-copilot-session-search" style={panelStyles.sessionSearch}>
               <Search size={14} aria-hidden="true" />
               <input
                 value={sessionQuery}
                 onChange={(event) => setSessionQuery(event.target.value)}
-                placeholder="搜索会话"
-                aria-label="搜索会话"
+                placeholder="搜索任务"
+                aria-label="搜索任务"
                 className="data-copilot-search-input"
+                style={panelStyles.sessionSearchInput}
               />
             </label>
-            <div className="data-copilot-session-list">
+            <div className="data-copilot-session-list" style={panelStyles.sessionList}>
               {loadingSessions ? (
                 <div className="data-copilot-state data-copilot-state-compact" role="status" aria-live="polite">
                   <LoaderCircle size={16} style={panelStyles.spinningIcon} aria-hidden="true" />
@@ -1588,8 +1977,10 @@ export function DataCopilotPanel({
                   const selected = session.id === selectedSessionId
                   return (
                     <div
-                      key={session.id}
                       className="data-copilot-session-item"
+                      role="button"
+                      tabIndex={0}
+                      key={session.id}
                       data-selected={selected}
                     >
                       <button
@@ -1629,15 +2020,15 @@ export function DataCopilotPanel({
 
           <main className="data-copilot-conversation" style={panelStyles.conversation}>
             <div className="data-copilot-conversation-header">
-              <div className="data-copilot-conversation-meta">
-                <strong className="data-copilot-conversation-title">
+              <div className="data-copilot-conversation-meta" style={panelStyles.conversationMeta}>
+                <strong className="data-copilot-conversation-title" style={panelStyles.conversationTitle}>
                   {selectedSession?.title ?? (selectedContextTask ? `${selectedContextTask.title} · 新会话` : '请选择历史采集任务')}
                 </strong>
                 <span>
                   {selectedContextSourceIds.length} 个数据源 · {activeMessages.length} 条消息
                 </span>
               </div>
-              <div className="data-copilot-conversation-actions">
+              <div className="data-copilot-conversation-actions data-copilot-conversation-header-actions" style={panelStyles.conversationHeaderActions}>
                 <button
                   className="data-copilot-small-icon-button"
                   type="button"
@@ -1661,28 +2052,58 @@ export function DataCopilotPanel({
                     }
                   }}
                   aria-label={contextCollapsed ? '展开数据上下文' : '收起数据上下文'}
+                  title={contextCollapsed ? '展开数据上下文' : '收起数据上下文'}
+                  style={panelStyles.contextToggleButton}
                 >
                   <Database size={14} aria-hidden="true" />
-                  数据 {selectedContextSourceIds.length}
+                  检查器 {workbenchProjection.nodes.length}
                 </button>
                 <div
                   className="data-copilot-conversation-header-status"
                   data-status={effectiveStatus}
                   role="status"
                   aria-live="polite"
+                  style={panelStyles.statusIndicator}
                 >
-                  <span className="data-copilot-status-dot" aria-hidden="true" />
+                  <span
+                    className="data-copilot-status-dot"
+                    aria-hidden="true"
+                    style={{
+                      ...panelStyles.statusDot,
+                      ...(running ? panelStyles.statusDotRunning : undefined),
+                      ...(effectiveStatus === 'failed' ? panelStyles.statusDotFailed : undefined),
+                    }}
+                  />
                   {runStatusLabel(effectiveStatus)}
                 </div>
               </div>
             </div>
 
-            <AgentWorkbench
-              projection={workbenchProjection}
-              sourceCount={selectedContextSourceIds.length}
-              onCancel={running && transport.stopGeneration
-                ? () => { void stopGeneration() }
-                : undefined}
+            {selectedSession || selectedContextTask ? (
+              <TaskRunHeader
+                status={effectiveStatus}
+                projection={workbenchProjection}
+                modelLabel={selectedModel?.label}
+                reasoningEffort={effectiveReasoningEffort}
+                sourceCount={selectedContextSourceIds.length}
+                workspaceBinding={selectedSession?.workspaceBinding ?? projectWorkspaceSelection}
+                onOpenInspector={(tab) => {
+                  setInspectorTab(tab)
+                  setContextCollapsed(false)
+                  if (globalThis.innerWidth <= 680) setMobilePane('context')
+                }}
+                onOpenWorkspace={() => setProjectWorkspaceOpen(true)}
+                onStop={running && transport.stopGeneration ? () => { void stopGeneration() } : undefined}
+              />
+            ) : null}
+
+            <ExecutionTimeline
+              activities={workbenchProjection.activities}
+              onOpenInspector={(tab) => {
+                setInspectorTab(tab)
+                setContextCollapsed(false)
+                if (globalThis.innerWidth <= 680) setMobilePane('context')
+              }}
             />
 
             {(selectedContextTask?.mode ?? selectedSession?.mode) === 'application' && (selectedContextTask?.id || selectedSession?.jobId) ? (
@@ -1692,10 +2113,10 @@ export function DataCopilotPanel({
               />
             ) : null}
 
-            <div className="data-copilot-message-stage">
+            <div className="data-copilot-message-stage" style={panelStyles.messageStage}>
               <div
-                ref={messageAreaRef}
                 className="data-copilot-message-area"
+                ref={messageAreaRef}
                 aria-live="polite"
                 aria-busy={loadingMessages}
                 onScroll={(event) => {
@@ -1726,7 +2147,7 @@ export function DataCopilotPanel({
                       ] : [
                         { label: '总结核心洞察', prompt: '结合原帖、评论和用户资料，总结当前任务最重要的内容洞察，并给出证据引用。', icon: <Sparkles size={15} aria-hidden="true" /> },
                         { label: '对比原帖观点', prompt: '对比当前任务中各原帖的观点、证据和分歧，整理为结构化结论。', icon: <FileText size={15} aria-hidden="true" /> },
-                        { label: '分析评论人群', prompt: '结合评论内容和评论用户资料，分析主要人群、需求、情绪和高频问题。', icon: <Users size={15} aria-hidden="true" /> },
+                        { label: '深度受众策略', prompt: '对当前任务做深度受众与内容策略研究。先调用 audience.research_brief，并用聚合或查询验证关键判断。输出：数据质量与样本边界、3-5 个需求或行为簇（分别给出评论记录数、唯一文本数、证据、置信度和动作）、需求优先级矩阵、争议与品牌风险图、内容/服务组合，以及带成功阈值的实验计划。明确区分观察、推断和建议，不能只罗列关键词。', icon: <Users size={15} aria-hidden="true" /> },
                         { label: '整理可引用证据', prompt: '从当前任务的原帖和评论中整理可引用的关键证据，并标明来源。', icon: <MessageSquareText size={15} aria-hidden="true" /> },
                       ]).map((action) => (
                         <button
@@ -1747,11 +2168,11 @@ export function DataCopilotPanel({
                   <DataCopilotMessage
                     key={message.id}
                     message={message}
-                    onRetry={transport.retryMessage ? retryMessage : undefined}
-                    onOpenAttachment={openAttachment}
+                    onRetry={transport.retryMessage ? handleMessageRetry : undefined}
+                    onOpenAttachment={handleMessageAttachment}
                     onOpenCitation={onOpenCitation}
-                    onApproval={transport.confirmApproval ? confirmApproval : undefined}
-                    onAction={(prompt) => void sendMessage(prompt)}
+                    onApproval={transport.confirmApproval ? handleMessageApproval : undefined}
+                    onAction={handleMessageAction}
                     jobId={selectedSession?.jobId || selectedContextTask?.id}
                     busy={running}
                     approvalBusy={running && effectiveStatus !== 'waiting_approval'}
@@ -1776,6 +2197,10 @@ export function DataCopilotPanel({
             <div
               className="data-copilot-composer-zone"
               data-dragging={draggingFiles}
+              style={{
+                ...panelStyles.composerZone,
+                ...(draggingFiles ? panelStyles.composerZoneDragging : undefined),
+              }}
               onDragEnter={(event) => {
                 event.preventDefault()
                 setDraggingFiles(true)
@@ -1830,8 +2255,8 @@ export function DataCopilotPanel({
                   ))}
                 </div>
               ) : null}
-              <div className="data-copilot-composer">
-                <div className="data-copilot-shortcut-bar" aria-label="快捷指令">
+              <div className="data-copilot-composer" style={panelStyles.composer}>
+                <div className="data-copilot-shortcut-bar" style={panelStyles.shortcutBar} aria-label="快捷指令">
                   {((selectedContextTask?.mode ?? selectedSession?.mode) === 'application' ? [
                     {
                       label: '写投递邮件',
@@ -1860,8 +2285,8 @@ export function DataCopilotPanel({
                       icon: <FileText size={12} aria-hidden="true" />,
                     },
                     {
-                      label: '分析人群',
-                      prompt: '结合评论内容与用户资料，分析主要人群、需求、情绪和高频问题。',
+                      label: '深度受众策略',
+                      prompt: '对当前任务做深度受众与内容策略研究。先调用 audience.research_brief，并用聚合或查询验证关键判断。输出：数据质量与样本边界、3-5 个需求或行为簇（分别给出评论记录数、唯一文本数、证据、置信度和动作）、需求优先级矩阵、争议与品牌风险图、内容/服务组合，以及带成功阈值的实验计划。明确区分观察、推断和建议，不能只罗列关键词。',
                       icon: <Users size={12} aria-hidden="true" />,
                     },
                   ]).map((shortcut) => (
@@ -1888,9 +2313,9 @@ export function DataCopilotPanel({
                   rows={3}
                   disabled={effectiveStatus === 'stopping'}
                 />
-                <div className="data-copilot-composer-toolbar">
-                  <div className="data-copilot-composer-tools">
-                    <div className="data-copilot-mode-control" role="group" aria-label="工作模式">
+                <div className="data-copilot-composer-toolbar" style={panelStyles.composerToolbar}>
+                  <div className="data-copilot-composer-tools" style={panelStyles.composerTools}>
+                    <div className="data-copilot-mode-control" style={panelStyles.modeControl} role="group" aria-label="工作模式">
                       {([
                         { id: 'ask', label: '提问' },
                         { id: 'analyze', label: '分析' },
@@ -1910,6 +2335,27 @@ export function DataCopilotPanel({
                         </button>
                       ))}
                     </div>
+                    <label
+                      style={panelStyles.reasoningControl}
+                      title={supportsReasoningEffort
+                        ? '控制模型在回答前投入的推理深度'
+                        : '当前模型协议不支持推理强度'}
+                    >
+                      <span style={panelStyles.reasoningLabel}>推理</span>
+                      <select
+                        value={effectiveReasoningEffort ?? ''}
+                        onChange={(event) => selectReasoningEffort(event.target.value as DataCopilotReasoningEffort)}
+                        disabled={running || submitting || !supportsReasoningEffort}
+                        aria-label="推理强度"
+                        style={panelStyles.reasoningSelect}
+                      >
+                        {availableReasoningEfforts.length
+                          ? availableReasoningEfforts.map((effort) => (
+                            <option key={effort} value={effort}>{reasoningEffortLabel(effort)}</option>
+                          ))
+                          : <option value="">不支持</option>}
+                      </select>
+                    </label>
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1933,6 +2379,7 @@ export function DataCopilotPanel({
                       }
                       title="上传附件"
                       aria-label="上传附件"
+                      style={panelStyles.composerIconButton}
                     >
                       <Paperclip size={16} aria-hidden="true" />
                     </button>
@@ -1943,6 +2390,7 @@ export function DataCopilotPanel({
                       disabled={running || submitting}
                       title="选择数据上下文"
                       aria-label={`选择数据上下文，已选 ${selectedContextSourceIds.length} 项`}
+                      style={panelStyles.contextCountButton}
                     >
                       {selectedContextSourceIds.length > 0 ? (
                         <CheckCircle2 size={13} aria-hidden="true" />
@@ -1957,6 +2405,7 @@ export function DataCopilotPanel({
                       onClick={() => void stopGeneration()}
                       disabled={!transport.stopGeneration || effectiveStatus === 'stopping'}
                       title="停止生成"
+                      style={panelStyles.stopButton}
                     >
                       <Square size={12} fill="currentColor" aria-hidden="true" />
                       停止
@@ -1975,6 +2424,7 @@ export function DataCopilotPanel({
                       }
                       title="发送"
                       aria-label="发送消息"
+                      style={panelStyles.sendButton}
                     >
                       <Send size={14} aria-hidden="true" />
                       发送
@@ -1988,23 +2438,44 @@ export function DataCopilotPanel({
           <button
             type="button"
             className="data-copilot-context-scrim"
-            aria-label="收起数据上下文"
+            aria-label="收起任务检查器"
             onClick={() => setContextCollapsed(true)}
           />
 
-          <DataCopilotContextBrowser
-            className="data-copilot-context-pane"
-            sources={contextSources}
-            selectedIds={selectedContextSourceIds}
-            contextMeta={selectedContextMeta}
-            usedTools={usedTools}
-            disabled={running || submitting}
-            activeTask={selectedContextTask}
-            loadTasks={transport.listContextTasks}
-            loadRecords={transport.listContextRecords}
-            onSelectTask={selectContextTask}
-            onLeaveTask={leaveContextTask}
-            onToggle={toggleContextSource}
+          <TaskInspector
+            projection={workbenchProjection}
+            sourceCount={selectedContextSourceIds.length}
+            messages={deferredInspectorMessages}
+            workspaceBinding={selectedSession?.workspaceBinding ?? projectWorkspaceSelection}
+            onCancel={running && transport.stopGeneration
+              ? () => { void stopGeneration() }
+              : undefined}
+            onRetry={!running && transport.retryMessage
+              ? () => {
+                  const retryableMessage = [...activeMessages].reverse().find((message) => message.retryable)
+                  if (retryableMessage) void retryMessage(retryableMessage)
+                }
+              : undefined}
+            retryDisabled={running}
+            onAction={running ? undefined : (prompt) => { void sendMessage(prompt) }}
+            activeTab={inspectorTab}
+            onTabChange={setInspectorTab}
+            context={(
+              <DataCopilotContextBrowser
+                className="copilot-task-inspector-data-context"
+                sources={contextSources}
+                selectedIds={selectedContextSourceIds}
+                contextMeta={selectedContextMeta}
+                usedTools={usedTools}
+                disabled={running || submitting}
+                activeTask={selectedContextTask}
+                loadTasks={transport.listContextTasks}
+                loadRecords={transport.listContextRecords}
+                onSelectTask={selectContextTask}
+                onLeaveTask={leaveContextTask}
+                onToggle={toggleContextSource}
+              />
+            )}
           />
         </div>
       </section>
@@ -2425,7 +2896,7 @@ const panelStyles: Record<string, CSSProperties> = {
     minHeight: 0,
     margin: 0,
     padding: 0,
-    gridTemplateRows: '66px auto auto minmax(0, 1fr) auto',
+    gridTemplateRows: '66px auto minmax(0, 1fr) auto',
     background: '#faf8f2',
   },
   conversationHeader: {
@@ -2446,19 +2917,19 @@ const panelStyles: Record<string, CSSProperties> = {
   statusDot: { width: 7, height: 7, borderRadius: '50%', background: '#aab1ad' },
   statusDotRunning: { background: '#19846b' },
   statusDotFailed: { background: '#bc493a' },
-  applicationWorkflow: { display: 'grid', gap: 8, margin: '0 16px 8px', padding: '10px 12px', border: '1px solid #d8e4dd', borderRadius: 6, background: '#f8fbf8' },
+  applicationWorkflow: { display: 'grid', gap: 8, margin: '0 16px 8px', padding: '10px 12px', border: '1px solid #e3e3e7', borderRadius: 6, background: '#fbfbfc' },
   applicationWorkflowHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
-  applicationWorkflowTitle: { display: 'inline-flex', alignItems: 'center', gap: 6, color: '#245e4d', fontSize: 11 },
-  applicationWorkflowStatus: { color: '#6f7d75', fontSize: 10, fontWeight: 650 },
+  applicationWorkflowTitle: { display: 'inline-flex', alignItems: 'center', gap: 6, color: '#34343a', fontSize: 11 },
+  applicationWorkflowStatus: { color: '#70717a', fontSize: 10, fontWeight: 650 },
   applicationWorkflowSteps: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 6 },
-  applicationWorkflowStep: { display: 'grid', gridTemplateColumns: '20px minmax(0, 1fr)', gap: 6, alignItems: 'center', minWidth: 0, padding: '6px 7px', borderRadius: 4, background: '#eef2ee', color: '#727e76' },
-  applicationWorkflowStepDone: { background: '#e0f1e7', color: '#286b54' },
-  applicationWorkflowStepIndex: { display: 'grid', width: 18, height: 18, placeItems: 'center', borderRadius: 9, background: '#d5ded8', fontSize: 10, fontWeight: 700 },
+  applicationWorkflowStep: { display: 'grid', gridTemplateColumns: '20px minmax(0, 1fr)', gap: 6, alignItems: 'center', minWidth: 0, padding: '6px 7px', borderRadius: 4, background: '#f1f1f3', color: '#70717a' },
+  applicationWorkflowStepDone: { background: '#eaf1ff', color: '#1f4fb5' },
+  applicationWorkflowStepIndex: { display: 'grid', width: 18, height: 18, placeItems: 'center', borderRadius: 9, background: '#e1e1e5', fontSize: 10, fontWeight: 700 },
   'applicationWorkflowStep strong': { display: 'block', overflow: 'hidden', fontSize: 10, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  'applicationWorkflowStep small': { display: 'block', overflow: 'hidden', color: '#7b8780', fontSize: 9, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  applicationWorkflowFooter: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, color: '#718078', fontSize: 9, lineHeight: 1.4 },
+  'applicationWorkflowStep small': { display: 'block', overflow: 'hidden', color: '#7b7b84', fontSize: 9, textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  applicationWorkflowFooter: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, color: '#70717a', fontSize: 9, lineHeight: 1.4 },
   applicationWorkflowActions: { display: 'inline-flex', flexShrink: 0, gap: 5 },
-  'applicationWorkflowActions button': { padding: '4px 7px', border: '1px solid #cbd9d1', borderRadius: 4, background: '#fff', color: '#2c6753', fontSize: 10, cursor: 'pointer' },
+  'applicationWorkflowActions button': { padding: '4px 7px', border: '1px solid #e1e1e5', borderRadius: 4, background: '#fff', color: '#4d4d56', fontSize: 10, cursor: 'pointer' },
   messageStage: { position: 'relative', minHeight: 0, overflow: 'hidden' },
   messageArea: { height: '100%', minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', background: '#faf8f2' },
   scrollToLatestButton: { position: 'absolute', right: 18, bottom: 14, display: 'grid', width: 34, height: 34, placeItems: 'center', padding: 0, border: '1px solid #bdb6a9', borderRadius: '50%', background: '#fffdf8', color: '#287b5d', boxShadow: '0 5px 14px rgba(48, 43, 34, 0.16)', cursor: 'pointer' },
@@ -2486,6 +2957,9 @@ const panelStyles: Record<string, CSSProperties> = {
   modeControl: { display: 'inline-flex', flex: '0 0 auto', height: 30, alignItems: 'center', padding: 2, border: '1px solid #d4cec2', borderRadius: 7, background: '#eeeadf' },
   modeButton: { height: 24, padding: '0 7px', border: 0, borderRadius: 3, background: 'transparent', color: '#67736d', fontSize: 10, fontWeight: 600, letterSpacing: 0, cursor: 'pointer' },
   modeButtonActive: { background: '#fffdf8', color: '#1f7657', boxShadow: '0 2px 5px rgba(45, 56, 46, 0.16)' },
+  reasoningControl: { display: 'inline-flex', flex: '0 0 auto', height: 30, alignItems: 'center', gap: 4, padding: '0 6px', border: '1px solid #d4cec2', borderRadius: 6, background: '#fffdf8', color: '#69756f' },
+  reasoningLabel: { fontSize: 10, fontWeight: 600, whiteSpace: 'nowrap' },
+  reasoningSelect: { height: 24, maxWidth: 58, padding: '0 2px', border: 0, outline: 0, background: 'transparent', color: '#2f4036', fontSize: 10, fontWeight: 650, cursor: 'pointer' },
   hiddenInput: { display: 'none' },
   composerIconButton: { display: 'grid', width: 32, height: 32, placeItems: 'center', padding: 0, border: 0, borderRadius: 4, background: 'transparent', color: '#526159', cursor: 'pointer' },
   contextCountButton: { display: 'flex', height: 30, alignItems: 'center', gap: 5, padding: '0 7px', border: 0, borderRadius: 4, background: 'transparent', color: '#69756f', fontSize: 11, cursor: 'pointer' },

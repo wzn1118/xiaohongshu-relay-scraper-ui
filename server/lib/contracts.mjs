@@ -121,6 +121,7 @@ export function validateRunRequest(value) {
   }
 
   const maxAgeDays = integerField(value.maxAgeDays, 'maxAgeDays', 14, 0, 365);
+  const skipPostprocess = booleanField(value.skipPostprocess, 'skipPostprocess', false);
 
   return Object.freeze({
     analysisMode,
@@ -147,11 +148,13 @@ export function validateRunRequest(value) {
     collectAudience: collectAudience || audienceOnly || expansion.enabled,
     audienceOnly,
     discoverMore,
-    skipPostprocess: booleanField(value.skipPostprocess, 'skipPostprocess', false),
+    skipPostprocess,
     noAutoAttach: booleanField(value.noAutoAttach, 'noAutoAttach', true),
     checkOnly: booleanField(value.checkOnly, 'checkOnly', false),
     securityVerificationTimeoutSeconds: integerField(value.securityVerificationTimeoutSeconds, 'securityVerificationTimeoutSeconds', 600, 60, 86400),
-    useCodexRuntime: analysisMode === 'general'
+    useCodexRuntime: skipPostprocess
+      ? false
+      : analysisMode === 'general'
       ? true
       : booleanField(value.useCodexRuntime, 'useCodexRuntime', true),
     codexBatchSize: integerField(value.codexBatchSize, 'codexBatchSize', 8, 1, 20),

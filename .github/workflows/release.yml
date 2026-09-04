@@ -1,0 +1,207 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  one-click-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install build prerequisites
+        shell: pwsh
+        run: |
+          npm ci --no-audit --no-fund
+          python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Build repository checkout
+        run: npm run build
+      - name: Install Chromium for the Windows open test
+        run: npx playwright install chromium
+      - name: Create sanitized one-click archives
+        id: package
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-one-click-windows.zip'
+          $codexArchive = Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows.zip'
+          ./scripts/package-github-release.ps1 -OutputPath $archive -SourceRef HEAD
+          ./scripts/package-github-release-codex.ps1 -OutputPath $codexArchive -SourceRef HEAD
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+          "checksum=$archive.sha256" >> $env:GITHUB_OUTPUT
+          "codex_archive=$codexArchive" >> $env:GITHUB_OUTPUT
+          "codex_checksum=$codexArchive.sha256" >> $env:GITHUB_OUTPUT
+      - name: Verify clean archive installation and health
+        shell: pwsh
+        run: ./scripts/verify-github-release.ps1 -ArchivePath '${{ steps.package.outputs.archive }}' -Port 65431
+      - name: Open the built-in Codex Windows archive
+        shell: pwsh
+        run: ./scripts/verify-github-release.ps1 -ArchivePath '${{ steps.package.outputs.codex_archive }}' -Port 65434 -LaunchEntry 'Start-Codex-App.cmd' -RequireCodexBuiltIn -BrowserSmoke -ScreenshotPath (Join-Path $env:RUNNER_TEMP 'xiaohongshu-relay-scraper-ui-codex-windows-open-smoke.png')
+      - name: Upload verified one-click package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaohongshu-relay-scraper-ui-one-click-windows-${{ github.sha }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.codex_archive }}
+            ${{ steps.package.outputs.codex_checksum }}
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-windows-open-smoke.png
+          if-no-files-found: error
+          retention-days: 30
+
+  one-click-macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install build prerequisites
+        run: |
+          npm ci --no-audit --no-fund
+          python3 -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Build repository checkout
+        run: npm run build
+      - name: Install Chromium for the macOS open test
+        run: npx playwright install chromium
+      - name: Create sanitized macOS archives
+        run: |
+          archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip"
+          codex_archive="$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip"
+          sh scripts/package-github-release-macos.sh --output-path "$archive" --source-ref HEAD
+          sh scripts/package-github-release-macos-codex.sh --output-path "$codex_archive" --source-ref HEAD
+      - name: Open the clean archive through the macOS Finder launcher
+        run: |
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-macos.zip" \
+            --port 65432 \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-open-smoke.png"
+      - name: Open the built-in Codex macOS archive
+        run: |
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip" \
+            --port 65434 \
+            --launch-entry Start-Codex-App.command \
+            --require-codex-built-in \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-codex-macos-open-smoke.png"
+      - name: Upload verified macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaohongshu-relay-scraper-ui-one-click-macos-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-macos.zip.sha256
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-open-smoke.png
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip.sha256
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-macos-open-smoke.png
+          if-no-files-found: error
+          retention-days: 30
+
+  verify-macos-intel:
+    needs: one-click-macos
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install verification prerequisites
+        run: |
+          npm ci --no-audit --no-fund
+          python3 -m pip install --disable-pip-version-check -r requirements.txt
+          npx playwright install chromium
+      - name: Download the Apple Silicon job's verified ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: xiaohongshu-relay-scraper-ui-one-click-macos-${{ github.sha }}
+          path: ${{ runner.temp }}/macos-package
+      - name: Open the same ZIP through the Intel macOS Finder launcher
+        run: |
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$RUNNER_TEMP/macos-package/xiaohongshu-relay-scraper-ui-one-click-macos.zip" \
+            --port 65433 \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png"
+      - name: Open the same built-in Codex ZIP on Intel macOS
+        run: |
+          sh scripts/verify-github-release-macos.sh \
+            --archive-path "$RUNNER_TEMP/macos-package/xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip" \
+            --port 65435 \
+            --launch-entry Start-Codex-App.command \
+            --require-codex-built-in \
+            --browser-smoke \
+            --screenshot-path "$RUNNER_TEMP/xiaohongshu-relay-scraper-ui-codex-macos-intel-open-smoke.png"
+      - name: Upload Intel macOS open evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-intel-open-evidence-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-macos-intel-open-smoke.png
+            ${{ runner.temp }}/xiaohongshu-relay-scraper-ui-codex-macos-intel-open-smoke.png
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [one-click-windows, one-click-macos, verify-macos-intel]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: xiaohongshu-relay-scraper-ui-one-click-*
+          merge-multiple: true
+      - name: Publish tag as GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(release-assets/*.zip release-assets/*.zip.sha256)
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --verify-tag --generate-notes --title "$TAG"
+          fi

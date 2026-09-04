@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -70,6 +71,217 @@ function waitForEnd(manager, id, timeoutMs = 3000) {
     });
   });
 }
+
+test('JobManager publishes the runner disk summary after loading a stale workflow state', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-final-summary-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const child = createFakeChild(230809);
+  await writeFile(fakeRunner, '', 'utf8');
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => child,
+  });
+
+  try {
+    await manager.initialize();
+    const started = await manager.start(validateRunRequest({
+      analysisMode: 'general',
+      checkOnly: true,
+      keyword: 'public raw collection',
+    }));
+    await waitForJob(manager, started.id, (job) => job.status === 'running');
+    const internal = manager.getInternal(started.id);
+    const staleState = JSON.parse(await readFile(internal.statePath, 'utf8'));
+    staleState.workflowSummary = {
+      status: 'failed',
+      rawCollection: true,
+      bodyCoveragePercent: 100,
+      qualityPending: true,
+    };
+    staleState.artifactCount = 0;
+    await writeFile(internal.statePath, JSON.stringify(staleState, null, 2), 'utf8');
+
+    const diskSummary = {
+      status: 'succeeded',
+      rawCollection: true,
+      postprocessSkipped: true,
+      analysisSkipped: true,
+      cardsDiscovered: 87,
+      bodySucceeded: 87,
+      bodyFailed: 0,
+      bodyCoveragePercent: 100,
+      qualityPending: false,
+      qualityPassed: 1,
+      issues: [],
+    };
+    await writeFile(
+      path.join(internal.outputDir, 'workflow-summary.json'),
+      JSON.stringify(diskSummary, null, 2),
+      'utf8',
+    );
+    await writeFile(path.join(internal.outputDir, 'raw-results.json'), '[]', 'utf8');
+
+    const ended = waitForEnd(manager, started.id);
+    child.emit('close', 0, null);
+    await ended;
+
+    const completed = manager.get(started.id);
+    assert.equal(completed.status, 'completed');
+    assert.equal(completed.workflowSummary.status, 'succeeded');
+    assert.equal(completed.workflowSummary.cardsDiscovered, 87);
+    assert.equal(completed.workflowSummary.bodySucceeded, 87);
+    assert.equal(completed.workflowSummary.qualityPending, false);
+    assert.equal(completed.artifactCount, 2);
+
+    const persistedState = JSON.parse(await readFile(internal.statePath, 'utf8'));
+    assert.equal(persistedState.workflowSummary.status, 'succeeded');
+    assert.equal(persistedState.workflowSummary.bodyCoveragePercent, 100);
+    assert.equal(persistedState.artifactCount, 2);
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager restart treats a raw collection disk summary as authoritative', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-raw-restart-summary-'));
+  const jobId = '20260809120000-rawrestart';
+  const outputDir = path.join(dataDir, jobId, 'artifacts');
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'completed',
+    outputDir,
+    params: { analysisMode: 'general', keyword: 'public raw collection' },
+    workflowSummary: {
+      status: 'failed',
+      rawCollection: true,
+      qualityPending: true,
+      agentStages: [{ id: 8, status: 'failed' }],
+    },
+  }]), 'utf8');
+  await writeFile(path.join(outputDir, 'workflow-summary.json'), JSON.stringify({
+    status: 'succeeded',
+    rawCollection: true,
+    postprocessSkipped: true,
+    analysisSkipped: true,
+    cardsDiscovered: 87,
+    bodySucceeded: 87,
+    bodyFailed: 0,
+    bodyCoveragePercent: 100,
+    qualityPending: false,
+    qualityPassed: 1,
+    issues: [],
+  }), 'utf8');
+
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: path.join(dataDir, 'runner.py'),
+  });
+  try {
+    await manager.initialize();
+    const restored = manager.get(jobId);
+    assert.equal(restored.status, 'completed');
+    assert.equal(restored.workflowSummary.status, 'succeeded');
+    assert.equal(restored.workflowSummary.cardsDiscovered, 87);
+    assert.equal(restored.workflowSummary.bodySucceeded, 87);
+    assert.equal(restored.workflowSummary.qualityPending, false);
+    assert.equal('agentStages' in restored.workflowSummary, false);
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager preserves raw collection success while materializing result records', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-raw-materialization-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  const child = createFakeChild(230810);
+  await writeFile(fakeRunner, '', 'utf8');
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    spawnImpl: () => child,
+    checkpointAnalyzerImpl: async ({ outputDir }) => {
+      const notes = JSON.parse(await readFile(path.join(outputDir, 'xiaohongshu_notes_latest.json'), 'utf8'));
+      await writeFile(path.join(outputDir, 'application_intelligence.json'), JSON.stringify({
+        records: notes.map((note) => ({ note_id: note.note_id, body: note.body })),
+      }), 'utf8');
+      await writeFile(path.join(outputDir, 'workflow-summary.json'), JSON.stringify({
+        status: 'completed_partial',
+        analysisMode: 'partial_collection',
+        agentStages: [{ id: 'coverage-agent', status: 'partial' }],
+      }), 'utf8');
+      await writeFile(path.join(outputDir, 'artifact-manifest.json'), JSON.stringify({
+        status: 'completed_partial',
+        artifacts: [
+          { path: 'application_intelligence.json', bytes: 1, sha256: 'generated' },
+          { path: 'workflow-summary.json', bytes: 1, sha256: 'overwritten' },
+        ],
+      }), 'utf8');
+      return { stdout: `CHECKPOINT_ANALYSIS records=${notes.length}\n`, stderr: '' };
+    },
+  });
+
+  try {
+    await manager.initialize();
+    const started = await manager.start(validateRunRequest({
+      analysisMode: 'general',
+      keyword: 'public raw collection',
+      skipPostprocess: true,
+    }));
+    await waitForJob(manager, started.id, (job) => job.status === 'running');
+    const internal = manager.getInternal(started.id);
+    const note = { note_id: 'raw-note-1', body: 'complete public result body', access_status: 'detail_ok' };
+    await writeFile(path.join(internal.outputDir, 'xiaohongshu_cards_latest.json'), JSON.stringify([note]), 'utf8');
+    await writeFile(path.join(internal.outputDir, 'xiaohongshu_notes_latest.json'), JSON.stringify([note]), 'utf8');
+    await writeFile(path.join(internal.outputDir, 'workflow-summary.json'), JSON.stringify({
+      status: 'succeeded',
+      rawCollection: true,
+      postprocessSkipped: true,
+      analysisSkipped: true,
+      cardsDiscovered: 1,
+      bodySucceeded: 1,
+      bodyFailed: 0,
+      bodyCoveragePercent: 100,
+      qualityPending: false,
+      generatedAt: '2026-08-09T12:00:00.000Z',
+    }), 'utf8');
+    await writeFile(path.join(internal.outputDir, 'artifact-manifest.json'), JSON.stringify({
+      status: 'succeeded',
+      artifacts: [{ path: 'workflow-summary.json', bytes: 1, sha256: 'initial' }],
+    }), 'utf8');
+
+    const ended = waitForEnd(manager, started.id);
+    child.emit('close', 0, null);
+    await ended;
+
+    const completed = manager.get(started.id);
+    assert.equal(completed.status, 'completed');
+    assert.equal(completed.workflowSummary.status, 'succeeded');
+    assert.equal(completed.workflowSummary.rawCollection, true);
+    assert.equal(completed.workflowSummary.bodySucceeded, 1);
+    assert.equal('agentStages' in completed.workflowSummary, false);
+
+    const summaryBytes = await readFile(path.join(internal.outputDir, 'workflow-summary.json'));
+    const diskSummary = JSON.parse(summaryBytes.toString('utf8'));
+    const manifest = JSON.parse(await readFile(path.join(internal.outputDir, 'artifact-manifest.json'), 'utf8'));
+    const summaryArtifact = manifest.artifacts.find((artifact) => artifact.path === 'workflow-summary.json');
+    assert.equal(diskSummary.status, 'succeeded');
+    assert.equal(diskSummary.rawCollection, true);
+    assert.equal(manifest.status, 'succeeded');
+    assert.equal(manifest.artifacts.some((artifact) => artifact.path === 'application_intelligence.json'), true);
+    assert.equal(summaryArtifact.bytes, summaryBytes.length);
+    assert.equal(summaryArtifact.sha256, crypto.createHash('sha256').update(summaryBytes).digest('hex'));
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
 
 async function waitForCondition(predicate, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
@@ -600,6 +812,7 @@ test('manual body recovery uses the same bounded warm-start probe as automatic r
     dataDir,
     pythonBin: 'python',
     runnerPath: fakeRunner,
+    legacyProfilePath: path.join(dataDir, 'profiles', 'candidate_profile.json'),
     spawnImpl: (_command, args) => {
       spawnedArgs = args;
       return child;
@@ -1936,8 +2149,19 @@ test('JobManager resumes in place with a stable Job identity and a new Attempt',
       checkOnly: true,
       mode: 'resume',
       resumeFromJobId: sourceId,
+      candidateProfile: {
+        name: 'Portable Candidate',
+        school: 'Portable University',
+        major: 'Product',
+        email: 'portable@example.com',
+      },
     }));
     const resumedOutputDir = manager.getInternal(started.id).outputDir;
+    const runtimeProfile = JSON.parse(await readFile(
+      path.join(path.dirname(resumedOutputDir), 'candidate-profile.runtime.json'),
+      'utf8',
+    ));
+    assert.equal(runtimeProfile.candidate_application.email, 'portable@example.com');
     assert.equal(started.id, sourceId);
     assert.equal(started.outputDir, original.outputDir);
     assert.equal(started.createdAt, original.createdAt);
@@ -2033,6 +2257,65 @@ test('JobManager resumes in place with a stable Job identity and a new Attempt',
     assert.match(await readFile(path.join(path.dirname(sourceOutputDir), 'run.log'), 'utf8'), new RegExp(latestAttempt.attemptId));
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('JobManager relocates packaged workflow state from an old computer to the current data directory', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'xhs-portable-history-'));
+  const dataDir = path.join(root, 'portable', 'data', 'jobs');
+  const jobId = '20260731005634-5c619106';
+  const portableJobDir = path.join(dataDir, jobId);
+  const portableOutputDir = path.join(portableJobDir, 'artifacts');
+  const portableStatePath = path.join(portableJobDir, 'workflow-state.json');
+  const oldJobDir = path.join(root, 'old-computer', 'data', 'jobs', jobId);
+  const oldOutputDir = path.join(oldJobDir, 'artifacts');
+  const fakeRunner = path.join(root, 'runner.py');
+
+  await mkdir(portableOutputDir, { recursive: true });
+  await writeFile(fakeRunner, '', 'utf8');
+  await initializeWorkflowState(portableStatePath, {
+    jobId,
+    status: 'incomplete',
+    createdAt: '2026-07-31T00:56:34.363Z',
+    updatedAt: '2026-08-04T11:58:40.954Z',
+    outputDir: oldOutputDir,
+    params: {
+      analysisMode: 'general',
+      candidateProfile: { name: 'Portable Candidate', email: 'portable@example.com' },
+    },
+    activeAttemptId: null,
+    currentAttemptId: null,
+    resumeCount: 0,
+    lastResumedAt: null,
+    stages: emptyWorkflowStages(),
+    attempts: [],
+    workflowSummary: { analysisMode: 'general' },
+    artifactCount: 0,
+  });
+  await writeFile(path.join(dataDir, 'jobs.json'), JSON.stringify([{
+    id: jobId,
+    status: 'incomplete',
+    outputDir: oldOutputDir,
+    logPath: path.join(oldJobDir, 'run.log'),
+    statePath: path.join(oldJobDir, 'workflow-state.json'),
+    params: {
+      analysisMode: 'general',
+      candidateProfile: { name: 'Portable Candidate', email: 'portable@example.com' },
+    },
+  }]), 'utf8');
+
+  const manager = new JobManager({ dataDir, pythonBin: 'python', runnerPath: fakeRunner });
+  try {
+    await manager.initialize();
+    const relocated = manager.getInternal(jobId);
+    assert.equal(relocated.outputDir, portableOutputDir);
+    assert.equal(relocated.logPath, path.join(portableJobDir, 'run.log'));
+    assert.equal(relocated.statePath, portableStatePath);
+    const persisted = JSON.parse(await readFile(path.join(dataDir, 'jobs.json'), 'utf8'));
+    assert.equal(persisted[0].outputDir, portableOutputDir);
+    assert.equal(persisted[0].statePath, portableStatePath);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -2186,7 +2469,8 @@ test('resume is revision-guarded and idempotent for concurrent retries', async (
     child.emit('close', 0, null);
     await ended;
   } finally {
-    await rm(dataDir, { recursive: true, force: true });
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 

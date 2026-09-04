@@ -1,4 +1,5 @@
 import {
+  memo,
   useEffect,
   useMemo,
   useState,
@@ -103,6 +104,24 @@ function ToolStatusIcon({ status }: { status: DataCopilotToolCall["status"] }) {
 }
 
 function toolDisplayName(name: string) {
+  const localNames: Record<string, string> = {
+    "workspace.list": "浏览工作区",
+    "workspace.read": "读取文件",
+    "workspace.write": "写入文件",
+    "workspace.patch": "应用补丁",
+    "exec.run": "运行命令",
+    "http.request": "发送 HTTP 请求",
+    "git.status": "检查 Git 状态",
+    "git.diff": "查看 Git 变更",
+    "git.log": "读取 Git 历史",
+    "git.branch": "切换 Git 分支",
+    "git.stage": "暂存变更",
+    "git.commit": "创建提交",
+    "git.restore": "还原变更",
+  };
+  if (localNames[name]) return localNames[name];
+  if (name.startsWith("mcp.")) return `MCP · ${name.slice(4).replaceAll(".", " / ")}`;
+  if (name.startsWith("terminal.")) return `终端 · ${name.slice(9).replaceAll(".", " ")}`;
   if (name === "attachment.parse") return "附件解析";
   if (name === "attachment.list") return "读取附件";
   if (name === "applications.extract_email_requirements") return "批量提取邮件要求";
@@ -280,7 +299,7 @@ function AnswerAstContent({
     return <p key={key} style={messageStyles.richParagraph}><InlineSafeText text={text || JSON.stringify(block.content)} /></p>;
   };
   const hasRecruitmentContact = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/iu.test(content);
-  return <div style={messageStyles.richContent} data-answer-schema={ast.schemaVersion}>
+  return <div className="data-copilot-rich-content" style={messageStyles.richContent} data-answer-schema={ast.schemaVersion}>
     {ast.blocks.map(renderBlock)}
     {hasRecruitmentContact && onAction ? <div style={messageStyles.inlineDeliveryActions}>
       <button type="button" onClick={() => onAction("基于当前结果生成结构化投递草稿，不发送邮件。") } disabled={busy} style={messageStyles.inlineDraftButton}><BriefcaseBusiness size={13} aria-hidden="true" />生成投递草稿</button>
@@ -407,7 +426,7 @@ function StructuredAssistantContent({
   flushEmails();
   const hasRecruitmentContact = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/iu.test(content);
   return (
-    <div style={messageStyles.richContent}>
+    <div className="data-copilot-rich-content" style={messageStyles.richContent}>
       {blocks}
       {hasRecruitmentContact && onAction ? (
         <div style={messageStyles.inlineDeliveryActions} aria-label="投递操作">
@@ -1607,6 +1626,12 @@ function ToolCallSummary({
   const [expanded, setExpanded] = useState(hasActive || hasFailure);
   const completed = toolCalls.filter((tool) => tool.status === "complete").length;
   const label = toolCalls.slice(0, 4).map((tool) => toolDisplayName(tool.name)).join("、");
+  const finishedCount = hasActive || hasFailure ? completed : completed || toolCalls.length;
+  const progressLabel = hasActive
+    ? `已完成 ${completed} 个步骤，共 ${toolCalls.length} 个`
+    : hasFailure
+      ? `已完成 ${completed} 个步骤，共 ${toolCalls.length} 个，存在失败步骤`
+      : `已完成 ${finishedCount} 个步骤，共 ${toolCalls.length} 个`;
   return (
     <section className="data-copilot-tool-summary" style={messageStyles.toolSummary} aria-label="执行步骤">
       <button
@@ -1618,10 +1643,14 @@ function ToolCallSummary({
       >
         <span style={messageStyles.toolSummaryIdentity}>
           {hasActive ? <LoaderCircle size={14} style={messageStyles.spinningIcon} aria-hidden="true" /> : hasFailure ? <AlertCircle size={14} aria-hidden="true" /> : <Check size={14} aria-hidden="true" />}
-          <strong>{hasActive ? "正在处理" : hasFailure ? "部分步骤需要处理" : `已完成 ${completed || toolCalls.length} 个步骤`}</strong>
+          <strong>执行轨迹</strong>
           <span style={messageStyles.toolSummaryCount}>{toolCalls.length}</span>
         </span>
-        <span style={messageStyles.toolSummaryMeta}>{label}{toolCalls.length > 4 ? " 等" : ""}{expanded ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}</span>
+        <span style={messageStyles.toolSummaryMeta}>
+          <span>{progressLabel}</span>
+          <span style={messageStyles.toolSummaryLabel}>{label}{toolCalls.length > 4 ? " 等" : ""}</span>
+          {expanded ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}
+        </span>
       </button>
       {expanded ? (
         <div className="data-copilot-tool-summary-details" style={messageStyles.toolSummaryDetails}>
@@ -1663,9 +1692,10 @@ function ApprovalCard({
       data-status={approval.status}
       aria-label="操作确认"
       aria-live={pending ? 'assertive' : 'polite'}
+      style={messageStyles.approvalCard}
     >
-      <div className="data-copilot-approval-header">
-        <span className="data-copilot-approval-identity">
+      <div className="data-copilot-approval-header" style={messageStyles.approvalHeader}>
+        <span className="data-copilot-approval-identity" style={messageStyles.approvalIdentity}>
           <ShieldCheck size={15} aria-hidden="true" />
           <strong>执行确认</strong>
         </span>
@@ -1731,7 +1761,7 @@ function MessageIdentity({ message }: { message: DataCopilotMessageData }) {
   return <Bot size={15} aria-hidden="true" />;
 }
 
-export function DataCopilotMessage({
+export const DataCopilotMessage = memo(function DataCopilotMessage({
   message,
   busy = false,
   approvalBusy = busy,
@@ -1807,7 +1837,7 @@ export function DataCopilotMessage({
 
   return (
     <article
-      className="data-copilot-message-row"
+      className={`data-copilot-message-row${isUser ? " data-copilot-message-user" : ""}${isError ? " data-copilot-message-error" : ""}`}
       data-role={message.role}
       data-tone={isError ? 'error' : 'default'}
       data-status={message.status}
@@ -1848,7 +1878,7 @@ export function DataCopilotMessage({
         </header>
 
         {message.kind === "analysis" ? (
-          <section className="data-copilot-analysis-block" style={messageStyles.analysisBlock}>
+          <section className="data-copilot-analysis data-copilot-analysis-block" style={messageStyles.analysisBlock}>
             <button
               className="data-copilot-analysis-toggle"
               type="button"
@@ -1996,7 +2026,7 @@ export function DataCopilotMessage({
       </div>
     </article>
   );
-}
+});
 
 const messageStyles: Record<string, CSSProperties> = {
   row: {
@@ -2245,9 +2275,9 @@ const messageStyles: Record<string, CSSProperties> = {
   toolStack: { display: "grid", gap: 6, marginTop: 8 },
   toolSummary: {
     overflow: "hidden",
-    border: "1px solid #d8ded9",
+    border: "1px solid #e1e1e5",
     borderRadius: 5,
-    background: "#f4f8f5",
+    background: "#ffffff",
   },
   toolSummaryButton: {
     display: "flex",
@@ -2259,7 +2289,7 @@ const messageStyles: Record<string, CSSProperties> = {
     padding: "0 10px",
     border: 0,
     background: "transparent",
-    color: "#3f4c45",
+    color: "#29292d",
     cursor: "pointer",
   },
   toolSummaryIdentity: { display: "flex", alignItems: "center", gap: 7, minWidth: 0 },
@@ -2269,8 +2299,8 @@ const messageStyles: Record<string, CSSProperties> = {
     height: 18,
     placeItems: "center",
     borderRadius: 9,
-    background: "#dbece4",
-    color: "#16634f",
+    background: "#edf1ff",
+    color: "#3f5fae",
     fontSize: 10,
     fontWeight: 700,
   },
@@ -2280,10 +2310,16 @@ const messageStyles: Record<string, CSSProperties> = {
     alignItems: "center",
     gap: 5,
     overflow: "hidden",
-    color: "#78817c",
+    color: "#71717a",
     fontSize: 10,
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
+  },
+  toolSummaryLabel: {
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    color: "#9999a2",
   },
   toolSummaryDetails: { display: "grid", gap: 6, padding: "0 7px 7px" },
   attachmentPreparation: {
@@ -2333,11 +2369,11 @@ const messageStyles: Record<string, CSSProperties> = {
   batchResultStatus: { color: "#2c755b", fontWeight: 650, whiteSpace: "nowrap" },
   toolCard: {
     overflow: "hidden",
-    border: "1px solid #d8ded9",
+    border: "1px solid #e2e2e6",
     borderRadius: 5,
-    background: "#fbfcfa",
+    background: "#fcfcfd",
   },
-  toolCardFailed: { borderColor: "#e9bbb3" },
+  toolCardFailed: { borderColor: "#ecc8c8", background: "#fffafa" },
   toolHeader: {
     display: "flex",
     width: "100%",
@@ -2348,7 +2384,7 @@ const messageStyles: Record<string, CSSProperties> = {
     padding: "0 9px",
     border: 0,
     background: "transparent",
-    color: "#4d5751",
+    color: "#303036",
     cursor: "pointer",
   },
   toolIdentity: { display: "flex", alignItems: "center", gap: 6, minWidth: 0 },
@@ -2362,18 +2398,18 @@ const messageStyles: Record<string, CSSProperties> = {
     display: "flex",
     alignItems: "center",
     gap: 5,
-    color: "#757e79",
+    color: "#7d7d86",
     fontSize: 10,
   },
   toolDetails: {
     display: "grid",
     gap: 8,
     padding: "8px 9px",
-    borderTop: "1px solid #e5e8e5",
+    borderTop: "1px solid #ececef",
   },
   detailLabel: {
     marginBottom: 4,
-    color: "#727a75",
+    color: "#71717b",
     fontSize: 10,
     fontWeight: 600,
   },

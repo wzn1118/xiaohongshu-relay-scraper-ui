@@ -94,6 +94,69 @@ export type DataCopilotToolCall = {
   error?: string
 }
 
+export type DataCopilotSubagentRunStatus =
+  | 'planned'
+  | 'running'
+  | 'completed'
+  | 'paused'
+  | 'cancelled'
+  | 'failed'
+
+export type DataCopilotSubagentTaskStatus =
+  | 'planned'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+
+export type DataCopilotSubagentToolStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+
+export type DataCopilotSubagentError = {
+  code?: string
+  message: string
+}
+
+export type DataCopilotSubagentTool = {
+  toolCallId: string
+  toolName: string
+  status: DataCopilotSubagentToolStatus
+  error?: DataCopilotSubagentError
+  startedAt?: string
+  finishedAt?: string
+}
+
+export type DataCopilotSubagentTask = {
+  taskId: string
+  role: string
+  title: string
+  dependsOn: string[]
+  status: DataCopilotSubagentTaskStatus
+  output: string
+  summary?: string
+  error?: DataCopilotSubagentError
+  tools: DataCopilotSubagentTool[]
+  startedAt?: string
+  finishedAt?: string
+}
+
+export type DataCopilotSubagentRun = {
+  runId: string
+  parentRunId?: string
+  conversationId: string
+  objective: string
+  planRevision?: number
+  status: DataCopilotSubagentRunStatus
+  tasks: DataCopilotSubagentTask[]
+  error?: DataCopilotSubagentError
+  plannedAt?: string
+  startedAt?: string
+  finishedAt?: string
+  updatedAt: string
+}
+
 export type DataCopilotCitation = {
   id: string
   label: string
@@ -137,11 +200,19 @@ export type DataCopilotSession = {
   preview?: string
   status?: DataCopilotRunStatus
   modelId?: string
+  reasoningEffort?: DataCopilotReasoningEffort
   contextSourceIds?: string[]
   jobId?: string
   mode?: string
   snapshotId?: string
   filters?: string[]
+  workspaceBinding?: DataCopilotWorkspaceBinding
+}
+
+export type DataCopilotWorkspaceBinding = {
+  projectId: string
+  workspaceId: string
+  worktreeId?: string
 }
 
 export type DataCopilotModel = {
@@ -151,7 +222,42 @@ export type DataCopilotModel = {
   contextWindow?: number
   supportsTools?: boolean
   supportsAttachments?: boolean
+  wireApi?: 'responses' | 'chat_completions'
+  supportsReasoningEffort?: boolean
+  reasoningEfforts?: readonly DataCopilotReasoningEffort[]
   disabled?: boolean
+}
+
+export const DATA_COPILOT_REASONING_EFFORTS = [
+  'none',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const
+
+export type DataCopilotReasoningEffort = (typeof DATA_COPILOT_REASONING_EFFORTS)[number]
+
+export const DATA_COPILOT_DEFAULT_REASONING_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+] as const satisfies readonly DataCopilotReasoningEffort[]
+
+export function dataCopilotReasoningEffortsForModel(
+  model: string,
+  wireApi?: DataCopilotModel['wireApi'],
+): readonly DataCopilotReasoningEffort[] {
+  const normalizedModel = model.trim()
+  const supportsReasoning = wireApi === 'responses'
+    || (wireApi === 'chat_completions'
+      && /^(?:gpt-5(?:[.-]|$)|o[134](?:[.-]|$)|codex(?:[.-]|$))/iu.test(normalizedModel))
+  if (!supportsReasoning) return []
+  return /^gpt-5\.6(?:-|$)/iu.test(normalizedModel)
+    ? DATA_COPILOT_REASONING_EFFORTS
+    : DATA_COPILOT_DEFAULT_REASONING_EFFORTS
 }
 
 export type DataCopilotContextSource = {
@@ -236,8 +342,12 @@ export type DataCopilotSendRequest = {
   content: string
   modelId: string
   workspaceMode?: 'ask' | 'analyze' | 'build'
+  reasoningEffort?: DataCopilotReasoningEffort
   attachmentIds: string[]
   contextSourceIds: string[]
+  projectId?: string
+  workspaceId?: string
+  worktreeId?: string
 }
 
 export type DataCopilotQualityArtifact = {
@@ -290,9 +400,16 @@ export type DataCopilotSendResult = {
 }
 
 export type DataCopilotSubscriptionHandlers = {
-  onMessage: (message: DataCopilotMessageData) => void
+  /**
+   * Legacy per-message callback. New high-throughput surfaces should prefer
+   * onMessages so streamed deltas can be committed once per animation frame.
+   */
+  onMessage?: (message: DataCopilotMessageData) => void
+  onMessages?: (messages: DataCopilotMessageData[]) => void
   onSession?: (session: DataCopilotSession) => void
   onStatus?: (status: DataCopilotRunStatus) => void
+  onSubagentRun?: (run: DataCopilotSubagentRun) => void
+  onSubagentRuns?: (runs: DataCopilotSubagentRun[]) => void
   onError?: (error: Error) => void
 }
 
@@ -313,10 +430,14 @@ export type DataCopilotTransport = {
   }) => Promise<DataCopilotContextCatalog>
   createSession: (input: {
     modelId: string
+    reasoningEffort?: DataCopilotReasoningEffort
     contextSourceIds: string[]
     jobId?: string
     mode?: 'application' | 'research'
     snapshotId?: string
+    projectId?: string
+    workspaceId?: string
+    worktreeId?: string
   }) => Promise<DataCopilotSession>
   loadMessages: (sessionId: string) => Promise<DataCopilotMessageData[]>
   sendMessage: (request: DataCopilotSendRequest) => Promise<DataCopilotSendResult>
@@ -328,7 +449,18 @@ export type DataCopilotTransport = {
   retryMessage?: (
     sessionId: string,
     messageId: string,
+    input?: {
+      modelId?: string
+      reasoningEffort?: DataCopilotReasoningEffort
+    },
   ) => Promise<DataCopilotSendResult>
+  updateSessionSettings?: (
+    sessionId: string,
+    input: {
+      modelId?: string
+      reasoningEffort?: DataCopilotReasoningEffort
+    },
+  ) => Promise<DataCopilotSession>
   confirmApproval?: (
     sessionId: string,
     approvalId: string,

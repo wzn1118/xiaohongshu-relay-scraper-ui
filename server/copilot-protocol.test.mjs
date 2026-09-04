@@ -163,10 +163,11 @@ test('model gateway normalizes chat-completion responses and request metadata', 
     },
     providers: { primary: { baseUrl: 'https://models.example/v1', apiKey: 'token' } },
   });
-  const result = await gateway.complete({ provider: 'primary', model: 'model-1', messages: [{ role: 'user', content: 'question' }] });
+  const result = await gateway.complete({ provider: 'primary', model: 'gpt-5.1-codex', messages: [{ role: 'user', content: 'question' }], reasoningEffort: 'high' });
   assert.equal(result.text, 'answer');
   assert.equal(request.url, 'https://models.example/v1/chat/completions');
-  assert.equal(request.body.model, 'model-1');
+  assert.equal(request.body.model, 'gpt-5.1-codex');
+  assert.equal(request.body.reasoning_effort, 'high');
   assert.equal(request.headers.Authorization, 'Bearer token');
 });
 
@@ -182,14 +183,15 @@ test('model gateway persists Responses state and supports background retrieval a
         baseUrl: 'https://models.example/v1',
         apiKey: 'token',
         wireApi: 'responses',
-        capabilities: { background: true, statefulResponses: true, conversationState: true, reasoningSummary: true },
+        capabilities: { background: true, statefulResponses: true, conversationState: true, reasoningSummary: true, reasoningEffort: true },
       },
     },
   });
-  const completed = await gateway.complete({ provider: 'responses', model: 'model-2', input: 'continue', previousResponseId: 'resp-1', conversationId: 'conv-1', background: true, reasoningSummary: 'auto' });
+  const completed = await gateway.complete({ provider: 'responses', model: 'gpt-5.6-sol', input: 'continue', previousResponseId: 'resp-1', conversationId: 'conv-1', background: true, reasoningSummary: 'auto', reasoningEffort: 'max' });
   assert.equal(completed.responseId, 'resp-2');
   assert.equal(requests[0].body.previous_response_id, 'resp-1');
   assert.equal(requests[0].body.conversation, 'conv-1');
+  assert.deepEqual(requests[0].body.reasoning, { summary: 'auto', effort: 'max' });
   await gateway.retrieve({ provider: 'responses', responseId: 'resp-2' });
   await gateway.cancel({ provider: 'responses', responseId: 'resp-2' });
   assert.deepEqual(requests.slice(1).map((request) => [request.method, request.url]), [

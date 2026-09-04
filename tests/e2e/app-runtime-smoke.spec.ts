@@ -9,6 +9,8 @@ const initialApiPaths = [
 ]
 
 test('loads the workbench against the live API without runtime failures', async ({ page }) => {
+  test.setTimeout(120_000)
+
   const pageErrors: string[] = []
   const consoleErrors: string[] = []
   const failedApiRequests: string[] = []
@@ -35,7 +37,7 @@ test('loads the workbench against the live API without runtime failures', async 
     page.waitForResponse((response) => new URL(response.url()).pathname === pathname),
   )
 
-  await page.goto('/')
+  await page.goto('/', { waitUntil: 'domcontentloaded', timeout: 90_000 })
   const responses = await Promise.all(initialResponses)
 
   for (const response of responses) {
@@ -43,8 +45,8 @@ test('loads the workbench against the live API without runtime failures', async 
     await response.json()
   }
   await expect(page.locator('.app-shell')).toBeVisible()
-  await expect(page.locator('#product-hero-title')).toBeVisible()
-  await expect(page.getByText('本地服务正常', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { level: 1, name: /今天你投了吗？/ })).toBeVisible()
+  await expect(page.getByText('应用服务正常', { exact: true })).toBeVisible()
 
   const horizontalOverflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,

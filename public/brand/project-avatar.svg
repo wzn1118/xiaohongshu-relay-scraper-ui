@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">今天你投了吗？项目头像</title>
+  <desc id="desc">炭黑背景上的红色投字卡片，配有绿色完成徽章。</desc>
+
+  <rect width="1024" height="1024" fill="#202423"/>
+  <rect x="42" y="42" width="940" height="940" rx="142" fill="none" stroke="#34413c" stroke-width="6"/>
+
+  <rect x="236" y="220" width="592" height="620" rx="70" fill="#d5a33c"/>
+  <rect x="184" y="168" width="600" height="620" rx="70" fill="#f8faf9"/>
+  <rect x="208" y="192" width="552" height="572" rx="48" fill="#e33b4d"/>
+  <text x="484" y="495" fill="#ffffff" font-family="Microsoft YaHei, Noto Sans CJK SC, PingFang SC, sans-serif" font-size="330" font-weight="900" text-anchor="middle" dominant-baseline="central">投</text>
+
+  <g aria-hidden="true">
+    <circle cx="748" cy="744" r="142" fill="#202423"/>
+    <circle cx="748" cy="744" r="116" fill="#14775d" stroke="#f8faf9" stroke-width="18"/>
+    <path d="m688 744 40 42 82-91" fill="none" stroke="#ffffff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

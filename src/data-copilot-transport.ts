@@ -10,8 +10,13 @@ import type {
   DataCopilotQualityArtifact,
   DataCopilotQualityEvaluation,
   DataCopilotQualityState,
+  DataCopilotReasoningEffort,
   DataCopilotRunStatus,
   DataCopilotSession,
+  DataCopilotSubagentError,
+  DataCopilotSubagentRun,
+  DataCopilotSubagentTask,
+  DataCopilotSubagentTool,
   DataCopilotSubscriptionHandlers,
   DataCopilotToolCall,
   DataCopilotTransport,
@@ -24,6 +29,7 @@ export type DataCopilotTransportOptions = {
   mode: 'application' | 'research'
   snapshotId: string
   aiSessionId?: string
+  renewAiSession?: () => Promise<string | undefined>
   apiBaseUrl?: string
   allowedScopes?: string[]
 }
@@ -75,6 +81,10 @@ export function createDataCopilotTransport(
       const jobId = input.jobId || options.jobId
       const mode = input.mode || options.mode
       const snapshotId = input.snapshotId || options.snapshotId
+      const selectedModel = {
+        aiSessionId: input.modelId || options.aiSessionId || '',
+        ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+      }
       const payload = await requestJson(route(), {
         method: 'POST',
         body: JSON.stringify({
@@ -86,7 +96,8 @@ export function createDataCopilotTransport(
             contextSourceIds: input.contextSourceIds,
           },
           aiSessionId: input.modelId || options.aiSessionId || '',
-          selectedModel: { aiSessionId: input.modelId || options.aiSessionId || '' },
+          selectedModel,
+          ...publicWorkspaceBinding(input),
           idempotencyKey: createIdempotencyKey('conversation'),
         }),
       })
@@ -101,20 +112,34 @@ export function createDataCopilotTransport(
     },
 
     async sendMessage(input) {
-      const payload = await requestJson(
-        route(`/${encodeURIComponent(input.sessionId)}/messages`),
-        {
+      const path = route(`/${encodeURIComponent(input.sessionId)}/messages`)
+      const idempotencyKey = createIdempotencyKey('message')
+      const buildBody = (modelId: string) => JSON.stringify({
+        content: input.content,
+        aiSessionId: modelId,
+        workspaceMode: input.workspaceMode || 'ask',
+        ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+        attachmentIds: input.attachmentIds,
+        contextSourceIds: input.contextSourceIds,
+        ...publicWorkspaceBinding(input),
+        idempotencyKey,
+      })
+      let payload: unknown
+      try {
+        payload = await requestJson(path, {
           method: 'POST',
-          body: JSON.stringify({
-            content: input.content,
-            aiSessionId: input.modelId || options.aiSessionId || '',
-            workspaceMode: input.workspaceMode || 'ask',
-            attachmentIds: input.attachmentIds,
-            contextSourceIds: input.contextSourceIds,
-            idempotencyKey: createIdempotencyKey('message'),
-          }),
-        },
-      )
+          body: buildBody(input.modelId || options.aiSessionId || ''),
+        })
+      } catch (error) {
+        const typed = error as Error & { code?: string }
+        if (typed.code !== 'AI_SESSION_EXPIRED' || !options.renewAiSession) throw error
+        const renewedId = await options.renewAiSession()
+        if (!renewedId) throw error
+        payload = await requestJson(path, {
+          method: 'POST',
+          body: buildBody(renewedId),
+        })
+      }
       return mapSendResult(payload, input.sessionId)
     },
 
@@ -145,16 +170,29 @@ export function createDataCopilotTransport(
       })
     },
 
-    async retryMessage(sessionId, messageId) {
+    async retryMessage(sessionId, messageId, input = {}) {
       const payload = await requestJson(route(`/${encodeURIComponent(sessionId)}/retry`), {
         method: 'POST',
         body: JSON.stringify({
           messageId,
-          aiSessionId: options.aiSessionId || '',
+          aiSessionId: input.modelId || options.aiSessionId || '',
+          ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
           idempotencyKey: createIdempotencyKey('retry'),
         }),
       })
       return mapSendResult(payload, sessionId)
+    },
+
+    async updateSessionSettings(sessionId, input) {
+      const selectedModel = {
+        ...(input.modelId ? { aiSessionId: input.modelId } : {}),
+        ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+      }
+      const payload = await requestJson(route(`/${encodeURIComponent(sessionId)}`), {
+        method: 'PATCH',
+        body: JSON.stringify({ selectedModel }),
+      })
+      return mapConversation(objectFrom(payload, 'conversation'))
     },
 
     async confirmApproval(sessionId, approvalId, approved) {
@@ -243,6 +281,22 @@ export function createDataCopilotTransport(
     subscribe(sessionId, handlers) {
       return subscribeToConversation(route, sessionId, handlers)
     },
+  }
+}
+
+function publicWorkspaceBinding(value: {
+  projectId?: string
+  workspaceId?: string
+  worktreeId?: string
+}) {
+  const projectId = String(value.projectId || '').trim()
+  const workspaceId = String(value.workspaceId || '').trim()
+  if (!projectId || !workspaceId) return {}
+  const worktreeId = String(value.worktreeId || '').trim()
+  return {
+    projectId,
+    workspaceId,
+    ...(worktreeId ? { worktreeId } : {}),
   }
 }
 
@@ -430,19 +484,32 @@ export function mapDataCopilotMessage(
 export function mapDataCopilotEvent(
   value: unknown,
   sessionId: string,
+  previousSubagentRun?: DataCopilotSubagentRun,
 ): {
   message?: DataCopilotMessageData
   session?: DataCopilotSession
   status?: DataCopilotRunStatus
+  subagentRun?: DataCopilotSubagentRun
 } {
   const event = asObject(value)
   const type = stringValue(event.type) || stringValue(event.event)
   const createdAt = stringValue(event.createdAt) || new Date().toISOString()
   const runId = stringValue(event.runId) || 'current'
 
-  if (event.message) {
+  if (isSubagentEvent(type)) {
     return {
-      message: mapDataCopilotMessage(event.message, sessionId),
+      subagentRun: reduceDataCopilotSubagentRun(previousSubagentRun, event, sessionId),
+      status: eventStatus(type, event),
+    }
+  }
+
+  if (isObjectValue(event.message)) {
+    const message = mapDataCopilotMessage(event.message, sessionId)
+    if (type === 'assistant.message' && runId !== 'current') {
+      message.id = `stream:${runId}`
+    }
+    return {
+      message,
       status: eventStatus(type, event),
     }
   }
@@ -530,6 +597,25 @@ export function mapDataCopilotEvent(
       status: 'planning',
     }
   }
+  if (isAssistantDelta(type) || isReasoningDelta(type)) {
+    const reasoning = isReasoningDelta(type)
+    return {
+      message: {
+        id: reasoning ? `reasoning:${runId}` : `stream:${runId}`,
+        sessionId,
+        role: 'assistant',
+        kind: reasoning ? 'analysis' : 'text',
+        content:
+          stringValue(event.text) ||
+          stringValue(event.delta) ||
+          stringValue(event.summary) ||
+          (typeof event.message === 'string' ? event.message : ''),
+        createdAt,
+        status: 'streaming',
+      },
+      status: reasoning ? 'planning' : 'executing',
+    }
+  }
   if (type === 'verification.failed' || type === 'verification.passed') {
     const passed = type === 'verification.passed'
     const verification = asObject(event.verification)
@@ -592,46 +678,562 @@ export function mapDataCopilotEvent(
   return { status: eventStatus(type, event) }
 }
 
-function subscribeToConversation(
+export function reduceDataCopilotSubagentRun(
+  current: DataCopilotSubagentRun | undefined,
+  value: unknown,
+  sessionId: string,
+): DataCopilotSubagentRun | undefined {
+  const event = asObject(value)
+  const type = stringValue(event.type) || stringValue(event.event)
+  if (!isSubagentEvent(type)) return current
+
+  const runId = stringValue(event.runId) || current?.runId
+  if (!runId) return current
+  const occurredAt = stringValue(event.createdAt) || new Date().toISOString()
+  const base: DataCopilotSubagentRun = current?.runId === runId
+    ? current
+    : {
+        runId,
+        parentRunId: stringValue(event.parentRunId) || undefined,
+        conversationId: stringValue(event.conversationId) || sessionId,
+        objective: stringValue(event.objective) || '子 Agent 协作任务',
+        status: 'planned',
+        tasks: [],
+        updatedAt: occurredAt,
+      }
+  let tasks = [...base.tasks]
+
+  const upsertTask = (
+    taskId: string,
+    update: (task: DataCopilotSubagentTask) => DataCopilotSubagentTask,
+  ) => {
+    const index = tasks.findIndex((task) => task.taskId === taskId)
+    const existing = index >= 0
+      ? tasks[index]
+      : createSubagentTask(event, taskId)
+    const next = update(existing)
+    if (index >= 0) tasks[index] = next
+    else tasks.push(next)
+  }
+
+  if (type === 'subagent.run.planned') {
+    const plannedTasks = arrayValue(event.tasks)
+      .map((task) => mapSubagentTask(task))
+      .filter((task): task is DataCopilotSubagentTask => Boolean(task))
+    tasks = plannedTasks.length ? mergeSubagentTasks(tasks, plannedTasks) : tasks
+    const revision = Number(event.planRevision)
+    return {
+      ...base,
+      parentRunId: stringValue(event.parentRunId) || base.parentRunId,
+      conversationId: stringValue(event.conversationId) || base.conversationId,
+      objective: stringValue(event.objective) || base.objective,
+      planRevision: Number.isFinite(revision) ? revision : base.planRevision,
+      status: 'planned',
+      tasks,
+      plannedAt: base.plannedAt || occurredAt,
+      updatedAt: occurredAt,
+    }
+  }
+
+  if (type === 'subagent.run.started') {
+    const revision = Number(event.planRevision)
+    return {
+      ...base,
+      parentRunId: stringValue(event.parentRunId) || base.parentRunId,
+      conversationId: stringValue(event.conversationId) || base.conversationId,
+      objective: stringValue(event.objective) || base.objective,
+      planRevision: Number.isFinite(revision) ? revision : base.planRevision,
+      status: 'running',
+      startedAt: base.startedAt || occurredAt,
+      updatedAt: occurredAt,
+    }
+  }
+
+  const taskId = stringValue(event.taskId)
+  if (type === 'subagent.task.started' && taskId) {
+    upsertTask(taskId, (task) => ({
+      ...task,
+      role: stringValue(event.role) || task.role,
+      title: stringValue(event.title) || task.title,
+      dependsOn: event.dependsOn === undefined ? task.dependsOn : stringList(event.dependsOn),
+      status: 'running',
+      startedAt: task.startedAt || occurredAt,
+    }))
+  }
+  if (type === 'subagent.output.delta' && taskId) {
+    const delta = stringValue(event.delta)
+    upsertTask(taskId, (task) => ({
+      ...task,
+      role: stringValue(event.role) || task.role,
+      status: task.status === 'planned' ? 'running' : task.status,
+      output: `${task.output}${delta}`,
+      startedAt: task.startedAt || occurredAt,
+    }))
+  }
+  if (type === 'subagent.reasoning.delta' && taskId) {
+    upsertTask(taskId, (task) => ({
+      ...task,
+      role: stringValue(event.role) || task.role,
+      status: task.status === 'planned' ? 'running' : task.status,
+      startedAt: task.startedAt || occurredAt,
+    }))
+  }
+  if (
+    (type === 'subagent.tool.started' ||
+      type === 'subagent.tool.completed' ||
+      type === 'subagent.tool.failed') &&
+    taskId
+  ) {
+    const toolCallId = stringValue(event.toolCallId) || stringValue(event.toolRunId)
+    if (toolCallId) {
+      upsertTask(taskId, (task) => ({
+        ...task,
+        role: stringValue(event.role) || task.role,
+        status: task.status === 'planned' ? 'running' : task.status,
+        tools: upsertSubagentTool(task.tools, {
+          toolCallId,
+          toolName: stringValue(event.toolName) || stringValue(event.name) || 'tool',
+          status: type === 'subagent.tool.started'
+            ? 'running'
+            : type === 'subagent.tool.completed'
+              ? 'completed'
+              : 'failed',
+          error: mapSubagentError(event.error),
+          startedAt: type === 'subagent.tool.started' ? occurredAt : undefined,
+          finishedAt: type === 'subagent.tool.started' ? undefined : occurredAt,
+        }),
+        startedAt: task.startedAt || occurredAt,
+      }))
+    }
+  }
+  if (type === 'subagent.task.completed' && taskId) {
+    upsertTask(taskId, (task) => ({
+      ...task,
+      role: stringValue(event.role) || task.role,
+      status: 'completed',
+      summary: stringValue(event.summary) || task.summary,
+      finishedAt: occurredAt,
+    }))
+  }
+  if (type === 'subagent.task.failed' && taskId) {
+    upsertTask(taskId, (task) => ({
+      ...task,
+      role: stringValue(event.role) || task.role,
+      status: 'failed',
+      error: mapSubagentError(event.error) || { message: '子 Agent 任务失败' },
+      finishedAt: occurredAt,
+    }))
+  }
+
+  if (
+    type.startsWith('subagent.task.') || type.startsWith('subagent.output.') ||
+    type.startsWith('subagent.tool.') || type === 'subagent.reasoning.delta'
+  ) {
+    return {
+      ...base,
+      parentRunId: stringValue(event.parentRunId) || base.parentRunId,
+      status: base.status === 'planned' ? 'running' : base.status,
+      tasks,
+      startedAt: base.startedAt || occurredAt,
+      updatedAt: occurredAt,
+    }
+  }
+
+  if (type === 'subagent.run.receipt' || type === 'subagent.run.cancel.requested') {
+    return {
+      ...base,
+      parentRunId: stringValue(event.parentRunId) || base.parentRunId,
+      conversationId: stringValue(event.conversationId) || base.conversationId,
+      updatedAt: occurredAt,
+    }
+  }
+
+  const runStatus = type === 'subagent.run.completed'
+    ? 'completed'
+    : type === 'subagent.run.paused'
+      ? 'paused'
+      : type === 'subagent.run.cancelled'
+        ? 'cancelled'
+      : 'failed'
+  const revision = Number(event.planRevision)
+  if (runStatus === 'cancelled') {
+    tasks = tasks.map((task) => task.status === 'running'
+      ? { ...task, status: 'cancelled', finishedAt: occurredAt }
+      : task)
+  }
+  return {
+    ...base,
+    parentRunId: stringValue(event.parentRunId) || base.parentRunId,
+    conversationId: stringValue(event.conversationId) || base.conversationId,
+    planRevision: Number.isFinite(revision) ? revision : base.planRevision,
+    status: runStatus,
+    tasks,
+    error: mapSubagentError(event.error) || base.error,
+    finishedAt: runStatus === 'paused' ? base.finishedAt : occurredAt,
+    updatedAt: occurredAt,
+  }
+}
+
+function mapSubagentTask(value: unknown): DataCopilotSubagentTask | undefined {
+  const task = asObject(value)
+  const taskId = stringValue(task.taskId)
+  if (!taskId) return undefined
+  return createSubagentTask(task, taskId)
+}
+
+function createSubagentTask(value: unknown, taskId: string): DataCopilotSubagentTask {
+  const task = asObject(value)
+  return {
+    taskId,
+    role: stringValue(task.role) || 'subagent',
+    title: stringValue(task.title) || taskId,
+    dependsOn: stringList(task.dependsOn),
+    status: 'planned',
+    output: '',
+    tools: [],
+  }
+}
+
+function mergeSubagentTasks(
+  current: DataCopilotSubagentTask[],
+  incoming: DataCopilotSubagentTask[],
+) {
+  const next = [...current]
+  for (const task of incoming) {
+    const index = next.findIndex((item) => item.taskId === task.taskId)
+    if (index === -1) next.push(task)
+    else next[index] = { ...task, ...next[index], role: task.role, title: task.title, dependsOn: task.dependsOn }
+  }
+  return next
+}
+
+function upsertSubagentTool(
+  current: DataCopilotSubagentTool[],
+  incoming: DataCopilotSubagentTool,
+) {
+  const index = current.findIndex((tool) => tool.toolCallId === incoming.toolCallId)
+  if (index === -1) return [...current, incoming]
+  const next = [...current]
+  next[index] = {
+    ...next[index],
+    ...incoming,
+    startedAt: next[index].startedAt || incoming.startedAt,
+  }
+  return next
+}
+
+function mapSubagentError(value: unknown): DataCopilotSubagentError | undefined {
+  if (typeof value === 'string' && value.trim()) return { message: value.trim() }
+  const error = asObject(value)
+  const message = stringValue(error.message)
+  if (!message) return undefined
+  return { code: stringValue(error.code) || undefined, message }
+}
+
+function stringList(value: unknown) {
+  return arrayValue(value).map((item) => stringValue(item)).filter(Boolean)
+}
+
+const EVENT_REPLAY_PAGE_SIZE = 200
+const EVENT_REPLAY_MAX_PAGES = 1000
+const STREAM_EVENT_TYPES = new Set([
+  'assistant.delta',
+  'assistant.reasoning.delta',
+  'message.delta',
+  'reasoning.delta',
+])
+
+type PendingStreamEvent = {
+  event: JsonObject
+  explicitText?: string
+  deltas: string[]
+}
+
+export function subscribeToConversation(
   route: (suffix?: string) => string,
   sessionId: string,
   handlers: DataCopilotSubscriptionHandlers,
 ) {
-  const eventSource = new EventSource(
-    route(`/${encodeURIComponent(sessionId)}/events`),
-    { withCredentials: true },
-  )
   let closed = false
+  let eventSource: EventSource | undefined
+  let lastProjectedEventId = 0
+  let processing = Promise.resolve()
+  let scheduledFrame: number | ReturnType<typeof setTimeout> | undefined
+  let scheduledWithAnimationFrame = false
+  const pendingMessages = new Map<string, DataCopilotMessageData>()
+  const pendingSubagentRuns = new Map<string, DataCopilotSubagentRun>()
+  const pendingStreamEvents = new Map<string, PendingStreamEvent>()
+  const projectEvent = createConversationEventProjector(sessionId)
+
+  const reportError = (error: unknown) => {
+    if (closed) return
+    handlers.onError?.(error instanceof Error ? error : new Error(String(error)))
+  }
+
+  const flushBatchedCallbacks = () => {
+    if (pendingMessages.size > 0) {
+      const messages = [...pendingMessages.values()]
+      pendingMessages.clear()
+      handlers.onMessages?.(messages)
+    }
+    if (pendingSubagentRuns.size > 0) {
+      const runs = [...pendingSubagentRuns.values()]
+      pendingSubagentRuns.clear()
+      handlers.onSubagentRuns?.(runs)
+    }
+  }
+
+  const scheduleBatchedCallbacks = () => {
+    if (closed || scheduledFrame !== undefined) return
+    const flush = () => {
+      scheduledFrame = undefined
+      scheduledWithAnimationFrame = false
+      try {
+        flushStreamEvents()
+        flushBatchedCallbacks()
+      } catch (error) {
+        reportError(error)
+      }
+    }
+    if (typeof globalThis.requestAnimationFrame === 'function') {
+      scheduledWithAnimationFrame = true
+      scheduledFrame = globalThis.requestAnimationFrame(flush)
+      return
+    }
+    scheduledFrame = setTimeout(flush, 16)
+  }
+
+  const deliver = (mapped: ReturnType<typeof projectEvent>) => {
+    if (mapped.message) {
+      if (handlers.onMessages) {
+        pendingMessages.set(mapped.message.id, mapped.message)
+      } else {
+        handlers.onMessage?.(mapped.message)
+      }
+    }
+    if (mapped.session) handlers.onSession?.(mapped.session)
+    if (mapped.status) handlers.onStatus?.(mapped.status)
+    if (mapped.subagentRun) {
+      if (handlers.onSubagentRuns) {
+        pendingSubagentRuns.set(mapped.subagentRun.runId, mapped.subagentRun)
+      } else {
+        handlers.onSubagentRun?.(mapped.subagentRun)
+      }
+    }
+  }
+
+  const projectMappedEvent = (event: JsonObject) => {
+    deliver(projectEvent(event))
+  }
+
+  const flushStreamEvents = () => {
+    if (pendingStreamEvents.size === 0) return
+    const events = [...pendingStreamEvents.values()]
+    pendingStreamEvents.clear()
+    for (const pending of events) {
+      const text = pending.explicitText === undefined
+        ? pending.deltas.join('')
+        : `${pending.explicitText}${pending.deltas.join('')}`
+      projectMappedEvent({
+        ...pending.event,
+        ...(pending.explicitText === undefined ? { delta: text } : { text }),
+      })
+    }
+  }
+
+  const queueStreamEvent = (event: JsonObject) => {
+    const type = stringValue(event.type) || stringValue(event.event)
+    const runId = stringValue(event.runId) || 'current'
+    const key = `${type}:${runId}`
+    const current = pendingStreamEvents.get(key) ?? { event, deltas: [] }
+    const explicitText = stringValue(event.text)
+    const delta =
+      stringValue(event.delta) ||
+      stringValue(event.summary) ||
+      (typeof event.message === 'string' ? event.message : '')
+    current.event = event
+    if (explicitText) {
+      current.explicitText = explicitText
+      current.deltas = []
+    }
+    if (delta) current.deltas.push(delta)
+    pendingStreamEvents.set(key, current)
+    scheduleBatchedCallbacks()
+  }
+
+  const project = (event: JsonObject, eventId = eventSequence(event)) => {
+    if (eventId > 0) {
+      if (eventId <= lastProjectedEventId) return
+      if (eventId !== lastProjectedEventId + 1) {
+        throw new Error(
+          `Data Copilot event replay is incomplete: expected ${lastProjectedEventId + 1}, received ${eventId}.`,
+        )
+      }
+      lastProjectedEventId = eventId
+    }
+    const type = stringValue(event.type) || stringValue(event.event)
+    if (STREAM_EVENT_TYPES.has(type)) {
+      queueStreamEvent(event)
+      return
+    }
+    flushStreamEvents()
+    projectMappedEvent(event)
+    flushBatchedCallbacks()
+  }
+
+  const replayThrough = async (requestedLastEventId?: number) => {
+    let replayLastEventId = requestedLastEventId
+    for (let pageIndex = 0; pageIndex < EVENT_REPLAY_MAX_PAGES && !closed; pageIndex += 1) {
+      if (replayLastEventId !== undefined && lastProjectedEventId >= replayLastEventId) return
+      const query = new URLSearchParams({
+        format: 'json',
+        afterSeq: String(lastProjectedEventId),
+        limit: String(EVENT_REPLAY_PAGE_SIZE),
+      })
+      const payload = asObject(await requestJson(
+        route(`/${encodeURIComponent(sessionId)}/events?${query.toString()}`),
+      ))
+      if (closed) return
+      if (replayLastEventId === undefined) {
+        replayLastEventId = eventSequence({ eventId: payload.lastSeq })
+      }
+      const target = replayLastEventId
+      if (!target || lastProjectedEventId >= target) return
+      const events = arrayValue(payload.events)
+        .map((event) => asObject(event))
+        .sort((left, right) => eventSequence(left) - eventSequence(right))
+      let advanced = false
+      for (const event of events) {
+        const eventId = eventSequence(event)
+        if (eventId <= lastProjectedEventId) continue
+        if (eventId > target) break
+        project(event, eventId)
+        advanced = true
+      }
+      flushStreamEvents()
+      flushBatchedCallbacks()
+      if (lastProjectedEventId >= target) return
+      if (!advanced) {
+        throw new Error(
+          `Data Copilot event replay stopped at ${lastProjectedEventId} before ${target}.`,
+        )
+      }
+    }
+    if (!closed && replayLastEventId !== undefined && lastProjectedEventId < replayLastEventId) {
+      throw new Error(
+        `Data Copilot event replay exceeded ${EVENT_REPLAY_MAX_PAGES} pages.`,
+      )
+    }
+  }
+
+  const processEvent = async (event: JsonObject) => {
+    if (closed) return
+    const type = stringValue(event.type) || stringValue(event.event)
+    if (type === 'stream.gap') {
+      const payload = asObject(event.payload)
+      const gapLastEventId = eventSequence({ eventId: payload.to })
+      if (gapLastEventId > lastProjectedEventId) await replayThrough(gapLastEventId)
+      return
+    }
+    const eventId = eventSequence(event)
+    if (eventId > 0 && eventId <= lastProjectedEventId) return
+    if (eventId > lastProjectedEventId + 1) await replayThrough(eventId - 1)
+    project(event, eventId)
+  }
+
   const receive = (raw: MessageEvent<string>) => {
-    try {
-      const mapped = mapDataCopilotEvent(JSON.parse(raw.data), sessionId)
-      if (mapped.message) handlers.onMessage(mapped.message)
-      if (mapped.session) handlers.onSession?.(mapped.session)
-      if (mapped.status) handlers.onStatus?.(mapped.status)
-    } catch (error) {
-      handlers.onError?.(error instanceof Error ? error : new Error(String(error)))
+    processing = processing
+      .then(() => processEvent(asObject(JSON.parse(raw.data))))
+      .catch(reportError)
+  }
+
+  const openStream = () => {
+    if (closed) return
+    const query = new URLSearchParams({ afterEventId: String(lastProjectedEventId) })
+    eventSource = new EventSource(
+      route(`/${encodeURIComponent(sessionId)}/events?${query.toString()}`),
+      { withCredentials: true },
+    )
+    eventSource.onmessage = receive
+    for (const eventName of [
+      'ready', 'stream.gap',
+      'user.message', 'assistant.message', 'assistant.plan', 'assistant.delta',
+      'assistant.reasoning.delta', 'message.delta', 'reasoning.delta', 'tool.started',
+      'tool.progress', 'tool.result', 'table.result', 'source.list', 'artifact.ready',
+      'email.draft', 'email.sent', 'application.email_draft', 'application.batch_preflight', 'application.batch',
+      'approval.required', 'approval.confirmed', 'approval.rejected',
+      'verification.failed', 'verification.passed',
+      'run.paused', 'run.failed', 'run.completed',
+      'subagent.run.planned', 'subagent.run.started',
+      'subagent.task.started', 'subagent.output.delta', 'subagent.reasoning.delta',
+      'subagent.tool.call.delta', 'subagent.tool.started', 'subagent.tool.completed', 'subagent.tool.failed',
+      'subagent.task.completed', 'subagent.task.failed',
+      'subagent.run.completed', 'subagent.run.paused', 'subagent.run.cancelled', 'subagent.run.failed',
+      'subagent.run.cancel.requested', 'subagent.run.receipt',
+    ]) {
+      eventSource.addEventListener(eventName, receive as EventListener)
+    }
+    eventSource.onerror = () => {
+      if (!closed && eventSource?.readyState === EventSource.CLOSED) {
+        reportError(new Error('Data Copilot 实时连接已断开。'))
+      }
     }
   }
-  eventSource.onmessage = receive
-  for (const eventName of [
-    'ready',
-    'user.message', 'assistant.message', 'assistant.plan', 'tool.started',
-    'tool.progress', 'tool.result', 'table.result', 'source.list', 'artifact.ready',
-    'email.draft', 'email.sent', 'application.email_draft', 'application.batch_preflight', 'application.batch',
-    'approval.required', 'approval.confirmed', 'approval.rejected',
-    'verification.failed', 'verification.passed',
-    'run.paused', 'run.failed', 'run.completed',
-  ]) {
-    eventSource.addEventListener(eventName, receive as EventListener)
-  }
-  eventSource.onerror = () => {
-    if (!closed && eventSource.readyState === EventSource.CLOSED) {
-      handlers.onError?.(new Error('Data Copilot 实时连接已断开。'))
-    }
-  }
+
+  void replayThrough().then(openStream).catch(reportError)
   return () => {
     closed = true
-    eventSource.close()
+    if (scheduledFrame !== undefined) {
+      if (scheduledWithAnimationFrame && typeof globalThis.cancelAnimationFrame === 'function') {
+        globalThis.cancelAnimationFrame(scheduledFrame as number)
+      } else {
+        clearTimeout(scheduledFrame as ReturnType<typeof setTimeout>)
+      }
+      scheduledFrame = undefined
+    }
+    pendingStreamEvents.clear()
+    pendingMessages.clear()
+    pendingSubagentRuns.clear()
+    eventSource?.close()
+  }
+}
+
+function eventSequence(value: unknown) {
+  const event = asObject(value)
+  const sequence = Number(event.eventId ?? event.seq ?? 0)
+  return Number.isSafeInteger(sequence) && sequence > 0 ? sequence : 0
+}
+
+function createConversationEventProjector(sessionId: string) {
+  const streams = new Map<string, string>()
+  const subagentRuns = new Map<string, DataCopilotSubagentRun>()
+  return (value: unknown) => {
+    const event = asObject(value)
+    const type = stringValue(event.type) || stringValue(event.event)
+    const runId = stringValue(event.runId) || 'current'
+    if (isSubagentEvent(type)) {
+      const mapped = mapDataCopilotEvent(event, sessionId, subagentRuns.get(runId))
+      if (mapped.subagentRun) subagentRuns.set(mapped.subagentRun.runId, mapped.subagentRun)
+      return mapped
+    }
+    if (isAssistantDelta(type) || isReasoningDelta(type)) {
+      const streamKind = isReasoningDelta(type) ? 'reasoning' : 'answer'
+      const key = `${streamKind}:${runId}`
+      const explicitText = stringValue(event.text)
+      const delta =
+        stringValue(event.delta) ||
+        stringValue(event.summary) ||
+        (typeof event.message === 'string' ? event.message : '')
+      const text = explicitText || `${streams.get(key) ?? ''}${delta}`
+      streams.set(key, text)
+      return mapDataCopilotEvent({ ...event, text }, sessionId)
+    }
+    if (type === 'assistant.message') streams.delete(`answer:${runId}`)
+    if (type === 'run.failed' || type === 'run.paused' || type === 'run.completed') {
+      streams.delete(`answer:${runId}`)
+      streams.delete(`reasoning:${runId}`)
+    }
+    return mapDataCopilotEvent(event, sessionId)
   }
 }
 
@@ -671,7 +1273,10 @@ function mapSendResult(value: unknown, sessionId: string) {
 
 function mapConversation(value: unknown): DataCopilotSession {
   const conversation = asObject(value)
+  const selectedModel = asObject(conversation.selectedModel)
   const runState = asObject(conversation.runState)
+  const checkpoint = asObject(runState.checkpoint)
+  const workspaceBinding = asObject(checkpoint.workspaceBinding)
   const lastContextSourceIds = arrayValue(conversation.contextSourceIds).map(String)
   const id = stringValue(conversation.conversationId) || stringValue(conversation.id)
   const jobId = stringValue(conversation.jobId)
@@ -689,8 +1294,9 @@ function mapConversation(value: unknown): DataCopilotSession {
     preview: stringValue(conversation.preview) || `${modeLabel} · #${jobId.slice(0, 8)}`,
     status: runStatusValue(conversation.status || runState.status),
     modelId:
-      stringValue(asObject(conversation.selectedModel).aiSessionId) ||
+      stringValue(selectedModel.aiSessionId) ||
       stringValue(conversation.modelId),
+    reasoningEffort: reasoningEffortValue(selectedModel.reasoningEffort),
     contextSourceIds: lastContextSourceIds.length
       ? lastContextSourceIds
       : arrayValue(asObject(conversation.scope).contextSourceIds).map(String),
@@ -698,6 +1304,13 @@ function mapConversation(value: unknown): DataCopilotSession {
     mode: stringValue(conversation.mode),
     snapshotId: stringValue(conversation.snapshotId),
     filters: filterLabels(conversation.filters),
+    workspaceBinding: stringValue(workspaceBinding.projectId) && stringValue(workspaceBinding.workspaceId)
+      ? {
+          projectId: stringValue(workspaceBinding.projectId),
+          workspaceId: stringValue(workspaceBinding.workspaceId),
+          worktreeId: stringValue(workspaceBinding.worktreeId) || undefined,
+        }
+      : undefined,
   }
 }
 
@@ -853,10 +1466,14 @@ function formatBytes(value: number) {
 
 function eventStatus(type: string, event: JsonObject): DataCopilotRunStatus | undefined {
   if (type === 'approval.required') return 'waiting_approval'
+  if (type === 'subagent.run.planned') return 'planning'
+  if (isSubagentEvent(type)) return 'executing'
   if (type === 'run.completed') return 'completed'
   if (type === 'run.failed') return 'failed'
   if (type === 'run.paused') return 'resumable'
   if (type === 'assistant.plan') return 'planning'
+  if (isReasoningDelta(type)) return 'planning'
+  if (isAssistantDelta(type)) return 'executing'
   if (type === 'tool.started' || type === 'tool.progress' || type === 'tool.result') return 'executing'
   if (type === 'assistant.message') return 'completed'
   const status = stringValue(event.status)
@@ -917,12 +1534,56 @@ function asObject(value: unknown): JsonObject {
     : {}
 }
 
+function isObjectValue(value: unknown): value is JsonObject {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isAssistantDelta(type: string) {
+  return type === 'assistant.delta' || type === 'message.delta'
+}
+
+function isReasoningDelta(type: string) {
+  return type === 'assistant.reasoning.delta' || type === 'reasoning.delta'
+}
+
+function isSubagentEvent(type: string) {
+  return type === 'subagent.run.planned' ||
+    type === 'subagent.run.started' ||
+    type === 'subagent.task.started' ||
+    type === 'subagent.output.delta' ||
+    type === 'subagent.reasoning.delta' ||
+    type === 'subagent.tool.call.delta' ||
+    type === 'subagent.tool.started' ||
+    type === 'subagent.tool.completed' ||
+    type === 'subagent.tool.failed' ||
+    type === 'subagent.task.completed' ||
+    type === 'subagent.task.failed' ||
+    type === 'subagent.run.completed' ||
+    type === 'subagent.run.paused' ||
+    type === 'subagent.run.cancelled' ||
+    type === 'subagent.run.failed' ||
+    type === 'subagent.run.cancel.requested' ||
+    type === 'subagent.run.receipt'
+}
+
 function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
 }
 
 function stringValue(value: unknown) {
   return typeof value === 'string' ? value : ''
+}
+
+function reasoningEffortValue(value: unknown): DataCopilotReasoningEffort | undefined {
+  const effort = stringValue(value)
+  return effort === 'none'
+    || effort === 'low'
+    || effort === 'medium'
+    || effort === 'high'
+    || effort === 'xhigh'
+    || effort === 'max'
+    ? effort
+    : undefined
 }
 
 function numberValue(value: unknown, fallback: number) {

@@ -11,7 +11,7 @@ _ROLE_SIGNAL = re.compile(
     re.I,
 )
 _ROLE_CORE_SIGNAL = re.compile(
-    r"(?:金融|投资|证券|债券|债权|资管|资产管理|\u4ea7\u54c1|\u8fd0\u8425|\u7528\u6237\u7814\u7a76|\u6570\u636e|\u5206\u6790|\u5546\u4e1a|\u5e02\u573a|\u54c1\u724c|\u5546\u52a1|\u9500\u552e|\u8d22\u52a1|\u6cd5\u52a1|\u4eba\u529b|\u884c\u653f|\u52a9\u7406|\u9879\u76ee|\u7ecf\u7406|\u4e13\u5458|\u5de5\u7a0b\u5e08|\u7b97\u6cd5|\u8bbe\u8ba1|\u5f00\u53d1|\u7814\u53d1|\u7f16\u8f91|\u54a8\u8be2|\u533b\u5b66|\u533b\u836f|\u4fe1\u606f|\u6c9f\u901a|product|operations?|marketing|design|engineer|developer|analyst|research|sales|finance|legal|human\s+resources?|consult)",
+    r"(?:金融|投资|证券|债券|债权|资管|资产管理|内容|推荐|增长|电商|社群|海外|视觉|软件|\u4ea7\u54c1|\u8fd0\u8425|\u7528\u6237\u7814\u7a76|\u6570\u636e|\u5206\u6790|\u5546\u4e1a|\u5e02\u573a|\u54c1\u724c|\u5546\u52a1|\u9500\u552e|\u8d22\u52a1|\u6cd5\u52a1|\u4eba\u529b|\u884c\u653f|\u52a9\u7406|\u9879\u76ee|\u7ecf\u7406|\u4e13\u5458|\u5de5\u7a0b\u5e08|\u7b97\u6cd5|\u8bbe\u8ba1|\u5f00\u53d1|\u7814\u53d1|\u7f16\u8f91|\u54a8\u8be2|\u533b\u5b66|\u533b\u836f|\u4fe1\u606f|\u6c9f\u901a|product|operations?|marketing|design|engineer|developer|analyst|research|sales|finance|legal|human\s+resources?|consult)",
     re.I,
 )
 _ROLE_SHAPE_SIGNAL = re.compile(

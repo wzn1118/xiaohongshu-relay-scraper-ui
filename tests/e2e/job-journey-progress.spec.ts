@@ -168,6 +168,23 @@ const unknownJob = {
   },
 }
 
+const qualityGateJob = {
+  ...unknownJob,
+  status: 'incomplete',
+  workflowSummary: {
+    checks: {
+      all_outreach_drafts_ready: false,
+      all_cover_letters_score_at_least_threshold: false,
+      all_generated_claims_evidence_valid: false,
+    },
+    issues: [{ code: 'COVER_LETTER_SCORE_BELOW_90' }],
+  },
+  experienceSnapshot: {
+    ...unknownJob.experienceSnapshot,
+    state: 'incomplete',
+  },
+}
+
 const emptyResults = {
   available: true,
   analysisMode: 'job',
@@ -239,7 +256,7 @@ async function openJourney(page: Page, journeyJob = job, options: { expireFirstR
     return json(route, {})
   })
   await page.clock.setFixedTime(new Date(now))
-  await page.goto('/', { waitUntil: 'commit' })
+  await page.goto('/?screen=task', { waitUntil: 'commit' })
   await expect(page.locator('.job-journey-panel')).toBeVisible({ timeout: 45_000 })
   return state
 }
@@ -282,6 +299,22 @@ test('继续任务遇到 AI 会话过期会自动重连并再次恢复', async (
   })
   await expect(page.getByText('任务已恢复，正在从已保存进度继续处理。')).toBeVisible()
   await expect(page.getByText('The selected AI session has expired.')).toHaveCount(0)
+})
+
+test('quality-gate recovery replays analysis and keeps submitted feedback visible', async ({ page }) => {
+  const state = await openJourney(page, qualityGateJob)
+  const journey = page.locator('.job-journey-panel')
+  const resumeButton = journey.locator('.journey-recovery-action')
+
+  await expect(resumeButton).toBeVisible()
+  await resumeButton.click()
+
+  await expect.poll(() => state.resumeRequests.length).toBe(1)
+  expect(state.resumeRequests[0]).toMatchObject({
+    scope: 'analysis',
+    idempotencyKey: expect.any(String),
+  })
+  await expect(journey.locator('.journey-recovery-feedback.success')).toBeVisible()
 })
 
 for (const viewport of [

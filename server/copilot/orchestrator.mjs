@@ -98,35 +98,50 @@ export class Orchestrator {
       const batchUnits = batch.reduce((sum, task) => sum + task.budgetUnits, 0);
       if (consumedUnits + batchUnits > limits.maxUnits) throw new TaskGraphError('TASK_BUDGET_EXCEEDED', `Task graph exceeded ${limits.maxUnits} budget units.`);
       consumedUnits += batchUnits;
-      await Promise.all(batch.map(async (task) => {
-        graph.markStarted(task.id);
-        const cached = task.idempotencyKey ? this.cache.get(task.idempotencyKey) : undefined;
-        if (cached !== undefined) {
-          const output = structuredClone(cached);
-          outputs.set(task.id, output);
-          graph.markCompleted(task.id, output);
-          reusedTasks += 1;
-          onEvent({ type: 'task.reused', taskId: task.id, idempotencyKey: task.idempotencyKey, occurredAt: this.now().toISOString() });
-          return;
-        }
-        onEvent({ type: 'task.started', taskId: task.id, occurredAt: this.now().toISOString() });
-        try {
-          const remainingMs = Math.max(1, limits.maxDurationMs - (Date.now() - startedAt));
-          const output = await executeWithControls(
-            (taskSignal) => executeTask(task, { outputs, signal: taskSignal }),
-            { signal, timeoutMs: Math.min(task.timeoutMs, remainingMs), taskId: task.id },
-          );
-          validateOutputContract(task, output);
-          outputs.set(task.id, output);
-          graph.markCompleted(task.id, output);
-          if (task.idempotencyKey) this.#cache(task.idempotencyKey, output);
-          onEvent({ type: 'task.completed', taskId: task.id, output, occurredAt: this.now().toISOString() });
-        } catch (error) {
-          graph.markFailed(task.id, error);
-          onEvent({ type: 'task.failed', taskId: task.id, error: String(error?.message || error), occurredAt: this.now().toISOString() });
-          throw error;
-        }
-      }));
+      const batchController = new AbortController();
+      let primaryError = null;
+      const abortBatch = () => batchController.abort(signal?.reason);
+      if (signal?.aborted) abortBatch();
+      else signal?.addEventListener('abort', abortBatch, { once: true });
+      try {
+        const outcomes = await Promise.allSettled(batch.map(async (task) => {
+          graph.markStarted(task.id);
+          const cached = task.idempotencyKey ? this.cache.get(task.idempotencyKey) : undefined;
+          if (cached !== undefined) {
+            const output = structuredClone(cached);
+            outputs.set(task.id, output);
+            graph.markCompleted(task.id, output);
+            reusedTasks += 1;
+            onEvent({ type: 'task.reused', taskId: task.id, idempotencyKey: task.idempotencyKey, occurredAt: this.now().toISOString() });
+            return;
+          }
+          onEvent({ type: 'task.started', taskId: task.id, occurredAt: this.now().toISOString() });
+          try {
+            const remainingMs = Math.max(1, limits.maxDurationMs - (Date.now() - startedAt));
+            const output = await executeWithControls(
+              (taskSignal) => executeTask(task, { outputs, signal: taskSignal }),
+              { signal: batchController.signal, timeoutMs: Math.min(task.timeoutMs, remainingMs), taskId: task.id },
+            );
+            validateOutputContract(task, output);
+            outputs.set(task.id, output);
+            graph.markCompleted(task.id, output);
+            if (task.idempotencyKey) this.#cache(task.idempotencyKey, output);
+            onEvent({ type: 'task.completed', taskId: task.id, output, occurredAt: this.now().toISOString() });
+          } catch (error) {
+            if (!primaryError && !batchController.signal.aborted) {
+              primaryError = error;
+              batchController.abort(error);
+            }
+            graph.markFailed(task.id, error);
+            onEvent({ type: 'task.failed', taskId: task.id, error: String(error?.message || error), occurredAt: this.now().toISOString() });
+            throw error;
+          }
+        }));
+        const failure = primaryError || outcomes.find((outcome) => outcome.status === 'rejected')?.reason;
+        if (failure) throw failure;
+      } finally {
+        signal?.removeEventListener?.('abort', abortBatch);
+      }
     }
     const unfinished = graph.snapshot().tasks.filter((task) => ['pending', 'running'].includes(task.status));
     if (unfinished.length) throw new TaskGraphError('TASK_GRAPH_STALLED', `Task graph stalled at ${unfinished.map((task) => task.id).join(', ')}.`);

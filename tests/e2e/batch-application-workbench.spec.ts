@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
 import { withResolvedApplicationSubject } from '../../server/application-delivery-candidates.mjs'
 
 const now = '2026-08-04T08:00:00.000Z'
@@ -169,7 +169,7 @@ paginatedApplications[24].attachmentRequirement = {
 }
 
 const attachmentSubjectNoteId = 'note-attachment-subject-fallback'
-const attachmentSubject = '北京大学-张三-2026年8月15日'
+const attachmentSubject = '应聘用户研究实习生｜张三'
 const rawAttachmentSubjectApplication = application(
   attachmentSubjectNoteId,
   '用户研究实习生招聘',
@@ -707,11 +707,13 @@ type ApiCapture = {
   resultQueries: string[]
   candidateRequests: string[]
   rewrites: Array<Record<string, unknown>>
+  draftSaves: Array<Record<string, unknown>>
 }
 
 type WorkbenchFixtureOptions = {
   staleCandidateCursorOnce?: boolean
   rewriteFailureNoteIds?: string[]
+  savedDraftSubjectByNoteId?: Record<string, string>
 }
 
 function deliveryManifestSummary(record: ReturnType<typeof application>, activeBatch: ReturnType<typeof frozenBatch> | ReturnType<typeof controlledBatch> | ReturnType<typeof sentThreeEmailBatch> | null) {
@@ -846,7 +848,7 @@ async function openWorkbench(
   sourceRecords = applications,
   options: WorkbenchFixtureOptions = {},
 ): Promise<ApiCapture> {
-  const capture: ApiCapture = { dryRuns: [], preflights: [], creates: [], approvals: [], controls: [], resultQueries: [], candidateRequests: [], rewrites: [] }
+  const capture: ApiCapture = { dryRuns: [], preflights: [], creates: [], approvals: [], controls: [], resultQueries: [], candidateRequests: [], rewrites: [], draftSaves: [] }
   const activeSourceRecords = sourceRecords.map((record) => ({
     ...record,
     outreach: { ...record.outreach },
@@ -907,6 +909,39 @@ async function openWorkbench(
       return fulfillJson(route, { ...results, total: activeSourceRecords.length, offset, limit, items: activeSourceRecords.slice(offset, offset + limit) })
     }
     if (path === `/api/jobs/${jobId}/artifacts`) return fulfillJson(route, [])
+    if (path === `/api/jobs/${jobId}/draft` && method === 'POST') {
+      const requestBody = request.postDataJSON() as Record<string, unknown>
+      capture.draftSaves.push(requestBody)
+      const noteId = String(requestBody.noteId || '')
+      const target = activeSourceRecords.find((record) => record.note_id === noteId)
+      if (!target) return fulfillJson(route, { code: 'APPLICATION_NOT_FOUND', message: 'fixture application not found' }, 404)
+      const outreach = requestBody.outreach && typeof requestBody.outreach === 'object'
+        ? requestBody.outreach as typeof target.outreach
+        : target.outreach
+      const version = target.draftVersion.version + 1
+      const draftVersion = {
+        ...target.draftVersion,
+        version,
+        contentHash: `${noteId}-saved-${version}`,
+        qualityStatus: 'stale',
+        qualityCheckedVersion: null,
+        qualityCheckedHash: null,
+        updatedAt: now,
+      }
+      const savedOutreach = {
+        ...target.outreach,
+        ...outreach,
+        ...(options.savedDraftSubjectByNoteId?.[noteId] ? { email_subject: options.savedDraftSubjectByNoteId[noteId] } : {}),
+      }
+      Object.assign(target, { outreach: savedOutreach, draftVersion, emailSubjectPreview: savedOutreach.email_subject })
+      return fulfillJson(route, {
+        noteId,
+        outreach: target.outreach,
+        draftVersion,
+        delivery: null,
+        cover_letter_evaluation: target.cover_letter_evaluation,
+      })
+    }
     if (path === `/api/jobs/${jobId}/draft/rewrite` && method === 'POST') {
       const requestBody = request.postDataJSON() as Record<string, unknown>
       capture.rewrites.push(requestBody)
@@ -1015,10 +1050,37 @@ async function openWorkbench(
   return capture
 }
 
-async function exerciseWorkbench(page: Page) {
+async function showDetailedView(panel: Locator) {
+  const button = panel.getByRole('button', { name: '详细视图' })
+  if (await button.getAttribute('aria-pressed') !== 'true') await button.click()
+  await expect(panel).toHaveClass(/detail-view/u)
+}
+
+async function openMoreTools(panel: Locator) {
+  const details = panel.locator('details.batch-more-tools')
+  if (!await details.evaluate((element) => (element as HTMLDetailsElement).open)) await details.locator('summary').click()
+  await expect(details).toHaveAttribute('open', '')
+}
+
+async function openPreciseFilters(panel: Locator) {
+  const details = panel.locator('details.batch-filter-details')
+  if (!await details.evaluate((element) => (element as HTMLDetailsElement).open)) await details.locator('summary').click()
+  await expect(details).toHaveAttribute('open', '')
+}
+
+async function exerciseWorkbench(page: Page, quickScreenshotName = '') {
   const capture = await openWorkbench(page)
   const panel = page.getByRole('region', { name: '批量投递工作台' })
   await expect(panel.locator('.batch-application-body')).toBeVisible()
+  await expect(panel).toHaveClass(/quick-view/u)
+  await expect(panel.getByRole('button', { name: '极速视图' })).toHaveAttribute('aria-pressed', 'true')
+  await expect(panel.locator('thead th').filter({ hasText: /^岗位$/u })).toHaveCount(1)
+  await expect(panel.locator('thead th').filter({ hasText: '投递正文' })).toBeHidden()
+  await expect(panel.getByRole('region', { name: '批量投递操作' })).toBeVisible()
+  await expect(panel.getByText('产品经理', { exact: true })).toBeVisible()
+  if (quickScreenshotName) {
+    await page.screenshot({ path: `output/playwright/batch-application/quick-workbench-${quickScreenshotName}.png` })
+  }
   const bodyRow = panel.locator('tbody tr').filter({ hasText: '产品经理' })
   const commentRow = panel.locator('tbody tr').filter({ hasText: '增长策略实习生' })
   const partialRow = panel.locator('tbody tr').filter({ hasText: '数据分析实习生' })
@@ -1026,9 +1088,11 @@ async function exerciseWorkbench(page: Page) {
   await expect(bodyRow.getByRole('checkbox')).toBeChecked()
   await commentRow.getByRole('checkbox').check({ force: true })
   await partialRow.getByRole('checkbox').check({ force: true })
-  await panel.getByRole('button', { name: 'Dry Run' }).click()
-  const freezeButton = panel.getByRole('button', { name: '冻结批次预览' })
-  await expect(freezeButton).toBeEnabled()
+  await panel.getByRole('button', { name: '预览邮件' }).click()
+  const sendButton = panel.getByRole('button', { name: '发送邮件', exact: true })
+  await expect(sendButton).toBeEnabled()
+
+  await showDetailedView(panel)
 
   await expect(panel.locator('thead th').filter({ hasText: '投递正文' })).toHaveCount(1)
   await expect(panel.locator('thead th').filter({ hasText: '岗位事实' })).toHaveCount(1)
@@ -1048,10 +1112,10 @@ async function exerciseWorkbench(page: Page) {
   await search.fill('产品经理')
   await expect(bodyRow).toBeVisible()
   await expect(bodyRow.getByTestId(`batch-cover-letter-${bodyNoteId}`)).toContainText('预演定稿关键词')
-  await expect(freezeButton).toBeDisabled()
+  await expect(sendButton).toBeDisabled()
   await search.fill('')
   await expect(commentRow.getByRole('button', { name: /author@example\.test/ })).toBeVisible()
-  await expect(freezeButton).toBeDisabled()
+  await expect(sendButton).toBeDisabled()
   const coverLetterToggle = bodyRow.getByRole('button', { name: '展开全文' })
   await expect(coverLetterToggle).toHaveAttribute('aria-expanded', 'false')
   await coverLetterToggle.click()
@@ -1068,6 +1132,7 @@ async function exerciseWorkbench(page: Page) {
   await expect(partialRow.getByText('评论采集未完成，暂不判断无邮箱')).toBeVisible()
   await expect(partialRow.getByText('无可用邮箱')).toHaveCount(0)
 
+  await openPreciseFilters(panel)
   await panel.getByRole('combobox', { name: '附件筛选' }).selectOption('will_rename')
   await expect(bodyRow).toBeVisible()
   await expect(commentRow).toHaveCount(0)
@@ -1082,7 +1147,7 @@ async function exerciseWorkbench(page: Page) {
   await commentRow.getByRole('button', { name: /author@example\.test/ }).click()
   await expect(commentRow.getByText('帖主评论', { exact: true })).toBeVisible()
   await expect(commentRow.getByText('增长策略实习生-张三-北京大学-简历.pdf', { exact: true })).toBeVisible()
-  await expect(freezeButton).toBeEnabled()
+  await expect(sendButton).toBeEnabled()
 
   expect(capture.dryRuns).toHaveLength(2)
   expect(capture.dryRuns[0]).toMatchObject({
@@ -1099,13 +1164,40 @@ async function exerciseWorkbench(page: Page) {
   })
 
   await bodyRow.getByRole('checkbox').uncheck({ force: true })
-  await expect(freezeButton).toBeDisabled()
+  await expect(sendButton).toBeDisabled()
   await bodyRow.getByRole('checkbox').check({ force: true })
-  await expect(freezeButton).toBeDisabled()
+  await expect(sendButton).toBeDisabled()
+  await openMoreTools(panel)
+  if ((page.viewportSize()?.width || 0) <= 420) {
+    const moreToolsLayout = await panel.locator('details.batch-more-tools').evaluate((details) => {
+      const summary = details.querySelector(':scope > summary')
+      const menu = details.querySelector(':scope > .batch-more-tools-menu')
+      const actions = menu?.querySelector(':scope > .batch-more-actions')
+      const detailsBox = details.getBoundingClientRect()
+      const summaryBox = summary?.getBoundingClientRect()
+      const menuBox = menu?.getBoundingClientRect()
+      const actionsBox = actions?.getBoundingClientRect()
+      return {
+        detailsLeft: detailsBox.left,
+        detailsWidth: detailsBox.width,
+        summaryLeft: summaryBox?.left || 0,
+        summaryWidth: summaryBox?.width || 0,
+        menuLeft: menuBox?.left || 0,
+        menuWidth: menuBox?.width || 0,
+        actionsLeft: actionsBox?.left || 0,
+        actionsWidth: actionsBox?.width || 0,
+      }
+    })
+    expect(Math.abs(moreToolsLayout.summaryLeft - moreToolsLayout.detailsLeft)).toBeLessThanOrEqual(1)
+    expect(moreToolsLayout.summaryWidth).toBeGreaterThanOrEqual(moreToolsLayout.detailsWidth - 2)
+    expect(Math.abs(moreToolsLayout.menuLeft - moreToolsLayout.detailsLeft), JSON.stringify(moreToolsLayout)).toBeLessThanOrEqual(1)
+    expect(moreToolsLayout.menuWidth).toBeGreaterThanOrEqual(moreToolsLayout.detailsWidth - 2)
+    expect(moreToolsLayout.actionsWidth).toBeGreaterThanOrEqual(moreToolsLayout.menuWidth - 22)
+  }
   await panel.getByRole('button', { name: '仅保留可投递' }).click()
-  await expect(freezeButton).toBeEnabled()
-  const candidateRequestsBeforeFreeze = capture.candidateRequests.length
-  await freezeButton.click()
+  await expect(sendButton).toBeEnabled()
+  const candidateRequestsBeforeSend = capture.candidateRequests.length
+  await sendButton.click()
   const frozen = panel.getByRole('region', { name: '冻结批次预览' })
   const frozenItems = frozen.locator('.frozen-item-list')
   await expect(frozen).toBeVisible()
@@ -1122,15 +1214,11 @@ async function exerciseWorkbench(page: Page) {
   await expect(emailCards.nth(0).locator('.batch-email-preview-body')).toHaveText(/.+/u)
   await expect(emailCards.nth(0).getByText('Cover Letter 正文', { exact: false })).toBeVisible()
   await expect(emailCards.nth(1)).toContainText('author@example.test')
-  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeFreeze + 1)
+  await expect.poll(() => capture.candidateRequests.length).toBeGreaterThan(candidateRequestsBeforeSend)
   await expect(panel.locator('.batch-candidate-pagination')).toHaveAttribute('aria-busy', 'false')
 
-  const candidateRequestsBeforeApproval = capture.candidateRequests.length
-  await frozen.getByRole('button', { name: '审批' }).click()
-  await expect(panel.getByText('已审批', { exact: true })).toHaveText('已审批')
-  await expect(frozen.getByRole('button', { name: '开始' })).toBeEnabled()
-  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeApproval + 1)
-  await expect(panel.locator('.batch-candidate-pagination')).toHaveAttribute('aria-busy', 'false')
+  await expect(panel.locator('.batch-status-badge')).toHaveClass(/running/u)
+  await expect(sendButton).toBeDisabled()
   await expect(panel.locator('.batch-selection-summary')).toContainText('筛选外 0 · 无效 2')
   expect(capture.creates).toHaveLength(1)
   expect(capture.creates[0]).toMatchObject({
@@ -1147,6 +1235,7 @@ async function exerciseWorkbench(page: Page) {
   })
   expect(String(capture.creates[0].idempotencyKey)).toContain('8'.repeat(64))
   expect(capture.approvals).toEqual([{ expectedRevision: 1 }])
+  expect(capture.controls).toEqual([{ action: 'start', body: { expectedRevision: 2 } }])
 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
   if ((page.viewportSize()?.width || 0) >= 1_200) {
@@ -1159,9 +1248,9 @@ for (const viewport of [
   { name: 'desktop', width: 1440, height: 1_000 },
   { name: 'mobile', width: 390, height: 844 },
 ]) {
-  test(`批量投递工作台在 ${viewport.name} 完成证据确认、冻结与审批`, async ({ page }) => {
+  test(`批量投递工作台在 ${viewport.name} 完成预览并启动真实发送`, async ({ page }) => {
     await page.setViewportSize(viewport)
-    const { panel } = await exerciseWorkbench(page)
+    const { panel } = await exerciseWorkbench(page, viewport.name)
     await expect(panel).toBeVisible()
     await expect(panel.locator('.batch-status-badge')).toBeVisible()
     if (viewport.name === 'mobile') {
@@ -1179,6 +1268,9 @@ for (const viewport of [
       })
       expect(mobileRowLayout).toEqual({ childrenContained: true, cellsSeparated: true })
     }
+    await panel.locator('.batch-send-dock').screenshot({
+      path: `output/playwright/batch-application/send-dock-${viewport.name}.png`,
+    })
     await page.evaluate(() => {
       document.documentElement.style.scrollBehavior = 'auto'
       document.body.style.scrollBehavior = 'auto'
@@ -1197,6 +1289,8 @@ test('structured filters include matching roles beyond the first candidate page'
   await expect(panel.locator('tbody tr')).toHaveCount(25)
   await expect.poll(() => capture.candidateRequests.length).toBe(1)
   expect(new URL(capture.candidateRequests[0]).searchParams.get('limit')).toBe('50')
+  await showDetailedView(panel)
+  await openPreciseFilters(panel)
   const namingFilter = panel.getByRole('combobox', { name: '附件筛选' })
   await namingFilter.selectOption('will_rename')
   await expect.poll(() => capture.candidateRequests.length).toBe(2)
@@ -1215,7 +1309,7 @@ test('structured filters include matching roles beyond the first candidate page'
   await expect.poll(() => capture.candidateRequests.length).toBe(3)
 })
 
-test('page size 100 can select and Dry Run twenty-five applications in one batch', async ({ page }) => {
+test('page size 100 can select and preview twenty-five applications in one batch', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1_000 })
   const capture = await openWorkbench(page, null, paginatedApplications)
   const panel = page.getByRole('region', { name: '批量投递工作台' })
@@ -1229,7 +1323,7 @@ test('page size 100 can select and Dry Run twenty-five applications in one batch
   await panel.getByRole('button', { name: '清空' }).click()
   await panel.getByRole('button', { name: '选择当前页' }).click()
   await expect(panel.locator('.batch-selection-actions')).toContainText('已选 25 / 100')
-  await panel.getByRole('button', { name: 'Dry Run' }).click()
+  await panel.getByRole('button', { name: '预览邮件' }).click()
   await expect.poll(() => capture.dryRuns.length).toBe(1)
   const noteIds = capture.dryRuns[0].noteIds as string[]
   expect(noteIds).toHaveLength(25)
@@ -1237,16 +1331,15 @@ test('page size 100 can select and Dry Run twenty-five applications in one batch
   await expect(panel.getByText('投递预演完成：25 项全部就绪；本次不会发送邮件。', { exact: true })).toBeVisible()
 })
 
-test('missing email subject falls back to the rendered attachment naming rule in the table and Dry Run', async ({ page }) => {
+test('attachment-only naming stays separate from the generated email subject in the table and preview', async ({ page }) => {
   expect(rawAttachmentSubjectApplication.outreach.email_subject).toBe('')
   expect(attachmentSubjectApplication).toMatchObject({
     outreach: { email_subject: attachmentSubject },
     emailSubjectPreview: attachmentSubject,
     emailSubjectRequirement: {
-      detected: true,
-      source: 'attachment_requirement',
-      template: '学校-姓名-到岗时间',
-      attachmentTemplate: '学校-姓名-到岗时间.pdf',
+      detected: false,
+      source: 'generated_default',
+      template: '',
     },
   })
 
@@ -1255,16 +1348,17 @@ test('missing email subject falls back to the rendered attachment naming rule in
   const panel = page.getByRole('region', { name: '批量投递工作台' })
   const row = panel.locator('tbody tr').filter({ has: page.getByText('用户研究实习生', { exact: true }) })
 
+  await showDetailedView(panel)
   await expect(row.getByText('实际发送标题', { exact: true })).toBeVisible()
   await expect(row.locator('.batch-subject')).toHaveText(attachmentSubject)
   await expect(row.locator('.batch-subject')).not.toContainText('.pdf')
-  await expect(row.getByText('无独立邮件主题，已采用附件命名要求', { exact: true })).toBeVisible()
-  await expect(row.getByText('附件命名要求兜底', { exact: true })).toBeVisible()
-  await expect(row.getByText('来源附件模板：学校-姓名-到岗时间.pdf；发送时去掉文件扩展名并校验', { exact: true })).toBeVisible()
+  await expect(row.getByText('发送标题已就绪', { exact: true })).toBeVisible()
+  await expect(row.getByText('附件命名要求兜底', { exact: true })).toHaveCount(0)
+  await expect(row.getByText('文章附件格式', { exact: true })).toBeVisible()
   await expect(row.getByText('学校-姓名-到岗时间.pdf', { exact: true })).toBeVisible()
 
   await row.getByRole('checkbox').check({ force: true })
-  await panel.getByRole('button', { name: 'Dry Run' }).click()
+  await panel.getByRole('button', { name: '预览邮件' }).click()
   await expect.poll(() => capture.preflights.length).toBe(1)
   expect(capture.preflights[0].items[0]).toMatchObject({
     noteId: attachmentSubjectNoteId,
@@ -1272,10 +1366,8 @@ test('missing email subject falls back to the rendered attachment naming rule in
     payload: {
       subject: attachmentSubject,
       subjectRule: {
-        detected: true,
-        source: 'attachment_requirement',
-        template: '学校-姓名-到岗时间',
-        attachmentTemplate: '学校-姓名-到岗时间.pdf',
+        source: 'generated',
+        template: '{jobTitle}申请-{candidateName}',
       },
     },
   })
@@ -1296,10 +1388,11 @@ test('bulk one-click polish calls the versioned rewrite contract and reports par
   }
   await expect(panel.locator('.batch-selection-actions')).toContainText('已选 3 / 100')
 
-  await panel.getByRole('button', { name: 'Dry Run' }).click()
-  const freezeButton = panel.getByRole('button', { name: '冻结批次预览' })
-  await expect(freezeButton).toBeEnabled()
+  await panel.getByRole('button', { name: '预览邮件' }).click()
+  const sendButton = panel.getByRole('button', { name: '发送邮件', exact: true })
+  await expect(sendButton).toBeEnabled()
 
+  await openMoreTools(panel)
   const polishButton = panel.getByRole('button', { name: '批量一键润色', exact: true })
   await expect(polishButton).toBeEnabled()
   const candidateRequestsBeforePolish = capture.candidateRequests.length
@@ -1310,7 +1403,7 @@ test('bulk one-click polish calls the versioned rewrite contract and reports par
   await expect(progress).toContainText('已处理 3/3')
   await expect(progress).toContainText('成功 2 · 失败 1')
   await expect(panel.getByText(/批量润色完成：成功 2 条，失败 1 条.*fixture rewrite failed.*旧投递预演已失效。/u)).toBeVisible()
-  await expect(freezeButton).toBeDisabled()
+  await expect(sendButton).toBeDisabled()
   await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforePolish + 1)
 
   expect(capture.rewrites).toHaveLength(3)
@@ -1340,6 +1433,7 @@ test('bulk one-click polish calls the versioned rewrite contract and reports par
 
   const successfulRow = panel.locator('tbody tr').filter({ has: page.getByText(selectedApplications[0].title, { exact: true }) })
   const failedRow = panel.locator('tbody tr').filter({ has: page.getByText(selectedApplications[1].title, { exact: true }) })
+  await showDetailedView(panel)
   await expect(successfulRow.getByTestId(`batch-cover-letter-${selectedApplications[0].note_id}`)).toContainText('批量润色后的岗位 1专属 Cover Letter')
   await expect(successfulRow.locator('.batch-subject')).toHaveText('岗位 1申请-批量润色')
   await expect(failedRow.getByTestId(`batch-cover-letter-${selectedApplications[1].note_id}`)).toContainText('这是针对岗位 2岗位准备的求职文案')
@@ -1381,6 +1475,7 @@ test('candidate pagination loads one server page and keeps cross-page selection 
   await panel.getByTitle('下一页待投岗位').click()
   await expect(page21Row.getByRole('checkbox')).toBeChecked()
   await expect.poll(() => capture.candidateRequests.length).toBe(3)
+  await openPreciseFilters(panel)
   await panel.getByRole('combobox', { name: '附件筛选' }).selectOption('will_rename')
   await expect(panel.getByText('岗位 25', { exact: true })).toBeVisible()
   await expect.poll(() => capture.candidateRequests.length).toBe(4)
@@ -1388,7 +1483,7 @@ test('candidate pagination loads one server page and keeps cross-page selection 
   await panel.getByRole('combobox', { name: '附件筛选' }).selectOption('all')
   await expect(panel.getByText('岗位 1', { exact: true })).toBeVisible()
   await expect.poll(() => capture.candidateRequests.length).toBe(4)
-  await panel.getByRole('button', { name: 'Dry Run' }).click()
+  await panel.getByRole('button', { name: '预览邮件' }).click()
   await expect.poll(() => capture.dryRuns.length).toBe(1)
   expect(capture.dryRuns[0]).toMatchObject({
     noteIds: ['note-page-01', 'note-page-21'],
@@ -1438,21 +1533,21 @@ test('changing the attachment naming rule invalidates the current preflight', as
   await page.setViewportSize({ width: 1440, height: 1_000 })
   const capture = await openWorkbench(page)
   const panel = page.getByRole('region', { name: '批量投递工作台' })
-  const freezeButton = panel.getByRole('button', { name: '冻结批次预览' })
+  const sendButton = panel.getByRole('button', { name: '发送邮件', exact: true })
 
-  await panel.getByRole('button', { name: 'Dry Run' }).click()
-  await expect(freezeButton).toBeEnabled()
-  await panel.locator('.batch-settings summary').click()
+  await panel.getByRole('button', { name: '预览邮件' }).click()
+  await expect(sendButton).toBeEnabled()
+  await openMoreTools(panel)
   await panel.locator('.batch-settings input').first().fill('{candidateName}-{jobTitle}-定制简历')
   await expect(panel.getByText('附件命名规则已变化，请重新运行投递预演。', { exact: true })).toBeVisible()
-  await expect(freezeButton).toBeDisabled()
-  await panel.getByRole('button', { name: 'Dry Run' }).click()
-  await expect(freezeButton).toBeEnabled()
+  await expect(sendButton).toBeDisabled()
+  await panel.getByRole('button', { name: '预览邮件' }).click()
+  await expect(sendButton).toBeEnabled()
   expect(capture.dryRuns).toHaveLength(2)
   expect(capture.dryRuns[1]).toMatchObject({ defaultAttachmentTemplate: '{candidateName}-{jobTitle}-定制简历' })
 })
 
-test('standalone batch workbench searches source email before Dry Run', async ({ page }) => {
+test('standalone batch workbench searches source email before preview', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1_000 })
   const capture = await openWorkbench(page)
   const panel = page.getByRole('region', { name: '批量投递工作台' })
@@ -1461,8 +1556,9 @@ test('standalone batch workbench searches source email before Dry Run', async ({
   await expect(panel.getByTitle('展开批量投递工作台')).toHaveCount(0)
   await expect(panel.locator('.batch-application-body')).toBeVisible()
   await expect(page.locator('.results-workspace .result-row')).toHaveCount(0)
-  await expect(page.getByText('选择、预检、审批、发送', { exact: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '批量投递', exact: true })).toBeVisible()
 
+  await showDetailedView(panel)
   const search = panel.getByPlaceholder('搜索岗位、邮箱、主题或附件名')
   await expect(panel.getByText('文章附件格式', { exact: true })).toBeVisible()
   await expect(panel.getByText('姓名-学校-岗位-简历.pdf', { exact: true })).toBeVisible()
@@ -1485,14 +1581,14 @@ test('standalone batch workbench searches source email before Dry Run', async ({
   await expect(panel.getByRole('button', { name: '查看图片证据' })).toBeVisible()
   await panel.locator('tbody input[type="checkbox"]').check()
   await expect(panel.locator('.batch-selection-actions')).toContainText('已选 1 / 100')
-  await panel.getByRole('button', { name: 'Dry Run' }).click()
+  await panel.getByRole('button', { name: '预览邮件' }).click()
   await expect(panel.getByText('图片 OCR · 已自动还原', { exact: true })).toBeVisible()
   await expect(panel.locator('.batch-contact-evidence').filter({ hasText: normalizedImageEvidence })).toBeVisible()
   expect(capture.resultQueries).toContain('1396334506@qq.com')
   expect(capture.dryRuns).toHaveLength(1)
 
   await panel.getByRole('button', { name: '查看图片证据' }).click()
-  await expect(page).toHaveURL(/\/$/u)
+  await expect(page).toHaveURL(/\/?\?screen=workspace$/u)
   const routeSection = page.locator('.result-detail .route-section')
   await expect(routeSection).toContainText('1396334506@qq.com')
   await expect(routeSection).toContainText('图中识别 · 已自动还原')
@@ -1506,10 +1602,11 @@ test('job body and batch delivery use separate interfaces', async ({ page }) => 
   const batchPanel = page.getByRole('region', { name: '批量投递工作台' })
   const bodyRow = batchPanel.locator('tbody tr').filter({ hasText: '产品经理' })
 
+  await showDetailedView(batchPanel)
   await expect(bodyRow.getByText(/正文已保存 · \d+ 字/u)).toBeVisible()
   await bodyRow.getByRole('button', { name: '查看正文' }).click()
 
-  await expect(page).toHaveURL(/\/$/u)
+  await expect(page).toHaveURL(/\/?\?screen=workspace$/u)
   await expect(page).toHaveTitle('今天你投了吗？｜岗位与投递')
   await expect(page.getByRole('alertdialog', { name: '当前文案尚未保存' })).toHaveCount(0)
   await expect(page.getByRole('region', { name: '批量投递工作台' })).toHaveCount(0)
@@ -1528,9 +1625,19 @@ test('job body and batch delivery use separate interfaces', async ({ page }) => 
   await page.screenshot({ path: 'output/playwright/batch-application/job-body-mobile.png' })
 
   await page.getByRole('navigation', { name: '切换工作台' }).getByRole('button', { name: '批量投递' }).click()
-  await expect(page).toHaveURL(/\/batch$/u)
+  await expect(page).toHaveURL(/\/batch\?screen=workspace$/u)
   await expect(page).toHaveTitle('今天你投了吗？｜批量投递工作台')
   await expect(page.locator('.results-workspace')).toHaveCount(0)
+  await expect(page.getByRole('region', { name: '批量投递工作台' })).toBeVisible()
+
+  const workflowNav = page.getByRole('navigation', { name: '任务流程' })
+  await expect(workflowNav.locator('.nav-button-label')).toHaveText(['总览', '环境', '新建', '结果', '投递', '历史', '文件'])
+  await workflowNav.getByRole('button', { name: '历史', exact: true }).click()
+  await expect(page).toHaveURL(/\/?\?screen=history$/u)
+  await expect(page.getByRole('heading', { name: /全部历史任务/u })).toBeVisible()
+  await expect(page.getByRole('region', { name: '批量投递工作台' })).toHaveCount(0)
+  await workflowNav.getByRole('button', { name: '投递', exact: true }).click()
+  await expect(page).toHaveURL(/\/batch\?screen=workspace$/u)
   await expect(page.getByRole('region', { name: '批量投递工作台' })).toBeVisible()
 })
 
@@ -1577,6 +1684,70 @@ test('product workbench shows three sent emails with their exact content and fil
   await panel.screenshot({ path: 'output/playwright/batch-application/sent-three-emails-product.png' })
 })
 
+test('delivery copy can be edited, persisted, and clearly leads to the real send action', async ({ page }) => {
+  await page.setViewportSize({ width: 1_440, height: 1_000 })
+  const capture = await openWorkbench(page)
+  const panel = page.getByRole('region', { name: '批量投递工作台' })
+  const bodyRow = panel.locator('tbody tr').filter({ hasText: '产品经理' })
+  const sendDock = panel.getByRole('region', { name: '批量投递操作' })
+
+  await expect(sendDock.getByText(/个岗位待预览/u)).toBeVisible()
+  await expect(sendDock.getByRole('button', { name: '预览邮件' })).toBeVisible()
+  await expect(sendDock.getByRole('button', { name: '发送邮件', exact: true })).toBeVisible()
+
+  await showDetailedView(panel)
+  await bodyRow.getByRole('button', { name: '编辑正文' }).click()
+  const editor = bodyRow.getByTestId(`batch-copy-editor-${bodyNoteId}`)
+  await expect(editor).toBeVisible()
+  await editor.getByLabel(`邮件标题 ${bodyNoteId}`).fill('产品经理申请-可编辑版本')
+  await editor.getByLabel(`邮件正文 ${bodyNoteId}`).fill('这是保存后的邮件正文，可在批量投递页面直接修改。')
+  await editor.getByLabel(`Cover Letter ${bodyNoteId}`).fill('这是保存后的 Cover Letter，可在刷新后继续用于投递。')
+  await editor.getByRole('button', { name: '保存正文' }).click()
+
+  await expect.poll(() => capture.draftSaves.length).toBe(1)
+  expect(capture.draftSaves[0]).toMatchObject({
+    noteId: bodyNoteId,
+    outreach: {
+      email_subject: '产品经理申请-可编辑版本',
+      email_body: '这是保存后的邮件正文，可在批量投递页面直接修改。',
+      cover_letter: '这是保存后的 Cover Letter，可在刷新后继续用于投递。',
+    },
+  })
+  await expect(panel.getByText(/正文已保存为 v2/u)).toBeVisible()
+  await expect(bodyRow.getByTestId(`batch-email-body-${bodyNoteId}`)).toHaveText('这是保存后的邮件正文，可在批量投递页面直接修改。')
+  await expect(bodyRow.getByTestId(`batch-cover-letter-${bodyNoteId}`)).toHaveText('这是保存后的 Cover Letter，可在刷新后继续用于投递。')
+  await expect(sendDock.getByRole('button', { name: '预览邮件' })).toBeEnabled()
+  await panel.screenshot({ path: 'output/playwright/batch-application/editable-copy-and-send-dock.png' })
+})
+
+test('delivery copy editor adopts the server-resolved email subject after save', async ({ page }) => {
+  const requiredSubject = '产品经理实习申请｜王梓榆｜南京大学'
+  const capture = await openWorkbench(page, null, applications, {
+    savedDraftSubjectByNoteId: { [bodyNoteId]: requiredSubject },
+  })
+  const panel = page.getByRole('region', { name: '批量投递工作台' })
+  const bodyRow = panel.locator('tbody tr').filter({ hasText: '产品经理' })
+
+  await showDetailedView(panel)
+  await bodyRow.getByRole('button', { name: '编辑正文' }).click()
+  const editor = bodyRow.getByTestId(`batch-copy-editor-${bodyNoteId}`)
+  await editor.getByLabel(`邮件标题 ${bodyNoteId}`).fill('学校+年级+专业+姓名+可实习X月')
+  await editor.getByLabel(`邮件正文 ${bodyNoteId}`).fill('这是更新后的邮件正文。')
+  await editor.getByLabel(`Cover Letter ${bodyNoteId}`).fill('这是更新后的 Cover Letter。')
+  await editor.getByRole('button', { name: '保存正文' }).click()
+
+  await expect.poll(() => capture.draftSaves.length).toBe(1)
+  expect(capture.draftSaves[0]).toMatchObject({
+    noteId: bodyNoteId,
+    outreach: { email_subject: '学校+年级+专业+姓名+可实习X月' },
+  })
+  await expect(panel.getByText('邮件标题已按岗位要求更新，请重新运行投递预演后再发送。', { exact: false })).toBeVisible()
+  await expect(bodyRow).toContainText(requiredSubject)
+
+  await bodyRow.getByRole('button', { name: '编辑正文' }).click()
+  await expect(bodyRow.getByLabel(`邮件标题 ${bodyNoteId}`)).toHaveValue(requiredSubject)
+})
+
 test('batch workbench controls start, pause, resume, and cancel with current revisions', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1_000 })
   const { panel, capture } = await exerciseWorkbench(page)
@@ -1590,22 +1761,19 @@ test('batch workbench controls start, pause, resume, and cancel with current rev
   await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeSentFilter + 1)
 
   let candidateRequestCount = capture.candidateRequests.length
-  await controls.getByRole('button', { name: '开始' }).click()
   await expect(status).toHaveClass(/running/u)
-  await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestCount + 1)
-  candidateRequestCount += 1
-  await expect(panel.locator('.batch-selection-summary')).toContainText('筛选外 2 · 无效 0 · 修订缺失 2，请重新加载')
-  await expect(panel.getByRole('button', { name: 'Dry Run' })).toBeDisabled()
+  await expect(panel.locator('.batch-selection-summary')).toContainText('筛选外 2 · 无效 0')
+  await expect(panel.getByRole('button', { name: '预览邮件' })).toBeDisabled()
 
-  await controls.getByRole('button', { name: '暂停' }).click()
+  await controls.getByRole('button', { name: '暂停发送' }).click()
   await expect(status).toHaveClass(/paused/u)
   await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestCount + 1)
   candidateRequestCount += 1
-  await controls.getByRole('button', { name: '恢复' }).click()
+  await controls.getByRole('button', { name: '继续发送' }).click()
   await expect(status).toHaveClass(/running/u)
   await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestCount + 1)
   candidateRequestCount += 1
-  await controls.getByRole('button', { name: '取消' }).click()
+  await controls.getByRole('button', { name: '取消未发送邮件' }).click()
   await expect(status).toHaveClass(/cancelled/u)
   await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestCount + 1)
 
@@ -1633,7 +1801,7 @@ test('batch revision drops a page cursor and reloads candidate eligibility from 
   expect(new URL(capture.candidateRequests.at(-1)!).searchParams.get('cursor')).toBe('20')
 
   const candidateRequestsBeforeStart = capture.candidateRequests.length
-  await panel.locator('.batch-control-actions').getByRole('button', { name: '开始' }).click()
+  await panel.getByRole('region', { name: '批量投递操作' }).getByRole('button', { name: '发送邮件', exact: true }).click()
   await expect(panel.locator('.batch-status-badge')).toHaveClass(/running/u)
   await expect.poll(() => capture.candidateRequests.length).toBe(candidateRequestsBeforeStart + 1)
   await expect(panel.getByText('岗位 1', { exact: true })).toBeVisible()

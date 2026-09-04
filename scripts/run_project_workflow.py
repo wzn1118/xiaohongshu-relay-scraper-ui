@@ -504,6 +504,21 @@ def collect_body_checkpoint(
     )
 
 
+def should_run_analysis_stage(
+    state: WorkflowStateSession,
+    *,
+    body_ran: bool,
+    complete_missing_only: bool,
+) -> bool:
+    return state.should_run(
+        "analysis",
+        # A quality-gate retry deliberately revisits analysis even when the
+        # previous analysis checkpoint is complete, so it can regenerate the
+        # blocked drafts and revalidate their evidence.
+        force=body_ran or complete_missing_only or state.resume_scope == "analysis",
+    )
+
+
 def load_application_checkpoint(output_dir: Path) -> dict[str, Any] | None:
     for filename in ("application_intelligence.checkpoint.json", "application_intelligence.json"):
         path = output_dir / filename
@@ -1167,6 +1182,78 @@ def load_body_summary(output_dir: Path) -> dict[str, Any]:
     return summary or checkpoint_body_summary(output_dir, stop_reason="checkpoint_reused")
 
 
+def build_raw_collection_summary(
+    analysis_mode: str,
+    body_summary: dict[str, Any],
+) -> dict[str, Any]:
+    empty_gate = {"discovered_count": 0, "body_count": 0}
+    body_metrics = canonical_body_metrics(body_summary, empty_gate)
+    pending_count = max(
+        0,
+        int(body_metrics.get("discovered") or 0) - int(body_metrics.get("succeeded") or 0),
+    )
+    passed = bool(body_summary.get("passed")) and pending_count == 0
+    stop_reason = str(body_summary.get("stopReason") or "")
+    rate_limit = body_summary.get("rateLimit")
+    security_verification = body_summary.get("securityVerification")
+    issues = [] if passed else [{
+        "code": stop_reason or "body_collection_incomplete",
+        "message": (
+            f"Raw collection has {pending_count} body records still pending."
+            if pending_count
+            else "Raw collection did not pass its body-completion checks."
+        ),
+    }]
+    return {
+        "schemaVersion": 1,
+        "runner": "xiaohongshu-project-workflow",
+        "status": "succeeded" if passed else "completed_partial",
+        "taskMode": analysis_mode,
+        "analysisMode": analysis_mode,
+        "rawCollection": True,
+        "postprocessSkipped": True,
+        "analysisSkipped": True,
+        "analysisSkipReason": "raw_collection_requested",
+        "collectionStopReason": stop_reason,
+        "securityVerification": security_verification if isinstance(security_verification, dict) else {},
+        "rateLimit": rate_limit if isinstance(rate_limit, dict) else {},
+        "generatedAt": utc_now(),
+        "cardsDiscovered": body_metrics["discovered"],
+        "notesCollected": body_metrics["succeeded"],
+        "bodiesCaptured": body_metrics["succeeded"],
+        "bodyCoveragePercent": body_metrics["completionRatePercent"],
+        "discovered": body_metrics["discovered"],
+        "bodyAttempted": body_metrics["attempted"],
+        "bodySucceeded": body_metrics["succeeded"],
+        "bodyFailed": body_metrics["failed"],
+        "bodyNotAttempted": body_metrics["notAttempted"],
+        "bodyBlocked": body_metrics["blocked"],
+        "bodyCancelled": body_metrics["cancelled"],
+        "bodyStatisticsSource": body_metrics["statisticsSource"],
+        "legacyInferred": body_metrics["legacyInferred"],
+        "bodyMetrics": body_metrics,
+        "bodyCompletionLedger": body_summary.get("bodyCompletionLedger"),
+        "sourceCoverage": {
+            "status": "partial" if pending_count else "complete",
+            "reason": body_collection_deferred_reason(body_summary) if pending_count else "",
+            "targetCount": body_metrics["discovered"],
+            "readyCount": body_metrics["succeeded"],
+            "pendingCount": pending_count,
+            "totalRecordCount": body_metrics["discovered"],
+            "fullBodyCount": body_metrics["succeeded"],
+            "statisticsSource": body_metrics["statisticsSource"],
+        },
+        "qualityPending": not passed,
+        "qualityPassed": 1 if passed else 0,
+        "checks": {
+            "bodyCollectionPassed": passed,
+            "bodyCoverageComplete": pending_count == 0,
+            "analysisSkippedByRequest": True,
+        },
+        "issues": issues,
+    }
+
+
 def finish_artifact_state(
     state: WorkflowStateSession | None,
     output_dir: Path,
@@ -1444,13 +1531,69 @@ def main_stateful(
         )
         return 0 if body_summary.get("passed") else 3
 
+    if "--skip-postprocess" in unlimited_arguments:
+        analysis_ran = state.should_run("analysis", force=body_ran)
+        if analysis_ran:
+            state.restart_stage("analysis", {
+                "records": {},
+                "totalCount": 0,
+                "completedCount": 0,
+                "remainingCount": 0,
+                "skipReason": "raw_collection_requested",
+            })
+            state.finish_stage("analysis", "completed", {
+                "records": {},
+                "totalCount": 0,
+                "completedCount": 0,
+                "remainingCount": 0,
+                "skipReason": "raw_collection_requested",
+            })
+
+        summary = build_raw_collection_summary(wrapper.analysis_mode, body_summary)
+        passed = summary["status"] == "succeeded"
+        emit_stage(4, "raw-content-and-images")
+        emit_stage(5, "postprocess", "disabled")
+        emit_stage(6, "ai-analysis", "disabled")
+        emit_stage(7, "collection-quality-check", "passed" if passed else "failed")
+
+        artifact_force = analysis_ran or body_ran
+        if state.should_run("artifacts", force=artifact_force):
+            state.start_stage("artifacts")
+            try:
+                atomic_json(output_dir / "workflow-summary.json", summary)
+                emit_stage(8, "collection-artifacts", "passed" if passed else "failed")
+                manifest_path = write_project_manifest(output_dir, summary)
+                finish_artifact_state(state, output_dir, manifest_path)
+            except BaseException as error:
+                fail_state_stage(state, "artifacts", error)
+                raise
+        elif state.scope_selects("artifacts"):
+            print(
+                f"WORKFLOW_STAGE artifacts skipped status={state.stage_status('artifacts')}",
+                flush=True,
+            )
+
+        print(
+            "RAW_COLLECTION_COMPLETE "
+            f"discovered={summary['discovered']} "
+            f"succeeded={summary['bodySucceeded']} "
+            f"failed={summary['bodyFailed']} "
+            f"pending={summary['sourceCoverage']['pendingCount']}",
+            flush=True,
+        )
+        return 0 if passed else 3
+
     only_incomplete = resume_in_place or state.resume_scope != "full"
     previous_application = load_application_checkpoint(output_dir) if only_incomplete else None
     payload: dict[str, Any] | None = load_application_checkpoint(output_dir)
     deferred_reason = ""
     source_pending_reason = ""
     source_pending_count = 0
-    analysis_ran = state.should_run("analysis", force=body_ran)
+    analysis_ran = should_run_analysis_stage(
+        state,
+        body_ran=body_ran,
+        complete_missing_only=wrapper.complete_missing_only,
+    )
     if analysis_ran:
         state.start_stage("analysis")
         try:

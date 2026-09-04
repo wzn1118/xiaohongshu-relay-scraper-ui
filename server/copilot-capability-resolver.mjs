@@ -1,11 +1,20 @@
-const DEFAULT_LIMIT = 12;
+const DEFAULT_LIMIT = 24;
 const ALWAYS_AVAILABLE = Object.freeze([
   'tool.search',
   'tool.describe',
   'dataset.list',
+  'workspace.list',
+  'workspace.read',
+  'agent.delegate',
+  'agent.status',
 ]);
 
 const DOMAIN_HINTS = Object.freeze([
+  { pattern: /(?:\bsubagents?\b|\bdelegate\b|\bspecialists?\b|\bparallel\b|\u5b50agent|\u5b50\u4ee3\u7406|\u59d4\u6d3e|\u5e76\u884c|\u5206\u5de5)/iu, prefixes: ['agent.'] },
+  { pattern: /(?:\bworkspace\b|\bfiles?\b|\bfolders?\b|\bdirector(?:y|ies)\b|\brepositor(?:y|ies)\b|\bsource\b|\bcode\b|\bpatch\b|\bedit\b|\bread\b|\bwrite\b|\u6587\u4ef6|\u76ee\u5f55|\u5de5\u4f5c\u533a|\u4ee3\u7801|\u6e90\u7801|\u4fee\u6539|\u8865\u4e01)/iu, prefixes: ['workspace.'] },
+  { pattern: /(?:\bexec\b|\bshell\b|\bterminal\b|\bcommand\b|\bpowershell\b|\bbash\b|\bnpm\b|\bnode\b|\bpython\b|\btests?\b|\bbuild\b|\brun\b|\u547d\u4ee4|\u7ec8\u7aef|\u6267\u884c|\u8fd0\u884c|\u6d4b\u8bd5|\u6784\u5efa)/iu, prefixes: ['exec.'] },
+  { pattern: /(?:\bhttps?\b|\bapi\b|\burls?\b|\brequest\b|\bendpoint\b|\bfetch\b|\u63a5\u53e3|\u8bf7\u6c42|\u7f51\u5740|\u94fe\u63a5)/iu, prefixes: ['http.'] },
+  { pattern: /(?:\bmcp\b|\bmodel context protocol\b|\btool server\b|\u6a21\u578b\u4e0a\u4e0b\u6587\u534f\u8bae|\u5de5\u5177\u670d\u52a1\u5668)/iu, prefixes: ['mcp.'] },
   { pattern: /(?:\bjobs?\b|\bapplications?\b|岗位|职位|投递)/iu, prefixes: ['jobs.', 'applications.', 'records.'] },
   { pattern: /(?:\bposts?\b|\bcontent\b|正文|原帖|帖子|笔记|图片)/iu, prefixes: ['content.', 'records.', 'dataset.'] },
   { pattern: /(?:\baudience\b|\bcomments?\b|\busers?\b|评论|回复|用户|受众|主页)/iu, prefixes: ['audience.', 'comments.', 'users.', 'records.'] },
@@ -18,13 +27,13 @@ const DOMAIN_HINTS = Object.freeze([
 
 export class CopilotCapabilityResolver {
   constructor({ maximumTools = DEFAULT_LIMIT, minimumTools = 6 } = {}) {
-    this.maximumTools = bounded(maximumTools, DEFAULT_LIMIT, 4, 24);
+    this.maximumTools = bounded(maximumTools, DEFAULT_LIMIT, 4, 48);
     this.minimumTools = bounded(minimumTools, 6, 3, this.maximumTools);
   }
 
   resolve(catalog, { query = '', activeToolNames = [], plan = null, limit = this.maximumTools } = {}) {
     const definitions = normalizeCatalog(catalog);
-    const maximum = bounded(limit, this.maximumTools, this.minimumTools, 24);
+    const maximum = bounded(limit, this.maximumTools, this.minimumTools, 48);
     const byName = new Map(definitions.map((definition) => [definition.name, definition]));
     const planText = plan && typeof plan === 'object'
       ? JSON.stringify({ objective: plan.objective, steps: plan.steps })

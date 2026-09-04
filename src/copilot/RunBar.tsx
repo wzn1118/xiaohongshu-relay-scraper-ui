@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronUp, Clock3, Database, Square, Workflow } from 'lucide-react'
+import { Bot, ChevronDown, ChevronUp, Clock3, Database, RotateCcw, Square, Workflow } from 'lucide-react'
 
 import type { WorkbenchProjection } from './workbench-types'
 
@@ -6,12 +6,16 @@ export function RunBar({
   projection,
   sourceCount,
   onCancel,
+  onRetry,
+  retryDisabled = false,
   collapsed,
   onToggleCollapse,
 }: {
   projection: WorkbenchProjection
   sourceCount: number
   onCancel?: () => void
+  onRetry?: () => void
+  retryDisabled?: boolean
   collapsed: boolean
   onToggleCollapse: () => void
 }) {
@@ -27,7 +31,8 @@ export function RunBar({
         <span style={{ width: `${projection.progress}%` }} />
       </div>
       <div className="copilot-run-metrics">
-        <span title="执行节点"><Workflow size={13} aria-hidden="true" />{projection.completedNodes}/{projection.nodes.length}</span>
+        <span title="执行节点"><Workflow size={13} aria-hidden="true" />{projection.completedNodes}/{projection.totalNodes}</span>
+        {projection.subagentRunCount ? <span title="子 Agent 运行"><Bot size={13} aria-hidden="true" />{projection.subagentRunCount}</span> : null}
         <span title="已连接数据源"><Database size={13} aria-hidden="true" />{sourceCount}</span>
         <span title="会话用时"><Clock3 size={13} aria-hidden="true" />{formatDuration(projection.elapsedMs)}</span>
       </div>
@@ -35,6 +40,18 @@ export function RunBar({
         {active && onCancel ? (
           <button className="copilot-run-action" type="button" title="停止运行" aria-label="停止运行" onClick={onCancel}>
             <Square size={12} fill="currentColor" aria-hidden="true" />
+          </button>
+        ) : null}
+        {!active && onRetry ? (
+          <button
+            className="copilot-run-retry"
+            type="button"
+            title="重试"
+            aria-label="重试"
+            disabled={retryDisabled}
+            onClick={onRetry}
+          >
+            <RotateCcw size={13} aria-hidden="true" />
           </button>
         ) : null}
         <button

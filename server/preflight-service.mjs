@@ -79,7 +79,9 @@ function createDefaultChecks(service) {
       blocking: true,
       action: 'Reconnect the AI provider so the server receives a valid session.',
       run: async ({ params }) => {
-        if (params.useCodexRuntime === false) return passed('AI processing is disabled for this run.', { enabled: false });
+        if (params.skipPostprocess === true || params.useCodexRuntime === false) {
+          return passed('AI processing is disabled for this raw collection run.', { enabled: false, rawCollection: params.skipPostprocess === true });
+        }
         if (!params.aiSessionId) return blocked('No AI provider session is configured.', { errorCode: 'AI_SESSION_MISSING' });
         try {
           const session = service.operations.resolveAiSession
@@ -97,7 +99,9 @@ function createDefaultChecks(service) {
       blocking: true,
       action: 'Select a model and verify its Base URL and wire API.',
       run: async ({ params }) => {
-        if (params.useCodexRuntime === false) return passed('AI model validation is not required for this run.', { enabled: false });
+        if (params.skipPostprocess === true || params.useCodexRuntime === false) {
+          return passed('AI model validation is not required for this raw collection run.', { enabled: false, rawCollection: params.skipPostprocess === true });
+        }
         if (!params.aiSessionId) return blocked('No AI model configuration is available.', { errorCode: 'AI_SESSION_MISSING' });
         try {
           const session = service.operations.resolveAiSession

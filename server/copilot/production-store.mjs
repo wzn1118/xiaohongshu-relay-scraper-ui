@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 4;
 
 export class CopilotProductionStore {
   constructor({ rootDir = 'data', now = () => new Date(), filePath = '' } = {}) {
@@ -192,10 +192,96 @@ export class CopilotProductionStore {
       );
       CREATE INDEX IF NOT EXISTS evidence_claims_run
         ON evidence_claims(run_id, created_at);
+      CREATE TABLE IF NOT EXISTS mcp_grants (
+        grant_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        token_prefix TEXT NOT NULL DEFAULT '',
+        name TEXT NOT NULL DEFAULT 'Local MCP access',
+        owner TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        manifest_hash TEXT NOT NULL DEFAULT '',
+        mode TEXT NOT NULL,
+        scopes_json TEXT NOT NULL DEFAULT '[]',
+        allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+        allowed_resources_json TEXT NOT NULL DEFAULT '[]',
+        max_risk TEXT NOT NULL DEFAULT 'approval_required',
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT NOT NULL DEFAULT '',
+        last_used_at TEXT NOT NULL DEFAULT '',
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS mcp_grants_owner_created
+        ON mcp_grants(owner, created_at DESC);
+      CREATE INDEX IF NOT EXISTS mcp_grants_conversation_status
+        ON mcp_grants(conversation_id, status);
+      CREATE TABLE IF NOT EXISTS mcp_sessions (
+        session_id TEXT PRIMARY KEY,
+        grant_id TEXT NOT NULL,
+        transport TEXT NOT NULL DEFAULT 'streamable-http',
+        status TEXT NOT NULL DEFAULT 'active',
+        client_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        closed_at TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS mcp_sessions_grant_status
+        ON mcp_sessions(grant_id, status, last_seen_at DESC);
+      CREATE TABLE IF NOT EXISTS mcp_tool_runs (
+        call_id TEXT PRIMARY KEY,
+        grant_id TEXT NOT NULL,
+        session_id TEXT NOT NULL DEFAULT '',
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        action_hash TEXT NOT NULL DEFAULT '',
+        tool_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        result_json TEXT NOT NULL DEFAULT 'null',
+        error_json TEXT NOT NULL DEFAULT '{}',
+        approval_id TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL DEFAULT '',
+        UNIQUE(grant_id, idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS mcp_tool_runs_grant_started
+        ON mcp_tool_runs(grant_id, started_at DESC);
+      CREATE TABLE IF NOT EXISTS mcp_audit (
+        audit_id TEXT PRIMARY KEY,
+        grant_id TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL DEFAULT '',
+        owner TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL,
+        status TEXT NOT NULL,
+        detail_json TEXT NOT NULL DEFAULT '{}',
+        occurred_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS mcp_audit_occurred
+        ON mcp_audit(occurred_at DESC);
+    `);
+    ensureSqliteColumn(this.database, 'mcp_grants', 'token_prefix', "TEXT NOT NULL DEFAULT ''");
+    ensureSqliteColumn(this.database, 'mcp_grants', 'name', "TEXT NOT NULL DEFAULT 'Local MCP access'");
+    ensureSqliteColumn(this.database, 'mcp_grants', 'manifest_hash', "TEXT NOT NULL DEFAULT ''");
+    ensureSqliteColumn(this.database, 'mcp_grants', 'allowed_resources_json', "TEXT NOT NULL DEFAULT '[]'");
+    ensureSqliteColumn(this.database, 'mcp_grants', 'max_risk', "TEXT NOT NULL DEFAULT 'approval_required'");
+    ensureSqliteColumn(this.database, 'mcp_tool_runs', 'action_hash', "TEXT NOT NULL DEFAULT ''");
+    this.database.exec(`
+      UPDATE mcp_grants
+      SET manifest_hash = COALESCE((
+        SELECT snapshots.manifest_hash
+        FROM snapshots
+        WHERE snapshots.job_id = mcp_grants.job_id
+          AND snapshots.snapshot_id = mcp_grants.snapshot_id
+      ), '')
+      WHERE manifest_hash = '';
     `);
     const appliedAt = this.now().toISOString();
     this.database.prepare(`INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (1, 'legacy-production-state', ?)`).run(appliedAt);
     this.database.prepare(`INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (2, 'durable-agent-runtime', ?)`).run(appliedAt);
+    this.database.prepare(`INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (3, 'mcp-access-plane', ?)`).run(appliedAt);
+    this.database.prepare(`INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (4, 'mcp-grant-snapshot-boundaries', ?)`).run(appliedAt);
   }
 
   describe() {
@@ -466,20 +552,36 @@ export class CopilotProductionStore {
     const normalized = jsonObject(manifest);
     const encoded = stableJson(normalized);
     const manifestHash = sha256(encoded);
+    const normalizedJobId = required(jobId, 'jobId');
+    const normalizedSnapshotId = required(snapshotId, 'snapshotId');
+    const current = this.getSnapshot(normalizedJobId, normalizedSnapshotId);
+    if (current && current.manifestHash !== manifestHash) {
+      throw storeError(
+        'COPILOT_SNAPSHOT_COLLISION',
+        `Snapshot ${normalizedSnapshotId} already exists with different content. Advance the task revision before creating a new snapshot.`,
+        409,
+      );
+    }
     this.database.prepare(`
       INSERT INTO snapshots (
         job_id, snapshot_id, revision, manifest_json, manifest_hash, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(job_id, snapshot_id) DO NOTHING
-    `).run(required(jobId, 'jobId'), required(snapshotId, 'snapshotId'), integer(revision), encoded, manifestHash, now, now);
-    return this.getSnapshot(jobId, snapshotId);
+    `).run(normalizedJobId, normalizedSnapshotId, integer(revision), encoded, manifestHash, now, now);
+    return this.getSnapshot(normalizedJobId, normalizedSnapshotId);
   }
 
   getSnapshot(jobId, snapshotId) {
     const row = this.database.prepare(`
       SELECT * FROM snapshots WHERE job_id = ? AND snapshot_id = ?
     `).get(required(jobId, 'jobId'), required(snapshotId, 'snapshotId'));
-    return row ? snapshotRecord(row) : null;
+    if (!row) return null;
+    const snapshot = snapshotRecord(row);
+    const actualHash = sha256(stableJson(snapshot.manifest));
+    if (actualHash !== snapshot.manifestHash) {
+      throw storeError('COPILOT_SNAPSHOT_INTEGRITY_FAILED', `Snapshot ${snapshot.snapshotId} failed manifest verification.`, 409);
+    }
+    return snapshot;
   }
 
   listSnapshots({ jobId, limit = 100 } = {}) {
@@ -638,6 +740,215 @@ export class CopilotProductionStore {
     return { acquired: Number(result.changes || 0) > 0, leaseKey: String(leaseKey), ownerId: String(ownerId), expiresAt };
   }
 
+  createMcpGrant(value = {}) {
+    const record = {
+      grantId: required(value.grantId, 'grantId'),
+      tokenHash: required(value.tokenHash, 'tokenHash'),
+      tokenPrefix: required(value.tokenPrefix, 'tokenPrefix'),
+      name: required(value.name, 'name'),
+      owner: required(value.owner, 'owner'),
+      conversationId: required(value.conversationId, 'conversationId'),
+      jobId: required(value.jobId, 'jobId'),
+      snapshotId: required(value.snapshotId, 'snapshotId'),
+      manifestHash: required(value.manifestHash, 'manifestHash'),
+      mode: required(value.mode, 'mode'),
+      scopes: arrayValue(value.scopes),
+      allowedTools: arrayValue(value.allowedTools),
+      allowedResources: arrayValue(value.allowedResources),
+      maxRisk: required(value.maxRisk, 'maxRisk'),
+      status: String(value.status || 'active'),
+      createdAt: String(value.createdAt || this.now().toISOString()),
+      expiresAt: required(value.expiresAt, 'expiresAt'),
+      metadata: jsonObject(value.metadata || {}),
+    };
+    this.database.prepare(`
+      INSERT INTO mcp_grants (
+        grant_id, token_hash, token_prefix, name, owner, conversation_id, job_id,
+        snapshot_id, manifest_hash, mode, scopes_json, allowed_tools_json,
+        allowed_resources_json, max_risk, status, created_at, expires_at, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      record.grantId, record.tokenHash, record.tokenPrefix, record.name, record.owner,
+      record.conversationId, record.jobId, record.snapshotId, record.manifestHash,
+      record.mode, JSON.stringify(record.scopes), JSON.stringify(record.allowedTools),
+      JSON.stringify(record.allowedResources), record.maxRisk, record.status,
+      record.createdAt, record.expiresAt, JSON.stringify(record.metadata),
+    );
+    return this.getMcpGrant(record.grantId);
+  }
+
+  getMcpGrant(grantId) {
+    const row = this.database.prepare('SELECT * FROM mcp_grants WHERE grant_id = ?').get(required(grantId, 'grantId'));
+    return row ? mcpGrantRecord(row) : null;
+  }
+
+  findMcpGrantByTokenHash(tokenHash) {
+    const row = this.database.prepare('SELECT * FROM mcp_grants WHERE token_hash = ?').get(required(tokenHash, 'tokenHash'));
+    return row ? mcpGrantRecord(row) : null;
+  }
+
+  listMcpGrants({ owner = '', conversationId = '', limit = 100 } = {}) {
+    const maximum = Math.min(500, Math.max(1, integer(limit, 100)));
+    let rows;
+    if (owner) rows = this.database.prepare('SELECT * FROM mcp_grants WHERE owner = ? ORDER BY created_at DESC LIMIT ?').all(String(owner), maximum);
+    else if (conversationId) rows = this.database.prepare('SELECT * FROM mcp_grants WHERE conversation_id = ? ORDER BY created_at DESC LIMIT ?').all(String(conversationId), maximum);
+    else rows = this.database.prepare('SELECT * FROM mcp_grants ORDER BY created_at DESC LIMIT ?').all(maximum);
+    return rows.map(mcpGrantRecord);
+  }
+
+  touchMcpGrant(grantId, occurredAt = this.now().toISOString()) {
+    this.database.prepare('UPDATE mcp_grants SET last_used_at = ? WHERE grant_id = ?').run(String(occurredAt), required(grantId, 'grantId'));
+    return this.getMcpGrant(grantId);
+  }
+
+  revokeMcpGrant(grantId, revokedAt = this.now().toISOString()) {
+    this.database.prepare(`UPDATE mcp_grants SET status = 'revoked', revoked_at = ? WHERE grant_id = ? AND status = 'active'`)
+      .run(String(revokedAt), required(grantId, 'grantId'));
+    return this.getMcpGrant(grantId);
+  }
+
+  upsertMcpSession(value = {}) {
+    const now = String(value.lastSeenAt || this.now().toISOString());
+    this.database.prepare(`
+      INSERT INTO mcp_sessions (session_id, grant_id, transport, status, client_json, created_at, last_seen_at, closed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        status = excluded.status,
+        client_json = excluded.client_json,
+        last_seen_at = excluded.last_seen_at,
+        closed_at = excluded.closed_at
+    `).run(
+      required(value.sessionId, 'sessionId'), required(value.grantId, 'grantId'),
+      String(value.transport || 'streamable-http'), String(value.status || 'active'),
+      JSON.stringify(jsonObject(value.client || {})), String(value.createdAt || now), now,
+      String(value.closedAt || ''),
+    );
+    return this.getMcpSession(value.sessionId);
+  }
+
+  getMcpSession(sessionId) {
+    const row = this.database.prepare('SELECT * FROM mcp_sessions WHERE session_id = ?').get(required(sessionId, 'sessionId'));
+    return row ? mcpSessionRecord(row) : null;
+  }
+
+  listMcpSessions({ grantId = '', limit = 100 } = {}) {
+    const maximum = Math.min(500, Math.max(1, integer(limit, 100)));
+    const rows = grantId
+      ? this.database.prepare('SELECT * FROM mcp_sessions WHERE grant_id = ? ORDER BY last_seen_at DESC LIMIT ?').all(String(grantId), maximum)
+      : this.database.prepare('SELECT * FROM mcp_sessions ORDER BY last_seen_at DESC LIMIT ?').all(maximum);
+    return rows.map(mcpSessionRecord);
+  }
+
+  closeMcpSession(sessionId, closedAt = this.now().toISOString()) {
+    this.database.prepare(`UPDATE mcp_sessions SET status = 'closed', closed_at = ?, last_seen_at = ? WHERE session_id = ?`)
+      .run(String(closedAt), String(closedAt), required(sessionId, 'sessionId'));
+    return this.getMcpSession(sessionId);
+  }
+
+  beginMcpToolRun(value = {}) {
+    const grantId = required(value.grantId, 'grantId');
+    const idempotencyKey = required(value.idempotencyKey, 'idempotencyKey');
+    const requestHash = required(value.requestHash, 'requestHash');
+    const actionHash = required(value.actionHash || requestHash, 'actionHash');
+    const existing = this.getMcpToolRunByIdempotency(grantId, idempotencyKey);
+    if (existing) {
+      if (existing.requestHash !== requestHash || existing.actionHash !== actionHash) {
+        throw storeError('MCP_IDEMPOTENCY_CONFLICT', 'The MCP idempotency key was reused with a different request.', 409);
+      }
+      return { run: existing, duplicate: true };
+    }
+    const record = {
+      callId: required(value.callId || crypto.randomUUID(), 'callId'),
+      grantId,
+      sessionId: String(value.sessionId || ''),
+      idempotencyKey,
+      requestHash,
+      actionHash,
+      toolName: required(value.toolName, 'toolName'),
+      status: String(value.status || 'running'),
+      startedAt: String(value.startedAt || this.now().toISOString()),
+    };
+    this.database.prepare(`
+      INSERT INTO mcp_tool_runs (
+        call_id, grant_id, session_id, idempotency_key, request_hash, action_hash, tool_name, status, started_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(...Object.values(record));
+    return { run: this.getMcpToolRun(record.callId), duplicate: false };
+  }
+
+  getMcpToolRun(callId) {
+    const row = this.database.prepare('SELECT * FROM mcp_tool_runs WHERE call_id = ?').get(required(callId, 'callId'));
+    return row ? mcpToolRunRecord(row) : null;
+  }
+
+  getMcpToolRunByIdempotency(grantId, idempotencyKey) {
+    const row = this.database.prepare('SELECT * FROM mcp_tool_runs WHERE grant_id = ? AND idempotency_key = ?')
+      .get(required(grantId, 'grantId'), required(idempotencyKey, 'idempotencyKey'));
+    return row ? mcpToolRunRecord(row) : null;
+  }
+
+  getMcpToolRunByApprovalId(approvalId) {
+    const row = this.database.prepare('SELECT * FROM mcp_tool_runs WHERE approval_id = ?').get(required(approvalId, 'approvalId'));
+    return row ? mcpToolRunRecord(row) : null;
+  }
+
+  updateMcpToolRun(callId, value = {}) {
+    const current = this.getMcpToolRun(callId);
+    if (!current) throw storeError('MCP_TOOL_RUN_NOT_FOUND', 'The MCP tool run was not found.', 404);
+    const next = {
+      status: String(value.status || current.status),
+      result: Object.hasOwn(value, 'result') ? value.result : current.result,
+      error: Object.hasOwn(value, 'error') ? jsonObject(value.error) : current.error,
+      approvalId: String(value.approvalId ?? current.approvalId ?? ''),
+      completedAt: String(value.completedAt ?? current.completedAt ?? ''),
+    };
+    this.database.prepare(`
+      UPDATE mcp_tool_runs SET status = ?, result_json = ?, error_json = ?, approval_id = ?, completed_at = ?
+      WHERE call_id = ?
+    `).run(next.status, JSON.stringify(next.result ?? null), JSON.stringify(next.error), next.approvalId, next.completedAt, current.callId);
+    return this.getMcpToolRun(current.callId);
+  }
+
+  listMcpToolRuns({ grantId = '', status = '', limit = 100 } = {}) {
+    const maximum = Math.min(500, Math.max(1, integer(limit, 100)));
+    let rows;
+    if (grantId && status) rows = this.database.prepare('SELECT * FROM mcp_tool_runs WHERE grant_id = ? AND status = ? ORDER BY started_at DESC LIMIT ?').all(String(grantId), String(status), maximum);
+    else if (grantId) rows = this.database.prepare('SELECT * FROM mcp_tool_runs WHERE grant_id = ? ORDER BY started_at DESC LIMIT ?').all(String(grantId), maximum);
+    else if (status) rows = this.database.prepare('SELECT * FROM mcp_tool_runs WHERE status = ? ORDER BY started_at DESC LIMIT ?').all(String(status), maximum);
+    else rows = this.database.prepare('SELECT * FROM mcp_tool_runs ORDER BY started_at DESC LIMIT ?').all(maximum);
+    return rows.map(mcpToolRunRecord);
+  }
+
+  recordMcpAudit(value = {}) {
+    const record = {
+      auditId: String(value.auditId || crypto.randomUUID()),
+      grantId: String(value.grantId || ''),
+      sessionId: String(value.sessionId || ''),
+      owner: String(value.owner || ''),
+      action: required(value.action, 'action'),
+      status: String(value.status || 'completed'),
+      detail: jsonObject(value.detail || {}),
+      occurredAt: String(value.occurredAt || this.now().toISOString()),
+    };
+    this.database.prepare(`
+      INSERT INTO mcp_audit (audit_id, grant_id, session_id, owner, action, status, detail_json, occurred_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.auditId, record.grantId, record.sessionId, record.owner, record.action, record.status, JSON.stringify(record.detail), record.occurredAt);
+    return record;
+  }
+
+  listMcpAudit({ grantId = '', limit = 100 } = {}) {
+    const maximum = Math.min(1000, Math.max(1, integer(limit, 100)));
+    const rows = grantId
+      ? this.database.prepare('SELECT * FROM mcp_audit WHERE grant_id = ? ORDER BY occurred_at DESC LIMIT ?').all(String(grantId), maximum)
+      : this.database.prepare('SELECT * FROM mcp_audit ORDER BY occurred_at DESC LIMIT ?').all(maximum);
+    return rows.map((row) => ({
+      auditId: row.audit_id, grantId: row.grant_id, sessionId: row.session_id,
+      owner: row.owner, action: row.action, status: row.status,
+      detail: parseJson(row.detail_json, {}), occurredAt: row.occurred_at,
+    }));
+  }
+
   close() {
     this.database.close();
   }
@@ -723,6 +1034,72 @@ function nodeAttemptRecord(row) {
     output: parseJson(row.output_json, null),
     checkpoint: parseJson(row.checkpoint_json, {}),
     error: parseJson(row.error_json, {}),
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+  };
+}
+
+function mcpGrantRecord(row) {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    grantId: row.grant_id,
+    tokenHash: row.token_hash,
+    tokenPrefix: row.token_prefix,
+    name: row.name,
+    owner: row.owner,
+    conversationId: row.conversation_id,
+    jobId: row.job_id,
+    snapshotId: row.snapshot_id,
+    manifestHash: row.manifest_hash,
+    mode: row.mode,
+    scopes: parseJson(row.scopes_json, []),
+    allowedTools: parseJson(row.allowed_tools_json, []),
+    allowedResources: parseJson(row.allowed_resources_json, []),
+    maxRisk: row.max_risk,
+    status: row.status,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    revokedAt: row.revoked_at,
+    lastUsedAt: row.last_used_at,
+    metadata: parseJson(row.metadata_json, {}),
+  };
+}
+
+function ensureSqliteColumn(database, table, column, definition) {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((item) => item.name === column)) {
+    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+function mcpSessionRecord(row) {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    sessionId: row.session_id,
+    grantId: row.grant_id,
+    transport: row.transport,
+    status: row.status,
+    client: parseJson(row.client_json, {}),
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
+    closedAt: row.closed_at,
+  };
+}
+
+function mcpToolRunRecord(row) {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    callId: row.call_id,
+    grantId: row.grant_id,
+    sessionId: row.session_id,
+    idempotencyKey: row.idempotency_key,
+    requestHash: row.request_hash,
+    actionHash: row.action_hash,
+    toolName: row.tool_name,
+    status: row.status,
+    result: parseJson(row.result_json, null),
+    error: parseJson(row.error_json, {}),
+    approvalId: row.approval_id,
     startedAt: row.started_at,
     completedAt: row.completed_at,
   };

@@ -306,7 +306,7 @@ test('delivery candidates expose the globally resolved subject instead of a nois
   assert.equal(item.deliveryManifestSummary.subjectRuleStatus, 'needs_input');
 });
 
-test('delivery candidates expose an attachment-derived subject and its effective rule metadata', () => {
+test('delivery candidates keep attachment naming separate from the generated email subject', () => {
   const result = buildApplicationDeliveryCandidates({
     jobId: 'job-1',
     records: [candidate('1', {
@@ -315,6 +315,11 @@ test('delivery candidates expose an attachment-derived subject and its effective
         name: '王梓楠',
         school: '示例大学',
         arrivalDate: '9月1日',
+      },
+      attachmentRequirement: {
+        detected: true,
+        template: '学校-姓名-到岗时间.pdf',
+        evidence: '简历命名：学校-姓名-到岗时间.pdf',
       },
       outreach: {
         email_subject: '',
@@ -326,13 +331,16 @@ test('delivery candidates expose an attachment-derived subject and its effective
   });
 
   const item = result.items[0];
-  assert.equal(item.outreach.email_subject, '示例大学-王梓楠-9月1日');
-  assert.equal(item.emailSubjectPreview, '示例大学-王梓楠-9月1日');
-  assert.equal(item.emailSubjectRequirement.source, 'attachment_requirement');
-  assert.equal(item.emailSubjectRequirement.template, '学校-姓名-到岗时间');
-  assert.equal(item.emailSubjectRequirement.attachmentTemplate, '学校-姓名-到岗时间.pdf');
-  assert.match(item.emailSubjectRequirement.evidence, /简历命名/u);
-  assert.equal(item.deliveryManifestSummary.subjectRuleStatus, 'job_requirement_satisfied');
+  assert.equal(item.outreach.email_subject, '应聘AI产品经理实习生｜王梓楠');
+  assert.equal(item.emailSubjectPreview, '应聘AI产品经理实习生｜王梓楠');
+  assert.equal(item.emailSubjectRequirement.source, 'generated_default');
+  assert.equal(item.emailSubjectRequirement.detected, false);
+  assert.equal(item.emailSubjectRequirement.template, '');
+  assert.equal(item.attachmentRequirement.detected, true);
+  assert.equal(item.attachmentRequirement.template, '学校-姓名-到岗时间.pdf');
+  assert.match(item.attachmentRequirement.evidence, /简历命名/u);
+  assert.equal(item.deliveryManifestSummary.subjectRuleStatus, 'batch_default');
+  assert.equal(item.deliveryManifestSummary.attachmentStatus, 'planned_rename');
   assert.equal(item.deliveryManifestSummary.readiness, 'ready_to_preview');
 });
 

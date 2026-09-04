@@ -338,23 +338,21 @@ test('reuses a shared attachment naming requirement when no email-only subject r
   assert.equal(buildApplicationEmailDraft(value).sendReady, true);
 });
 
-test('uses an attachment-only filename rule as the subject fallback and removes its extension', () => {
+test('keeps an attachment-only filename rule out of the email subject', () => {
   const value = record();
   value.body = '简历命名：学校-姓名-到岗时间.pdf\n投递邮箱 talent@example.com';
   value.candidate_profile.arrivalDate = '9月1日';
   value.outreach.email_subject = '';
 
   const rule = applicationDeliverySubjectRule(value);
-  assert.equal(rule.source, 'attachment_requirement');
-  assert.equal(rule.template, '学校-姓名-到岗时间');
-  assert.equal(rule.attachmentTemplate, '学校-姓名-到岗时间.pdf');
+  assert.equal(rule.source, 'generated_default');
+  assert.equal(rule.detected, false);
   const resolved = resolveApplicationEmailSubject(value, '');
-  assert.equal(resolved.subject, '示例大学-王梓楠-9月1日');
-  assert.equal(resolved.subject.endsWith('.pdf'), false);
+  assert.equal(resolved.subject, '应聘AI 产品经理实习生｜王梓楠');
 
   const persisted = resolveApplicationEmailSubject(value, resolved.subject);
   assert.equal(persisted.subject, resolved.subject);
-  assert.equal(persisted.validation.status, 'compliant');
+  assert.equal(persisted.validation.status, 'not_applicable');
 });
 
 test('prefers an explicit email subject rule over a separate attachment filename rule', () => {
@@ -366,7 +364,7 @@ test('prefers an explicit email subject rule over a separate attachment filename
   assert.equal(resolved.subject, '王梓楠-AI 产品经理实习生');
 });
 
-test('fails closed when an attachment-derived subject is missing a required field', () => {
+test('does not require attachment filename fields in an email subject', () => {
   const value = record();
   value.body = '简历命名：学校-姓名-到岗时间.pdf\n投递邮箱 talent@example.com';
   delete value.candidate_profile.school;
@@ -374,12 +372,12 @@ test('fails closed when an attachment-derived subject is missing a required fiel
   value.outreach.email_subject = '';
 
   const resolved = resolveApplicationEmailSubject(value, '');
-  assert.equal(resolved.subject, '');
-  assert.deepEqual(resolved.missingFields, ['school', 'arrivalDate']);
-  assert.equal(validateApplicationEmailSubject(value, '').status, 'missing_fields');
+  assert.equal(resolved.subject, '应聘AI 产品经理实习生｜王梓楠');
+  assert.deepEqual(resolved.missingFields, []);
+  assert.equal(validateApplicationEmailSubject(value, resolved.subject).status, 'not_applicable');
   const draft = buildApplicationEmailDraft(value);
-  assert.equal(draft.subjectRule.source, 'attachment_requirement');
-  assert.equal(draft.sendReady, false);
+  assert.equal(draft.subjectRule.source, 'generated_default');
+  assert.equal(draft.sendReady, true);
 });
 
 test('fills field aliases from the real profile and splits duration from arrival', () => {

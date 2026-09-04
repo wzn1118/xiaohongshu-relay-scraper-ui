@@ -978,6 +978,23 @@ class WorkflowStateSession:
             values["startedAt"] = now
         return self.update_stage(stage, values)
 
+    def restart_stage(self, stage: str, patch: dict[str, Any] | None = None) -> dict[str, Any]:
+        if stage not in STAGE_NAMES:
+            raise WorkflowStateError(f"Unsupported workflow stage: {stage}")
+        now = utc_now()
+        values = _deep_merge(_empty_stages()[stage], {
+            "status": "running",
+            "attemptId": self.attempt_id,
+            "startedAt": now,
+            "lastCheckpointAt": now,
+            **(patch or {}),
+        })
+
+        def mutate(next_state: dict[str, Any]) -> None:
+            next_state.setdefault("stages", {})[stage] = values
+
+        return self._update(mutate)
+
     def finish_stage(
         self,
         stage: str,

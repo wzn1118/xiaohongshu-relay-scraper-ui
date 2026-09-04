@@ -66,6 +66,7 @@ export class CopilotApprovalStore {
       summary: normalizeText(value.summary, 1000),
       arguments: copilotJsonValue(value.arguments || {}, 'approval arguments'),
     };
+    if (value.binding !== undefined) request.binding = copilotJsonValue(value.binding, 'approval binding');
     const expiresAt = normalizeOptionalDate(value.expiresAt);
     const requestHash = copilotHash({ ...request, expiresAt });
 
@@ -316,6 +317,7 @@ function validateApproval(value, reference) {
     summary: value.summary,
     arguments: value.arguments,
     expiresAt: value.expiresAt,
+    ...(Object.hasOwn(value, 'binding') ? { binding: value.binding } : {}),
   });
   if (
     copilotHash(value.scope) !== value.scopeHash

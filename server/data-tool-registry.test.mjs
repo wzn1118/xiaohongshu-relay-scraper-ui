@@ -222,6 +222,7 @@ test("tool catalog exposes manifests and activates dynamically discovered capabi
   const { registry } = fixture();
   const manifest = registry.list();
   const audience = registry.search("评论用户与主页覆盖情况", { limit: 8 });
+  const deepAudience = registry.search("深度受众策略", { limit: 8 });
   const state = {};
   const discovered = await registry.execute("tool.search", {
     query: "评论用户与主页覆盖情况",
@@ -234,11 +235,89 @@ test("tool catalog exposes manifests and activates dynamically discovered capabi
   assert.ok(manifest.length >= 25);
   assert.ok(manifest.every((tool) => tool.version && tool.category && tool.inputSchema));
   assert.ok(audience.some((tool) => tool.name === "comments.query"));
+  assert.ok(deepAudience.some((tool) => tool.name === "audience.research_brief"));
+  assert.ok(manifest.some((tool) => tool.name === "audience.research_brief"));
   assert.ok(manifest.some((tool) => tool.name === "applications.compose_email"));
   assert.ok(manifest.some((tool) => tool.name === "applications.extract_email_requirements"));
   assert.equal(discovered.type, "tool.catalog");
   assert.ok(state.activeToolNames.includes("comments.query"));
   assert.ok(registry.describe(["comments.query"])[0].scopes.includes("audience:read"));
+});
+
+test("audience research brief separates records, unique text, signals, and evidence", async (t) => {
+  const outputDir = await mkdtemp(path.join(tmpdir(), "copilot-audience-research-"));
+  t.after(() => rm(outputDir, { recursive: true, force: true }));
+  await Promise.all([
+    writeFile(path.join(outputDir, "audience-posts.json"), JSON.stringify([
+      { post_id: "post-style-001", title: "轻亚日常穿搭" },
+    ]), "utf8"),
+    writeFile(path.join(outputDir, "audience-comments.json"), JSON.stringify([
+      {
+        comment_id: "comment-001",
+        post_id: "post-style-001",
+        text: "上班能穿吗？求同款链接",
+        likes: 20,
+        location: "IP属地：上海",
+        source_url: "https://example.test/comments/001",
+        user: { user_id: "user-001" },
+      },
+      {
+        comment_id: "comment-002",
+        post_id: "post-style-001",
+        parent_comment_id: "comment-001",
+        text: "胳膊粗也能穿吗？",
+        likes: 10,
+        location: "广州",
+        user: { user_id: "user-002" },
+      },
+      {
+        comment_id: "comment-003",
+        post_id: "post-style-001",
+        text: "轻亚算不算亚文化，感觉被商业化了",
+        likes: 30,
+        user: { user_id: "user-003" },
+      },
+      {
+        comment_id: "comment-004",
+        post_id: "post-style-001",
+        text: "轻亚算不算亚文化，感觉被商业化了",
+        likes: 5,
+        user: { user_id: "user-004" },
+      },
+    ]), "utf8"),
+    writeFile(path.join(outputDir, "audience-users.json"), JSON.stringify([
+      { user_id: "user-001", roles: ["commenter"], enrichment_status: "complete" },
+      { user_id: "user-002", roles: ["commenter"], enrichment_status: "partial" },
+      { user_id: "user-003", roles: ["author"], enrichment_status: "pending" },
+      { user_id: "user-004", roles: ["commenter"], enrichment_status: "pending" },
+    ]), "utf8"),
+  ]);
+  const { registry } = fixture({ outputDir });
+  const result = await registry.execute("audience.research_brief", { exampleLimit: 2 }, {
+    reference: REFERENCE,
+    state: {},
+  });
+
+  assert.equal(result.type, "audience.research_brief");
+  assert.equal(result.coverage.commentRecords, 4);
+  assert.equal(result.coverage.uniqueCommentTexts, 3);
+  assert.equal(result.coverage.repeatedTextRecords, 1);
+  assert.equal(result.coverage.replyCommentRecords, 1);
+  assert.equal(result.dataQuality.geography.recordsWithLocation, 2);
+  assert.equal(result.dataQuality.geography.recordsWithoutLocation, 2);
+  assert.deepEqual(result.dataQuality.profileCompletion, [
+    { value: "pending", count: 2 },
+    { value: "complete", count: 1 },
+    { value: "partial", count: 1 },
+  ]);
+  assert.equal(result.participation.questionOrInformationSeekingRecords, 2);
+  assert.equal(result.engagement.topComments[0].commentId, "comment-003");
+  const identity = result.demandAndRiskSignals.find((signal) => signal.id === "identity_and_meaning");
+  assert.equal(identity.evidence.commentRecords, 2);
+  assert.equal(identity.evidence.uniqueCommentTexts, 1);
+  assert.equal(identity.evidence.repeatedTextRecords, 1);
+  assert.equal(identity.examples[0].commentId, "comment-003");
+  assert.deepEqual(result.sources, ["xhs-data://jobs/job-email-001/audience"]);
 });
 
 test("batch email requirement extraction returns every application with auditable coverage", async (t) => {
