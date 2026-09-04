@@ -1,0 +1,801 @@
+.job-journey-panel.journey-console {
+  --journey-ink: #26292c;
+  --journey-muted: #666b6f;
+  --journey-line: #d6d6d0;
+  --journey-paper: #fbfbf8;
+  --journey-state: #276d5a;
+  --journey-state-deep: #185744;
+  --journey-state-soft: #e7f2ed;
+  margin-top: 17px;
+  overflow: hidden;
+  border-top: 1px solid #bfc2bd;
+  border-bottom: 1px solid #bfc2bd;
+  background: var(--journey-paper);
+  color: var(--journey-ink);
+  container: job-journey / inline-size;
+}
+
+.job-journey-panel.journey-state-queued {
+  --journey-state: #667079;
+  --journey-state-deep: #4e565d;
+  --journey-state-soft: #eceeec;
+}
+
+.job-journey-panel.journey-state-running {
+  --journey-state: #18715b;
+  --journey-state-deep: #0d5947;
+  --journey-state-soft: #e4f2ec;
+}
+
+.job-journey-panel.journey-state-retrying {
+  --journey-state: #2d6f98;
+  --journey-state-deep: #23587a;
+  --journey-state-soft: #e5eff6;
+}
+
+.job-journey-panel.journey-state-stale {
+  --journey-state: #9a6716;
+  --journey-state-deep: #77500f;
+  --journey-state-soft: #fff3d9;
+}
+
+.job-journey-panel.journey-state-blocked {
+  --journey-state: #a64d32;
+  --journey-state-deep: #833822;
+  --journey-state-soft: #faeae4;
+}
+
+.job-journey-panel.journey-state-partial {
+  --journey-state: #8b641d;
+  --journey-state-deep: #6e4d12;
+  --journey-state-soft: #f7eed8;
+}
+
+.job-journey-panel.journey-state-failed {
+  --journey-state: #a13f50;
+  --journey-state-deep: #7e2b3a;
+  --journey-state-soft: #f8e7ea;
+}
+
+.job-journey-panel.journey-state-completed {
+  --journey-state: #24705a;
+  --journey-state-deep: #175843;
+  --journey-state-soft: #e3f0ea;
+}
+
+.job-journey-panel.journey-console section {
+  margin: 0;
+}
+
+.job-journey-panel.journey-console .journey-command-band {
+  padding: 16px 15px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(210px, .42fr);
+  align-items: stretch;
+  gap: 16px;
+  border-left: 4px solid var(--journey-state);
+  background: var(--journey-state-soft);
+}
+
+.job-journey-panel.journey-console .journey-current-heading {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+}
+
+.job-journey-panel.journey-console .journey-current-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--journey-state) 58%, #fff);
+  border-radius: 5px;
+  background: #fff;
+  color: var(--journey-state-deep);
+}
+
+.job-journey-panel.journey-console .journey-live-summary {
+  min-width: 0;
+}
+
+.job-journey-panel.journey-console .journey-status-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 9px;
+}
+
+.job-journey-panel.journey-console .journey-state-badge {
+  min-height: 24px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--journey-state);
+  border-radius: 3px;
+  background: #fff;
+  color: var(--journey-state-deep);
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.job-journey-panel.journey-console .journey-current-stage {
+  min-width: 0;
+  color: var(--journey-state-deep);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.job-journey-panel.journey-console .journey-current-heading h3,
+.job-journey-panel.journey-console .journey-section-heading h3,
+.job-journey-panel.journey-console .journey-recommendation h3 {
+  margin: 5px 0 0;
+  color: var(--journey-ink);
+  font-size: 16px;
+  line-height: 1.4;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+.job-journey-panel.journey-console .journey-current-heading p,
+.job-journey-panel.journey-console .journey-recommendation p {
+  margin: 4px 0 0;
+  color: #565d5b;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.job-journey-panel.journey-console .journey-signal-stack {
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  border-left: 1px solid color-mix(in srgb, var(--journey-state) 24%, #cfd1cc);
+}
+
+.job-journey-panel.journey-console .journey-connection,
+.job-journey-panel.journey-console .journey-checkpoint {
+  min-width: 0;
+  margin: 0;
+  padding: 8px 0 8px 13px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--journey-state-deep);
+}
+
+.job-journey-panel.journey-console .journey-checkpoint {
+  border-top: 1px solid color-mix(in srgb, var(--journey-state) 20%, #d5d6d1);
+  color: #606663;
+}
+
+.job-journey-panel.journey-console .journey-connection.reconnecting,
+.job-journey-panel.journey-console .journey-connection.stale {
+  color: #7c5513;
+}
+
+.job-journey-panel.journey-console .journey-connection.offline {
+  color: #7e3541;
+}
+
+.job-journey-panel.journey-console .journey-connection span,
+.job-journey-panel.journey-console .journey-checkpoint span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.job-journey-panel.journey-console .journey-connection strong,
+.job-journey-panel.journey-console .journey-checkpoint strong {
+  color: inherit;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.job-journey-panel.journey-console .journey-connection small,
+.job-journey-panel.journey-console .journey-checkpoint small {
+  color: #606663;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.job-journey-panel.journey-console .journey-coverage,
+.job-journey-panel.journey-console .journey-results,
+.job-journey-panel.journey-console .journey-path {
+  padding: 15px;
+  border-top: 1px solid var(--journey-line);
+}
+
+.job-journey-panel.journey-console .journey-section-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.job-journey-panel.journey-console .journey-section-heading > div {
+  min-width: 0;
+}
+
+.job-journey-panel.journey-console .journey-eyebrow {
+  display: block;
+  color: #6d7371;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+}
+
+.job-journey-panel.journey-console .journey-remaining {
+  min-width: 118px;
+  display: grid;
+  gap: 2px;
+  text-align: right;
+}
+
+.job-journey-panel.journey-console .journey-remaining small {
+  color: #747976;
+  font-size: 9px;
+}
+
+.job-journey-panel.journey-console .journey-remaining strong {
+  color: var(--journey-state-deep);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.job-journey-panel.journey-console .journey-percent {
+  min-width: 54px;
+  color: var(--journey-state-deep);
+  font: 800 20px/1 Georgia, serif;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.job-journey-panel.journey-console .journey-progress-track {
+  height: 10px;
+  margin-top: 11px;
+  position: relative;
+  overflow: hidden;
+  border: 1px solid #c5c7c2;
+  background: #e0e1dc;
+}
+
+.job-journey-panel.journey-console .journey-progress-track > i {
+  display: block;
+  height: 100%;
+  background: var(--journey-state);
+  transition: width .35s ease;
+}
+
+.job-journey-panel.journey-console .journey-progress-track.indeterminate > i {
+  width: 34%;
+  position: absolute;
+  left: -34%;
+  background: var(--journey-state);
+  animation: journeyConsoleIndeterminate 1.7s ease-in-out infinite;
+}
+
+.job-journey-panel.journey-console .journey-progress-explanation {
+  margin: 8px 0 0;
+  color: var(--journey-muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+@keyframes journeyConsoleIndeterminate {
+  0% { left: -34%; }
+  100% { left: 100%; }
+}
+
+.job-journey-panel.journey-console .journey-results {
+  padding-top: 0;
+  background: #f7f7f3;
+}
+
+.job-journey-panel.journey-console .journey-counts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-top: 0;
+  border-bottom: 1px solid var(--journey-line);
+}
+
+.job-journey-panel.journey-console .journey-counts > div {
+  min-width: 0;
+  padding: 13px 10px 12px;
+  display: grid;
+  gap: 3px;
+}
+
+.job-journey-panel.journey-console .journey-counts > div + div {
+  border-left: 1px solid var(--journey-line);
+}
+
+.job-journey-panel.journey-console .journey-counts span,
+.job-journey-panel.journey-console .journey-counts small {
+  color: #6a706d;
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.job-journey-panel.journey-console .journey-counts strong {
+  color: var(--journey-ink);
+  font: 800 22px/1.15 Georgia, serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.job-journey-panel.journey-console .journey-performance {
+  padding-top: 11px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px 20px;
+}
+
+.job-journey-panel.journey-console .journey-performance > span {
+  min-width: 150px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 2px 6px;
+  color: var(--journey-state);
+}
+
+.job-journey-panel.journey-console .journey-performance svg {
+  grid-row: 1 / 3;
+}
+
+.job-journey-panel.journey-console .journey-performance strong {
+  color: #343936;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.job-journey-panel.journey-console .journey-performance small {
+  color: #747a77;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.job-journey-panel.journey-console .journey-recommendation {
+  padding: 14px 15px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  border-top: 1px solid color-mix(in srgb, var(--journey-state) 34%, #d6d6d0);
+  border-left: 4px solid var(--journey-state);
+  background: color-mix(in srgb, var(--journey-state-soft) 72%, #fff);
+}
+
+.job-journey-panel.journey-console .journey-recommendation.warning {
+  --journey-state: #946416;
+  --journey-state-deep: #704a0e;
+  --journey-state-soft: #fff2d7;
+}
+
+.job-journey-panel.journey-console .journey-recommendation.blocking {
+  --journey-state: #a24435;
+  --journey-state-deep: #7f3025;
+  --journey-state-soft: #fae8e4;
+}
+
+.job-journey-panel.journey-console .journey-recommendation-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--journey-state);
+  border-radius: 50%;
+  background: #fff;
+  color: var(--journey-state-deep);
+}
+
+.job-journey-panel.journey-console .journey-recommendation > div {
+  min-width: 0;
+}
+
+.job-journey-panel.journey-console .journey-recommendation h3 {
+  margin-top: 3px;
+  font-size: 14px;
+}
+
+.job-journey-panel.journey-console .journey-recommendation small {
+  margin-top: 4px;
+  display: block;
+  color: #716951;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.job-journey-panel.journey-console .journey-primary-action {
+  min-height: 40px;
+  max-width: 220px;
+  padding: 0 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--journey-state-deep);
+  border-radius: 4px;
+  background: var(--journey-state);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.job-journey-panel.journey-console .journey-primary-action:hover:not(:disabled) {
+  background: var(--journey-state-deep);
+}
+
+.job-journey-panel.journey-console .journey-primary-action:focus-visible {
+  outline: 3px solid rgba(36, 91, 134, .34);
+  outline-offset: 3px;
+}
+
+.job-journey-panel.journey-console .journey-primary-action:disabled {
+  border-color: #a7aaa6;
+  background: #a7aaa6;
+  color: #fff;
+  cursor: wait;
+}
+
+.job-journey-panel.journey-console .journey-section-heading.compact {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.job-journey-panel.journey-console .journey-section-heading.compact > small {
+  color: #6d7370;
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.job-journey-panel.journey-console .task-journey-list {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--journey-line);
+}
+
+.job-journey-panel.journey-console .task-journey-list li {
+  min-height: 54px;
+  padding: 7px 4px;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  position: relative;
+  gap: 9px;
+  border-bottom: 1px solid #e4e4df;
+  color: #747a77;
+}
+
+.job-journey-panel.journey-console .task-journey-list li:last-child {
+  border-bottom: 0;
+}
+
+.job-journey-panel.journey-console .task-journey-list li[aria-current="step"] {
+  margin-left: -15px;
+  margin-right: -15px;
+  padding-left: 15px;
+  padding-right: 15px;
+  border-left: 4px solid var(--journey-state);
+  background: var(--journey-state-soft);
+}
+
+.job-journey-panel.journey-console .task-journey-marker {
+  width: 27px;
+  height: 27px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #c5c7c2;
+  border-radius: 50%;
+  background: #f0f0ec;
+  color: #767c79;
+}
+
+.job-journey-panel.journey-console .task-journey-list li > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.job-journey-panel.journey-console .task-journey-list strong {
+  color: #303532;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.job-journey-panel.journey-console .task-journey-list small {
+  color: #707673;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.job-journey-panel.journey-console .task-journey-list em {
+  padding: 4px 6px;
+  border: 1px solid #cdcfca;
+  border-radius: 3px;
+  background: #f3f3ef;
+  color: #626865;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.job-journey-panel.journey-console .task-journey-list li.completed .task-journey-marker {
+  border-color: #27745e;
+  background: #27745e;
+  color: #fff;
+}
+
+.job-journey-panel.journey-console .task-journey-list li.completed em {
+  border-color: #9dc8b8;
+  background: #e5f2ed;
+  color: #17624e;
+}
+
+.job-journey-panel.journey-console .task-journey-list li.running .task-journey-marker,
+.job-journey-panel.journey-console .task-journey-list li.retrying .task-journey-marker {
+  border-color: #4e88aa;
+  background: #e6f0f6;
+  color: #245f84;
+  box-shadow: 0 0 0 3px rgba(45, 111, 152, .12);
+}
+
+.job-journey-panel.journey-console .task-journey-list li.running em,
+.job-journey-panel.journey-console .task-journey-list li.retrying em {
+  border-color: #a5c5d7;
+  background: #e6f0f6;
+  color: #245f84;
+}
+
+.job-journey-panel.journey-console .task-journey-list li.waiting_system .task-journey-marker,
+.job-journey-panel.journey-console .task-journey-list li.partial .task-journey-marker {
+  border-color: #c4933c;
+  background: #fff2d9;
+  color: #8a5c12;
+}
+
+.job-journey-panel.journey-console .task-journey-list li.waiting_system em,
+.job-journey-panel.journey-console .task-journey-list li.partial em {
+  border-color: #d9bd82;
+  background: #fff2d9;
+  color: #79500d;
+}
+
+.job-journey-panel.journey-console .task-journey-list li.waiting_user .task-journey-marker,
+.job-journey-panel.journey-console .task-journey-list li.failed .task-journey-marker {
+  border-color: #c66d79;
+  background: #f9e7ea;
+  color: #953646;
+}
+
+.job-journey-panel.journey-console .task-journey-list li.waiting_user em,
+.job-journey-panel.journey-console .task-journey-list li.failed em {
+  border-color: #dca1aa;
+  background: #f9e7ea;
+  color: #8c3040;
+}
+
+.job-journey-panel.journey-console .journey-problems {
+  padding: 14px 15px;
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--journey-line);
+}
+
+.job-journey-panel.journey-console .journey-problem {
+  padding: 10px 0;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  border: 0;
+  border-top: 1px solid #e2ded3;
+  background: transparent;
+  color: #805710;
+}
+
+.job-journey-panel.journey-console .journey-problem.blocking {
+  border-color: #e0c2c5;
+  background: transparent;
+  color: #933747;
+}
+
+.job-journey-panel.journey-console .journey-problem > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.job-journey-panel.journey-console .journey-problem strong {
+  color: #303532;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.job-journey-panel.journey-console .journey-problem p {
+  margin: 0;
+  color: #5e635f;
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.job-journey-panel.journey-console .journey-problem small {
+  color: #716951;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+@container job-journey (max-width: 620px) {
+  .job-journey-panel.journey-console .journey-command-band {
+    grid-template-columns: 1fr;
+  }
+
+  .job-journey-panel.journey-console .journey-signal-stack {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-top: 1px solid color-mix(in srgb, var(--journey-state) 24%, #cfd1cc);
+    border-left: 0;
+  }
+
+  .job-journey-panel.journey-console .journey-connection,
+  .job-journey-panel.journey-console .journey-checkpoint {
+    padding: 9px 10px 0 0;
+  }
+
+  .job-journey-panel.journey-console .journey-checkpoint {
+    padding-left: 10px;
+    border-top: 0;
+    border-left: 1px solid color-mix(in srgb, var(--journey-state) 20%, #d5d6d1);
+  }
+
+  .job-journey-panel.journey-console .journey-recommendation {
+    grid-template-columns: 34px minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .job-journey-panel.journey-console .journey-primary-action {
+    grid-column: 2;
+    justify-self: start;
+    max-width: 100%;
+  }
+}
+
+@container job-journey (max-width: 430px) {
+  .job-journey-panel.journey-console .journey-command-band,
+  .job-journey-panel.journey-console .journey-coverage,
+  .job-journey-panel.journey-console .journey-results,
+  .job-journey-panel.journey-console .journey-path,
+  .job-journey-panel.journey-console .journey-recommendation,
+  .job-journey-panel.journey-console .journey-problems {
+    padding-left: 11px;
+    padding-right: 11px;
+  }
+
+  .job-journey-panel.journey-console .journey-current-heading {
+    grid-template-columns: 36px minmax(0, 1fr);
+    gap: 9px;
+  }
+
+  .job-journey-panel.journey-console .journey-current-icon {
+    width: 36px;
+    height: 36px;
+  }
+
+  .job-journey-panel.journey-console .journey-signal-stack {
+    grid-template-columns: 1fr;
+  }
+
+  .job-journey-panel.journey-console .journey-checkpoint {
+    padding-left: 0;
+    border-top: 1px solid color-mix(in srgb, var(--journey-state) 20%, #d5d6d1);
+    border-left: 0;
+  }
+
+  .job-journey-panel.journey-console .journey-section-heading {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+  }
+
+  .job-journey-panel.journey-console .journey-remaining {
+    min-width: 0;
+  }
+
+  .job-journey-panel.journey-console .journey-percent {
+    grid-column: 1 / -1;
+    min-width: 0;
+    text-align: left;
+  }
+
+  .job-journey-panel.journey-console .journey-counts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .job-journey-panel.journey-console .journey-counts > div:nth-child(3) {
+    border-left: 0;
+  }
+
+  .job-journey-panel.journey-console .journey-counts > div:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--journey-line);
+  }
+
+  .job-journey-panel.journey-console .journey-recommendation {
+    grid-template-columns: 30px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .job-journey-panel.journey-console .journey-recommendation-icon {
+    width: 30px;
+    height: 30px;
+  }
+
+  .job-journey-panel.journey-console .journey-primary-action {
+    grid-column: 1 / -1;
+    width: 100%;
+    justify-self: stretch;
+  }
+
+  .job-journey-panel.journey-console .journey-section-heading.compact {
+    grid-template-columns: 1fr;
+    align-items: start;
+    gap: 5px;
+  }
+
+  .job-journey-panel.journey-console .journey-section-heading.compact > small {
+    white-space: normal;
+  }
+
+  .job-journey-panel.journey-console .task-journey-list li,
+  .job-journey-panel.journey-console .task-journey-list li[aria-current="step"] {
+    grid-template-columns: 28px minmax(0, 1fr);
+    margin-left: 0;
+    margin-right: 0;
+    padding: 9px 0;
+  }
+
+  .job-journey-panel.journey-console .task-journey-list li[aria-current="step"] {
+    padding-left: 7px;
+  }
+
+  .job-journey-panel.journey-console .task-journey-list em {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .job-journey-panel.journey-console .journey-performance {
+    display: grid;
+  }
+
+  .job-journey-panel.journey-console .journey-performance > span {
+    min-width: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .job-journey-panel.journey-console .spin,
+  .job-journey-panel.journey-console .journey-progress-track.indeterminate > i {
+    animation: none;
+  }
+
+  .job-journey-panel.journey-console .journey-progress-track > i {
+    transition: none;
+  }
+}
