@@ -737,7 +737,7 @@ goals = true
             ), patch("scripts.ai_provider_runtime.run_with_tree_timeout", side_effect=complete):
                 self.assertEqual(provider.generate_json("system", "user", {"type": "object"}), {})
 
-    @unittest.skipUnless(os.name == "nt", "Windows taskkill is unavailable on POSIX")
+    @unittest.skipUnless(os.name == "nt", "requires Windows taskkill")
     def test_tree_timeout_terminates_the_windows_process_group(self) -> None:
         class TimedProcess:
             pid = 43210

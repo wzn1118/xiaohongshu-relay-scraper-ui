@@ -4936,7 +4936,9 @@ function App() {
         : selectedDraftQualityRetryable
           ? selectedDraftQualityUnchecked || selectedDraftQualityModelFallback
             ? '运行质量检查'
-            : '重新质量检查'
+            : selectedDraftQualityStale
+              ? '质量已失效'
+              : '重新质量检查'
           : '已保存'
   const openImagePreview = useCallback((title: string, images: PreviewImage[], index = 0) => {
     if (!images.length) return
