@@ -1199,6 +1199,11 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (!allowed.has(method)) return json(res, 400, errorBody('CODEX_BROWSER_METHOD_INVALID', 'Codex browser request method is not allowed.'));
         return json(res, 200, await codexBrowserService.request(method, body?.params && typeof body.params === 'object' ? body.params : {}));
       }
+      if (req.method === 'POST' && url.pathname === '/api/codex-browser/workflow') {
+        if (!codexHostCommands?.workflow) return json(res, 503, errorBody('CODEX_WORKFLOW_UNAVAILABLE', 'Codex workflow service is unavailable.'));
+        const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));
+        return json(res, 200, await codexHostCommands.workflow(body && typeof body === 'object' ? body : {}));
+      }
       if (req.method === 'POST' && url.pathname === '/api/codex-model/v1/responses') {
         if (!codexModelBridgeService?.responses) {
           return json(res, 503, errorBody('CODEX_MODEL_BRIDGE_UNAVAILABLE', 'The Codex model bridge is unavailable.'));

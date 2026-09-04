@@ -22,6 +22,15 @@ const elements = {
   prompt: document.querySelector('#prompt'),
   send: document.querySelector('#send'),
   sendState: document.querySelector('#send-state'),
+  workflowRefresh: document.querySelector('#workflow-refresh'),
+  workflowState: document.querySelector('#workflow-state'),
+  workflowCount: document.querySelector('#workflow-count'),
+  workflowFiles: document.querySelector('#workflow-files'),
+  workflowOutput: document.querySelector('#workflow-output'),
+  workflowCommandState: document.querySelector('#workflow-command-state'),
+  workflowApply: document.querySelector('#workflow-apply'),
+  workflowRollback: document.querySelector('#workflow-rollback'),
+  workflowError: document.querySelector('#workflow-error'),
 };
 
 let runtimeStatus = null;
@@ -33,6 +42,8 @@ let polling = false;
 let disconnected = false;
 let threadReadGeneration = 0;
 let threadReadPending = 0;
+let workflowSnapshot = null;
+const selectedFiles = new Set();
 
 async function request(method, params = {}) {
   const response = await fetch('/api/codex-browser/request', {
@@ -43,6 +54,24 @@ async function request(method, params = {}) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload?.error?.message || `Codex request returned HTTP ${response.status}.`);
+  return payload;
+}
+
+async function workflowRequest(action, extra = {}) {
+  const response = await fetch('/api/codex-browser/workflow', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action,
+      cwd: runtimeStatus?.workspaceRoot || undefined,
+      source: 'uncommitted',
+      threadId: activeThreadId || undefined,
+      ...extra,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload?.error?.message || payload?.message || `Workflow request returned HTTP ${response.status}.`);
   return payload;
 }
 
@@ -58,7 +87,7 @@ function renderThreads() {
     button.textContent = threadLabel(thread);
     button.title = button.textContent;
     button.className = thread.id === activeThreadId ? 'active' : '';
-    button.addEventListener('click', () => void selectThread(thread));
+    button.addEventListener('click', () => void selectThread(thread).then(() => refreshWorkflow()));
     elements.threadList.append(button);
   }
 }
@@ -147,6 +176,7 @@ async function refresh() {
   const savedThreadId = localStorage.getItem(ACTIVE_THREAD_KEY) || '';
   const selected = threads.find((thread) => thread.id === (activeThreadId || savedThreadId));
   if (selected) await selectThread(selected, { cursor: eventCursor });
+  await refreshWorkflow();
   persistCursor();
 }
 
@@ -160,6 +190,7 @@ async function createThread() {
   if (!thread?.id) throw new Error('Codex 未返回任务 ID。');
   await refreshThreadList(thread);
   await selectThread(threads.find((candidate) => candidate.id === thread.id) || thread);
+  await refreshWorkflow();
   return thread.id;
 }
 
@@ -178,12 +209,29 @@ async function pollEvents() {
         const thread = threads.find((candidate) => candidate.id === activeThreadId) || { id: activeThreadId };
         await selectThread(thread, { cursor: eventCursor });
       }
+      await refreshWorkflow();
     } else {
+      let workflowNeedsRefresh = false;
       for (const event of Array.isArray(payload.events) ? payload.events : []) {
+        const message = event?.message && typeof event.message === 'object' ? event.message : event;
+        const method = String(message?.method || '');
+        const eventThreadId = String(message?.params?.threadId || message?.params?.thread?.id || '');
+        const belongsToThread = !activeThreadId || !eventThreadId || eventThreadId === activeThreadId;
+        const text = eventText(message);
+        if (belongsToThread && text) {
+          const failed = /failed|error|exit code [1-9]/iu.test(`${method} ${text}`);
+          appendWorkflowOutput(text);
+          if (elements.workflowCommandState) elements.workflowCommandState.textContent = failed ? '失败' : '有新输出';
+        }
+        if (belongsToThread && (method === 'turn/completed' || method === 'turn/failed' || method === 'turn/error')) workflowNeedsRefresh = true;
         projection = applyCodexBrowserEvent(projection, event);
       }
       eventCursor = Number(payload.cursor) || eventCursor;
       if (projection.messages.length || payload.events?.length) renderMessages();
+      if (workflowNeedsRefresh) {
+        if (elements.workflowCommandState) elements.workflowCommandState.textContent = projection.status === 'failed' ? '失败' : '已完成';
+        await refreshWorkflow();
+      }
     }
     if (disconnected || projection.connection === 'reconnecting') {
       disconnected = true;
@@ -227,6 +275,127 @@ function loadingElement(text) {
   return item;
 }
 
+function showWorkflowError(error) {
+  if (!elements.workflowError) return;
+  elements.workflowError.hidden = !error;
+  elements.workflowError.textContent = error ? String(error.message || error) : '';
+}
+
+function selectedReviewFiles() {
+  return (workflowSnapshot?.files || []).filter((file) => selectedFiles.has(file.path));
+}
+
+function appendWorkflowOutput(text, state = '有新输出') {
+  if (!elements.workflowOutput || !text) return;
+  const previous = elements.workflowOutput.textContent === '尚未收到命令输出。' ? '' : elements.workflowOutput.textContent.trim();
+  elements.workflowOutput.textContent = previous ? `${previous}\n${text}` : String(text);
+  if (elements.workflowCommandState) elements.workflowCommandState.textContent = state;
+  elements.workflowOutput.scrollTop = elements.workflowOutput.scrollHeight;
+}
+
+function renderWorkflow(snapshot = null) {
+  if (!elements.workflowFiles) return;
+  workflowSnapshot = snapshot;
+  const files = Array.isArray(snapshot?.files) ? snapshot.files : [];
+  const paths = new Set(files.map((file) => file.path));
+  for (const path of selectedFiles) if (!paths.has(path)) selectedFiles.delete(path);
+  if (elements.workflowCount) elements.workflowCount.textContent = String(files.length);
+  if (elements.workflowState) elements.workflowState.textContent = snapshot ? `${files.length} 个文件 · 快照 #${snapshot.snapshotGeneration ?? '-'}` : '暂无工作区快照';
+  elements.workflowFiles.replaceChildren();
+  if (!files.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted';
+    empty.textContent = '暂无工作区变更';
+    elements.workflowFiles.append(empty);
+  }
+  for (const file of files) {
+    const row = document.createElement('article');
+    row.className = `workflow-file ${selectedFiles.has(file.path) ? 'selected' : ''}`;
+    const head = document.createElement('div');
+    head.className = 'workflow-file-head';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = selectedFiles.has(file.path);
+    checkbox.setAttribute('aria-label', `选择 ${file.path}`);
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) selectedFiles.add(file.path);
+      else selectedFiles.delete(file.path);
+      renderWorkflow(workflowSnapshot);
+    });
+    const name = document.createElement('code');
+    name.textContent = file.path;
+    name.title = file.path;
+    const stats = document.createElement('span');
+    stats.className = 'file-stats';
+    stats.textContent = file.changeKind === 'untracked' ? '未跟踪' : `+${file.additions || 0}  -${file.deletions || 0}`;
+    const diffButton = document.createElement('button');
+    diffButton.type = 'button';
+    diffButton.className = 'file-diff-button';
+    diffButton.textContent = '查看 diff';
+    const diff = document.createElement('pre');
+    diff.className = 'file-diff';
+    diff.hidden = true;
+    diff.textContent = '正在读取 diff...';
+    diffButton.addEventListener('click', async () => {
+      diff.hidden = !diff.hidden;
+      if (!diff.hidden && diff.textContent === '正在读取 diff...') {
+        try {
+          const result = await workflowRequest('diff', { files: [file], snapshotGeneration: snapshot?.snapshotGeneration });
+          diff.textContent = result?.diffs?.[file.path] || '(无文本 diff)';
+        } catch (error) {
+          diff.textContent = `读取失败：${error.message}`;
+        }
+      }
+    });
+    head.append(checkbox, name, stats, diffButton);
+    row.append(head, diff);
+    elements.workflowFiles.append(row);
+  }
+  const canMutate = Boolean(snapshot) && selectedReviewFiles().length > 0;
+  if (elements.workflowApply) elements.workflowApply.disabled = !canMutate;
+  if (elements.workflowRollback) elements.workflowRollback.disabled = !canMutate;
+}
+
+async function refreshWorkflow() {
+  if (!elements.workflowFiles) return;
+  showWorkflowError(null);
+  if (elements.workflowState) elements.workflowState.textContent = '正在读取工作区...';
+  try {
+    renderWorkflow(await workflowRequest('snapshot'));
+  } catch (error) {
+    renderWorkflow(null);
+    showWorkflowError(error);
+  }
+}
+
+async function mutateWorkflow(action) {
+  const files = selectedReviewFiles();
+  if (!files.length || !workflowSnapshot) return;
+  const verb = action === 'apply' ? '暂存选中的变更' : '回滚选中的变更';
+  if (!window.confirm(`确定要${verb}吗？此操作会修改当前工作区。`)) return;
+  if (elements.workflowApply) elements.workflowApply.disabled = true;
+  if (elements.workflowRollback) elements.workflowRollback.disabled = true;
+  showWorkflowError(null);
+  try {
+    await workflowRequest(action, {
+      files,
+      snapshotGeneration: workflowSnapshot.snapshotGeneration,
+      confirm: true,
+      commandId: `workflow-${action}-${Date.now()}`,
+    });
+    selectedFiles.clear();
+    await refreshWorkflow();
+  } catch (error) {
+    showWorkflowError(error);
+    renderWorkflow(workflowSnapshot);
+  }
+}
+
+function eventText(message) {
+  const params = message?.params || {};
+  return params.delta || params.text || params.output || params.item?.text || params.item?.command || params.item?.output || message?.error?.message || '';
+}
+
 elements.newThread.addEventListener('click', async () => {
   elements.newThread.disabled = true;
   try { await createThread(); } catch (error) {
@@ -235,6 +404,9 @@ elements.newThread.addEventListener('click', async () => {
   } finally { elements.newThread.disabled = false; }
 });
 elements.refresh.addEventListener('click', () => void refresh().catch(showFatalError));
+elements.workflowRefresh?.addEventListener('click', () => void refreshWorkflow());
+elements.workflowApply?.addEventListener('click', () => void mutateWorkflow('apply'));
+elements.workflowRollback?.addEventListener('click', () => void mutateWorkflow('rollback'));
 elements.composer.addEventListener('submit', async (event) => {
   event.preventDefault();
   const prompt = elements.prompt.value.trim();
