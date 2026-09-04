@@ -49,7 +49,6 @@ import {
   Shuffle,
   Sparkles,
   SquareTerminal,
-  Table2,
   Target,
   Send,
   Trash2,
@@ -76,6 +75,7 @@ import { JobJourneyPanel } from './JobJourneyPanel'
 import { experienceSnapshotForJob, jobExperienceView } from './job-experience'
 import { UnsavedDraftDialog } from './UnsavedDraftDialog'
 import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
+import './app-experience.css'
 import type { DraftSaveRequest } from './useUnsavedDraftGuard'
 import type {
   Artifact,
@@ -199,11 +199,11 @@ const defaultCandidateProfile: CandidateApplicationProfile = {
   name: '',
   school: '',
   major: '',
-  degreeYear: '研二',
+  degreeYear: '',
   phoneWeChat: '',
   email: '',
-  availabilityDays: '5',
-  internshipDuration: '6个月',
+  availabilityDays: '',
+  internshipDuration: '',
 }
 
 function loadCandidateProfile(): CandidateApplicationProfile {
@@ -231,7 +231,7 @@ function importedCandidateProfileValues(imported?: Partial<CandidateApplicationP
 
 const defaultRequest: JobRequest = {
   analysisMode: 'job',
-  keyword: '实习继任',
+  keyword: '',
   contentPreset: 'auto',
   contentGoal: '',
   searchSort: 'latest',
@@ -1722,6 +1722,7 @@ function App() {
   const [jobConnectionState, setJobConnectionState] = useState<WorkflowConnectionState>('offline')
   const [jobLastEventAt, setJobLastEventAt] = useState<string | null>(null)
   const [dataCopilotOpen, setDataCopilotOpen] = useState(false)
+  const [setupOpen, setSetupOpen] = useState(false)
   const [historyScope, setHistoryScope] = useState<HistoryScope>('all')
   const [historyPage, setHistoryPage] = useState(1)
   const [historyPageSize, setHistoryPageSize] = useState(50)
@@ -4205,7 +4206,6 @@ function App() {
   }, [historyScope, historyPageSize])
   const runningCount = workspaceJobs.filter((job) => ['queued', 'resuming', 'running'].includes(job.status)).length
   const completedCount = workspaceJobs.filter((job) => job.status === 'completed').length
-  const failedCount = workspaceJobs.filter((job) => job.status === 'failed').length
   const incompleteCount = workspaceJobs.filter((job) => ['incomplete', 'cancelled', 'interrupted', 'blocked'].includes(job.status)).length
   const currentArtifacts = artifacts.length ? artifacts : activeJob?.artifacts || []
   const discoveredCount = Number(
@@ -4214,7 +4214,6 @@ function App() {
       ?? activeJob?.discoveredCount
       ?? 0,
   )
-  const exportCount = useMemo(() => workspaceJobs.reduce((sum, job) => sum + (job.artifactCount ?? job.artifacts?.length ?? 0), 0), [workspaceJobs])
   const activeAllMode = activeJob?.config?.limit === 0
   const activeBodyImport = activeJob?.config?.bodyOnly === true
   const activeAnalysisMode = workspaceMode
@@ -4307,6 +4306,109 @@ function App() {
     { label: '搜索关键词', ready: Boolean(request.keyword.trim()), detail: request.keyword.trim() || '请输入关键词' },
   ]
   const missingReadiness = readinessChecks.filter((item) => !item.ready).map((item) => item.label)
+  const experienceTaskRunning = Boolean(activeJob && ['queued', 'resuming', 'running'].includes(activeJob.status))
+  const experienceTaskRecoverable = Boolean(activeJob?.resumeAvailable && activeJob.status !== 'completed')
+  const experienceTaskHasResults = Boolean(results?.available && results.items.length > 0)
+    || Number(activeJob?.applicationCount || 0) > 0
+  const experienceCoreChecks = [
+    { label: '浏览器', ready: relaySiteReady, detail: relaySiteReady ? '目标页已打开' : relayReady ? '等待目标页' : '需要连接', target: 'relay-config' },
+    { label: 'AI', ready: Boolean(aiSession), detail: aiSession?.model || '需要连接', target: 'ai-memory' },
+    ...(request.analysisMode === 'job' ? [{
+      label: '求职资料',
+      ready: backgroundReady && candidateReady,
+      detail: backgroundReady && candidateReady ? '背景与署名完整' : '需要补充',
+      target: 'ai-memory',
+    }] : []),
+  ]
+  const experienceReadyCount = experienceCoreChecks.filter((item) => item.ready).length
+  const experienceSetupBlocker = experienceCoreChecks.find((item) => !item.ready)
+  const experienceHomeTitle = experienceTaskRunning
+    ? `${activeJob?.keyword || '当前任务'}正在推进`
+    : experienceTaskRecoverable
+      ? `继续“${activeJob?.keyword || '上次任务'}”`
+      : activeJob?.status === 'completed'
+        ? `“${activeJob.keyword || '上次任务'}”已完成`
+        : request.analysisMode === 'general'
+          ? '从一个问题开始内容研究'
+          : '从一个关键词开始今天的投递'
+  const experienceHomeDescription = activeJob
+    ? readableNextStep
+    : request.analysisMode === 'general'
+      ? '输入想研究的人群、经验、产品或地点，系统会保留正文、图片和引用证据。'
+      : '输入岗位关键词，采集、判断、文案准备和投递会沿用同一个任务记录。'
+  const experiencePrimaryLabel = experienceTaskRunning
+    ? '查看当前进度'
+    : experienceTaskRecoverable
+      ? '继续上次任务'
+      : activeJob?.status === 'completed' || experienceTaskHasResults
+        ? '查看任务结果'
+        : experienceSetupBlocker
+          ? '完成启动设置'
+          : '配置本次任务'
+
+  const revealExperienceSection = (id: string) => {
+    window.requestAnimationFrame(() => {
+      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }
+
+  const openExperienceSettings = (target = 'setup-center') => {
+    setSetupOpen(true)
+    if (batchSurfaceActive) {
+      performSwitchApplicationView('jobs')
+      window.setTimeout(() => revealExperienceSection(target), 240)
+      return
+    }
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => revealExperienceSection(target)))
+  }
+
+  const openExperienceSection = (id: 'history' | 'artifacts') => {
+    if (batchSurfaceActive) {
+      performSwitchApplicationView('jobs')
+      window.setTimeout(() => revealExperienceSection(id), 240)
+      return
+    }
+    revealExperienceSection(id)
+  }
+
+  const launchFromExperienceHome = () => {
+    if (!request.keyword.trim()) {
+      setNotice('请先输入本次任务的搜索关键词。')
+      document.getElementById('experience-keyword')?.focus()
+      return
+    }
+    if (experienceSetupBlocker) {
+      setNotice(`请先完成${experienceSetupBlocker.label}设置，完成后即可启动。`)
+      openExperienceSettings(experienceSetupBlocker.target)
+      return
+    }
+    if (request.speedMode === 'random' && request.randomDelayMinSeconds > request.randomDelayMaxSeconds) {
+      setNotice('随机节奏的最短间隔需要小于或等于最长间隔')
+      revealExperienceSection('task-config')
+      return
+    }
+    void runJob({ ...request, analysisMode: workspaceMode, checkOnly: false })
+  }
+
+  const handleExperiencePrimary = () => {
+    if (experienceTaskRunning) {
+      revealExperienceSection('current-task')
+      return
+    }
+    if (experienceTaskRecoverable && activeJob) {
+      void resumeJob(activeJob)
+      return
+    }
+    if (activeJob?.status === 'completed' || experienceTaskHasResults) {
+      revealExperienceSection('results')
+      return
+    }
+    if (experienceSetupBlocker) {
+      openExperienceSettings(experienceSetupBlocker.target)
+      return
+    }
+    revealExperienceSection('task-config')
+  }
   const selectedDeliveryRoutes = selectedResult ? deliveryRoutes(selectedResult) : []
   const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email' && route.actionable)
   const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message' && route.actionable)
@@ -4955,17 +5057,15 @@ function App() {
   }
 
   return (
-    <div className={`app-shell ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
+    <div className={`app-shell experience-ui ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
       <aside className="side-rail">
         <div className="brand-mark" aria-label="今天你投了吗？">投</div>
         <nav aria-label="主导航">
-          <button className={`nav-button ${workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''}`} type="button" title="岗位投递工作台" aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={20} /><span>岗位台</span></button>
-          <button className={`nav-button ${workspaceMode === 'job' && applicationView === 'batch' ? 'active' : ''}`} type="button" title="批量投递工作台" aria-current={workspaceMode === 'job' && applicationView === 'batch' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><Layers3 size={20} /><span>批量投递</span></button>
-          <button className={`nav-button ${workspaceMode === 'general' ? 'active' : ''}`} type="button" title="非岗位信息研究工作台" aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={20} /><span>研究台</span></button>
-          {!batchSurfaceActive && <button className="nav-button" title="任务历史" onClick={() => document.getElementById('history')?.scrollIntoView({ behavior: 'smooth' })}><Clock3 size={20} /><span>历史</span></button>}
-          {!batchSurfaceActive && <button className="nav-button" title="导出文件" onClick={() => document.getElementById('artifacts')?.scrollIntoView({ behavior: 'smooth' })}><Table2 size={20} /><span>产物</span></button>}
+          <button className={`nav-button ${workspaceMode === 'job' ? 'active' : ''}`} type="button" title="今日任务" aria-current={workspaceMode === 'job' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={20} /><span>任务</span></button>
+          <button className={`nav-button ${workspaceMode === 'general' ? 'active' : ''}`} type="button" title="内容研究" aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={20} /><span>研究</span></button>
+          <button className="nav-button" type="button" title="任务记录" onClick={() => openExperienceSection('history')}><Clock3 size={20} /><span>记录</span></button>
+          <button className={`nav-button ${setupOpen ? 'utility-active' : ''}`} type="button" title="运行设置" aria-expanded={setupOpen} onClick={() => openExperienceSettings()}><Settings2 size={20} /><span>设置</span></button>
         </nav>
-        {workspaceMode === 'job' && !batchSurfaceActive && <button className="nav-button rail-settings" title="发件邮箱设置" onClick={() => document.getElementById('email-config')?.scrollIntoView({ behavior: 'smooth' })}><Settings2 size={20} /><span>设置</span></button>}
       </aside>
 
       <div className="workspace">
@@ -4976,11 +5076,11 @@ function App() {
               <h1>{workspaceMode === 'general' ? '今天你投了吗？｜内容研究工作台' : applicationView === 'batch' ? '今天你投了吗？｜批量投递工作台' : '今天你投了吗？｜岗位与投递'}</h1>
               <span className="version">v3.0</span>
             </div>
-            <nav className="workspace-switcher" aria-label="切换工作台">
-              <button type="button" className={workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={15} /><span>岗位投递</span></button>
-              <button type="button" className={workspaceMode === 'job' && applicationView === 'batch' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'batch' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><Layers3 size={15} /><span>批量投递</span></button>
-              <button type="button" className={workspaceMode === 'general' ? 'active' : ''} aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={15} /><span>非岗位研究</span></button>
-            </nav>
+            <div className="experience-breadcrumb" aria-label="当前工作区">
+              <span>{workspaceMode === 'general' ? '研究' : '求职任务'}</span>
+              <ChevronRight size={14} />
+              <strong>{applicationView === 'batch' ? '审批与发送' : workspaceMode === 'general' ? '采集与洞察' : '发现与准备'}</strong>
+            </div>
           </div>
           <div className="topbar-status">
             <button
@@ -5011,60 +5111,68 @@ function App() {
         )}
 
         <main>
-          <section className={`product-hero ${activeAnalysisMode === 'general' ? 'content-ai-hero' : ''}`} aria-labelledby="product-hero-title">
-            <div className="product-hero-copy">
-              <span className="marketing-kicker">{activeAnalysisMode === 'general' ? 'FROM DISCOVERY TO STRUCTURE' : 'FROM DISCOVERY TO DELIVERY'}</span>
-              <h2 id="product-hero-title">{activeAnalysisMode === 'general' ? '研究经验、人群、趋势、产品或地点，不再被岗位模板限制。' : '别再在碎片信息里找机会，把每次发现都变成更有把握的投递。🚀'}</h2>
-              <p className="product-hero-lede">{activeAnalysisMode === 'general' ? '选择研究场景和目标后，全量保存正文与原图；AI 会结合关键词、OCR 与逐条证据，动态生成本次专属栏目和结构化结论。' : '今天你投了吗？把“发现岗位 🔎、读懂正文 🧠、匹配经历、写好求职信 ✍️、完成投递 📮”放在同一条求职流程里。'}</p>
-              <div className="product-hero-actions">
-                <button type="button" className="primary-button" onClick={() => document.getElementById('task-config')?.scrollIntoView({ behavior: 'smooth' })}><Play size={16} />{activeAnalysisMode === 'general' ? '创建非岗位研究' : '马上开始采集 🚀'}</button>
+          <section className="experience-command-center" aria-labelledby="product-hero-title">
+            <div className="experience-command-main">
+              <div className="experience-command-kicker">
+                <span>{activeJob ? '当前任务' : '今日下一步'}</span>
+                <b className={experienceTaskRunning ? 'is-running' : activeJob?.status === 'completed' ? 'is-ready' : ''}>
+                  {activeJob ? statusText[activeJob.status] : experienceReadyCount === experienceCoreChecks.length ? '可以开始' : `还差 ${experienceCoreChecks.length - experienceReadyCount} 项`}
+                </b>
               </div>
-              <div className="product-proof-list" aria-label="产品能力">
-                {activeAnalysisMode === 'general' ? <>
-                  <span><BrainCircuit size={14} />AI 动态生成内容栏目</span>
-                  <span><Images size={14} />正文、图片与 OCR 联合理解</span>
-                  <span><ShieldCheck size={14} />结论保留原文证据</span>
-                </> : <>
-                  <span><Check size={14} />🧩 多 Agent 分工推进</span>
-                  <span><Check size={14} />🛡️ 保留正文与失败原因</span>
-                  <span><Check size={14} />📦 JSON / CSV / XLSX / MD 导出</span>
-                </>}
-              </div>
-            </div>
-            {activeAnalysisMode === 'general' && (
-              <aside className={`content-ai-runtime ${aiSession ? 'ready' : ''}`} aria-label="内容 AI 运行状态">
-                <div className="content-ai-runtime-heading">
-                  <span className="content-ai-runtime-icon"><BrainCircuit size={20} /></span>
-                  <span><small>CONTENT AI RUNTIME</small><strong>{aiSession ? `${selectedProvider?.label || providerId} 已接入` : 'AI 等待连接'}</strong></span>
-                  <b>{aiSession ? '已就绪' : '未连接'}</b>
-                </div>
-                <dl>
-                  <div><dt>当前模型</dt><dd>{aiSession?.model || '尚未选择'}</dd></div>
-                  <div><dt>分析输入</dt><dd>搜索关键词 · 正文 · 图片文字</dd></div>
-                  <div><dt>生成结果</dt><dd>摘要 · 实体 · 洞察 · 动态栏目</dd></div>
-                </dl>
-                <button type="button" onClick={() => document.getElementById('ai-memory')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>
-                  {aiSession ? <Settings2 size={15} /> : <KeyRound size={15} />}{aiSession ? '查看 AI 配置' : '连接 AI 模型'}
+              <h2 id="product-hero-title">{experienceHomeTitle}</h2>
+              <p>{experienceHomeDescription}</p>
+              <div className="experience-command-actions">
+                <button type="button" className="primary-button" onClick={handleExperiencePrimary} disabled={submitting}>
+                  {experienceTaskRecoverable ? <RotateCcw size={17} /> : experienceTaskRunning ? <Activity size={17} /> : <ArrowUpDown size={17} />}
+                  {experiencePrimaryLabel}
                 </button>
-              </aside>
-            )}
+                <button type="button" className="secondary-button" onClick={() => revealExperienceSection('task-config')}><Search size={17} />新建任务</button>
+                {workspaceMode === 'job' && activeJob && experienceTaskHasResults && <button type="button" className="secondary-button" onClick={() => switchApplicationView('batch')}><Layers3 size={17} />批量投递</button>}
+              </div>
+              <form className="experience-quick-launch" onSubmit={(event) => { event.preventDefault(); launchFromExperienceHome() }}>
+                <label htmlFor="experience-keyword">{workspaceMode === 'general' ? '研究关键词' : '岗位关键词'}</label>
+                <div>
+                  <Search size={18} />
+                  <input id="experience-keyword" value={request.keyword} onChange={(event) => updateRequest('keyword', event.target.value)} placeholder={workspaceMode === 'general' ? '例如：AI 产品经理面试经验' : '例如：AI 产品经理实习'} />
+                  <button type="submit" disabled={submitting || experienceTaskRunning || !request.keyword.trim()}>
+                    {submitting ? <LoaderCircle className="spin" size={17} /> : experienceSetupBlocker ? <ShieldCheck size={17} /> : <Play size={17} />}
+                    {experienceTaskRunning ? '任务运行中' : experienceSetupBlocker ? '检查并继续' : '启动全流程'}
+                  </button>
+                </div>
+              </form>
+            </div>
+            <aside className="experience-readiness" aria-label="启动条件">
+              <header>
+                <span><small>启动条件</small><strong>{experienceReadyCount} / {experienceCoreChecks.length} 已就绪</strong></span>
+                <button type="button" onClick={() => openExperienceSettings()}><Settings2 size={16} />运行设置</button>
+              </header>
+              <div className="experience-readiness-grid">
+                {experienceCoreChecks.map((item) => <button type="button" className={item.ready ? 'is-ready' : 'needs-action'} key={item.label} onClick={() => openExperienceSettings(item.target)}>
+                  <span>{item.ready ? <Check size={15} /> : <CircleAlert size={15} />}</span>
+                  <span><strong>{item.label}</strong><small>{item.detail}</small></span>
+                  <ChevronRight size={15} />
+                </button>)}
+                {workspaceMode === 'job' && <button type="button" className={smtpConfig.verified ? 'is-ready' : 'is-optional'} onClick={() => openExperienceSettings('email-config')}>
+                  <span>{smtpConfig.verified ? <Check size={15} /> : <Mail size={15} />}</span>
+                  <span><strong>发件邮箱</strong><small>{smtpConfig.verified ? '连接已验证' : smtpConfig.configured ? '配置已保存' : '投递前再配置'}</small></span>
+                  <ChevronRight size={15} />
+                </button>}
+              </div>
+              <footer>
+                <span className={health?.ok ? 'is-ready' : ''}><Activity size={15} />{health?.ok ? '本地服务正常' : loading ? '正在检查服务' : '服务未响应'}</span>
+                <span>{runningCount} 运行 · {incompleteCount} 待续 · {completedCount} 完成</span>
+              </footer>
+            </aside>
           </section>
 
-          <section className="overview-band" id="product-overview" aria-label="运行概览">
-            <div className="overview-copy">
-              <p>多 Agent 工作流</p>
-              <strong>{runningCount ? `${runningCount} 个任务正在推进` : '工作台已待命'}</strong>
-            </div>
-            <div className="metric"><span>成功任务</span><strong>{completedCount}</strong><small>当前历史</small></div>
-            <div className="metric"><span>未完成任务</span><strong className={incompleteCount ? 'warning-text' : ''}>{incompleteCount}</strong><small>中断或主动取消</small></div>
-            <div className="metric"><span>失败任务</span><strong className={failedCount ? 'danger-text' : ''}>{failedCount}</strong><small>执行错误并保留原因</small></div>
-            <div className="metric"><span>导出文件</span><strong>{exportCount}</strong><small>JSON / CSV / XLSX / MD</small></div>
-            <div className="health-stamp">
-              <Activity size={18} />
-              <span><strong>{health?.ok ? '本地服务正常' : loading ? '正在检查服务' : '服务未响应'}</strong><small>{health?.runnerAvailable === false ? 'Runner 路径待配置' : 'Runner 已纳入受控执行'}</small></span>
-            </div>
-          </section>
-
+          <section className={`experience-setup-hub ${setupOpen ? 'is-open' : ''}`} id="setup-center" aria-label="运行设置">
+            <button type="button" className="experience-setup-summary" aria-expanded={setupOpen} aria-controls="experience-setup-content" onClick={() => setSetupOpen((open) => !open)}>
+              <span className="experience-setup-icon"><Settings2 size={20} /></span>
+              <span className="experience-setup-copy"><small>低频运行设置</small><strong>浏览器、AI、个人资料与发件邮箱</strong><span>{setupOpen ? '设置已展开，完成后可收起并回到任务' : '日常使用保持收起；状态异常时再进入处理'}</span></span>
+              <span className={experienceReadyCount === experienceCoreChecks.length ? 'is-ready' : 'needs-action'}>{experienceReadyCount} / {experienceCoreChecks.length} 核心条件</span>
+              <ChevronDown className={setupOpen ? 'expanded' : ''} size={18} />
+            </button>
+            {setupOpen && <div className="experience-setup-content" id="experience-setup-content">
           <section className="panel relay-config-panel" id="relay-config" aria-label="Relay 配置">
             <div className="panel-heading compact">
               <div><span className="step-label">RELAY CONFIGURATION</span><h2>Relay 配置</h2></div>
@@ -5310,6 +5418,8 @@ function App() {
               {candidateImportStatus === 'empty' && <div className="candidate-profile-import-note"><CircleAlert size={15} /><span>简历已写入背景记忆，但未识别到完整署名信息，请手动补充。</span></div>}
             </section>}
           </section>
+            </div>}
+          </section>
 
           <div className="primary-grid">
             <section className="panel config-panel" id="task-config">
@@ -5436,7 +5546,7 @@ function App() {
               </form>
             </section>
 
-            <section className="panel mission-panel">
+            <section className="panel mission-panel" id="current-task">
               <div className="panel-heading">
                 <div><span className="step-label">02 / AGENT TEAM</span><h2>当前任务</h2></div>
                 {activeJob ? <StatusPill status={activeJob.status} /> : <span className="muted-badge">尚未创建</span>}
@@ -5481,7 +5591,7 @@ function App() {
               )}
             </section>
 
-            <details className="panel log-panel technical-details-panel" open>
+            <details className="panel log-panel technical-details-panel">
               <summary className="panel-heading dark-heading">
                 <div><span className="step-label">STATUS EXPLAINED</span><h2>系统状态说明</h2><small>先看日常说明；原始记录只在需要排查时展开</small></div>
                 <span className="technical-details-toggle"><Info size={15} />{logs.length ? `还有 ${logs.length} 条系统记录` : '暂无系统记录'}<ChevronDown size={17} /></span>
@@ -5552,6 +5662,7 @@ function App() {
             <div className="panel-heading compact">
               <div><span className="step-label">{batchSurfaceActive ? 'BATCH APPLICATION DELIVERY' : expansionModuleActive ? 'RELATIONSHIP EXPANSION WORKSPACE' : audienceModuleActive ? 'AUDIENCE & USER INTELLIGENCE' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || 'KEYWORD CONTENT INTELLIGENCE' : 'PER-LINK APPLICATION INTELLIGENCE'}</span><h2>{batchSurfaceActive ? '批量投递工作台' : expansionModuleActive ? '关系扩散' : audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{batchSurfaceActive ? <p className="result-heading-description">从已保存正文中选择岗位，预检收件人、文案和附件后再分批发送。</p> : expansionModuleActive ? <p className="result-heading-description">从当前任务已保存的帖子出发，多轮采集公开用户、帖子、评论与关系，并持续写回同一任务。</p> : audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
               <div className="result-heading-meta">
+                {!batchSurfaceActive && activeAnalysisMode === 'job' && activeJob && experienceTaskHasResults && <button type="button" className="experience-result-action" onClick={() => switchApplicationView('batch')}><Layers3 size={16} />批量投递</button>}
                 <span className={`runtime-badge ${batchSurfaceActive || expansionStatus === 'completed' || audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{batchSurfaceActive ? '投递批次 · 发送前预检' : expansionModuleActive ? `多轮扩散 · ${expansionStatusText}` : audienceModuleActive ? `全量评论流 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容流' : 'AI 质量流'} · ${String(codexRuntime?.status || '等待结果')}`}</span>
                 <span className="count-badge">{expansionModuleActive ? Number((expansionSummary?.counters as Record<string, unknown> | undefined)?.users || 0) : audienceModuleActive ? audienceResults?.total ?? 0 : results?.total ?? activeJob?.applicationCount ?? 0}</span>
               </div>
