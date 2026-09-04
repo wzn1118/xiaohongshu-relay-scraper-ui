@@ -26,7 +26,7 @@ try {
   if (pageErrors.length) throw new Error(`Page raised errors: ${pageErrors.join(' | ')}`);
   const screenshotPath = path.resolve(options.screenshotPath);
   await page.screenshot({ path: screenshotPath, fullPage: true });
-  process.stdout.write(`${JSON.stringify({ ok: true, url: options.url, title: await page.title(), screenshotPath })}\n`);
+  process.stdout.write(`${JSON.stringify({ ok: true, url: options.url, title: await page.title(), screenshot: path.basename(screenshotPath) })}\n`);
 } finally {
   await browser.close();
 }

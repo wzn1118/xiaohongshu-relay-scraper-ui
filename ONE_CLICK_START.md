@@ -4,9 +4,9 @@
 
 ## 内置 Codex 版
 
-- Windows：下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows.zip`，完整解压后双击 `Start-Codex-App.cmd`。
-- macOS：下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos.zip`，完整解压后双击 `Start-Codex-App.command`。
-- 首次启动的 `npm ci` 会自动安装与当前 Windows、Apple Silicon 或 Intel 架构匹配的 Codex app-server，无需预装 Codex CLI。
+- Windows x64：下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-windows-x64.zip`，完整解压后双击 `Start-Codex-App.cmd`。
+- Apple Silicon：下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-arm64.zip`；Intel Mac：下载 `xiaohongshu-relay-scraper-ui-one-click-codex-built-in-macos-x64.zip`。完整解压后双击 `Start-Codex-App.command`。
+- 每份包都自带目标平台的 Codex app-server。`runtime/codex/codex-runtime-manifest.json` 声明平台、架构、相对入口和 SHA-256；启动验收会拒绝 PE、ELF、Mach-O 或架构不匹配的伪装 runtime。
 - 发布验收会确认 app-server 初始化、`thread/list` 调用、`/codex/` 页面渲染和交互控件。
 
 ## Windows 10/11
@@ -91,11 +91,11 @@ chmod +x start-linux-macos.sh scripts/*.sh
 每次推送 `main`，GitHub Actions 都会：
 
 1. 从 Git 已提交文件生成净化 ZIP；
-2. 拒绝 `.env`、数据、登录态、运行时、依赖缓存和日志进入发布包；
+2. 拒绝 `.env`、数据、登录态、本机 runtime、依赖缓存和日志进入发布包；内置版只允许 manifest 列出的 Codex executable；
 3. 在全新临时目录解压；
 4. 在 Apple Silicon macOS 上，从解压包内可双击的 `Start-App.command` 执行首次依赖安装、生产构建和启动；
-5. 让 Intel macOS 下载同一个 ZIP，并从同一个启动入口完成冷启动；
-6. 在两个 Mac 架构上用 Chromium 打开实际页面，检查可见内容、交互控件和页面脚本错误；
-7. 验证 `/api/health`，并保留打开后的页面截图；
-8. 生成 Windows 和 macOS 各自的 SHA-256 校验文件并上传 Actions artifact；
-9. 对 `v*` 标签创建包含普通 Windows、普通 macOS、内置 Codex Windows、内置 Codex macOS 四个独立 ZIP 的 GitHub Release。
+5. 在 Intel runner 独立构建 macOS x64 包，在 Apple Silicon runner 独立构建 macOS arm64 包，禁止跨架构复用一份 runtime ZIP；
+6. 在 Windows、两种 Mac 架构上验证原生二进制头与 manifest 哈希，再从平台启动入口完成冷启动；
+7. 验证 `/api/health`、Codex status、`thread/list` 与 `/codex/` 页面，并用 Chromium 检查交互和脚本错误；
+8. 生成不含绝对路径、密钥或用户状态的 JSON 证据、截图与 SHA-256 文件；
+9. 对 `v*` 标签仅发布已在目标架构 runner 上通过上述验收的 ZIP。

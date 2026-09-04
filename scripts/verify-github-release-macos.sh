@@ -14,6 +14,8 @@ Options:
   --screenshot-path PATH     Save the browser-smoke screenshot at PATH.
   --launch-entry FILE        Launcher inside the ZIP. Defaults to Start-App.command.
   --require-codex-built-in   Verify the bundled Codex provider and UI entry.
+  --expected-architecture A  Required runtime architecture: arm64 or x64.
+  --evidence-path PATH       Write redacted JSON acceptance evidence.
 EOF
 }
 
@@ -23,6 +25,8 @@ browser_smoke=0
 screenshot_path=''
 launch_entry='Start-App.command'
 require_codex_built_in=0
+expected_architecture=''
+evidence_path=''
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -51,6 +55,16 @@ while [ "$#" -gt 0 ]; do
       ;;
     --require-codex-built-in)
       require_codex_built_in=1
+      ;;
+    --expected-architecture)
+      shift
+      [ "$#" -gt 0 ] || { echo '--expected-architecture requires a value' >&2; exit 2; }
+      expected_architecture=$1
+      ;;
+    --evidence-path)
+      shift
+      [ "$#" -gt 0 ] || { echo '--evidence-path requires a value' >&2; exit 2; }
+      evidence_path=$1
       ;;
     -h|--help)
       usage
@@ -88,12 +102,14 @@ extract_root="$temporary_root/extract"
 runtime_root="$temporary_root/runtime"
 launcher_log="$temporary_root/launcher.log"
 launcher_pid=''
+temporary_env_path=''
 
 cleanup() {
   if [ -n "$launcher_pid" ] && kill -0 "$launcher_pid" >/dev/null 2>&1; then
     kill "$launcher_pid" >/dev/null 2>&1 || true
     wait "$launcher_pid" >/dev/null 2>&1 || true
   fi
+  [ -z "$temporary_env_path" ] || rm -f "$temporary_env_path"
   rm -rf "$temporary_root"
 }
 trap cleanup EXIT HUP INT TERM
@@ -116,7 +132,16 @@ done
 if [ "$require_codex_built_in" -eq 1 ]; then
   [ -f "$project_root/CODEX_BUILT_IN_START.md" ] || { echo 'The Codex edition marker is missing.' >&2; exit 1; }
   [ "$launch_entry" = 'Start-Codex-App.command' ] || { echo 'The Codex edition must use Start-Codex-App.command.' >&2; exit 1; }
+  case "$expected_architecture" in arm64|x64) ;; *) echo 'Codex verification requires --expected-architecture arm64 or x64.' >&2; exit 2 ;; esac
+  host_architecture=$(uname -m)
+  case "$host_architecture" in arm64|aarch64) host_architecture=arm64 ;; x86_64|amd64) host_architecture=x64 ;; esac
+  [ "$(uname -s)" = Darwin ] || { echo 'A built-in macOS Codex package must be verified on macOS.' >&2; exit 1; }
+  [ "$host_architecture" = "$expected_architecture" ] || { echo "Runner architecture $host_architecture does not match package architecture $expected_architecture." >&2; exit 1; }
+  runtime_evidence=$(node "$project_root/scripts/codex-runtime-artifact.mjs" --mode verify --project-root "$project_root" --platform darwin --architecture "$expected_architecture")
 fi
+
+temporary_env_path="$project_root/.env"
+printf 'HOST=127.0.0.1\nPORT=%s\nXHS_MCP_ENABLED=false\nXHS_MCP_PORT=%s\n' "$port" "$((port + 1))" > "$temporary_env_path"
 
 check_output=$(cd "$project_root" && sh scripts/one-click.sh --check-only --no-browser --port "$port")
 printf '%s\n' "$check_output"
@@ -253,7 +278,7 @@ try {
     await codexLaunch.waitFor({ state: 'visible', timeout: 30_000 });
     let codexStatus = null;
     for (let attempt = 0; attempt < 180; attempt += 1) {
-      const codexStatusResponse = await page.request.get(`${origin}/api/codex-browser/status`);
+    const codexStatusResponse = await page.request.get(`${origin}/api/codex-browser/status`);
       if (!codexStatusResponse.ok()) throw new Error(`Codex status returned HTTP ${codexStatusResponse.status()}.`);
       codexStatus = await codexStatusResponse.json();
       if (codexStatus.ready === true && codexStatus.presentation === 'bundled' && codexStatus.backend?.initialized === true) break;
@@ -262,6 +287,10 @@ try {
     if (codexStatus.ready !== true || codexStatus.presentation !== 'bundled' || codexStatus.backend?.initialized !== true) {
       throw new Error('The bundled Codex app-server or browser presentation is not ready.');
     }
+    const threadListResponse = await page.request.post(`${origin}/api/codex-browser/request`, {
+      data: { method: 'thread/list', params: { limit: 3, useStateDbOnly: true } },
+    });
+    if (!threadListResponse.ok()) throw new Error(`Codex thread/list smoke returned HTTP ${threadListResponse.status()}.`);
     const codexResponse = await page.goto(`${origin}/codex/`, { waitUntil: 'networkidle', timeout: 60_000 });
     if (!codexResponse?.ok()) throw new Error(`Codex page returned HTTP ${codexResponse?.status() || 'unknown'}.`);
     await page.locator('html[data-codex-ready="true"]').waitFor({ state: 'attached', timeout: 30_000 });
@@ -277,7 +306,7 @@ try {
     interactiveCount,
     codexBuiltIn: requireCodexBuiltIn,
     codexProvider: codexProvider?.id || null,
-    screenshotPath,
+    screenshot: screenshotPath.split('/').at(-1),
   }));
 } finally {
   await browser.close();
@@ -287,5 +316,35 @@ JS
   printf '%s\n' "$browser_smoke_result"
 fi
 
-printf '{"archive":"%s","projectRoot":"%s","launchEntry":"%s","launcherExecutable":true,"launcherFirstRun":true,"healthUrl":"%s","service":"xiaohongshu-relay-scraper","ok":true,"cleanBootstrap":true,"codexBuiltIn":%s,"browserSmoke":%s}\n' \
-  "$resolved_archive_path" "$project_root" "$launch_entry" "$health_url" "$([ "$require_codex_built_in" -eq 1 ] && printf true || printf false)" "$browser_smoke_result"
+runtime_evidence=${runtime_evidence:-null}
+archive_name=${resolved_archive_path##*/}
+screenshot_name=${screenshot_path##*/}
+evidence_json=$(node --input-type=module - "$archive_name" "$launch_entry" "${expected_architecture:-unknown}" "$require_codex_built_in" "$runtime_evidence" "$browser_smoke_result" "$screenshot_name" <<'JS'
+const [archive, launchEntry, architecture, codexFlag, runtimeJson, browserJson, screenshot] = process.argv.slice(2);
+process.stdout.write(JSON.stringify({
+  schemaVersion: 1,
+  archive,
+  platform: 'darwin',
+  architecture,
+  launchEntry,
+  launcherExecutable: true,
+  launcherFirstRun: true,
+  healthPath: '/api/health',
+  service: 'xiaohongshu-relay-scraper',
+  ok: true,
+  cleanBootstrap: true,
+  codexBuiltIn: codexFlag === '1',
+  runtime: JSON.parse(runtimeJson),
+  codexStatusPath: codexFlag === '1' ? '/api/codex-browser/status' : null,
+  codexPage: codexFlag === '1' ? '/codex/' : null,
+  browserSmoke: JSON.parse(browserJson),
+  screenshot: screenshot || null,
+}));
+JS
+)
+printf '%s\n' "$evidence_json"
+if [ -n "$evidence_path" ]; then
+  case "$evidence_path" in /*) ;; *) evidence_path="$(pwd)/$evidence_path" ;; esac
+  mkdir -p "$(dirname -- "$evidence_path")"
+  printf '%s\n' "$evidence_json" > "$evidence_path"
+fi

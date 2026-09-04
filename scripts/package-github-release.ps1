@@ -88,14 +88,7 @@ try {
     $archive.Dispose()
 }
 
-$sha256 = [Security.Cryptography.SHA256]::Create()
-$fileStream = [IO.File]::OpenRead($resolvedOutputPath)
-try {
-    $hash = ([BitConverter]::ToString($sha256.ComputeHash($fileStream))).Replace('-', '').ToLowerInvariant()
-} finally {
-    $fileStream.Dispose()
-    $sha256.Dispose()
-}
+$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedOutputPath).Hash.ToLowerInvariant()
 $checksumPath = "$resolvedOutputPath.sha256"
 $checksumLine = "$hash  $([IO.Path]::GetFileName($resolvedOutputPath))`n"
 [IO.File]::WriteAllText($checksumPath, $checksumLine, (New-Object Text.UTF8Encoding($false)))
