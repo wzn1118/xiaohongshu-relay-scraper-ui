@@ -1235,11 +1235,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           return json(res, 400, errorBody('CODEX_BROWSER_CURSOR_INVALID', 'Codex browser event cursor is invalid.'));
         }
         const sessionId = String(url.searchParams.get('sessionId') || '').trim();
+        const page = codexBrowserService?.readEvents?.({ after, sessionId, limit: 30 });
+        if (page) return json(res, 200, page);
         const events = (codexBrowserService?.listEvents?.({ after, sessionId }) || []).slice(0, 30);
-        return json(res, 200, {
-          events,
-          cursor: events.at(-1)?.sequence ?? after,
-        });
+        return json(res, 200, { events, cursor: events.at(-1)?.sequence ?? after });
       }
       if (req.method === 'POST' && url.pathname === '/api/codex-browser/messages') {
         const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));

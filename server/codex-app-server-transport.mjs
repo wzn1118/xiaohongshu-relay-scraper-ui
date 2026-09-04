@@ -12,6 +12,7 @@ export function createCodexAppServerTransport({
   executableArgs = [],
   workspaceRoot,
   sqliteHome = process.env.XHS_CODEX_SQLITE_HOME || path.join(os.tmpdir(), 'xiaohongshu-relay-codex-sqlite'),
+  codexHome = process.env.XHS_CODEX_CHILD_HOME || path.join(sqliteHome, 'home'),
   contextMcp = null,
   contextMcps = null,
   modelProvider = null,
@@ -106,7 +107,8 @@ export function createCodexAppServerTransport({
       let process = null;
       try {
         mkdirSync(sqliteHome, { recursive: true });
-        if (globalThis.process.env.CODEX_HOME) mkdirSync(globalThis.process.env.CODEX_HOME, { recursive: true });
+        const isolatedCodexHome = path.resolve(String(codexHome || sqliteHome));
+        mkdirSync(isolatedCodexHome, { recursive: true });
         const appServerArgs = [
           '-c',
           'features.code_mode_host=true',
@@ -116,8 +118,15 @@ export function createCodexAppServerTransport({
         ];
         const environment = {
           ...globalThis.process.env,
+          CODEX_HOME: isolatedCodexHome,
           CODEX_SQLITE_HOME: sqliteHome,
         };
+        // Never let a host Codex/proxy configuration leak into the embedded runtime.
+        // The product bridge is the only model route this child is allowed to use.
+        delete environment.OPENAI_BASE_URL;
+        delete environment.OPENAI_API_KEY;
+        delete environment.OPENAI_ORG_ID;
+        delete environment.OPENAI_PROJECT_ID;
         for (const server of configuredContextMcps) environment[server.bearerTokenEnvVar] = server.token;
         if (configuredModelProvider) environment[configuredModelProvider.apiKeyEnvVar] = configuredModelProvider.apiKey;
         process = spawnProcess(executablePath, [...executableArgs, ...appServerArgs], {

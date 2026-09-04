@@ -132,6 +132,10 @@ test('injects a private Responses bridge provider without exposing its credentia
   assert.ok(spawned.args.includes('model_providers.xhs_product_api.wire_api="responses"'));
   assert.ok(spawned.args.includes('model_providers.xhs_product_api.env_key="XHS_CODEX_MODEL_BRIDGE_TOKEN"'));
   assert.equal(spawned.options.env.XHS_CODEX_MODEL_BRIDGE_TOKEN, 'bridge-secret');
+  assert.notEqual(spawned.options.env.CODEX_HOME, path.resolve(spawned.options.env.CODEX_SQLITE_HOME));
+  assert.equal(spawned.options.env.CODEX_HOME, path.join(path.resolve(spawned.options.env.CODEX_SQLITE_HOME), 'home'));
+  assert.equal('OPENAI_BASE_URL' in spawned.options.env, false);
+  assert.equal('OPENAI_API_KEY' in spawned.options.env, false);
   assert.deepEqual(transport.status().modelProvider, {
     configured: true,
     id: 'xhs_product_api',
@@ -141,5 +145,25 @@ test('injects a private Responses bridge provider without exposing its credentia
     wireApi: 'responses',
   });
   assert.equal(JSON.stringify(transport.status()).includes('bridge-secret'), false);
+  await transport.close();
+});
+
+test('isolates the embedded runtime when no product model provider is configured', async () => {
+  const child = fakeProcess();
+  let spawned = null;
+  const transport = createCodexAppServerTransport({
+    executablePath: 'codex.exe',
+    workspaceRoot: 'C:\\workspace',
+    sqliteHome: 'C:\\sqlite',
+    spawnProcess: (executablePath, args, options) => {
+      spawned = { executablePath, args, options };
+      return child;
+    },
+  });
+  await transport.start();
+  assert.equal(spawned.options.env.CODEX_HOME, path.resolve('C:\\sqlite\\home'));
+  assert.equal(spawned.options.env.CODEX_SQLITE_HOME, path.resolve('C:\\sqlite'));
+  assert.equal('OPENAI_BASE_URL' in spawned.options.env, false);
+  assert.equal('OPENAI_API_KEY' in spawned.options.env, false);
   await transport.close();
 });

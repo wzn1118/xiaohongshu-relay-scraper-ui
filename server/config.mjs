@@ -27,6 +27,12 @@ const smtpPass = String(process.env.SMTP_PASS || '');
 const smtpFrom = String(process.env.SMTP_FROM || smtpUser).trim();
 const smtpAuth = String(process.env.SMTP_AUTH || 'auto').trim().toLowerCase();
 const smtpOAuthTenant = normalizeMicrosoftTenant(process.env.SMTP_OAUTH_TENANT);
+const codexHome = String(process.env.CODEX_HOME || '').trim();
+const detectedCodexExecutable = [
+  process.env.CODEX_CLI_PATH,
+  codexHome ? path.join(codexHome, 'plugins', '.plugin-appserver', 'codex.exe') : '',
+  codexHome ? path.join(codexHome, 'plugins', '.plugin-appserver', 'codex') : '',
+].map((candidate) => String(candidate || '').trim()).find((candidate) => candidate && existsSync(candidate)) || '';
 
 export const config = Object.freeze({
   host,
@@ -37,8 +43,8 @@ export const config = Object.freeze({
       || path.join(workspaceRoot, 'output', 'codex-desktop-runtime-55d9fb967596'),
   ),
   codexDesktopUserDataDir: String(process.env.XHS_CODEX_DESKTOP_USER_DATA_DIR || '').trim(),
-  codexExecutablePath: String(process.env.XHS_CODEX_EXECUTABLE || '').trim(),
-  codexBuiltInEdition: readBoolean(process.env.XHS_CODEX_BUILT_IN_EDITION, false),
+  codexExecutablePath: String(process.env.XHS_CODEX_EXECUTABLE || detectedCodexExecutable).trim(),
+  codexBuiltInEdition: readBoolean(process.env.XHS_CODEX_BUILT_IN_EDITION, true),
   codexWorktreeRoot: path.resolve(
     process.env.XHS_CODEX_WORKTREE_ROOT
       || path.join(dataDir, '..', 'codex-worktrees'),
