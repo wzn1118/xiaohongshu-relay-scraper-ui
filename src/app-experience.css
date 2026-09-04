@@ -62,6 +62,137 @@
   gap: 14px;
 }
 
+.experience-library-toolbar {
+  order: 1;
+  min-height: 72px;
+  padding: 4px 0 14px;
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid #c8c7c1;
+}
+
+.experience-library-toolbar > div:first-child {
+  min-width: 0;
+}
+
+.experience-library-toolbar h2 {
+  margin: 4px 0 0;
+  color: #202124;
+  font-family: SimSun, "Microsoft YaHei UI", serif;
+  font-size: 26px;
+  line-height: 1.2;
+}
+
+.experience-library-toolbar > div:first-child > small {
+  display: block;
+  margin-top: 4px;
+  overflow: hidden;
+  color: #72757a;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.experience-library-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.experience-overview-button,
+.experience-library-tabs button {
+  min-height: 40px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid #aaa9a3;
+  border-radius: 4px;
+  background: #fff;
+  color: #44474b;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.experience-library-tabs {
+  padding: 3px;
+  display: flex;
+  gap: 3px;
+  border: 1px solid #c8c7c1;
+  border-radius: 5px;
+  background: #e8e6df;
+}
+
+.experience-library-tabs button {
+  min-height: 34px;
+  border: 0;
+  background: transparent;
+}
+
+.experience-library-tabs button.active {
+  background: #303236;
+  color: #fff;
+}
+
+.experience-view-overview .secondary-grid {
+  display: none;
+}
+
+.experience-view-history :is(.experience-command-center, .experience-setup-hub, .primary-grid, .coverage-panel, .results-panel),
+.experience-view-artifacts :is(.experience-command-center, .experience-setup-hub, .primary-grid, .coverage-panel, .results-panel) {
+  display: none;
+}
+
+.experience-view-history .experience-library-toolbar,
+.experience-view-artifacts .experience-library-toolbar {
+  display: flex;
+}
+
+.experience-view-history .secondary-grid,
+.experience-view-artifacts .secondary-grid {
+  order: 2;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.experience-view-history .artifacts-panel,
+.experience-view-artifacts .history-panel {
+  display: none;
+}
+
+.experience-ui .notice {
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.experience-ui .notice.success {
+  color: #116b57;
+  border-color: #9bc7b7;
+  background: #eef8f4;
+}
+
+.experience-ui .notice.info {
+  color: #245a78;
+  border-color: #a9c7d8;
+  background: #f0f7fb;
+}
+
+.experience-ui .notice.warning {
+  color: #725612;
+  border-color: #d9c27f;
+  background: #fff9e8;
+}
+
+.experience-ui .notice.error {
+  color: #8b2638;
+  border-color: #e2a5ae;
+  background: #fff0f2;
+}
+
 .experience-command-center {
   order: 1;
   display: grid;
@@ -381,9 +512,23 @@
   grid-column: 1 / -1;
 }
 
+.experience-ui .primary-grid.task-focused > .mission-panel {
+  grid-column: 1 / -1;
+}
+
+.config-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .experience-ui .experience-setup-hub {
   order: 3;
   scroll-margin-top: 86px;
+}
+
+.experience-ui .experience-setup-hub:not(.is-open) {
+  display: none;
 }
 
 .experience-setup-summary {
@@ -568,15 +713,25 @@
 @media (max-width: 900px) {
   .experience-ui .topbar {
     position: sticky;
-    min-height: 68px;
-    align-items: center;
-    flex-direction: row;
+    min-height: 0;
+    padding-block: 9px;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .experience-ui .topbar-leading {
+    width: 100%;
     min-width: 0;
+    flex: 0 1 auto;
     flex-direction: row;
     align-items: center;
+  }
+
+  .experience-ui .topbar-status {
+    width: 100%;
+    gap: 8px;
+    justify-content: flex-end;
   }
 
   .experience-breadcrumb {
@@ -634,7 +789,7 @@
 
   .experience-ui .product-title {
     min-height: 38px;
-    padding-right: 40px;
+    padding-right: 82px;
   }
 
   .experience-ui .product-title h1 {
@@ -645,6 +800,36 @@
   .experience-ui .workspace > main {
     gap: 10px;
     padding: 10px 10px 82px;
+  }
+
+  .experience-library-toolbar {
+    padding: 2px 0 10px;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .experience-library-toolbar h2 {
+    font-size: 22px;
+  }
+
+  .experience-library-actions {
+    width: 100%;
+    display: grid;
+    grid-template-columns: minmax(110px, .75fr) minmax(0, 1.25fr);
+  }
+
+  .experience-overview-button {
+    width: 100%;
+  }
+
+  .experience-library-tabs {
+    min-width: 0;
+  }
+
+  .experience-library-tabs button {
+    min-width: 0;
+    flex: 1;
   }
 
   .experience-command-main {

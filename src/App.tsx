@@ -1595,6 +1595,7 @@ function audienceSnapshotRegressed(current: AudienceResultsResponse, next: Audie
 }
 
 type ApplicationView = 'jobs' | 'batch'
+type ExperienceView = 'overview' | 'history' | 'artifacts'
 
 function workspaceModeFromLocation(): AnalysisMode {
   if (typeof window === 'undefined') return 'job'
@@ -1687,6 +1688,15 @@ function isIncompleteApplicationResult(result: ApplicationResult) {
     || result.job_card?.parse_basis === 'search_card'
 }
 
+type NoticeTone = 'success' | 'info' | 'warning' | 'error'
+
+function noticeToneFor(message: string): NoticeTone {
+  if (/失败|错误|异常|冲突|失效|未检测到|无法|不可|阻断|请先|缺少|未通过/.test(message)) return 'error'
+  if (/成功|已保存|已清除|已连接|已安装|已就绪|已自动恢复|已通过|已启动|已排队|已加入|已复制|已发送|已移除|无需/.test(message)) return 'success'
+  if (/等待|正在|尚未|部分|稍后|可使用/.test(message)) return 'warning'
+  return 'info'
+}
+
 function App() {
   const [authSession, setAuthSession] = useState<AuthSession | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
@@ -1697,6 +1707,8 @@ function App() {
   const [workspaceMode, setWorkspaceMode] = useState<AnalysisMode>(() => workspaceModeFromLocation())
   const [applicationView, setApplicationView] = useState<ApplicationView>(() => applicationViewFromLocation())
   const [generalResultModule, setGeneralResultModule] = useState<GeneralResultModule>(() => generalResultModuleFromLocation())
+  const [experienceView, setExperienceView] = useState<ExperienceView>('overview')
+  const [taskComposerOpen, setTaskComposerOpen] = useState(false)
   const requestCache = useRef<Record<AnalysisMode, JobRequest>>({
     job: { ...defaultRequest, analysisMode: 'job', candidateProfile: loadCandidateProfile() },
     general: { ...defaultRequest, analysisMode: 'general', keyword: '', useCodexRuntime: true, collectAudience: true, candidateProfile: loadCandidateProfile() },
@@ -1966,6 +1978,8 @@ function App() {
       window.history.pushState({ workspaceMode: mode, applicationView: nextApplicationView }, '', workspacePath(mode, nextApplicationView))
     }
     setApplicationView(nextApplicationView)
+    setExperienceView('overview')
+    setTaskComposerOpen(false)
     if (mode === 'general') setGeneralResultModule(updateHistory ? 'insights' : generalResultModuleFromLocation())
     setWorkspaceMode(mode)
     setRequest({ ...requestCache.current[mode] })
@@ -2015,6 +2029,8 @@ function App() {
       window.history.pushState({ workspaceMode: 'job', applicationView: view }, '', nextPath)
     }
     setApplicationView(view)
+    setExperienceView('overview')
+    setTaskComposerOpen(false)
     setNotice(null)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }, [applicationView, workspaceMode])
@@ -2132,12 +2148,16 @@ function App() {
   }, [activeJob, applicationView, audienceDataJobId, draftGuard.requestTransition, generalResultModule, jobs, performSwitchApplicationView, performSwitchWorkspace, workspaceMode])
 
   useEffect(() => {
-    document.title = workspaceMode === 'general'
-      ? '今天你投了吗？｜内容研究工作台'
-      : applicationView === 'batch'
-        ? '今天你投了吗？｜批量投递工作台'
-        : '今天你投了吗？｜岗位与投递'
-  }, [applicationView, workspaceMode])
+    document.title = experienceView === 'history'
+      ? '今天你投了吗？｜历史任务'
+      : experienceView === 'artifacts'
+        ? '今天你投了吗？｜交付产物'
+        : workspaceMode === 'general'
+          ? '今天你投了吗？｜内容研究工作台'
+          : applicationView === 'batch'
+            ? '今天你投了吗？｜批量投递工作台'
+            : '今天你投了吗？｜岗位与投递'
+  }, [applicationView, experienceView, workspaceMode])
 
   useEffect(() => {
     const provider = detectedSmtpPreset?.provider || smtpConfig.provider
@@ -3529,6 +3549,7 @@ function App() {
         setLogs((current) => [...current, `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] AI 已自动重连，任务创建成功。`])
       }
       setActiveJob(job)
+      setTaskComposerOpen(false)
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)])
       connectJob(job)
       return job
@@ -3570,6 +3591,7 @@ function App() {
       })
       const job = response.job
       setActiveJob(job)
+      setTaskComposerOpen(false)
       activeJobIdCache.current[workspaceMode] = job.id
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)])
       connectJob(job)
@@ -4108,7 +4130,12 @@ function App() {
       switchWorkspace(targetMode)
       return
     }
-    void selectJob(job)
+    void draftGuard.requestTransition('切换任务', () => {
+      performSelectJob(job)
+      setExperienceView('overview')
+      setTaskComposerOpen(false)
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    })
   }
 
   const openFeaturedJob = () => {
@@ -4346,13 +4373,34 @@ function App() {
           ? '完成启动设置'
           : '配置本次任务'
 
+  const experienceComposerVisible = taskComposerOpen || (!loading && !activeJob)
+
+  const showExperienceOverview = () => {
+    setSetupOpen(false)
+    setTaskComposerOpen(false)
+    setExperienceView('overview')
+    window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'smooth' }))
+  }
+
   const revealExperienceSection = (id: string) => {
-    window.requestAnimationFrame(() => {
+    setExperienceView('overview')
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
       document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    })
+    }))
+  }
+
+  const openTaskComposer = () => {
+    setSetupOpen(false)
+    setExperienceView('overview')
+    setTaskComposerOpen(true)
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      document.getElementById('task-config')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }))
   }
 
   const openExperienceSettings = (target = 'setup-center') => {
+    setExperienceView('overview')
+    setTaskComposerOpen(false)
     setSetupOpen(true)
     if (batchSurfaceActive) {
       performSwitchApplicationView('jobs')
@@ -4362,13 +4410,25 @@ function App() {
     window.requestAnimationFrame(() => window.requestAnimationFrame(() => revealExperienceSection(target)))
   }
 
-  const openExperienceSection = (id: 'history' | 'artifacts') => {
+  const openCodexRuntime = () => {
+    const codexProvider = providers.find((provider) => provider.id === 'codex')
+    if (codexProvider) selectProvider(codexProvider.id, providers)
+    openExperienceSettings('ai-memory')
+  }
+
+  const openExperienceSection = (view: Exclude<ExperienceView, 'overview'>) => {
+    const showView = () => {
+      setSetupOpen(false)
+      setTaskComposerOpen(false)
+      setExperienceView(view)
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    }
     if (batchSurfaceActive) {
       performSwitchApplicationView('jobs')
-      window.setTimeout(() => revealExperienceSection(id), 240)
+      window.setTimeout(showView, 240)
       return
     }
-    revealExperienceSection(id)
+    showView()
   }
 
   const launchFromExperienceHome = () => {
@@ -4384,7 +4444,7 @@ function App() {
     }
     if (request.speedMode === 'random' && request.randomDelayMinSeconds > request.randomDelayMaxSeconds) {
       setNotice('随机节奏的最短间隔需要小于或等于最长间隔')
-      revealExperienceSection('task-config')
+      openTaskComposer()
       return
     }
     void runJob({ ...request, analysisMode: workspaceMode, checkOnly: false })
@@ -4392,6 +4452,7 @@ function App() {
 
   const handleExperiencePrimary = () => {
     if (experienceTaskRunning) {
+      setTaskComposerOpen(false)
       revealExperienceSection('current-task')
       return
     }
@@ -4400,6 +4461,7 @@ function App() {
       return
     }
     if (activeJob?.status === 'completed' || experienceTaskHasResults) {
+      setTaskComposerOpen(false)
       revealExperienceSection('results')
       return
     }
@@ -4407,7 +4469,7 @@ function App() {
       openExperienceSettings(experienceSetupBlocker.target)
       return
     }
-    revealExperienceSection('task-config')
+    openTaskComposer()
   }
   const selectedDeliveryRoutes = selectedResult ? deliveryRoutes(selectedResult) : []
   const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email' && route.actionable)
@@ -5057,14 +5119,15 @@ function App() {
   }
 
   return (
-    <div className={`app-shell experience-ui ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
+    <div className={`app-shell experience-ui experience-view-${experienceView} ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
       <aside className="side-rail">
         <div className="brand-mark" aria-label="今天你投了吗？">投</div>
         <nav aria-label="主导航">
-          <button className={`nav-button ${workspaceMode === 'job' ? 'active' : ''}`} type="button" title="今日任务" aria-current={workspaceMode === 'job' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={20} /><span>任务</span></button>
-          <button className={`nav-button ${workspaceMode === 'general' ? 'active' : ''}`} type="button" title="内容研究" aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={20} /><span>研究</span></button>
-          <button className="nav-button" type="button" title="任务记录" onClick={() => openExperienceSection('history')}><Clock3 size={20} /><span>记录</span></button>
-          <button className={`nav-button ${setupOpen ? 'utility-active' : ''}`} type="button" title="运行设置" aria-expanded={setupOpen} onClick={() => openExperienceSettings()}><Settings2 size={20} /><span>设置</span></button>
+          <button className={`nav-button ${experienceView === 'overview' && workspaceMode === 'job' ? 'active' : ''}`} type="button" title="今日任务" aria-current={experienceView === 'overview' && workspaceMode === 'job' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? (showExperienceOverview(), switchApplicationView('jobs')) : switchWorkspace('job', true, 'jobs')}><Target size={20} /><span>任务</span></button>
+          <button className={`nav-button ${experienceView === 'overview' && workspaceMode === 'general' ? 'active' : ''}`} type="button" title="内容研究" aria-current={experienceView === 'overview' && workspaceMode === 'general' ? 'page' : undefined} onClick={() => workspaceMode === 'general' ? showExperienceOverview() : switchWorkspace('general')}><BookOpenCheck size={20} /><span>研究</span></button>
+          <button className={`nav-button ${experienceView === 'history' ? 'active' : ''}`} type="button" title="历史任务" aria-current={experienceView === 'history' ? 'page' : undefined} onClick={() => openExperienceSection('history')}><Clock3 size={20} /><span>历史</span></button>
+          <button className={`nav-button ${experienceView === 'artifacts' ? 'active' : ''}`} type="button" title="交付产物" aria-current={experienceView === 'artifacts' ? 'page' : undefined} onClick={() => openExperienceSection('artifacts')}><Archive size={20} /><span>产物</span></button>
+          <button className={`nav-button ${experienceView === 'overview' && setupOpen ? 'utility-active' : ''}`} type="button" title="运行设置" aria-expanded={setupOpen} onClick={() => openExperienceSettings()}><Settings2 size={20} /><span>设置</span></button>
         </nav>
       </aside>
 
@@ -5072,25 +5135,40 @@ function App() {
         <header className="topbar">
           <div className="topbar-leading">
             <div className="product-title">
-              <span className="eyebrow">{workspaceMode === 'general' ? 'CONTENT INTELLIGENCE' : applicationView === 'batch' ? 'BATCH APPLICATION WORKBENCH' : 'APPLICATION INTELLIGENCE'}</span>
-              <h1>{workspaceMode === 'general' ? '今天你投了吗？｜内容研究工作台' : applicationView === 'batch' ? '今天你投了吗？｜批量投递工作台' : '今天你投了吗？｜岗位与投递'}</h1>
+              <span className="eyebrow">{experienceView === 'history' ? 'TASK ARCHIVE' : experienceView === 'artifacts' ? 'DELIVERABLES' : workspaceMode === 'general' ? 'CONTENT INTELLIGENCE' : applicationView === 'batch' ? 'BATCH APPLICATION WORKBENCH' : 'APPLICATION INTELLIGENCE'}</span>
+              <h1>{experienceView === 'history' ? '今天你投了吗？｜历史任务' : experienceView === 'artifacts' ? '今天你投了吗？｜交付产物' : workspaceMode === 'general' ? '今天你投了吗？｜内容研究工作台' : applicationView === 'batch' ? '今天你投了吗？｜批量投递工作台' : '今天你投了吗？｜岗位与投递'}</h1>
               <span className="version">v3.0</span>
             </div>
             <div className="experience-breadcrumb" aria-label="当前工作区">
               <span>{workspaceMode === 'general' ? '研究' : '求职任务'}</span>
               <ChevronRight size={14} />
-              <strong>{applicationView === 'batch' ? '审批与发送' : workspaceMode === 'general' ? '采集与洞察' : '发现与准备'}</strong>
+              <strong>{experienceView === 'history' ? '历史任务' : experienceView === 'artifacts' ? '交付产物' : applicationView === 'batch' ? '审批与发送' : workspaceMode === 'general' ? '采集与洞察' : '发现与准备'}</strong>
             </div>
           </div>
           <div className="topbar-status">
             <button
               type="button"
-              className="copilot-launch-button"
-              disabled={!activeJob}
-              title={!activeJob ? '请先选择任务' : !aiSession ? '打开历史会话（发送前需连接 AI 模型）' : '打开数据 Copilot'}
-              onClick={() => setDataCopilotOpen(true)}
+              className="copilot-launch-button codex-runtime-button"
+              title="打开内置 Codex Runtime"
+              onClick={openCodexRuntime}
             >
-              <MessagesSquare size={16} />
+              <Sparkles size={16} />
+              <span>Codex</span>
+            </button>
+            <button
+              type="button"
+              className="copilot-launch-button data-assistant-button"
+              title={activeJob ? '打开数据助手' : '先选择任务后使用数据助手'}
+              onClick={() => {
+                if (activeJob) {
+                  setDataCopilotOpen(true)
+                  return
+                }
+                setNotice('请先从历史任务中选择一项，再打开数据助手。')
+                openExperienceSection('history')
+              }}
+            >
+              <MessageSquare size={16} />
               <span>数据助手</span>
             </button>
             <div className={`relay-indicator ${relayReady ? 'ready' : relayConnecting ? 'connecting' : 'offline'}`}>
@@ -5102,15 +5180,32 @@ function App() {
           </div>
         </header>
 
-        {notice && (
-          <div className="notice" role="alert">
-            <CircleAlert size={17} />
+        {notice && (() => {
+          const tone = noticeToneFor(notice)
+          return (
+          <div className={`notice ${tone}`} role={tone === 'error' ? 'alert' : 'status'}>
+            {tone === 'success' ? <Check size={17} /> : tone === 'error' ? <CircleAlert size={17} /> : <Info size={17} />}
             <span>{notice}</span>
             <button onClick={() => setNotice(null)} title="关闭"><X size={16} /></button>
           </div>
-        )}
+          )
+        })()}
 
         <main>
+          <header className="experience-library-toolbar">
+            <div>
+              <span className="step-label">TASK LIBRARY</span>
+              <h2>{experienceView === 'history' ? '历史任务' : '交付产物'}</h2>
+              <small>{experienceView === 'history' ? `${historyJobs.length} 条任务记录` : activeJob ? `当前任务 · ${activeJob.keyword}` : '尚未选择任务'}</small>
+            </div>
+            <div className="experience-library-actions">
+              <button type="button" className="experience-overview-button" onClick={showExperienceOverview}><Target size={16} />当前任务</button>
+              <div className="experience-library-tabs" role="tablist" aria-label="任务资料视图">
+                <button type="button" role="tab" aria-selected={experienceView === 'history'} className={experienceView === 'history' ? 'active' : ''} onClick={() => openExperienceSection('history')}><Clock3 size={16} />历史</button>
+                <button type="button" role="tab" aria-selected={experienceView === 'artifacts'} className={experienceView === 'artifacts' ? 'active' : ''} onClick={() => openExperienceSection('artifacts')}><Archive size={16} />产物</button>
+              </div>
+            </div>
+          </header>
           <section className="experience-command-center" aria-labelledby="product-hero-title">
             <div className="experience-command-main">
               <div className="experience-command-kicker">
@@ -5126,7 +5221,7 @@ function App() {
                   {experienceTaskRecoverable ? <RotateCcw size={17} /> : experienceTaskRunning ? <Activity size={17} /> : <ArrowUpDown size={17} />}
                   {experiencePrimaryLabel}
                 </button>
-                <button type="button" className="secondary-button" onClick={() => revealExperienceSection('task-config')}><Search size={17} />新建任务</button>
+                <button type="button" className="secondary-button" onClick={openTaskComposer}><Search size={17} />新建任务</button>
                 {workspaceMode === 'job' && activeJob && experienceTaskHasResults && <button type="button" className="secondary-button" onClick={() => switchApplicationView('batch')}><Layers3 size={17} />批量投递</button>}
               </div>
               <form className="experience-quick-launch" onSubmit={(event) => { event.preventDefault(); launchFromExperienceHome() }}>
@@ -5421,11 +5516,14 @@ function App() {
             </div>}
           </section>
 
-          <div className="primary-grid">
-            <section className="panel config-panel" id="task-config">
+          <div className={`primary-grid ${experienceComposerVisible ? 'has-composer' : 'task-focused'}`}>
+            {experienceComposerVisible && <section className="panel config-panel" id="task-config">
               <div className="panel-heading">
                 <div><span className="step-label">01 / CONFIGURE</span><h2>{collectionEntryMode === 'import' ? '批量采集指定正文' : request.analysisMode === 'general' ? '新建非岗位信息研究任务' : '新建采集与投递分析任务'}</h2></div>
-                <span className="local-badge">本地执行</span>
+                <div className="config-heading-actions">
+                  <span className="local-badge">本地执行</span>
+                  {activeJob && taskComposerOpen && <button type="button" className="icon-button" title="收起新建任务" aria-label="收起新建任务" onClick={() => setTaskComposerOpen(false)}><X size={16} /></button>}
+                </div>
               </div>
               <div className="collection-entry-switch" role="tablist" aria-label="采集入口">
                 <button type="button" role="tab" aria-selected={collectionEntryMode === 'search'} className={collectionEntryMode === 'search' ? 'selected' : ''} onClick={() => setCollectionEntryMode('search')}><Search size={15} />关键词发现</button>
@@ -5544,7 +5642,7 @@ function App() {
                   <button className="secondary-button" type="button" disabled={submitting} onClick={() => void runJob({ ...request, checkOnly: true })}><Activity size={18} />仅检查链路</button>
                 </div>
               </form>
-            </section>
+            </section>}
 
             <section className="panel mission-panel" id="current-task">
               <div className="panel-heading">

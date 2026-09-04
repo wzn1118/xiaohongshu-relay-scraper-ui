@@ -57,6 +57,8 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .copilot-launch-button { height: 34px; padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid #9dbdb3; border-radius: 4px; background: #eef7f4; color: #0f6d57; font-size: 11px; font-weight: 800; white-space: nowrap; }
 .copilot-launch-button:hover { border-color: #0f6d57; background: #e2f1ec; }
 .copilot-launch-button svg { flex: 0 0 auto; }
+.codex-runtime-button { border-color: #b9b9b4; background: #fff; color: #34363a; }
+.codex-runtime-button:hover { border-color: #74767b; background: #f0f0ed; }
 .relay-indicator { min-width: 180px; display: flex; align-items: center; gap: 9px; color: var(--ink-soft); }
 .relay-indicator.ready > svg { color: var(--green); }
 .relay-indicator.offline > svg { color: var(--red); }
@@ -1751,12 +1753,12 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .rail-settings { width: 56px; margin: 0 0 0 5px; }
   .topbar { min-height: 108px; padding: 9px 12px 10px; align-items: stretch; position: relative; }
   .topbar-leading { width: 100%; flex-direction: column; align-items: stretch; gap: 8px; }
-  .product-title { min-height: 31px; padding-right: 42px; align-items: center; }
+  .product-title { min-height: 31px; padding-right: 82px; align-items: center; }
   .product-title h1 { margin: 0; font-size: 20px; }
   .product-title .eyebrow, .version, .relay-indicator span, .topbar .icon-button { display: none; }
   .workspace-switcher { width: 100%; grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .workspace-switcher button { min-height: 35px; padding: 0 5px; font-size: 8px; }
-  .topbar-status { display: flex; position: absolute; top: 8px; right: 12px; }
+  .topbar-status { display: flex; gap: 6px; position: absolute; top: 8px; right: 12px; }
   .topbar-status > :not(.copilot-launch-button) { display: none; }
   .copilot-launch-button { width: 34px; padding: 0; }
   .copilot-launch-button span { display: none; }
