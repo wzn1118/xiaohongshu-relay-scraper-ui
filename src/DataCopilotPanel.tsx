@@ -1318,6 +1318,16 @@ export function DataCopilotPanel({
               </button>
             ) : null}
             <button
+              className="data-copilot-icon-button data-copilot-collapse-button"
+              type="button"
+              onClick={onClose}
+              title="收起面板"
+              aria-label="折叠 Data Copilot"
+              style={panelStyles.headerButton}
+            >
+              <PanelRightClose size={17} aria-hidden="true" />
+            </button>
+            <button
               className="data-copilot-icon-button data-copilot-fullscreen-button"
               type="button"
               onClick={() => setFullscreen((value) => !value)}
