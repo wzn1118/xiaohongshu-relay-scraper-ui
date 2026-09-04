@@ -221,19 +221,25 @@ export function JobJourneyPanel({
       ? '已中断'
       : displayCopy.label
   const primaryProblemCopy = primaryIssue ? safeProblemCopy(primaryIssue, savedResultCount, resumeAvailable) : null
-  const actionableProblem = visibleIssues.find((problem) => {
+  const actionableProblem = displayState === 'retrying'
+    ? null
+    : visibleIssues.find((problem) => {
     const actionId = normalizeProblemActionId(problem.action?.id)
     return Boolean(actionId && actionId !== 'resume' && onProblemAction)
-  }) || null
+      }) || null
   const actionableProblemId = actionableProblem ? normalizeProblemActionId(actionableProblem.action?.id) : null
-  const recommendationTitle = primaryProblemCopy?.title || (displayState === 'completed'
+  const recommendationTitle = displayState === 'retrying'
+    ? '系统正在恢复当前步骤'
+    : primaryProblemCopy?.title || (displayState === 'completed'
     ? '查看已整理结果'
     : displayState === 'failed' && !canResume
       ? '查看技术详情并重新创建任务'
       : displayCopy.label)
-  const recommendationDetail = primaryProblemCopy?.message || (canResume && remainingStageSummary
-    ? remainingStageSummary
-    : displayCopy.detail)
+  const recommendationDetail = displayState === 'retrying'
+    ? primaryProblemCopy ? `无需操作。${primaryProblemCopy.message}` : displayCopy.detail
+    : primaryProblemCopy?.message || (canResume && remainingStageSummary
+      ? remainingStageSummary
+      : displayCopy.detail)
   const recommendationLabel = actionableProblemId === 'check_recovery'
     ? '立即检查是否恢复'
     : actionableProblem?.action?.label
@@ -253,7 +259,9 @@ export function JobJourneyPanel({
     : active
       ? '正在建立首个检查点'
       : '本任务没有可用检查点'
-  const recommendationKind = primaryIssue?.severity === 'blocking'
+  const recommendationKind = displayState === 'retrying'
+    ? 'retrying'
+    : primaryIssue?.severity === 'blocking'
     ? 'blocking'
     : primaryIssue
       ? 'warning'
@@ -369,17 +377,18 @@ export function JobJourneyPanel({
       <section
         className={`journey-recommendation ${recommendationKind}`}
         aria-labelledby="journey-recommendation-heading"
-        role={primaryIssue?.severity === 'blocking' ? 'alert' : 'status'}
-        aria-live={primaryIssue?.severity === 'blocking' ? 'assertive' : 'polite'}
+        role={displayState !== 'retrying' && primaryIssue?.severity === 'blocking' ? 'alert' : 'status'}
+        aria-live={displayState !== 'retrying' && primaryIssue?.severity === 'blocking' ? 'assertive' : 'polite'}
         aria-atomic="true"
       >
         <span className="journey-recommendation-icon">
           {primaryIssue ? <CircleAlert aria-hidden="true" size={19} /> : displayState === 'completed' ? <Check aria-hidden="true" size={19} /> : <Activity aria-hidden="true" size={19} />}
         </span>
         <div>
-          <span className="journey-eyebrow">{primaryIssue?.severity === 'blocking' ? '阻断原因' : primaryIssue ? '需要关注' : '建议下一步'}</span>
-          <h3 id="journey-recommendation-heading">{recommendationTitle}</h3>
+          <span className="journey-eyebrow">{displayState === 'retrying' ? '系统正在处理' : primaryIssue?.severity === 'blocking' ? '阻断原因' : primaryIssue ? '需要关注' : '建议下一步'}</span>
+          <strong className="journey-recommendation-title" id="journey-recommendation-heading">{recommendationTitle}</strong>
           <p>{recommendationDetail}</p>
+          {canResume && remainingStageSummary && <small className="journey-recovery-note">{remainingStageSummary}</small>}
           {resumeFeedback && <p className={`journey-recovery-feedback ${resumeFeedback.tone}`} role={resumeFeedback.tone === 'error' ? 'alert' : 'status'}>
             {resumeFeedback.tone === 'error' ? <CircleAlert size={14} /> : <RefreshCw className={resumeFeedback.tone === 'progress' ? 'spin' : ''} size={14} />}
             {resumeFeedback.text}
