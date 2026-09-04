@@ -527,7 +527,7 @@ function RecordDetail({ jobId, record, selectedSet, disabled, onToggle }: {
       <div className="data-copilot-context-section-heading"><strong>选择数据上下文</strong><span>可按本轮问题精确选择</span></div>
       <div className="data-copilot-context-section-list">{record.sections.map((section) => {
         const selected = selectedSet.has(section.sourceId)
-        return <button key={section.sourceId} type="button" className="data-copilot-context-section-button" data-selected={selected} disabled={disabled} onClick={() => onToggle(section.sourceId)} aria-pressed={selected}><span className="data-copilot-context-check" data-selected={selected}>{selected ? <Check size={13} aria-hidden="true" /> : null}</span><span><strong>{section.label}</strong><small>{section.description}</small></span></button>
+        return <button key={section.sourceId} type="button" className="data-copilot-context-section-button" data-selected={selected} disabled={disabled} onClick={() => onToggle(section.sourceId)} aria-pressed={selected} aria-label={`${section.label}${section.description}`}><span className="data-copilot-context-check" data-selected={selected}>{selected ? <Check size={13} aria-hidden="true" /> : null}</span><span><strong>{section.label}</strong><small>{section.description}</small></span></button>
       })}</div>
       {record.body ? <section className="data-copilot-context-content-section"><strong>正文</strong><p>{record.body}</p></section> : null}
       {record.analysis ? <details className="data-copilot-context-analysis"><summary>已有 AI 分析</summary><pre>{formatAnalysis(record.analysis)}</pre></details> : null}

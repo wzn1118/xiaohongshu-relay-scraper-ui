@@ -1678,10 +1678,10 @@ export function DataCopilotPanel({
               </button>
             ) : null}
             <button
-              className="data-copilot-icon-button data-copilot-close-button"
+              className="data-copilot-icon-button data-copilot-collapse-button"
               type="button"
               onClick={onClose}
-              title="折叠"
+              title="收起面板"
               aria-label="折叠 Data Copilot"
               style={panelStyles.headerButton}
             >

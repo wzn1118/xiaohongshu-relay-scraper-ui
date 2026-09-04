@@ -137,6 +137,11 @@
   color: #ffe4df !important;
 }
 
+.data-copilot-collapse-button {
+  margin-left: 4px;
+  box-shadow: -6px 0 0 -5px #506158;
+}
+
 .data-copilot-model-control {
   height: 38px !important;
 }
@@ -2096,7 +2101,8 @@
   .data-copilot-resize-handle,
   .data-copilot-brand-text,
   .data-copilot-desktop-pane-button,
-  .data-copilot-fullscreen-button {
+  .data-copilot-fullscreen-button,
+  .data-copilot-close-button {
     display: none !important;
   }
 
@@ -2146,6 +2152,7 @@
 
   .data-copilot-mobile-nav-button {
     display: flex !important;
+    width: 100% !important;
     min-width: 0;
     height: 38px !important;
     align-items: center;
