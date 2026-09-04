@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import {
   BrainCircuit,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  Database,
   Download,
   ExternalLink,
   FileText,
   Gauge,
+  Layers3,
+  ListFilter,
   LoaderCircle,
   MapPin,
   Pause,
@@ -22,6 +27,7 @@ import {
   X,
 } from 'lucide-react'
 import { api } from './api'
+import './AudienceAiPanel.css'
 import type {
   AiSession,
   Artifact,
@@ -129,16 +135,23 @@ export function AudienceAiPanel({
   const [resultLoading, setResultLoading] = useState(false)
   const [action, setAction] = useState<'start' | 'cancel' | 'resume' | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [overviewError, setOverviewError] = useState<string | null>(null)
+  const [resultError, setResultError] = useState<string | null>(null)
+  const [downloadMenuOpen, setDownloadMenuOpen] = useState(false)
   const [collectionConfirmed, setCollectionConfirmed] = useState(false)
   const requestSequence = useRef(0)
 
   const loadOverview = useCallback(async (quiet = false) => {
     const sequence = ++requestSequence.current
-    if (!quiet) setLoading(true)
+    if (!quiet) {
+      setLoading(true)
+      setOverviewError(null)
+    }
     try {
       const next = normalizeOverview(await api.audienceAi(jobId, post.post_id))
       if (sequence !== requestSequence.current) return
       setOverview(next)
+      setOverviewError(null)
       const status = next.currentRun?.status || next.activeVersion?.status || next.status || 'not_started'
       onStatusChange?.(post.post_id, status)
       setSelectedRunId((current) => {
@@ -150,8 +163,9 @@ export function AudienceAiPanel({
       const apiError = error as Error & { status?: number }
       if (apiError.status === 404) {
         setOverview(emptyOverview(jobId, post.post_id))
+        setOverviewError(null)
       } else {
-        setNotice(`AI 状态读取失败：${apiError.message}`)
+        setOverviewError(`AI 状态读取失败：${apiError.message}`)
       }
     } finally {
       if (!quiet && sequence === requestSequence.current) setLoading(false)
@@ -176,16 +190,19 @@ export function AudienceAiPanel({
   const loadResults = useCallback(async (runId: string, tab = resultTab, offset = resultOffset) => {
     if (!runId) {
       setResult(null)
+      setResultError(null)
       return
     }
     setResultLoading(true)
+    setResultError(null)
     try {
       const module = resultTabs.find((item) => item.id === tab)?.module || 'analysis'
       const next = await api.audienceAiResults(jobId, post.post_id, runId, module, offset, 50)
       setResult(normalizeResults(next, module, runId, offset))
       setResultOffset(offset)
     } catch (error) {
-      setNotice(`分析结果读取失败：${(error as Error).message}`)
+      setResult(null)
+      setResultError(`分析结果读取失败：${(error as Error).message}`)
     } finally {
       setResultLoading(false)
     }
@@ -203,6 +220,9 @@ export function AudienceAiPanel({
     setResultQuery('')
     setResultSort('source')
     setNotice(null)
+    setOverviewError(null)
+    setResultError(null)
+    setDownloadMenuOpen(false)
     setCollectionConfirmed(false)
     void loadOverview()
   }, [jobId, post.post_id]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -392,143 +412,247 @@ export function AudienceAiPanel({
 
   const terminalRun = currentRun && !isActive ? currentRun : overview?.versions.find((run) => run.resumable && ['interrupted', 'cancelled', 'partial', 'failed'].includes(run.status))
   const artifactLinks = artifacts.length > 0 ? artifacts : result?.artifacts || []
+  const selectedTab = resultTabs.find((tab) => tab.id === resultTab) || resultTabs[0]
+  const supportsResultTools = !selectedTab.analysisFields && resultTab !== 'overview'
+  const selectedProfileMode = profileModeOptions.find((item) => item.id === scope.profileMode) || profileModeOptions[0]
+  const selectedInputCount = 1 + [scope.includeTopLevelComments, scope.includeReplies, scope.includeUsers].filter(Boolean).length
+  const viewingOlderVersion = Boolean(selectedRunId && overview?.activeVersion && selectedRunId !== overview.activeVersion.runId)
+  const readinessMessage = !preview
+    ? '正在核对输入覆盖与预算。'
+    : sessionExpired
+      ? 'AI 会话已过期，重新配置后即可启动。'
+      : !aiSession
+        ? '连接 AI 模型后即可启动分析。'
+        : !hasBody
+          ? '需要先补齐原帖正文。'
+          : !hasComments
+            ? '需要先采集并保存评论。'
+            : blockers[0]
+              ? blockers[0]
+              : collectionMode && !collectionConfirmed
+                ? '确认补采预算后即可启动。'
+                : scope.modules.length === 0
+                  ? '至少选择一个分析模块。'
+                  : canStart
+                    ? '输入、预算与模型均已就绪。'
+                    : isActive
+                      ? '分析正在运行，已完成结果会持续保存。'
+                      : terminalRun?.resumable
+                        ? '已有未完成运行，可从检查点继续。'
+                        : '当前配置可以重新生成版本。'
 
-  return <section className="audience-ai-panel" aria-labelledby="audience-ai-title">
+  const changeResultTab = (tab: ResultTab) => {
+    setResultTab(tab)
+    setResultOffset(0)
+    setResultQuery('')
+    setResultError(null)
+  }
+
+  const handleResultTabKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+    const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+    const currentIndex = Math.max(0, tabs.indexOf(document.activeElement as HTMLButtonElement))
+    const nextIndex = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? tabs.length - 1
+        : (currentIndex + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length
+    event.preventDefault()
+    tabs[nextIndex]?.focus()
+    tabs[nextIndex]?.click()
+  }
+
+  return <section className={`audience-ai-panel audience-ai-workbench state-${status}`} aria-labelledby="audience-ai-title">
     <header className="audience-ai-heading">
-      <div className="audience-ai-title-icon"><BrainCircuit size={19} /></div>
-      <div>
-        <span>POST AUDIENCE AI</span>
+      <div className="audience-ai-title-icon"><BrainCircuit size={21} /></div>
+      <div className="audience-ai-heading-copy">
+        <span>POST AUDIENCE AI / 逐帖工作台</span>
         <h3 id="audience-ai-title">逐帖受众 AI 深度分析</h3>
         <p><strong>{post.title || '未命名原帖'}</strong><small>{post.author?.display_name || '作者未记录'} · 绑定任务 {jobId}</small></p>
       </div>
-      <span className={`audience-ai-status ${status}`}>{statusIcon(status)}{statusLabel(status)}</span>
-      <button type="button" className="audience-ai-close" title="关闭分析面板" aria-label="关闭分析面板" onClick={onClose}><X size={16} /></button>
+      <div className="audience-ai-heading-actions">
+        <span className={`audience-ai-status ${status}`}>{statusIcon(status)}{statusLabel(status)}</span>
+        <button type="button" className="audience-ai-close" title="关闭分析面板" aria-label="关闭分析面板" onClick={onClose}><X size={18} /></button>
+      </div>
     </header>
 
-    {notice && <div className="audience-ai-notice" role="status"><CircleAlert size={15} /><span>{notice}</span><button type="button" title="关闭提示" onClick={() => setNotice(null)}><X size={14} /></button></div>}
+    {notice && <div className="audience-ai-notice" role="status"><CircleAlert size={17} /><span>{notice}</span><button type="button" title="关闭提示" aria-label="关闭提示" onClick={() => setNotice(null)}><X size={16} /></button></div>}
+    {overviewError && <div className="audience-ai-error-state" role="alert"><CircleAlert size={20} /><span><strong>无法读取分析状态</strong><small>{overviewError}</small></span><button type="button" onClick={() => void loadOverview()}><RefreshCw size={16} />重试</button></div>}
 
-    {isActive && <div className="audience-ai-live" role="status" aria-live="polite">
-      <div><LoaderCircle className="spin" size={17} /><span><strong>{statusLabel(status)}</strong><small>{progress.message || currentRun?.errorMessage || '已完成内容会持续保存，可继续查看原始评论、用户卡和上一版结果。'}</small></span><b>{progressPercent}%</b></div>
-      <progress max="100" value={progressPercent} />
-      <dl><div><dt>处理单元</dt><dd>{Number(progress.completedUnits || 0)} / {Number(progress.totalUnits || 0) || '-'}</dd></div><div><dt>评论</dt><dd>{Number(progress.commentsAnalyzed || 0)}</dd></div><div><dt>用户</dt><dd>{Number(progress.usersAnalyzed || 0)}</dd></div><div><dt>Token</dt><dd>{formatNumber(sumTokenUsage(progress.tokenUsage))}</dd></div></dl>
-    </div>}
+    {loading && !overview ? <div className="audience-ai-initial-loading" role="status" aria-live="polite">
+      <LoaderCircle className="spin" size={24} />
+      <span><strong>正在准备受众分析工作台</strong><small>核对已保存评论、用户覆盖、模型会话和历史版本。</small></span>
+      <div aria-hidden="true"><i /><i /><i /></div>
+    </div> : <>
+      {isActive && <div className="audience-ai-live" role="status" aria-live="polite">
+        <div><LoaderCircle className="spin" size={19} /><span><strong>{statusLabel(status)}</strong><small>{progress.message || currentRun?.errorMessage || '已完成内容会持续保存，可继续查看原始评论、用户卡和上一版结果。'}</small></span><b>{progressPercent}%</b></div>
+        <progress max="100" value={progressPercent} />
+        <dl><div><dt>处理单元</dt><dd>{Number(progress.completedUnits || 0)} / {Number(progress.totalUnits || 0) || '-'}</dd></div><div><dt>评论</dt><dd>{Number(progress.commentsAnalyzed || 0)}</dd></div><div><dt>用户</dt><dd>{Number(progress.usersAnalyzed || 0)}</dd></div><div><dt>Token</dt><dd>{formatNumber(sumTokenUsage(progress.tokenUsage))}</dd></div></dl>
+      </div>}
 
-    {currentRun && overview?.activeVersion && currentRun.runId !== overview.activeVersion.runId && <div className="audience-ai-version-banner"><RefreshCw size={14} /><span>新版本正在更新；下方继续展示已验证的上一版 {shortRunId(overview.activeVersion.runId)}。</span></div>}
+      {currentRun && overview?.activeVersion && currentRun.runId !== overview.activeVersion.runId && <div className="audience-ai-version-banner"><RefreshCw size={16} /><span><strong>新版本正在更新；下方继续展示已验证的上一版 {shortRunId(overview.activeVersion.runId)}</strong><small>运行中的半成品不会覆盖稳定结果。</small></span></div>}
 
-    <div className="audience-ai-body">
-      <section className="audience-ai-config" aria-label="分析范围配置">
-        <div className="audience-ai-section-title"><div><span>01</span><strong>输入与范围</strong></div><button type="button" onClick={() => void loadPreview()} disabled={previewing}>{previewing ? <LoaderCircle className="spin" size={14} /> : <Gauge size={14} />}查看输入覆盖</button></div>
+      <div className="audience-ai-body">
+        <section className="audience-ai-config" aria-label="分析范围配置">
+          <div className="audience-ai-section-title">
+            <div><span>01</span><strong>输入范围</strong><small>{selectedInputCount} 类输入 · {scope.modules.length} 个分析模块</small></div>
+            <button type="button" onClick={() => void loadPreview()} disabled={previewing}>{previewing ? <LoaderCircle className="spin" size={16} /> : <Gauge size={16} />}核对覆盖</button>
+          </div>
 
-        <div className="audience-ai-fixed-scope"><ShieldCheck size={15} /><span><strong>原帖完整内容</strong><small>固定纳入，不能关闭；评论与用户始终读取该帖全部持久化数据。</small></span><Check size={15} /></div>
+          <div className="audience-ai-fixed-scope"><ShieldCheck size={18} /><span><strong>原帖完整内容</strong><small>始终纳入已保存正文与媒体信息，分析不会创建新任务。</small></span><Check size={17} /></div>
 
-        <div className="audience-ai-switches">
-          <label><input type="checkbox" checked={scope.includeTopLevelComments} onChange={(event) => updateScope('includeTopLevelComments', event.target.checked)} /><span><strong>顶层评论</strong><small>{formatNumber(coverage.topLevelComments)} 条</small></span></label>
-          <label><input type="checkbox" checked={scope.includeReplies} onChange={(event) => updateScope('includeReplies', event.target.checked)} /><span><strong>评论回复</strong><small>{formatNumber(coverage.replies)} 条</small></span></label>
-          <label><input type="checkbox" checked={scope.includeUsers} onChange={(event) => updateScope('includeUsers', event.target.checked)} /><span><strong>评论用户</strong><small>{formatNumber(coverage.uniqueUsers)} 位</small></span></label>
-          <label><input type="checkbox" checked={scope.incrementalOnly} onChange={(event) => updateScope('incrementalOnly', event.target.checked)} /><span><strong>只分析新增</strong><small>复用未变化分块</small></span></label>
-        </div>
+          <fieldset className="audience-ai-switches">
+            <legend>评论与用户输入</legend>
+            <label><input type="checkbox" checked={scope.includeTopLevelComments} onChange={(event) => updateScope('includeTopLevelComments', event.target.checked)} /><span><strong>顶层评论</strong><small>{formatNumber(coverage.topLevelComments)} 条可用</small></span></label>
+            <label><input type="checkbox" checked={scope.includeReplies} onChange={(event) => updateScope('includeReplies', event.target.checked)} /><span><strong>评论回复</strong><small>{formatNumber(coverage.replies)} 条可用</small></span></label>
+            <label><input type="checkbox" checked={scope.includeUsers} onChange={(event) => updateScope('includeUsers', event.target.checked)} /><span><strong>评论用户</strong><small>{formatNumber(coverage.uniqueUsers)} 位可用</small></span></label>
+            <label><input type="checkbox" checked={scope.incrementalOnly} onChange={(event) => updateScope('incrementalOnly', event.target.checked)} /><span><strong>只分析新增</strong><small>复用未变化分块</small></span></label>
+          </fieldset>
 
-        <fieldset className="audience-ai-profile-modes">
-          <legend>用户主页范围</legend>
-          {profileModeOptions.map((item) => <label key={item.id} className={scope.profileMode === item.id ? 'active' : ''}>
-            <input type="radio" name={`profile-mode-${post.post_id}`} checked={scope.profileMode === item.id} onChange={() => setProfileMode(item.id)} />
-            <span><strong>{item.label}</strong><small>{item.description}</small></span>
-          </label>)}
-        </fieldset>
+          <details className="audience-ai-profile-disclosure">
+            <summary><span><UsersRound size={17} /><span><strong>用户主页范围</strong><small>{selectedProfileMode.label}</small></span></span><ChevronDown size={17} /></summary>
+            <fieldset className="audience-ai-profile-modes">
+              <legend className="audience-ai-sr-only">选择用户主页范围</legend>
+              {profileModeOptions.map((item) => <label key={item.id} className={scope.profileMode === item.id ? 'active' : ''}>
+                <input type="radio" name={`profile-mode-${post.post_id}`} checked={scope.profileMode === item.id} onChange={() => setProfileMode(item.id)} />
+                <span><strong>{item.label}</strong><small>{item.description}</small></span>
+              </label>)}
+            </fieldset>
+            {scope.profileMode === 'collect_missing_header' && <label className="audience-ai-budget"><span>最多补齐用户</span><input type="number" min="1" max="2000" value={scope.profileUserLimit} onChange={(event) => updateScope('profileUserLimit', clampInteger(event.target.value, 1, 2000))} /></label>}
+            {scope.profileMode === 'recent_public_posts' && <div className="audience-ai-budgets">
+              <label><span>用户上限</span><input type="number" min="1" max="2000" value={scope.profileUserLimit} onChange={(event) => updateRecentBudget('profileUserLimit', clampInteger(event.target.value, 1, 2000))} /></label>
+              <label><span>每用户帖子</span><input type="number" min="1" max="20" value={scope.profilePostLimitPerUser} onChange={(event) => updateRecentBudget('profilePostLimitPerUser', clampInteger(event.target.value, 1, 20))} /></label>
+              <label><span>总帖子上限</span><input type="number" min="1" max={Math.min(2000, scope.profileUserLimit * scope.profilePostLimitPerUser)} value={scope.profilePostTotalLimit} onChange={(event) => updateRecentBudget('profilePostTotalLimit', clampInteger(event.target.value, 1, Math.min(2000, scope.profileUserLimit * scope.profilePostLimitPerUser)))} /></label>
+            </div>}
+            {collectionMode && <label className="audience-ai-confirm"><input type="checkbox" checked={collectionConfirmed} onChange={(event) => setCollectionConfirmed(event.target.checked)} /><span>确认在原任务内按上述预算补采当前帖相关用户；不创建新任务。</span></label>}
+          </details>
 
-        {scope.profileMode === 'collect_missing_header' && <label className="audience-ai-budget"><span>最多补齐用户</span><input type="number" min="1" max="2000" value={scope.profileUserLimit} onChange={(event) => updateScope('profileUserLimit', clampInteger(event.target.value, 1, 2000))} /></label>}
-        {scope.profileMode === 'recent_public_posts' && <div className="audience-ai-budgets">
-          <label><span>用户上限</span><input type="number" min="1" max="2000" value={scope.profileUserLimit} onChange={(event) => updateRecentBudget('profileUserLimit', clampInteger(event.target.value, 1, 2000))} /></label>
-          <label><span>每用户帖子</span><input type="number" min="1" max="20" value={scope.profilePostLimitPerUser} onChange={(event) => updateRecentBudget('profilePostLimitPerUser', clampInteger(event.target.value, 1, 20))} /></label>
-          <label><span>总帖子上限</span><input type="number" min="1" max={Math.min(2000, scope.profileUserLimit * scope.profilePostLimitPerUser)} value={scope.profilePostTotalLimit} onChange={(event) => updateRecentBudget('profilePostTotalLimit', clampInteger(event.target.value, 1, Math.min(2000, scope.profileUserLimit * scope.profilePostLimitPerUser)))} /></label>
-        </div>}
-        {collectionMode && <label className="audience-ai-confirm"><input type="checkbox" checked={collectionConfirmed} onChange={(event) => setCollectionConfirmed(event.target.checked)} /><span>确认在原任务内按上述预算补采当前帖相关用户；不创建新任务。</span></label>}
+          <fieldset className="audience-ai-modules">
+            <legend><Layers3 size={16} />分析模块 <small>按交付目标选择</small></legend>
+            {moduleOptions.map((item) => <label key={item.id} className={(item.id === 'profile_insights' && scope.profileMode === 'none') ? 'disabled' : ''}><input type="checkbox" checked={scope.modules.includes(item.id)} disabled={item.id === 'profile_insights' && scope.profileMode === 'none'} onChange={() => toggleModule(item.id)} /><span>{item.label}</span></label>)}
+          </fieldset>
 
-        <fieldset className="audience-ai-modules">
-          <legend>分析模块</legend>
-          {moduleOptions.map((item) => <label key={item.id} className={(item.id === 'profile_insights' && scope.profileMode === 'none') ? 'disabled' : ''}><input type="checkbox" checked={scope.modules.includes(item.id)} disabled={item.id === 'profile_insights' && scope.profileMode === 'none'} onChange={() => toggleModule(item.id)} /><span>{item.label}</span></label>)}
-        </fieldset>
+          <div className="audience-ai-inline-fields">
+            <label><span>输出语言</span><select aria-label="输出语言" value={scope.outputLanguage} onChange={(event) => updateScope('outputLanguage', event.target.value)}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label>
+            <label><span>证据严格度</span><select aria-label="证据严格度" value={scope.evidenceStrictness} onChange={(event) => updateScope('evidenceStrictness', event.target.value as AudienceAiScope['evidenceStrictness'])}><option value="strict">严格</option><option value="balanced">平衡</option></select></label>
+          </div>
+        </section>
 
-        <div className="audience-ai-inline-fields">
-          <label><span>输出语言</span><select value={scope.outputLanguage} onChange={(event) => updateScope('outputLanguage', event.target.value)}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select></label>
-          <label><span>证据严格度</span><select value={scope.evidenceStrictness} onChange={(event) => updateScope('evidenceStrictness', event.target.value as AudienceAiScope['evidenceStrictness'])}><option value="strict">严格</option><option value="balanced">平衡</option></select></label>
-        </div>
-      </section>
+        <aside className="audience-ai-preview" aria-label="输入覆盖与执行预算">
+          <div className="audience-ai-section-title">
+            <div><span>02</span><strong>运行准备</strong><small>{canStart ? '全部就绪' : isActive ? '正在执行' : terminalRun?.resumable ? '可从检查点继续' : '等待条件'}</small></div>
+            {(loading || previewing) && <LoaderCircle className="spin" size={17} />}
+          </div>
 
-      <aside className="audience-ai-preview" aria-label="输入覆盖与执行预算">
-        <div className="audience-ai-section-title"><div><span>02</span><strong>覆盖与预算</strong></div>{loading && <LoaderCircle className="spin" size={14} />}</div>
-        <dl className="audience-ai-coverage-grid">
-          <CoverageMetric label="原帖正文" value={coverage.originalBodyAvailable === false ? '缺失' : coverage.originalBodyAvailable ? '可用' : '待核对'} warning={coverage.originalBodyAvailable === false} />
-          <CoverageMetric label="媒体分析" value={coverage.mediaAnalysisAvailable ? '可用' : '未提供'} />
-          <CoverageMetric label="顶层评论" value={formatNumber(coverage.topLevelComments)} />
-          <CoverageMetric label="回复" value={formatNumber(coverage.replies)} />
-          <CoverageMetric label="独立用户" value={formatNumber(coverage.uniqueUsers)} />
-          <CoverageMetric label="已有主页" value={formatNumber(coverage.profilesAvailable)} />
-          <CoverageMetric label="完整主页" value={formatNumber(coverage.profilesComplete)} />
-          <CoverageMetric label="部分主页" value={formatNumber(coverage.profilesPartial)} />
-          <CoverageMetric label="缺失主页" value={formatNumber(coverage.profilesMissing)} />
-          <CoverageMetric label="数据版本" value={shortRevision(preview?.inputRevision || displayedRun?.inputRevision)} mono />
-          <CoverageMetric label="上一版状态" value={overview?.activeVersion ? statusLabel(overview.activeVersion.status) : '尚无版本'} />
-          <CoverageMetric label="上一版时间" value={overview?.activeVersion ? formatDate(overview.activeVersion.completedAt || overview.activeVersion.updatedAt) : '尚无版本'} />
-        </dl>
-        <dl className="audience-ai-estimates">
-          <div><dt>预计分块 / 调用</dt><dd>{formatNumber(preview?.estimatedChunks)} / {formatNumber(preview?.estimatedCalls)}</dd></div>
-          <div><dt>预计 Token</dt><dd>{formatNumber(preview?.estimatedTokens)} <small>估算</small></dd></div>
-          <div><dt>预计成本</dt><dd>{preview?.estimatedCost == null ? '待 Provider 报价' : `${formatMoney(preview.estimatedCost)} 估算`}</dd></div>
-          <div><dt>预计网络请求</dt><dd>{formatNumber(preview?.estimatedNetworkRequests ?? estimateNetworkRequests(scope))} <small>估算</small></dd></div>
-        </dl>
-        <div className={`audience-ai-runtime-config ${aiSession && !sessionExpired ? 'ready' : ''}`}>
-          <BrainCircuit size={16} /><span><strong>{aiSession && !sessionExpired ? `${aiSession.provider} · ${aiSession.model}` : sessionExpired ? 'AI Session 已过期' : '尚未连接 AI'}</strong><small>{aiSession && !sessionExpired ? `会话有效至 ${formatDate(aiSession.expiresAt)}` : '配置后可启动；当前帖子与受众数据不会受影响。'}</small></span>
-          <button type="button" onClick={onConfigureAi}><Settings2 size={14} />配置</button>
-        </div>
-        {blockers.length > 0 && <ul className="audience-ai-blockers">{blockers.map((message) => <li key={message}><CircleAlert size={13} />{message}</li>)}</ul>}
-        {warnings.length > 0 && <ul className="audience-ai-warnings">{warnings.map((message) => <li key={message}><CircleAlert size={13} />{message}</li>)}</ul>}
-        {!hasComments && <p className="audience-ai-block"><CircleAlert size={14} />该帖尚无已持久化评论，不能启动空分析。</p>}
-        {!hasBody && <p className="audience-ai-block"><CircleAlert size={14} />原帖正文缺失，请先沿用原任务补齐正文。</p>}
-        <div className="audience-ai-actions">
-          {isActive ? <button type="button" className="danger" disabled={action !== null || status === 'cancelling'} onClick={() => void cancel()}>{action === 'cancel' ? <LoaderCircle className="spin" size={15} /> : <Pause size={15} />}取消</button>
-            : terminalRun?.resumable ? <button type="button" className="primary" disabled={action !== null} onClick={() => void resume(terminalRun)}>{action === 'resume' ? <LoaderCircle className="spin" size={15} /> : <Play size={15} />}继续原运行</button>
-              : <button type="button" className="primary" disabled={!canStart || action !== null || scope.modules.length === 0} onClick={() => void start()}>{action === 'start' ? <LoaderCircle className="spin" size={15} /> : overview?.activeVersion ? <RefreshCw size={15} /> : <Sparkles size={15} />}{overview?.activeVersion ? '重新分析' : '开始分析'}</button>}
-          <button type="button" disabled={previewing} onClick={() => void loadPreview()}>{previewing ? <LoaderCircle className="spin" size={15} /> : <Search size={15} />}刷新预览</button>
-          <button type="button" disabled={!overview?.activeVersion} onClick={() => {
-            if (!overview?.activeVersion) return
-            setSelectedRunId(overview.activeVersion.runId)
-            window.requestAnimationFrame(() => document.getElementById('audience-ai-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
-          }}><FileText size={15} />查看上一版</button>
-          <button type="button" disabled={artifactLinks.length === 0} title={artifactLinks.length ? `下载当前版本的 ${artifactLinks.length} 个结果文件` : '当前版本尚未生成可下载结果'} onClick={() => document.getElementById('audience-ai-downloads')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })}><Download size={15} />下载结果</button>
-        </div>
-      </aside>
-    </div>
+          <div className={`audience-ai-readiness ${canStart ? 'ready' : isActive ? 'running' : 'pending'}`}>
+            {canStart ? <Check size={18} /> : isActive ? <LoaderCircle className="spin" size={18} /> : <CircleAlert size={18} />}
+            <span><strong>{canStart ? '可以开始分析' : isActive ? statusLabel(status) : terminalRun?.resumable ? '存在可继续运行' : '启动前还需处理'}</strong><small>{readinessMessage}</small></span>
+          </div>
 
-    {(overview?.versions.length || selectedRunId) ? <section className="audience-ai-results" id="audience-ai-results" aria-label="分析结果">
-      <header>
-        <div><span>03</span><strong>分析结果</strong>{displayedRun?.stale && <i>输入已更新 · 旧版仍可查看</i>}</div>
-        <label><span>版本</span><select value={selectedRunId} onChange={(event) => setSelectedRunId(event.target.value)}>{overview?.versions.map((version) => <option key={version.runId} value={version.runId}>{formatDate(version.completedAt || version.updatedAt)} · {statusLabel(version.stale ? 'stale' : version.status)} · {shortRunId(version.runId)}</option>)}</select></label>
-        {artifactLinks.length > 0 && <div className="audience-ai-downloads" id="audience-ai-downloads">{artifactLinks.map((artifact) => <a key={artifact.id} href={api.artifactUrl(jobId, artifact)} download title={`下载 ${artifact.name}`}><Download size={14} /><span>{artifact.name}</span></a>)}</div>}
-      </header>
-      <nav role="tablist" aria-label="受众 AI 结果视图">{resultTabs.map((tab) => <button type="button" role="tab" aria-selected={resultTab === tab.id} className={resultTab === tab.id ? 'active' : ''} key={tab.id} onClick={() => { setResultTab(tab.id); setResultOffset(0); setResultQuery('') }}>{tab.label}</button>)}</nav>
-      <div className="audience-ai-result-tools">
-        <span>{displayedRun ? `${displayedRun.model?.provider || 'AI'} · ${displayedRun.model?.model || '模型未记录'} · ${displayedRun.promptVersion || 'Prompt v1'}` : '等待结果'}</span>
-        {!resultTabs.find((tab) => tab.id === resultTab)?.analysisFields && resultTab !== 'overview' && <><label><Search size={14} /><input value={resultQuery} onChange={(event) => setResultQuery(event.target.value)} placeholder="筛选当前结果" /></label><label className="audience-ai-result-sort"><span>排序</span><select value={resultSort} onChange={(event) => setResultSort(event.target.value as ResultSort)}><option value="source">来源顺序</option><option value="confidence-desc">置信度从高到低</option><option value="confidence-asc">置信度从低到高</option><option value="name">名称</option></select></label></>}
+          <dl className="audience-ai-coverage-summary" aria-label="关键输入覆盖">
+            <CoverageMetric label="已存评论" value={formatNumber(coverage.collectedComments ?? (Number(coverage.topLevelComments || 0) + Number(coverage.replies || 0)))} />
+            <CoverageMetric label="独立用户" value={formatNumber(coverage.uniqueUsers)} />
+            <CoverageMetric label="可用主页" value={formatNumber(coverage.profilesAvailable)} />
+            <CoverageMetric label="数据版本" value={shortRevision(preview?.inputRevision || displayedRun?.inputRevision)} mono />
+          </dl>
+
+          <details className="audience-ai-coverage-disclosure">
+            <summary><span><Database size={16} />完整覆盖清单</span><ChevronDown size={16} /></summary>
+            <dl className="audience-ai-coverage-grid">
+              <CoverageMetric label="原帖正文" value={coverage.originalBodyAvailable === false ? '缺失' : coverage.originalBodyAvailable ? '可用' : '待核对'} warning={coverage.originalBodyAvailable === false} />
+              <CoverageMetric label="媒体分析" value={coverage.mediaAnalysisAvailable ? '可用' : '未提供'} />
+              <CoverageMetric label="顶层评论" value={formatNumber(coverage.topLevelComments)} />
+              <CoverageMetric label="回复" value={formatNumber(coverage.replies)} />
+              <CoverageMetric label="完整主页" value={formatNumber(coverage.profilesComplete)} />
+              <CoverageMetric label="部分主页" value={formatNumber(coverage.profilesPartial)} />
+              <CoverageMetric label="缺失主页" value={formatNumber(coverage.profilesMissing)} />
+              <CoverageMetric label="上一版状态" value={overview?.activeVersion ? statusLabel(overview.activeVersion.status) : '尚无版本'} />
+            </dl>
+          </details>
+
+          <div className="audience-ai-budget-heading"><Gauge size={16} /><span><strong>本次预算</strong><small>随输入范围实时估算</small></span></div>
+          <dl className="audience-ai-estimates">
+            <div><dt>分块 / 调用</dt><dd>{formatNumber(preview?.estimatedChunks)} / {formatNumber(preview?.estimatedCalls)}</dd></div>
+            <div><dt>Token</dt><dd>{formatNumber(preview?.estimatedTokens)} <small>估算</small></dd></div>
+            <div><dt>成本</dt><dd>{preview?.estimatedCost == null ? '待 Provider 报价' : `${formatMoney(preview.estimatedCost)} 估算`}</dd></div>
+            <div><dt>网络请求</dt><dd>{formatNumber(preview?.estimatedNetworkRequests ?? estimateNetworkRequests(scope))} <small>估算</small></dd></div>
+          </dl>
+
+          <div className={`audience-ai-runtime-config ${aiSession && !sessionExpired ? 'ready' : ''}`}>
+            <BrainCircuit size={18} /><span><strong>{aiSession && !sessionExpired ? `${aiSession.provider} · ${aiSession.model}` : sessionExpired ? 'AI 会话已过期' : '尚未连接 AI'}</strong><small>{aiSession && !sessionExpired ? `有效至 ${formatDate(aiSession.expiresAt)}` : '配置后即可启动，现有数据不会受影响。'}</small></span>
+            <button type="button" onClick={onConfigureAi}><Settings2 size={16} />配置</button>
+          </div>
+
+          {blockers.length > 0 && <ul className="audience-ai-blockers">{blockers.map((message) => <li key={message}><CircleAlert size={15} />{message}</li>)}</ul>}
+          {warnings.length > 0 && <ul className="audience-ai-warnings">{warnings.map((message) => <li key={message}><CircleAlert size={15} />{message}</li>)}</ul>}
+          {!hasComments && <p className="audience-ai-block"><CircleAlert size={16} />该帖尚无已持久化评论，不能启动空分析。</p>}
+          {!hasBody && <p className="audience-ai-block"><CircleAlert size={16} />原帖正文缺失，请先沿用原任务补齐正文。</p>}
+
+          <div className="audience-ai-launch-zone">
+            <p><ShieldCheck size={16} /><span>{readinessMessage}</span></p>
+            <div className="audience-ai-actions">
+              {isActive ? <button type="button" className="danger audience-ai-primary-action" disabled={action !== null || status === 'cancelling'} onClick={() => void cancel()}>{action === 'cancel' ? <LoaderCircle className="spin" size={17} /> : <Pause size={17} />}取消</button>
+                : terminalRun?.resumable ? <button type="button" className="primary audience-ai-primary-action" disabled={action !== null} onClick={() => void resume(terminalRun)}>{action === 'resume' ? <LoaderCircle className="spin" size={17} /> : <Play size={17} />}继续原运行</button>
+                  : <button type="button" className="primary audience-ai-primary-action" disabled={!canStart || action !== null || scope.modules.length === 0} onClick={() => void start()}>{action === 'start' ? <LoaderCircle className="spin" size={17} /> : overview?.activeVersion ? <RefreshCw size={17} /> : <Sparkles size={17} />}{overview?.activeVersion ? '重新分析' : '开始分析'}</button>}
+              <button type="button" disabled={previewing} onClick={() => void loadPreview()}>{previewing ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}刷新预览</button>
+              <button type="button" disabled={!overview?.activeVersion} onClick={() => {
+                if (!overview?.activeVersion) return
+                setSelectedRunId(overview.activeVersion.runId)
+                window.requestAnimationFrame(() => document.getElementById('audience-ai-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+              }}><FileText size={16} />查看上一版</button>
+              <button type="button" disabled={artifactLinks.length === 0} title={artifactLinks.length ? `下载当前版本的 ${artifactLinks.length} 个结果文件` : '当前版本尚未生成可下载结果'} onClick={() => {
+                setDownloadMenuOpen(true)
+                window.requestAnimationFrame(() => document.getElementById('audience-ai-downloads')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }))
+              }}><Download size={16} />结果文件 {artifactLinks.length || ''}</button>
+            </div>
+          </div>
+        </aside>
       </div>
-      {resultLoading ? <div className="audience-ai-result-empty"><LoaderCircle className="spin" size={22} /><span>正在读取已持久化结果</span></div>
-        : !result ? <div className="audience-ai-result-empty"><FileText size={22} /><span>该版本尚无可展示结果</span></div>
-          : resultTab === 'overview' ? <OverviewResult analysis={result.analysis || firstRecord(result.items)} coverage={result.coverage || displayedRun?.coverage} />
-            : resultTabs.find((tab) => tab.id === resultTab)?.analysisFields ? <AnalysisSliceResult analysis={result.analysis || firstRecord(result.items)} fields={resultTabs.find((tab) => tab.id === resultTab)?.analysisFields || []} coverage={result.coverage || displayedRun?.coverage} />
-            : visibleItems.length === 0 ? <div className="audience-ai-result-empty"><Search size={22} /><span>{resultQuery ? '当前筛选没有结果' : '该模块尚无结果'}</span></div>
-              : <div className={`audience-ai-result-list ${resultTab}`}>{visibleItems.map((item, index) => <ResultItem
-                key={resultKey(item, index)}
-                item={item}
-                tab={resultTab}
-                onLocate={() => void locateEvidence(item)}
-                onViewEvidence={(reference) => {
-                  setResultTab('evidence')
-                  setResultOffset(0)
-                  setResultQuery(reference)
-                }}
-              />)}</div>}
-      {result && result.total > result.limit && <footer className="audience-ai-result-pagination"><span>{result.offset + 1}-{Math.min(result.offset + result.limit, result.total)} / {result.total}</span><div><button type="button" title="上一页" disabled={result.offset === 0 || resultLoading} onClick={() => void loadResults(selectedRunId, resultTab, Math.max(0, result.offset - result.limit))}><ChevronLeft size={15} /></button><button type="button" title="下一页" disabled={result.offset + result.limit >= result.total || resultLoading} onClick={() => void loadResults(selectedRunId, resultTab, result.offset + result.limit)}><ChevronRight size={15} /></button></div></footer>}
-    </section> : <div className="audience-ai-first-run"><BrainCircuit size={21} /><span><strong>尚无逐帖分析版本</strong><small>先核对输入覆盖，再从当前任务的已保存数据启动分析。</small></span></div>}
+
+      {(overview?.versions.length || selectedRunId) ? <section className="audience-ai-results" id="audience-ai-results" aria-label="分析结果">
+        <header className="audience-ai-results-heading">
+          <div className="audience-ai-results-title"><span>03</span><strong>版本化结果</strong><small>{displayedRun ? `${statusLabel(displayedRun.status)} · ${formatDate(displayedRun.completedAt || displayedRun.updatedAt)}` : '等待版本'}</small></div>
+          <label className="audience-ai-version-select"><span>版本</span><select aria-label="分析结果版本" value={selectedRunId} onChange={(event) => { setSelectedRunId(event.target.value); setDownloadMenuOpen(false) }}>{overview?.versions.map((version) => <option key={version.runId} value={version.runId}>{formatDate(version.completedAt || version.updatedAt)} · {statusLabel(version.stale ? 'stale' : version.status)} · {shortRunId(version.runId)}</option>)}</select></label>
+          {artifactLinks.length > 0 ? <details className="audience-ai-downloads" id="audience-ai-downloads" open={downloadMenuOpen} onToggle={(event) => setDownloadMenuOpen(event.currentTarget.open)}>
+            <summary><Download size={16} /><span>结果文件</span><b>{artifactLinks.length}</b><ChevronDown size={15} /></summary>
+            <div>{artifactLinks.map((artifact) => <a key={artifact.id} href={api.artifactUrl(jobId, artifact)} download title={`下载 ${artifact.name}`}><FileText size={16} /><span><strong>{artifact.name}</strong><small>下载文件</small></span><Download size={15} /></a>)}</div>
+          </details> : <span className="audience-ai-download-empty"><Download size={16} />暂无结果文件</span>}
+        </header>
+
+        {(viewingOlderVersion || displayedRun?.stale) && <div className="audience-ai-result-version-note"><RefreshCw size={16} /><span><strong>{displayedRun?.stale ? '输入已更新，当前为旧版本' : '正在查看历史版本'}</strong><small>历史结果保持只读，可随时切换回最新已验证版本。</small></span></div>}
+
+        <nav role="tablist" aria-label="受众 AI 结果视图" aria-orientation="horizontal" onKeyDown={handleResultTabKeyDown}>{resultTabs.map((tab) => <button type="button" role="tab" id={`audience-ai-tab-${tab.id}`} aria-controls="audience-ai-tabpanel" aria-selected={resultTab === tab.id} tabIndex={resultTab === tab.id ? 0 : -1} className={resultTab === tab.id ? 'active' : ''} key={tab.id} onClick={() => changeResultTab(tab.id)}>{tab.label}</button>)}</nav>
+
+        <div className="audience-ai-result-tools">
+          <div className="audience-ai-result-meta"><span><BrainCircuit size={15} />{displayedRun ? `${displayedRun.model?.provider || 'AI'} · ${displayedRun.model?.model || '模型未记录'}` : '等待结果'}</span><span><Layers3 size={15} />{displayedRun?.promptVersion || 'Prompt v1'}</span>{result && <span><Database size={15} />{result.total} 条</span>}</div>
+          {supportsResultTools && <div className="audience-ai-result-filters">
+            <label><Search size={16} /><input aria-label="筛选当前结果" value={resultQuery} onChange={(event) => setResultQuery(event.target.value)} placeholder="筛选当前页结果" />{resultQuery && <button type="button" title="清空筛选" aria-label="清空结果筛选" onClick={() => setResultQuery('')}><X size={15} /></button>}</label>
+            <label className="audience-ai-result-sort"><ListFilter size={16} /><span>排序</span><select aria-label="结果排序" value={resultSort} onChange={(event) => setResultSort(event.target.value as ResultSort)}><option value="source">来源顺序</option><option value="confidence-desc">置信度从高到低</option><option value="confidence-asc">置信度从低到高</option><option value="name">名称</option></select></label>
+          </div>}
+        </div>
+
+        <div className="audience-ai-result-viewport" id="audience-ai-tabpanel" role="tabpanel" aria-labelledby={`audience-ai-tab-${resultTab}`} tabIndex={0}>
+          {resultLoading ? <div className="audience-ai-result-empty loading"><LoaderCircle className="spin" size={25} /><span><strong>正在读取已持久化结果</strong><small>当前版本与原始受众数据保持可见，不会触发重新分析。</small></span></div>
+            : resultError ? <div className="audience-ai-result-empty error" role="alert"><CircleAlert size={25} /><span><strong>结果读取失败</strong><small>{resultError}</small></span><button type="button" onClick={() => void loadResults(selectedRunId, resultTab, resultOffset)}><RefreshCw size={16} />重试</button></div>
+              : !result ? <div className="audience-ai-result-empty"><FileText size={25} /><span><strong>该版本尚无可展示结果</strong><small>可以切换其他版本或稍后刷新当前运行。</small></span></div>
+                : resultTab === 'overview' ? <OverviewResult analysis={result.analysis || firstRecord(result.items)} coverage={result.coverage || displayedRun?.coverage} />
+                  : selectedTab.analysisFields ? <AnalysisSliceResult analysis={result.analysis || firstRecord(result.items)} fields={selectedTab.analysisFields} coverage={result.coverage || displayedRun?.coverage} />
+                    : visibleItems.length === 0 ? <div className="audience-ai-result-empty"><Search size={25} /><span><strong>{resultQuery ? '当前筛选没有结果' : '该模块尚无结果'}</strong><small>{resultQuery ? '清空关键词或调整排序后重试。' : '其他已完成标签和历史版本仍可查看。'}</small></span></div>
+                      : <div className={`audience-ai-result-list ${resultTab}`}>{visibleItems.map((item, index) => <ResultItem
+                        key={resultKey(item, index)}
+                        item={item}
+                        tab={resultTab}
+                        onLocate={() => void locateEvidence(item)}
+                        onViewEvidence={(reference) => {
+                          changeResultTab('evidence')
+                          setResultQuery(reference)
+                        }}
+                      />)}</div>}
+        </div>
+
+        {result && result.total > result.limit && <footer className="audience-ai-result-pagination"><span>{result.offset + 1}-{Math.min(result.offset + result.limit, result.total)} / {result.total}</span><div><button type="button" title="上一页" aria-label="上一页结果" disabled={result.offset === 0 || resultLoading} onClick={() => void loadResults(selectedRunId, resultTab, Math.max(0, result.offset - result.limit))}><ChevronLeft size={17} /></button><button type="button" title="下一页" aria-label="下一页结果" disabled={result.offset + result.limit >= result.total || resultLoading} onClick={() => void loadResults(selectedRunId, resultTab, result.offset + result.limit)}><ChevronRight size={17} /></button></div></footer>}
+      </section> : <div className="audience-ai-first-run"><BrainCircuit size={26} /><span><strong>尚无逐帖分析版本</strong><small>输入覆盖核对完成后，从右侧运行控制区开始第一次分析。</small></span></div>}
+    </>}
   </section>
 }
 
@@ -567,13 +691,13 @@ function ResultItem({
   const id = String(item.commentId || item.rootThreadId || item.userId || item.segmentId || evidence.evidenceId || evidence.id || evidence.entityId || '')
   const title = String(item.displayName || item.name || item.theme || item.label || item.sentiment || item.stance || `${tab === 'comments' ? '评论' : ['users', 'profiles'].includes(tab) ? '用户' : tab === 'evidence' ? '证据' : '主题'} ${id ? shortRunId(id) : ''}`)
   const secondary = [item.stance, item.intent, item.interactionRole, item.confidence != null ? `置信度 ${formatConfidence(item.confidence)}` : null].filter(Boolean).join(' · ')
-  const hidden = new Set(['displayName', 'name', 'theme', 'label', 'stance', 'intent', 'interactionRole', 'confidence', 'evidenceRefs'])
+  const hidden = new Set(['displayName', 'name', 'theme', 'label', 'stance', 'intent', 'interactionRole', 'confidence', 'evidenceRefs', 'excerpt'])
   const bodyEntries = Object.entries(item).filter(([key]) => !hidden.has(key) && !['commentId', 'userId', 'rootThreadId', 'segmentId', 'entityId', 'evidenceId', 'id'].includes(key))
   const canLocate = tab === 'evidence' && ['comment', 'user'].includes(String(evidence.entityType || ''))
-  return <article>
+  return <article className={tab === 'evidence' ? 'is-evidence' : ''}>
     <header><span>{['users', 'profiles'].includes(tab) ? <UsersRound size={15} /> : tab === 'evidence' ? <MapPin size={15} /> : <FileText size={15} />}</span><div><strong>{title}</strong>{secondary && <small>{secondary}</small>}</div>{canLocate && <button type="button" title="定位到原始数据" onClick={onLocate}><ExternalLink size={14} />定位</button>}</header>
     {evidence.excerpt && <blockquote>{evidence.excerpt}</blockquote>}
-    {bodyEntries.length > 0 && <details><summary><span>查看分析详情</span><ChevronRight size={14} /></summary><dl>{bodyEntries.slice(0, 12).map(([key, value]) => <div key={key}><dt>{fieldLabel(key)}</dt><dd><StructuredValue value={value} compact /></dd></div>)}</dl></details>}
+    {bodyEntries.length > 0 && <details open={tab === 'evidence' ? true : undefined}><summary><span>{tab === 'evidence' ? '证据字段' : '查看分析详情'}</span><ChevronRight size={14} /></summary><dl>{bodyEntries.slice(0, 12).map(([key, value]) => <div key={key}><dt>{fieldLabel(key)}</dt><dd><StructuredValue value={value} compact /></dd></div>)}</dl></details>}
     {Array.isArray(item.evidenceRefs) && item.evidenceRefs.length > 0 && <footer><ShieldCheck size={13} /><span>{item.evidenceRefs.length} 条已关联证据</span><select aria-label={`查看 ${title} 的证据`} title="查看证据" defaultValue="" onChange={(event) => {
       const reference = event.currentTarget.value
       event.currentTarget.value = ''
