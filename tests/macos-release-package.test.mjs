@@ -36,6 +36,8 @@ test('macOS GitHub Release package has separate build, verification, and publish
 
   assert.match(verifierScript, /unzip -q/);
   assert.match(verifierScript, /exec "\.\/\$launch_entry" --no-browser --port/);
+  assert.match(verifierScript, /wait "\$launcher_pid"/);
+  assert.match(verifierScript, /cleanup_attempt/);
   assert.match(verifierScript, /launcherFirstRun/);
   assert.doesNotMatch(verifierScript, /exec node server\/index\.mjs/);
   assert.match(verifierScript, /api\/health/);
@@ -86,6 +88,7 @@ test('macOS GitHub Release package has separate build, verification, and publish
   assert.match(launchGuide, new RegExp(macosArchivePattern));
   assert.match(launchGuide, /Start-App\.command/);
   assert.match(oneClickScript, /export "\$env_key=\$env_value"/);
+  assert.match(oneClickScript, /wait "\$SERVER_PID"/);
 });
 
 test('macOS release shell scripts pass POSIX shell syntax validation', async (context) => {

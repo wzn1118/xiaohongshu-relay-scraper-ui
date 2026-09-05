@@ -110,6 +110,14 @@ cleanup() {
     wait "$launcher_pid" >/dev/null 2>&1 || true
   fi
   [ -z "$temporary_env_path" ] || rm -f "$temporary_env_path"
+  cleanup_attempt=0
+  while [ "$cleanup_attempt" -lt 10 ]; do
+    if rm -rf "$temporary_root" 2>/dev/null; then
+      return 0
+    fi
+    cleanup_attempt=$((cleanup_attempt + 1))
+    sleep 0.2
+  done
   rm -rf "$temporary_root"
 }
 trap cleanup EXIT HUP INT TERM
