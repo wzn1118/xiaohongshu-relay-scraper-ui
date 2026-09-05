@@ -45,6 +45,18 @@ let threadReadPending = 0;
 let workflowSnapshot = null;
 const selectedFiles = new Set();
 
+function announceBrowserReady() {
+  if (window.parent === window || document.documentElement.dataset.codexReady !== 'true') return;
+  window.parent.postMessage({ type: 'codex-browser-ready' }, window.location.origin);
+}
+
+window.addEventListener('message', (event) => {
+  if (event.source !== window.parent
+    || event.origin !== window.location.origin
+    || event.data?.type !== 'codex-browser-ready-probe') return;
+  announceBrowserReady();
+});
+
 async function request(method, params = {}) {
   const response = await fetch('/api/codex-browser/request', {
     method: 'POST',
@@ -178,6 +190,7 @@ async function refresh() {
   if (selected) await selectThread(selected, { cursor: eventCursor });
   await refreshWorkflow();
   persistCursor();
+  announceBrowserReady();
 }
 
 async function createThread() {

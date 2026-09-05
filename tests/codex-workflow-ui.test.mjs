@@ -16,4 +16,9 @@ test('Codex workflow surface exposes review, diff, output, and guarded mutation 
   assert.match(script, /workflowCommandState\.textContent = failed \? '失败' : '有新输出'/u);
   assert.match(script, /threadId: activeThreadId/u);
   assert.match(script, /snapshotGeneration/u);
+  assert.match(script, /document\.documentElement\.dataset\.codexReady !== 'true'/u);
+  assert.match(script, /event\.source !== window\.parent/u);
+  assert.match(script, /event\.data\?\.type !== 'codex-browser-ready-probe'/u);
+  assert.match(script, /window\.parent\.postMessage\(\{ type: 'codex-browser-ready' \}/u);
+  assert.match(script, /persistCursor\(\);\s*announceBrowserReady\(\);/u);
 });
