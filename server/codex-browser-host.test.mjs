@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 const hostPath = path.resolve('public', 'codex-browser-host.js');
+const appPath = path.resolve('src', 'App.tsx');
 
 test('browser host retries transient Relay startup failures and republishes the Codex connection state', async () => {
   const source = await readFile(hostPath, 'utf8');
@@ -50,4 +51,18 @@ test('browser host retries transient Relay startup failures and republishes the 
   assert.match(source, /query\.get\('connector'\) === 'local'/u);
   assert.match(source, /destination\.searchParams\.set\('connector', 'local'\)/u);
   assert.match(source, /localDeviceRequested \? '本机设备' : '远程设备'/u);
+});
+
+test('embedded Codex readiness uses a replayable, source-checked iframe handshake', async () => {
+  const [hostSource, appSource] = await Promise.all([
+    readFile(hostPath, 'utf8'),
+    readFile(appPath, 'utf8'),
+  ]);
+  assert.match(hostSource, /event\.data\?\.type !== 'codex-browser-ready-probe'/u);
+  assert.match(hostSource, /window\.parent\.postMessage\(\{ type: 'codex-browser-ready'/u);
+  assert.match(hostSource, /announceBrowserReady\(\);/u);
+  assert.match(appSource, /const codexFrameRef = useRef<HTMLIFrameElement \| null>\(null\)/u);
+  assert.match(appSource, /event\.source !== codexFrameRef\.current\?\.contentWindow/u);
+  assert.match(appSource, /\{ type: 'codex-browser-ready-probe' \}/u);
+  assert.match(appSource, /window\.setInterval\(probeCodexFrame, 500\)/u);
 });

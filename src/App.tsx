@@ -1791,6 +1791,7 @@ function App() {
   const [codexShareLoading, setCodexShareLoading] = useState(false)
   const [codexShareError, setCodexShareError] = useState('')
   const [codexFrameReady, setCodexFrameReady] = useState(false)
+  const codexFrameRef = useRef<HTMLIFrameElement | null>(null)
 
   useEffect(() => {
     const current = codexMirrorSession
@@ -1925,12 +1926,30 @@ function App() {
       return undefined
     }
     setCodexFrameReady(false)
+    let acknowledged = false
+    let probeTimer: number | undefined
     const onCodexReady = (event: MessageEvent) => {
-      if (event.origin !== window.location.origin || event.source === window || event.data?.type !== 'codex-browser-ready') return
+      if (event.origin !== window.location.origin
+        || event.source !== codexFrameRef.current?.contentWindow
+        || event.data?.type !== 'codex-browser-ready') return
+      acknowledged = true
+      if (probeTimer !== undefined) window.clearInterval(probeTimer)
       setCodexFrameReady(true)
     }
+    const probeCodexFrame = () => {
+      if (acknowledged) return
+      codexFrameRef.current?.contentWindow?.postMessage(
+        { type: 'codex-browser-ready-probe' },
+        window.location.origin,
+      )
+    }
     window.addEventListener('message', onCodexReady)
-    return () => window.removeEventListener('message', onCodexReady)
+    probeCodexFrame()
+    probeTimer = window.setInterval(probeCodexFrame, 500)
+    return () => {
+      window.removeEventListener('message', onCodexReady)
+      if (probeTimer !== undefined) window.clearInterval(probeTimer)
+    }
   }, [codexBrowserOpen, codexPresentationMode, codexSemanticFrameUrl])
   const codexMirrorStatusLabel = useMemo(() => {
     const session = codexMirrorSession?.session
@@ -6827,10 +6846,18 @@ function App() {
         </aside>}
         {codexShareError && <p className="codex-share-error" role="alert"><CircleAlert size={14} />{codexShareError}</p>}
         <iframe
+          ref={codexFrameRef}
           className="codex-browser-frame"
           src={codexPresentationMode === 'mirror' ? codexMirrorFrameUrl : codexSemanticFrameUrl}
           title={codexPresentationMode === 'mirror' ? 'Codex Native Mirror' : 'Codex'}
           allow={codexPresentationMode === 'mirror' ? 'autoplay; fullscreen' : 'clipboard-read; clipboard-write'}
+          onLoad={(event) => {
+            if (codexPresentationMode !== 'semantic') return
+            event.currentTarget.contentWindow?.postMessage(
+              { type: 'codex-browser-ready-probe' },
+              window.location.origin,
+            )
+          }}
         />
         {codexPresentationMode === 'semantic' && !codexFrameReady && <div className="codex-browser-loading" role="status" aria-live="polite">
           <LoaderCircle className="spin" size={18} />

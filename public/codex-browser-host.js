@@ -86,6 +86,20 @@
     }));
   }
 
+  function announceBrowserReady() {
+    if (window.parent === window) return;
+    window.parent.postMessage({ type: 'codex-browser-ready', sessionId: appSessionId }, window.location.origin);
+  }
+
+  function handleBrowserReadyProbe(event) {
+    if (event.source !== window.parent
+      || event.origin !== window.location.origin
+      || event.data?.type !== 'codex-browser-ready-probe') return;
+    announceBrowserReady();
+  }
+
+  window.addEventListener('message', handleBrowserReadyProbe);
+
   function workspaceProjectIdFromMessage(message) {
     if (message?.type !== 'fetch') return '';
     const requestUrl = String(message.url || '');
@@ -454,7 +468,7 @@
     if (observedMessages.length > 500) observedMessages.splice(0, observedMessages.length - 500);
     observeWorkspaceSelection(message);
     if (message?.type === 'ready' && window.parent !== window) {
-      window.parent.postMessage({ type: 'codex-browser-ready', sessionId: appSessionId }, window.location.origin);
+      announceBrowserReady();
     }
     const commandId = newHostRpcCommandId();
     try {
@@ -1541,6 +1555,7 @@
     window.__codexBrowserEventCursor = eventCursor;
     publishInitialHostState();
     publishHostRpcState();
+    announceBrowserReady();
   }
   function startHostRuntime() {
     if (hostRuntimeStarted) return;
@@ -1564,6 +1579,7 @@
     startHostRuntime();
   }
   window.addEventListener('beforeunload', () => {
+    window.removeEventListener('message', handleBrowserReadyProbe);
     stopLocalConnectorPolling();
     if (relayRecoveryTimer) clearTimeout(relayRecoveryTimer);
     if (serverEpochPollTimer) clearInterval(serverEpochPollTimer);
