@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createCodexAppServerTransport } from './codex-app-server-transport.mjs';
 
@@ -87,6 +88,93 @@ test('terminates a timed-out initialization before allowing a clean retry', asyn
   assert.equal(second.messages[0].method, 'initialize');
   assert.equal(transport.status().initialized, true);
   await transport.close();
+});
+
+test('backs up and resumes a stale backfill before starting the embedded runtime', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-transport-backfill-'));
+  const sqliteHome = path.join(root, 'state');
+  await mkdir(sqliteHome, { recursive: true });
+  const statePath = path.join(sqliteHome, 'state_5.sqlite');
+  const database = new DatabaseSync(statePath);
+  database.exec(`
+    CREATE TABLE backfill_state (
+      id INTEGER PRIMARY KEY,
+      status TEXT NOT NULL,
+      last_watermark TEXT,
+      last_success_at INTEGER,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO backfill_state VALUES (1, 'running', 'resume-here', NULL, 1);
+  `);
+  database.close();
+
+  const child = fakeProcess();
+  const transport = createCodexAppServerTransport({
+    executablePath: 'codex.exe',
+    workspaceRoot: 'C:\\workspace',
+    sqliteHome,
+    backfillRecoveryStaleMs: 1_000,
+    spawnProcess: () => child,
+  });
+  await transport.start();
+
+  const status = transport.status();
+  assert.equal(status.backfillRecovery.recovered, true);
+  assert.equal((await stat(status.backfillRecovery.backupPath)).isFile(), true);
+  const verified = new DatabaseSync(statePath, { readOnly: true });
+  const recoveredState = verified.prepare('SELECT status, last_watermark FROM backfill_state WHERE id = 1').get();
+  assert.equal(recoveredState.status, 'pending');
+  assert.equal(recoveredState.last_watermark, 'resume-here');
+  verified.close();
+  await transport.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test('recovers and retries once when app-server reports an interrupted backfill', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-transport-backfill-retry-'));
+  const sqliteHome = path.join(root, 'state');
+  await mkdir(sqliteHome, { recursive: true });
+  const statePath = path.join(sqliteHome, 'state_5.sqlite');
+  const database = new DatabaseSync(statePath);
+  database.exec(`
+    CREATE TABLE backfill_state (
+      id INTEGER PRIMARY KEY,
+      status TEXT NOT NULL,
+      last_watermark TEXT,
+      last_success_at INTEGER,
+      updated_at INTEGER NOT NULL
+    );
+    INSERT INTO backfill_state VALUES (1, 'running', NULL, NULL, ${Math.floor(Date.now() / 1_000)});
+  `);
+  database.close();
+
+  const first = fakeProcess({ respondToInitialize: false });
+  const second = fakeProcess();
+  const processes = [first, second];
+  const transport = createCodexAppServerTransport({
+    executablePath: 'codex.exe',
+    workspaceRoot: 'C:\\workspace',
+    sqliteHome,
+    backfillRecoveryStaleMs: 60_000,
+    spawnProcess: () => {
+      const process = processes.shift();
+      if (process === first) {
+        setImmediate(() => {
+          first.stderr.write('timed out waiting for state db backfill after 30s (status: running)\n');
+          first.emit('exit', 1, null);
+        });
+      }
+      return process;
+    },
+  });
+
+  await transport.start();
+  assert.equal(first.killed, undefined);
+  assert.equal(second.messages[0].method, 'initialize');
+  assert.equal(transport.status().initialized, true);
+  assert.equal(transport.status().backfillRecovery.recovered, true);
+  await transport.close();
+  await rm(root, { recursive: true, force: true });
 });
 
 test('includes app-server stderr when initialization exits', async () => {
