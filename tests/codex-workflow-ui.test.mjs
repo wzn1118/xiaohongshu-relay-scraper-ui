@@ -20,5 +20,6 @@ test('Codex workflow surface exposes review, diff, output, and guarded mutation 
   assert.match(script, /event\.source !== window\.parent/u);
   assert.match(script, /event\.data\?\.type !== 'codex-browser-ready-probe'/u);
   assert.match(script, /window\.parent\.postMessage\(\{ type: 'codex-browser-ready' \}/u);
+  assert.match(script, /elements\.runtimeVersion\.textContent = payload\.backend\.appServerVersion \|\| 'app-server';\s*announceBrowserReady\(\);/u);
   assert.match(script, /persistCursor\(\);\s*announceBrowserReady\(\);/u);
 });

@@ -183,6 +183,7 @@ async function refresh() {
   document.documentElement.dataset.codexReady = 'true';
   elements.runtimeState.textContent = '已连接';
   elements.runtimeVersion.textContent = payload.backend.appServerVersion || 'app-server';
+  announceBrowserReady();
   eventCursor = reconcileEventCursor(readStoredJson(EVENT_CURSOR_KEY), payload.backend);
   await refreshThreadList();
   const savedThreadId = localStorage.getItem(ACTIVE_THREAD_KEY) || '';
