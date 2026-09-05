@@ -3890,7 +3890,7 @@ function App() {
       let effectivePayload = latestPayload
       let job: Job
       try {
-        job = await api.createJob(effectivePayload)
+        job = await api.createJob(effectivePayload, { autoPauseActive: true })
       } catch (error) {
         const apiError = error as Error & { code?: string }
         if (apiError.code !== 'AI_SESSION_EXPIRED' || !requiresAiSession || !sessionHint || !latestPayload.aiSessionId) throw error
@@ -3905,7 +3905,7 @@ function App() {
         setAiSession(session)
         updateRequest('aiSessionId', session.id)
         effectivePayload = { ...latestPayload, aiSessionId: session.id }
-        job = await api.createJob(effectivePayload)
+        job = await api.createJob(effectivePayload, { autoPauseActive: true })
         setLogs((current) => [...current, `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] AI 已自动重连，任务创建成功。`])
       }
       setActiveJob(job)
@@ -4827,12 +4827,14 @@ function App() {
       setExperienceView(view)
       window.scrollTo({ top: 0, behavior: 'smooth' })
     }
-    if (batchSurfaceActive) {
-      performSwitchApplicationView('jobs')
-      window.setTimeout(showView, 240)
-      return
-    }
-    showView()
+    void draftGuard.requestTransition(view === 'history' ? '查看历史任务' : '查看交付产物', () => {
+      if (batchSurfaceActive) {
+        performSwitchApplicationView('jobs')
+        window.setTimeout(showView, 240)
+        return
+      }
+      showView()
+    })
   }
 
   const launchFromExperienceHome = () => {
@@ -4936,9 +4938,7 @@ function App() {
         : selectedDraftQualityRetryable
           ? selectedDraftQualityUnchecked || selectedDraftQualityModelFallback
             ? '运行质量检查'
-            : selectedDraftQualityStale
-              ? '质量已失效'
-              : '重新质量检查'
+            : '重新质量检查'
           : '已保存'
   const openImagePreview = useCallback((title: string, images: PreviewImage[], index = 0) => {
     if (!images.length) return
@@ -5652,6 +5652,7 @@ function App() {
               type="button"
               className="copilot-launch-button codex-runtime-button codex-browser-launch"
               title="打开内置 Codex"
+              aria-label="Codex"
               aria-haspopup="dialog"
               onClick={openCodexRuntime}
             >
@@ -5662,6 +5663,7 @@ function App() {
               type="button"
               className="copilot-launch-button data-assistant-button"
               title={activeJob ? '打开数据助手' : '先选择任务后使用数据助手'}
+              aria-label="数据助手"
               onClick={() => {
                 if (activeJob) {
                   setDataCopilotOpen(true)
@@ -5757,7 +5759,7 @@ function App() {
                 </button>}
               </div>
               <footer>
-                <span className={health?.ok ? 'is-ready' : ''}><Activity size={15} />{health?.ok ? '本地服务正常' : loading ? '正在检查服务' : '服务未响应'}</span>
+                <span className={health?.ok ? 'is-ready' : ''}><Activity size={15} />{health?.ok ? '应用服务正常' : loading ? '正在检查服务' : '服务未响应'}</span>
                 <span>{runningCount} 运行 · {incompleteCount} 待续 · {completedCount} 完成</span>
               </footer>
             </aside>

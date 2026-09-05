@@ -1420,6 +1420,52 @@ test('JobManager persists history and enforces a single active task', async () =
   }
 });
 
+test('auto-pauses-active-job-on-new-start', async () => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-auto-pause-'));
+  const fakeRunner = path.join(dataDir, 'runner.py');
+  await writeFile(fakeRunner, '', 'utf8');
+  const children = [createFakeChild(12401), createFakeChild(12402)];
+  let spawnCount = 0;
+  const manager = new JobManager({
+    dataDir,
+    pythonBin: 'python',
+    runnerPath: fakeRunner,
+    terminateImpl: async (child) => child.kill('SIGTERM'),
+    spawnImpl: () => children[spawnCount++],
+  });
+
+  try {
+    await manager.initialize();
+    const first = await manager.start(validateRunRequest({ checkOnly: true, keyword: '旧任务' }));
+    await waitForJob(manager, first.id, (job) => job.status === 'running');
+    await writeFile(
+      path.join(manager.getInternal(first.id).outputDir, 'xiaohongshu_cards_latest.json'),
+      JSON.stringify([{ note_id: 'checkpoint-1' }]),
+      'utf8',
+    );
+    const firstEnded = waitForEnd(manager, first.id);
+    const second = await manager.start(
+      validateRunRequest({ checkOnly: true, keyword: '新任务' }),
+      { pauseActive: true },
+    );
+
+    await firstEnded;
+    const paused = manager.get(first.id);
+    assert.equal(paused.status, 'interrupted');
+    assert.equal(paused.message, '任务已自动暂停，检查点已保存，可从原任务恢复。');
+    assert.equal(paused.resumeAvailable, true);
+    assert.equal(manager.get(second.id).status, 'running');
+    assert.equal(spawnCount, 2);
+
+    const secondEnded = waitForEnd(manager, second.id);
+    children[1].emit('close', 0, null);
+    await secondEnded;
+  } finally {
+    await manager.shutdown();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('legacy resume requests never queue a child Job while the original Job is active', async () => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'xhs-job-queue-'));
   const fakeRunner = path.join(dataDir, 'runner.py');
