@@ -18,6 +18,10 @@ const DEFAULT_INSTALL_ROOT = path.join(
 const DEFAULT_CONFIG_PATH = path.join(DEFAULT_INSTALL_ROOT, 'connector-config.json');
 const REQUIRED_LAUNCH_FIELDS = ['origin', 'intent', 'code', 'nonce', 'expires', 'sig'];
 const VERSION_PATTERN = /^[A-Za-z0-9._-]{1,80}$/;
+const DEFAULT_LOCAL_RELAY_ORIGINS = [
+  'http://127.0.0.1:4327',
+  'http://127.0.0.1:4317',
+];
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
@@ -29,16 +33,19 @@ async function main() {
     ...valuesFor(options, 'allowedOrigin'),
     ...splitOrigins(process.env.XHS_CODEX_CONNECT_ALLOWED_ORIGINS),
   ]);
-  const localRelayOrigin = normalizeOrigin(options.localRelay || connectorConfig.localRelayOrigin || 'http://127.0.0.1:4317');
+  const configuredLocalRelayOrigin = normalizeOrigin(options.localRelay || connectorConfig.localRelayOrigin || DEFAULT_LOCAL_RELAY_ORIGINS[0]);
+  const localRelayOrigins = [...new Set([configuredLocalRelayOrigin, ...DEFAULT_LOCAL_RELAY_ORIGINS])];
 
   if (options.health) {
-    const health = await probeLocalRelay(localRelayOrigin);
+    const health = await probeLocalRelayCandidates(localRelayOrigins);
     const installation = await readJsonIfExists(path.join(path.dirname(configPath), 'current.json'));
     process.stdout.write(`${JSON.stringify({ connector: 'ready', configPath, allowedOrigins, installation, health }, null, 2)}\n`);
     return;
   }
 
   if (options.update) {
+    const relay = await probeLocalRelayCandidates(localRelayOrigins);
+    const localRelayOrigin = relay.available ? relay.origin : configuredLocalRelayOrigin;
     const result = await updateConnector({
       origin: maintenanceOrigin(options.origin, allowedOrigins),
       allowedOrigins,
@@ -56,7 +63,7 @@ async function main() {
   if (options.rollback) {
     const result = await rollbackConnector({ configPath });
     const restart = options.restart
-      ? await restartInstalledConnector({ configPath, localRelayOrigin })
+      ? await restartInstalledConnector({ configPath, localRelayOrigin: configuredLocalRelayOrigin })
       : null;
     process.stdout.write(`${JSON.stringify({ ...result, ...(restart ? { restart } : {}) }, null, 2)}\n`);
     return;
@@ -68,7 +75,7 @@ async function main() {
         await updateConnector({
           origin: maintenanceOrigin(options.origin, allowedOrigins),
           allowedOrigins,
-          localRelayOrigin,
+          localRelayOrigin: configuredLocalRelayOrigin,
           configPath,
           currentConfig: connectorConfig,
         });
@@ -76,6 +83,8 @@ async function main() {
         console.error(`Connector update check failed: ${error.message}`);
       }
     }
+    const relay = await probeLocalRelayCandidates(localRelayOrigins);
+    const localRelayOrigin = relay.available ? relay.origin : configuredLocalRelayOrigin;
     const runtime = await resolveActiveRuntime(configPath, options.relayScript);
     const child = spawn(runtime.nodeExecutable, [
       runtime.relayScript,
@@ -93,7 +102,7 @@ async function main() {
   if (!connectUrl) throw new Error('--connect-url is required.');
   if (!allowedOrigins.length) throw new Error('No allowed browser origin is configured for the local connector.');
   const launch = parseLaunchUrl(connectUrl, allowedOrigins);
-  const runtime = await probeLocalRelay(localRelayOrigin);
+  const runtime = await probeLocalRelayCandidates(localRelayOrigins);
   if (!runtime.available) {
     throw new Error(`The local Relay is not ready at ${runtime.origin}. Start the local production package, then retry the connection link.`);
   }
@@ -311,6 +320,15 @@ async function probeLocalRelay(originInput) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function probeLocalRelayCandidates(origins) {
+  const probes = await Promise.all(origins.map((origin) => probeLocalRelay(origin)));
+  return probes.find((probe) => probe.available) || probes[0] || {
+    origin: DEFAULT_LOCAL_RELAY_ORIGINS[0],
+    available: false,
+    status: null,
+  };
 }
 
 async function requestJson(url) {

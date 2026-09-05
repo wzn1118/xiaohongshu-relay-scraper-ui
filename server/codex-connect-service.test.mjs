@@ -26,6 +26,7 @@ test('creates a signed one-time local connector launch and exposes the paired de
     now: () => now,
     signingSecret: 'fixture-signing-secret',
     allowedOrigins: ['https://app.example.com'],
+    localRelayOrigin: 'http://127.0.0.1:4327',
   });
 
   try {
@@ -47,6 +48,7 @@ test('creates a signed one-time local connector launch and exposes the paired de
     });
     assert.equal(claimed.device.name, 'Fixture Windows');
     assert.equal(claimed.gateway.websocketUrl, 'wss://app.example.com/v1/device-tunnel');
+    assert.equal(claimed.relay.localOrigin, 'http://127.0.0.1:4327');
     assert.equal(claimed.credentials.deviceToken, 'device-token-returned-once');
 
     const current = service.getIntent(created.intent.id, { ownerId: 'owner@example.com' });

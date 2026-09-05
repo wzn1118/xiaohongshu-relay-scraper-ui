@@ -16,6 +16,8 @@ export function resolveCodexAppServerCommand({
   if (override) return commandForPath(path.resolve(root, override), nodeExecutable, 'environment');
 
   if (preferBundled) {
+    const packaged = packagedNativePath(root, platform, architecture);
+    if (packaged && exists(packaged)) return commandForPath(packaged, nodeExecutable, 'bundled-packaged-native');
     const native = bundledNativePath(root, platform, architecture);
     if (native && exists(native)) return commandForPath(native, nodeExecutable, 'bundled-native');
     const bundledEntrypoint = path.join(root, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
@@ -25,6 +27,11 @@ export function resolveCodexAppServerCommand({
   const runtimeRoot = path.resolve(String(desktopRuntimeRoot || path.join(root, 'output', 'codex-desktop-runtime-55d9fb967596')));
   const desktopExecutable = path.join(runtimeRoot, 'app', 'resources', platform === 'win32' ? 'codex.exe' : 'codex');
   return commandForPath(desktopExecutable, nodeExecutable, 'desktop-runtime');
+}
+
+function packagedNativePath(root, platform, architecture) {
+  if (!['darwin', 'win32'].includes(platform) || !['arm64', 'x64'].includes(architecture)) return null;
+  return path.join(root, 'runtime', 'codex', `${platform}-${architecture}`, 'bin', platform === 'win32' ? 'codex.exe' : 'codex');
 }
 
 function bundledNativePath(root, platform, architecture) {

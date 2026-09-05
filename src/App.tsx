@@ -40,8 +40,6 @@ import {
   Database,
   Pause,
   Paperclip,
-  PanelLeftClose,
-  PanelLeftOpen,
   Play,
   RefreshCw,
   RotateCcw,
@@ -54,7 +52,6 @@ import {
   Shuffle,
   Sparkles,
   SquareTerminal,
-  Table2,
   Target,
   Send,
   Trash2,
@@ -85,6 +82,7 @@ import { JobJourneyPanel } from './JobJourneyPanel'
 import { experienceSnapshotForJob, jobExperienceView } from './job-experience'
 import { UnsavedDraftDialog } from './UnsavedDraftDialog'
 import { useUnsavedDraftGuard } from './useUnsavedDraftGuard'
+import './app-experience.css'
 import type { DraftSaveRequest } from './useUnsavedDraftGuard'
 import type {
   Artifact,
@@ -208,11 +206,11 @@ const defaultCandidateProfile: CandidateApplicationProfile = {
   name: '',
   school: '',
   major: '',
-  degreeYear: '研二',
+  degreeYear: '',
   phoneWeChat: '',
   email: '',
-  availabilityDays: '5',
-  internshipDuration: '6个月',
+  availabilityDays: '',
+  internshipDuration: '',
 }
 
 function loadCandidateProfile(): CandidateApplicationProfile {
@@ -240,7 +238,7 @@ function importedCandidateProfileValues(imported?: Partial<CandidateApplicationP
 
 const defaultRequest: JobRequest = {
   analysisMode: 'job',
-  keyword: '实习继任',
+  keyword: '',
   contentPreset: 'auto',
   contentGoal: '',
   searchSort: 'latest',
@@ -1610,6 +1608,7 @@ function audienceSnapshotRegressed(current: AudienceResultsResponse, next: Audie
 }
 
 type ApplicationView = 'jobs' | 'batch'
+type ExperienceView = 'overview' | 'history' | 'artifacts'
 type WorkflowScreen = 'start' | 'setup' | 'task' | 'workspace' | 'history' | 'artifacts'
 
 const workflowScreenValues: WorkflowScreen[] = ['start', 'setup', 'task', 'workspace', 'history', 'artifacts']
@@ -1721,6 +1720,15 @@ function isIncompleteApplicationResult(result: ApplicationResult) {
     || result.job_card?.parse_basis === 'search_card'
 }
 
+type NoticeTone = 'success' | 'info' | 'warning' | 'error'
+
+function noticeToneFor(message: string): NoticeTone {
+  if (/失败|错误|异常|冲突|失效|未检测到|无法|不可|阻断|请先|缺少|未通过/.test(message)) return 'error'
+  if (/成功|已保存|已清除|已连接|已安装|已就绪|已自动恢复|已通过|已启动|已排队|已加入|已复制|已发送|已移除|无需/.test(message)) return 'success'
+  if (/等待|正在|尚未|部分|稍后|可使用/.test(message)) return 'warning'
+  return 'info'
+}
+
 function App() {
   const [authSession, setAuthSession] = useState<AuthSession | null>(null)
   const [authLoading, setAuthLoading] = useState(true)
@@ -1731,15 +1739,9 @@ function App() {
   const [workspaceMode, setWorkspaceMode] = useState<AnalysisMode>(() => workspaceModeFromLocation())
   const [applicationView, setApplicationView] = useState<ApplicationView>(() => applicationViewFromLocation())
   const [generalResultModule, setGeneralResultModule] = useState<GeneralResultModule>(() => generalResultModuleFromLocation())
+  const [experienceView, setExperienceView] = useState<ExperienceView>('overview')
+  const [taskComposerOpen, setTaskComposerOpen] = useState(false)
   const [workflowScreen, setWorkflowScreen] = useState<WorkflowScreen>(() => workflowScreenFromLocation())
-  const [railCollapsed, setRailCollapsed] = useState(() => {
-    if (typeof window === 'undefined') return false
-    try {
-      return window.localStorage.getItem('xhs-workflow-rail-collapsed') === '1'
-    } catch {
-      return false
-    }
-  })
   const requestCache = useRef<Record<AnalysisMode, JobRequest>>({
     job: { ...defaultRequest, analysisMode: 'job', candidateProfile: loadCandidateProfile() },
     general: { ...defaultRequest, analysisMode: 'general', keyword: '', useCodexRuntime: true, collectAudience: true, candidateProfile: loadCandidateProfile() },
@@ -1765,6 +1767,7 @@ function App() {
   const [jobConnectionState, setJobConnectionState] = useState<WorkflowConnectionState>('offline')
   const [jobLastEventAt, setJobLastEventAt] = useState<string | null>(null)
   const [dataCopilotOpen, setDataCopilotOpen] = useState(false)
+  const [setupOpen, setSetupOpen] = useState(false)
   const [codexBrowserOpen, setCodexBrowserOpen] = useState(false)
   const [codexRelayStatus, setCodexRelayStatus] = useState<CodexRelayStatus | null>(null)
   const [codexRuntimeStatus, setCodexRuntimeStatus] = useState<CodexBrowserStatus | null>(null)
@@ -1788,6 +1791,7 @@ function App() {
   const [codexShareLoading, setCodexShareLoading] = useState(false)
   const [codexShareError, setCodexShareError] = useState('')
   const [codexFrameReady, setCodexFrameReady] = useState(false)
+  const codexFrameRef = useRef<HTMLIFrameElement | null>(null)
 
   useEffect(() => {
     const current = codexMirrorSession
@@ -1922,12 +1926,30 @@ function App() {
       return undefined
     }
     setCodexFrameReady(false)
+    let acknowledged = false
+    let probeTimer: number | undefined
     const onCodexReady = (event: MessageEvent) => {
-      if (event.origin !== window.location.origin || event.source === window || event.data?.type !== 'codex-browser-ready') return
+      if (event.origin !== window.location.origin
+        || event.source !== codexFrameRef.current?.contentWindow
+        || event.data?.type !== 'codex-browser-ready') return
+      acknowledged = true
+      if (probeTimer !== undefined) window.clearInterval(probeTimer)
       setCodexFrameReady(true)
     }
+    const probeCodexFrame = () => {
+      if (acknowledged) return
+      codexFrameRef.current?.contentWindow?.postMessage(
+        { type: 'codex-browser-ready-probe' },
+        window.location.origin,
+      )
+    }
     window.addEventListener('message', onCodexReady)
-    return () => window.removeEventListener('message', onCodexReady)
+    probeCodexFrame()
+    probeTimer = window.setInterval(probeCodexFrame, 500)
+    return () => {
+      window.removeEventListener('message', onCodexReady)
+      if (probeTimer !== undefined) window.clearInterval(probeTimer)
+    }
   }, [codexBrowserOpen, codexPresentationMode, codexSemanticFrameUrl])
   const codexMirrorStatusLabel = useMemo(() => {
     const session = codexMirrorSession?.session
@@ -2231,6 +2253,8 @@ function App() {
     }
     setWorkflowScreen(nextWorkflowScreen)
     setApplicationView(nextApplicationView)
+    setExperienceView('overview')
+    setTaskComposerOpen(false)
     if (mode === 'general') setGeneralResultModule(updateHistory ? 'insights' : generalResultModuleFromLocation())
     setWorkspaceMode(mode)
     setRequest({ ...requestCache.current[mode] })
@@ -2289,6 +2313,8 @@ function App() {
     }
     setWorkflowScreen(nextWorkflowScreen)
     setApplicationView(view)
+    setExperienceView('overview')
+    setTaskComposerOpen(false)
     setNotice(null)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }, [applicationView, workspaceMode])
@@ -2446,12 +2472,16 @@ function App() {
   }, [activeJob, applicationView, audienceDataJobId, draftGuard.requestTransition, generalResultModule, jobs, performSwitchApplicationView, performSwitchWorkspace, workflowScreen, workspaceMode])
 
   useEffect(() => {
-    document.title = workspaceMode === 'general'
-      ? '今天你投了吗？｜内容研究工作台'
-      : applicationView === 'batch'
-        ? '今天你投了吗？｜批量投递工作台'
-        : '今天你投了吗？｜岗位与投递'
-  }, [applicationView, workspaceMode])
+    document.title = experienceView === 'history'
+      ? '今天你投了吗？｜历史任务'
+      : experienceView === 'artifacts'
+        ? '今天你投了吗？｜交付产物'
+        : workspaceMode === 'general'
+          ? '今天你投了吗？｜内容研究工作台'
+          : applicationView === 'batch'
+            ? '今天你投了吗？｜批量投递工作台'
+            : '今天你投了吗？｜岗位与投递'
+  }, [applicationView, experienceView, workspaceMode])
 
   useEffect(() => {
     const provider = detectedSmtpPreset?.provider || smtpConfig.provider
@@ -3879,7 +3909,7 @@ function App() {
       let effectivePayload = latestPayload
       let job: Job
       try {
-        job = await api.createJob(effectivePayload)
+        job = await api.createJob(effectivePayload, { autoPauseActive: true })
       } catch (error) {
         const apiError = error as Error & { code?: string }
         if (apiError.code !== 'AI_SESSION_EXPIRED' || !requiresAiSession || !sessionHint || !latestPayload.aiSessionId) throw error
@@ -3894,10 +3924,11 @@ function App() {
         setAiSession(session)
         updateRequest('aiSessionId', session.id)
         effectivePayload = { ...latestPayload, aiSessionId: session.id }
-        job = await api.createJob(effectivePayload)
+        job = await api.createJob(effectivePayload, { autoPauseActive: true })
         setLogs((current) => [...current, `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] AI 已自动重连，任务创建成功。`])
       }
       setActiveJob(job)
+      setTaskComposerOpen(false)
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)])
       connectJob(job)
       return job
@@ -3939,6 +3970,7 @@ function App() {
       })
       const job = response.job
       setActiveJob(job)
+      setTaskComposerOpen(false)
       activeJobIdCache.current[workspaceMode] = job.id
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)])
       connectJob(job)
@@ -4488,7 +4520,10 @@ function App() {
       } else {
         performSelectJob(job)
       }
+      setExperienceView('overview')
+      setTaskComposerOpen(false)
       performSwitchWorkflowScreen('workspace')
+      window.scrollTo({ top: 0, behavior: 'smooth' })
     })
   }
 
@@ -4587,7 +4622,6 @@ function App() {
   }, [historyScope, historyPageSize])
   const runningCount = workspaceJobs.filter((job) => ['queued', 'resuming', 'running'].includes(job.status)).length
   const completedCount = workspaceJobs.filter((job) => job.status === 'completed').length
-  const failedCount = workspaceJobs.filter((job) => job.status === 'failed').length
   const incompleteCount = workspaceJobs.filter((job) => ['incomplete', 'cancelled', 'interrupted', 'blocked'].includes(job.status)).length
   const currentArtifacts = artifacts.length ? artifacts : activeJob?.artifacts || []
   const discoveredCount = Number(
@@ -4596,12 +4630,10 @@ function App() {
       ?? activeJob?.discoveredCount
       ?? 0,
   )
-  const exportCount = useMemo(() => workspaceJobs.reduce((sum, job) => sum + (job.artifactCount ?? job.artifacts?.length ?? 0), 0), [workspaceJobs])
   const activeAllMode = activeJob?.config?.limit === 0
   const activeBodyImport = activeJob?.config?.bodyOnly === true
   const activeAnalysisMode = workspaceMode
   const batchSurfaceActive = activeAnalysisMode === 'job' && applicationView === 'batch'
-  const currentWorkflowScreen: WorkflowScreen = batchSurfaceActive ? 'workspace' : workflowScreen
   const audienceModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'audience'
   const expansionModuleActive = activeAnalysisMode === 'general' && generalResultModule === 'expansion'
   const displayJobConnectionState: WorkflowConnectionState = jobConnectionState === 'live'
@@ -4711,6 +4743,159 @@ function App() {
     { label: '搜索关键词', ready: Boolean(request.keyword.trim()), detail: request.keyword.trim() || '请输入关键词' },
   ]
   const missingReadiness = readinessChecks.filter((item) => !item.ready).map((item) => item.label)
+  const experienceTaskRunning = Boolean(activeJob && ['queued', 'resuming', 'running'].includes(activeJob.status))
+  const experienceTaskRecoverable = Boolean(activeJob?.resumeAvailable && activeJob.status !== 'completed')
+  const experienceTaskHasResults = Boolean(results?.available && results.items.length > 0)
+    || Number(activeJob?.applicationCount || 0) > 0
+  const experienceCoreChecks = [
+    { label: '浏览器', ready: relaySiteReady, detail: relaySiteReady ? '目标页已打开' : relayReady ? '等待目标页' : '需要连接', target: 'relay-config' },
+    { label: 'AI', ready: Boolean(aiSession), detail: aiSession?.model || '需要连接', target: 'ai-memory' },
+    ...(request.analysisMode === 'job' ? [{
+      label: '求职资料',
+      ready: backgroundReady && candidateReady,
+      detail: backgroundReady && candidateReady ? '背景与署名完整' : '需要补充',
+      target: 'ai-memory',
+    }] : []),
+  ]
+  const experienceReadyCount = experienceCoreChecks.filter((item) => item.ready).length
+  const experienceSetupBlocker = experienceCoreChecks.find((item) => !item.ready)
+  const experienceHomeTitle = experienceTaskRunning
+    ? `${activeJob?.keyword || '当前任务'}正在推进`
+    : experienceTaskRecoverable
+      ? `继续“${activeJob?.keyword || '上次任务'}”`
+      : activeJob?.status === 'completed'
+        ? `“${activeJob.keyword || '上次任务'}”已完成`
+        : request.analysisMode === 'general'
+          ? '从一个问题开始内容研究'
+          : '从一个关键词开始今天的投递'
+  const experienceHomeDescription = activeJob
+    ? readableNextStep
+    : request.analysisMode === 'general'
+      ? '输入想研究的人群、经验、产品或地点，系统会保留正文、图片和引用证据。'
+      : '输入岗位关键词，采集、判断、文案准备和投递会沿用同一个任务记录。'
+  const experiencePrimaryLabel = experienceTaskRunning
+    ? '查看当前进度'
+    : experienceTaskRecoverable
+      ? '继续上次任务'
+      : activeJob?.status === 'completed' || experienceTaskHasResults
+        ? '查看任务结果'
+        : experienceSetupBlocker
+          ? '完成启动设置'
+          : '配置本次任务'
+
+  const experienceComposerVisible = taskComposerOpen || (!loading && !activeJob)
+
+  const showExperienceOverview = () => {
+    setSetupOpen(false)
+    setTaskComposerOpen(false)
+    setExperienceView('overview')
+    window.requestAnimationFrame(() => window.scrollTo({ top: 0, behavior: 'smooth' }))
+  }
+
+  const revealExperienceSection = (id: string) => {
+    setExperienceView('overview')
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }))
+  }
+
+  const openTaskComposer = () => {
+    setSetupOpen(false)
+    setExperienceView('overview')
+    setTaskComposerOpen(true)
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      document.getElementById('task-config')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }))
+  }
+
+  const openExperienceSettings = (target = 'setup-center') => {
+    setExperienceView('overview')
+    setTaskComposerOpen(false)
+    setSetupOpen(true)
+    if (batchSurfaceActive) {
+      performSwitchApplicationView('jobs')
+      window.setTimeout(() => revealExperienceSection(target), 240)
+      return
+    }
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => revealExperienceSection(target)))
+  }
+
+  const openCodexRuntime = () => {
+    setCodexBrowserOpen(true)
+    setCodexRelayError('')
+    setCodexContextError('')
+    void api.codexRelayStatus()
+      .then((status) => setCodexRelayStatus(status))
+      .catch((error: ApiError) => {
+        setCodexRelayStatus(null)
+        setCodexRelayError(error.message || 'Local Relay status check failed.')
+      })
+    void api.codexBrowserStatus().then(setCodexRuntimeStatus).catch(() => setCodexRuntimeStatus(null))
+    void api.xhsContextStatus()
+      .then((status) => setCodexContextStatus(status))
+      .catch((error: ApiError) => {
+        setCodexContextStatus(null)
+        setCodexContextError(error.message || 'Local context status check failed.')
+      })
+  }
+
+  const openExperienceSection = (view: Exclude<ExperienceView, 'overview'>) => {
+    const showView = () => {
+      setSetupOpen(false)
+      setTaskComposerOpen(false)
+      setExperienceView(view)
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    }
+    void draftGuard.requestTransition(view === 'history' ? '查看历史任务' : '查看交付产物', () => {
+      if (batchSurfaceActive) {
+        performSwitchApplicationView('jobs')
+        window.setTimeout(showView, 240)
+        return
+      }
+      showView()
+    })
+  }
+
+  const launchFromExperienceHome = () => {
+    if (!request.keyword.trim()) {
+      setNotice('请先输入本次任务的搜索关键词。')
+      document.getElementById('experience-keyword')?.focus()
+      return
+    }
+    if (experienceSetupBlocker) {
+      setNotice(`请先完成${experienceSetupBlocker.label}设置，完成后即可启动。`)
+      openExperienceSettings(experienceSetupBlocker.target)
+      return
+    }
+    if (request.speedMode === 'random' && request.randomDelayMinSeconds > request.randomDelayMaxSeconds) {
+      setNotice('随机节奏的最短间隔需要小于或等于最长间隔')
+      openTaskComposer()
+      return
+    }
+    void runJob({ ...request, analysisMode: workspaceMode, checkOnly: false })
+  }
+
+  const handleExperiencePrimary = () => {
+    if (experienceTaskRunning) {
+      setTaskComposerOpen(false)
+      revealExperienceSection('current-task')
+      return
+    }
+    if (experienceTaskRecoverable && activeJob) {
+      void resumeJob(activeJob)
+      return
+    }
+    if (activeJob?.status === 'completed' || experienceTaskHasResults) {
+      setTaskComposerOpen(false)
+      revealExperienceSection('results')
+      return
+    }
+    if (experienceSetupBlocker) {
+      openExperienceSettings(experienceSetupBlocker.target)
+      return
+    }
+    openTaskComposer()
+  }
   const selectedDeliveryRoutes = selectedResult ? deliveryRoutes(selectedResult) : []
   const selectedEmailRoute = selectedDeliveryRoutes.find((route) => route.channel === 'email' && route.actionable)
   const selectedMessageRoute = selectedDeliveryRoutes.find((route) => route.channel === 'direct_message' && route.actionable)
@@ -5360,61 +5545,6 @@ function App() {
     { label: '质量通过', value: coverage?.qualityPassed, icon: ShieldCheck },
   ]
 
-  const setupReadiness = activeAnalysisMode === 'job'
-    ? [relaySiteReady, Boolean(aiSession), smtpConfig.verified]
-    : [relaySiteReady, Boolean(aiSession)]
-  const setupReadyCount = setupReadiness.filter(Boolean).length
-  const setupStepCount = setupReadiness.length
-  const workflowStepCount = activeAnalysisMode === 'job' ? 7 : 6
-  const workflowStepNumber = batchSurfaceActive
-    ? 5
-    : ({ start: 1, setup: 2, task: 3, workspace: 4, history: activeAnalysisMode === 'job' ? 6 : 5, artifacts: activeAnalysisMode === 'job' ? 7 : 6 } as Record<WorkflowScreen, number>)[currentWorkflowScreen]
-  const currentModule = batchSurfaceActive
-    ? {
-        eyebrow: '步骤 05',
-        title: '批量投递',
-        description: activeJob ? `当前任务：${activeJob.keyword || activeJob.id}` : '尚未选择岗位任务',
-        state: smtpConfig.verified ? '发送通道已验证' : '发送通道待验证',
-      }
-    : ({
-        start: {
-          eyebrow: '步骤 01',
-          title: '工作总览',
-          description: activeJob ? `当前任务：${activeJob.keyword || activeJob.id}` : '当前没有选中的任务',
-          state: health?.ok ? '服务正常' : loading ? '正在检查服务' : '服务待检查',
-        },
-        setup: {
-          eyebrow: '步骤 02',
-          title: '运行环境',
-          description: activeAnalysisMode === 'job' ? '采集浏览器、智能分析和发件邮箱' : '采集浏览器与智能分析服务',
-          state: `${setupReadyCount} / ${setupStepCount} 已就绪`,
-        },
-        task: {
-          eyebrow: '步骤 03',
-          title: activeAnalysisMode === 'general' ? '创建研究任务' : '创建采集任务',
-          description: request.keyword.trim() ? `当前关键词：${request.keyword.trim()}` : '尚未填写关键词',
-          state: activeJob ? '已有选中任务' : '等待创建',
-        },
-        workspace: {
-          eyebrow: '步骤 04',
-          title: activeAnalysisMode === 'general' ? '研究结果' : '运行与结果',
-          description: activeJob ? `${activeJob.keyword || activeJob.id} · ${jobStatusText(activeJob.status)}` : '尚未选择任务',
-          state: activeJob ? jobStatusText(activeJob.status) : '无任务',
-        },
-        history: {
-          eyebrow: `步骤 ${String(activeAnalysisMode === 'job' ? 6 : 5).padStart(2, '0')}`,
-          title: '任务历史',
-          description: activeJob ? `当前选中：${activeJob.keyword || activeJob.id}` : '浏览并恢复已保存任务',
-          state: `${workspaceJobs.length} 个任务`,
-        },
-        artifacts: {
-          eyebrow: `步骤 ${String(activeAnalysisMode === 'job' ? 7 : 6).padStart(2, '0')}`,
-          title: '文件交付',
-          description: activeJob ? `当前任务：${activeJob.keyword || activeJob.id}` : '选择任务后查看文件',
-          state: `${currentArtifacts.length} 个当前文件`,
-        },
-      } satisfies Record<WorkflowScreen, { eyebrow: string; title: string; description: string; state: string }>)[currentWorkflowScreen]
-
   const closeCodexNativeMirror = () => {
     const current = codexMirrorSession
     if (current) {
@@ -5510,98 +5640,60 @@ function App() {
   }
 
   return (
-    <div className={`app-shell ${railCollapsed ? 'rail-collapsed' : ''} ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
+    <div className={`app-shell experience-ui experience-view-${experienceView} ${batchSurfaceActive ? 'batch-interface batch-surface-active' : expansionModuleActive ? 'expansion-interface' : workspaceMode === 'general' ? 'content-interface' : 'job-interface'}`}>
       <aside className="side-rail">
-        <div className="rail-brand">
-          <div className="brand-mark" aria-label="今天你投了吗？">投</div>
-          <span><strong>今天你投了吗？</strong><small>{activeAnalysisMode === 'general' ? '内容研究' : '岗位与投递'}</small></span>
-        </div>
-        <div className="rail-progress" aria-label={`当前第 ${workflowStepNumber} 步，共 ${workflowStepCount} 步`}>
-          <span>操作流程</span><strong>{workflowStepNumber} / {workflowStepCount}</strong>
-        </div>
-        <nav className="workflow-nav" aria-label="任务流程">
-          <button aria-label="总览" className={`nav-button ${currentWorkflowScreen === 'start' ? 'active' : ''}`} type="button" title="查看当前任务和整体状态" aria-current={currentWorkflowScreen === 'start' ? 'page' : undefined} onClick={() => switchWorkflowScreen('start')}><span className="nav-step-index">01</span><span className="nav-step-icon"><Activity size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">总览</strong><small>当前任务</small></span><span className="nav-button-state">{health?.ok ? '正常' : '检查'}</span><ChevronRight className="nav-chevron" size={15} /></button>
-          <button aria-label="环境" className={`nav-button ${currentWorkflowScreen === 'setup' ? 'active' : ''}`} type="button" title="配置采集浏览器、智能分析和发件邮箱" aria-current={currentWorkflowScreen === 'setup' ? 'page' : undefined} onClick={() => switchWorkflowScreen('setup')}><span className="nav-step-index">02</span><span className="nav-step-icon"><ShieldCheck size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">环境</strong><small>采集、分析、邮箱</small></span><span className="nav-button-state">{setupReadyCount}/{setupStepCount}</span><ChevronRight className="nav-chevron" size={15} /></button>
-          <button aria-label="新建" className={`nav-button ${currentWorkflowScreen === 'task' ? 'active' : ''}`} type="button" title="新建采集或研究任务" aria-current={currentWorkflowScreen === 'task' ? 'page' : undefined} onClick={() => switchWorkflowScreen('task')}><span className="nav-step-index">03</span><span className="nav-step-icon"><Target size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">新建</strong><small>{activeAnalysisMode === 'general' ? '研究任务' : '采集任务'}</small></span><span className="nav-button-state">{activeJob ? '已有' : '待建'}</span><ChevronRight className="nav-chevron" size={15} /></button>
-          <button aria-label="结果" className={`nav-button ${currentWorkflowScreen === 'workspace' && !batchSurfaceActive ? 'active' : ''}`} type="button" title="查看运行进度和任务结果" aria-current={currentWorkflowScreen === 'workspace' && !batchSurfaceActive ? 'page' : undefined} onClick={() => switchWorkflowScreen('workspace')}><span className="nav-step-index">04</span><span className="nav-step-icon"><Play size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">结果</strong><small>进度与内容</small></span><span className="nav-button-state">{activeJob ? jobStatusText(activeJob.status) : '无任务'}</span><ChevronRight className="nav-chevron" size={15} /></button>
-          {workspaceMode === 'job' && <button aria-label="投递" className={`nav-button ${batchSurfaceActive ? 'active' : ''}`} type="button" title="预检并批量发送投递邮件" aria-current={batchSurfaceActive ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><span className="nav-step-index">05</span><span className="nav-step-icon"><Layers3 size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">投递</strong><small>预检与发送</small></span><span className="nav-button-state">{smtpConfig.verified ? '可发送' : '待验证'}</span><ChevronRight className="nav-chevron" size={15} /></button>}
-          <button aria-label="历史" className={`nav-button ${currentWorkflowScreen === 'history' ? 'active' : ''}`} type="button" title="任务历史" aria-current={currentWorkflowScreen === 'history' ? 'page' : undefined} onClick={() => switchWorkflowScreen('history')}><span className="nav-step-index">{activeAnalysisMode === 'job' ? '06' : '05'}</span><span className="nav-step-icon"><Clock3 size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">历史</strong><small>任务记录</small></span><span className="nav-button-state">{workspaceJobs.length} 项</span><ChevronRight className="nav-chevron" size={15} /></button>
-          <button aria-label="文件" className={`nav-button ${currentWorkflowScreen === 'artifacts' ? 'active' : ''}`} type="button" title="下载结果和交付文件" aria-current={currentWorkflowScreen === 'artifacts' ? 'page' : undefined} onClick={() => switchWorkflowScreen('artifacts')}><span className="nav-step-index">{activeAnalysisMode === 'job' ? '07' : '06'}</span><span className="nav-step-icon"><Table2 size={18} /></span><span className="nav-button-copy"><strong className="nav-button-label">文件</strong><small>下载与交付</small></span><span className="nav-button-state">{exportCount} 个</span><ChevronRight className="nav-chevron" size={15} /></button>
+        <div className="brand-mark" aria-label="今天你投了吗？">投</div>
+        <nav aria-label="主导航">
+          <button className={`nav-button ${experienceView === 'overview' && workspaceMode === 'job' ? 'active' : ''}`} type="button" title="今日任务" aria-current={experienceView === 'overview' && workspaceMode === 'job' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? (showExperienceOverview(), switchApplicationView('jobs')) : switchWorkspace('job', true, 'jobs')}><Target size={20} /><span>任务</span></button>
+          <button className={`nav-button ${experienceView === 'overview' && workspaceMode === 'general' ? 'active' : ''}`} type="button" title="内容研究" aria-current={experienceView === 'overview' && workspaceMode === 'general' ? 'page' : undefined} onClick={() => workspaceMode === 'general' ? showExperienceOverview() : switchWorkspace('general')}><BookOpenCheck size={20} /><span>研究</span></button>
+          <button className={`nav-button ${experienceView === 'history' ? 'active' : ''}`} type="button" title="历史任务" aria-current={experienceView === 'history' ? 'page' : undefined} onClick={() => openExperienceSection('history')}><Clock3 size={20} /><span>历史</span></button>
+          <button className={`nav-button ${experienceView === 'artifacts' ? 'active' : ''}`} type="button" title="交付产物" aria-current={experienceView === 'artifacts' ? 'page' : undefined} onClick={() => openExperienceSection('artifacts')}><Archive size={20} /><span>产物</span></button>
+          <button className={`nav-button ${experienceView === 'overview' && setupOpen ? 'utility-active' : ''}`} type="button" title="运行设置" aria-expanded={setupOpen} onClick={() => openExperienceSettings()}><Settings2 size={20} /><span>设置</span></button>
         </nav>
-        <button
-          type="button"
-          className="rail-collapse-button"
-          aria-label={railCollapsed ? '展开左侧导航' : '收起左侧导航'}
-          aria-expanded={!railCollapsed}
-          title={railCollapsed ? '展开左侧导航' : '收起左侧导航，为主屏留出更多空间'}
-          onClick={() => setRailCollapsed((current) => {
-            const next = !current
-            try {
-              window.localStorage.setItem('xhs-workflow-rail-collapsed', next ? '1' : '0')
-            } catch {
-              // The layout still works when storage is unavailable.
-            }
-            return next
-          })}
-        >
-          {railCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
-          <span>{railCollapsed ? '展开导航' : '收起导航'}</span>
-        </button>
       </aside>
 
       <div className="workspace">
         <header className="topbar">
           <div className="topbar-leading">
             <div className="product-title">
-              <span className="eyebrow">{workspaceMode === 'general' ? '内容研究工作台' : applicationView === 'batch' ? '批量投递工作台' : '岗位信息与投递管理'}</span>
-              <h1><span>今天你投了吗？</span><span className="product-title-context">{workspaceMode === 'general' ? '｜内容研究工作台' : applicationView === 'batch' ? '｜批量投递工作台' : '｜岗位与投递'}</span></h1>
+              <span className="eyebrow">{experienceView === 'history' ? 'TASK ARCHIVE' : experienceView === 'artifacts' ? 'DELIVERABLES' : workspaceMode === 'general' ? 'CONTENT INTELLIGENCE' : applicationView === 'batch' ? 'BATCH APPLICATION WORKBENCH' : 'APPLICATION INTELLIGENCE'}</span>
+              <h1>{experienceView === 'history' ? '今天你投了吗？｜历史任务' : experienceView === 'artifacts' ? '今天你投了吗？｜交付产物' : workspaceMode === 'general' ? '今天你投了吗？｜内容研究工作台' : applicationView === 'batch' ? '今天你投了吗？｜批量投递工作台' : '今天你投了吗？｜岗位与投递'}</h1>
               <span className="version">v3.1</span>
             </div>
-            <nav className="workspace-switcher" aria-label="切换工作台">
-              <button type="button" aria-label="岗位投递" className={workspaceMode === 'job' && applicationView === 'jobs' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'jobs' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('jobs') : switchWorkspace('job', true, 'jobs')}><Target size={15} /><span className="workspace-label-long">岗位投递</span><span className="workspace-label-short" aria-hidden="true">岗位</span></button>
-              <button type="button" aria-label="批量投递" className={workspaceMode === 'job' && applicationView === 'batch' ? 'active' : ''} aria-current={workspaceMode === 'job' && applicationView === 'batch' ? 'page' : undefined} onClick={() => workspaceMode === 'job' ? switchApplicationView('batch') : switchWorkspace('job', true, 'batch')}><Layers3 size={15} /><span className="workspace-label-long">批量投递</span><span className="workspace-label-short" aria-hidden="true">批量</span></button>
-              <button type="button" aria-label="非岗位研究" className={workspaceMode === 'general' ? 'active' : ''} aria-current={workspaceMode === 'general' ? 'page' : undefined} onClick={() => switchWorkspace('general')}><BookOpenCheck size={15} /><span className="workspace-label-long">非岗位研究</span><span className="workspace-label-short" aria-hidden="true">研究</span></button>
-            </nav>
+            <div className="experience-breadcrumb" aria-label="当前工作区">
+              <span>{workspaceMode === 'general' ? '研究' : '求职任务'}</span>
+              <ChevronRight size={14} />
+              <strong>{experienceView === 'history' ? '历史任务' : experienceView === 'artifacts' ? '交付产物' : applicationView === 'batch' ? '审批与发送' : workspaceMode === 'general' ? '采集与洞察' : '发现与准备'}</strong>
+            </div>
           </div>
           <div className="topbar-status">
             <button
               type="button"
-              className="copilot-launch-button codex-browser-launch"
-              title="在当前浏览器中打开完整 Codex"
+              className="copilot-launch-button codex-runtime-button codex-browser-launch"
+              title="打开内置 Codex"
+              aria-label="Codex"
               aria-haspopup="dialog"
-              onClick={() => {
-                setCodexBrowserOpen(true)
-                setCodexRelayError('')
-                setCodexContextError('')
-                void api.codexRelayStatus()
-                  .then((status) => setCodexRelayStatus(status))
-                  .catch((error: ApiError) => {
-                    setCodexRelayStatus(null)
-                    setCodexRelayError(error.message || 'Local Relay status check failed.')
-                  })
-                void api.codexBrowserStatus().then(setCodexRuntimeStatus).catch(() => setCodexRuntimeStatus(null))
-                void api.xhsContextStatus()
-                  .then((status) => {
-                    setCodexContextStatus(status)
-                  })
-                  .catch((error: ApiError) => {
-                    setCodexContextStatus(null)
-                    setCodexContextError(error.message || 'Local context status check failed.')
-                  })
-              }}
+              onClick={openCodexRuntime}
             >
               <SquareTerminal size={16} />
               <span>Codex</span>
             </button>
             <button
               type="button"
-              className="icon-button legacy-copilot-launch"
-              disabled={!activeJob}
-              title={!activeJob ? '选择任务后可打开旧版数据助手' : '打开旧版数据助手（回退）'}
-              aria-label="打开旧版数据助手"
-              onClick={() => setDataCopilotOpen(true)}
+              className="copilot-launch-button data-assistant-button"
+              title={activeJob ? '打开数据助手' : '先选择任务后使用数据助手'}
+              aria-label="数据助手"
+              onClick={() => {
+                if (activeJob) {
+                  setDataCopilotOpen(true)
+                  return
+                }
+                setNotice('请先从历史任务中选择一项，再打开数据助手。')
+                openExperienceSection('history')
+              }}
             >
-              <MessagesSquare size={16} />
+              <MessageSquare size={16} />
+              <span>数据助手</span>
             </button>
             <div className={`relay-indicator ${relayReady ? 'ready' : relayConnecting ? 'connecting' : 'offline'}`}>
               {relayReady ? <Wifi size={17} /> : relayConnecting ? <LoaderCircle className="spin" size={17} /> : <WifiOff size={17} />}
@@ -5612,72 +5704,95 @@ function App() {
           </div>
         </header>
 
-        {notice && (
-          <div className="notice" role="alert">
-            <CircleAlert size={17} />
+        {notice && (() => {
+          const tone = noticeToneFor(notice)
+          return (
+          <div className={`notice ${tone}`} role={tone === 'error' ? 'alert' : 'status'}>
+            {tone === 'success' ? <Check size={17} /> : tone === 'error' ? <CircleAlert size={17} /> : <Info size={17} />}
             <span>{notice}</span>
             <button onClick={() => setNotice(null)} title="关闭"><X size={16} /></button>
           </div>
-        )}
+          )
+        })()}
 
-        <main className={`workflow-main screen-${currentWorkflowScreen}`}>
-          <header className="workflow-module-bar">
-            <div className="workflow-module-copy">
-              <span>{currentModule.eyebrow} / 共 {String(workflowStepCount).padStart(2, '0')} 步</span>
-              <h2>{currentModule.title}</h2>
-              <p>{currentModule.description}</p>
+        <main>
+          <header className="experience-library-toolbar">
+            <div>
+              <span className="step-label">TASK LIBRARY</span>
+              <h2>{experienceView === 'history' ? '历史任务' : '交付产物'}</h2>
+              <small>{experienceView === 'history' ? `${historyJobs.length} 条任务记录` : activeJob ? `当前任务 · ${activeJob.keyword}` : '尚未选择任务'}</small>
             </div>
-            <div className="workflow-module-actions">
-              <span className="workflow-module-state"><small>当前状态</small><strong>{currentModule.state}</strong></span>
-              {batchSurfaceActive ? (
-                <button type="button" className="secondary-button" onClick={() => switchApplicationView('jobs')}><ChevronLeft size={16} />返回运行结果</button>
-              ) : currentWorkflowScreen === 'start' ? (
-                <button type="button" className="primary-button" onClick={() => switchWorkflowScreen(activeJob ? 'workspace' : 'task')}>{activeJob ? <Eye size={16} /> : <Target size={16} />}{activeJob ? '查看当前任务' : '创建任务'}</button>
-              ) : currentWorkflowScreen === 'setup' ? (
-                <button type="button" className="primary-button" onClick={() => switchWorkflowScreen('task')}><ChevronRight size={16} />进入创建任务</button>
-              ) : currentWorkflowScreen === 'workspace' ? (
-                activeAnalysisMode === 'job'
-                  ? <button type="button" className="primary-button" onClick={() => switchApplicationView('batch')}><Layers3 size={16} />进入批量投递</button>
-                  : <button type="button" className="secondary-button" onClick={() => switchWorkflowScreen('history')}><Clock3 size={16} />查看任务历史</button>
-              ) : currentWorkflowScreen === 'history' ? (
-                <button type="button" className="primary-button" onClick={() => switchWorkflowScreen('artifacts')}><Table2 size={16} />查看文件</button>
-              ) : currentWorkflowScreen === 'artifacts' ? (
-                <button type="button" className="secondary-button" onClick={() => switchWorkflowScreen('task')}><Target size={16} />创建新任务</button>
-              ) : null}
+            <div className="experience-library-actions">
+              <button type="button" className="experience-overview-button" onClick={showExperienceOverview}><Target size={16} />当前任务</button>
+              <div className="experience-library-tabs" role="tablist" aria-label="任务资料视图">
+                <button type="button" role="tab" aria-selected={experienceView === 'history'} className={experienceView === 'history' ? 'active' : ''} onClick={() => openExperienceSection('history')}><Clock3 size={16} />历史</button>
+                <button type="button" role="tab" aria-selected={experienceView === 'artifacts'} className={experienceView === 'artifacts' ? 'active' : ''} onClick={() => openExperienceSection('artifacts')}><Archive size={16} />产物</button>
+              </div>
             </div>
           </header>
-
-          <section className="current-task-band workflow-screen workflow-screen-start" aria-label="当前任务摘要">
-            <span className={`current-task-icon ${activeJob ? 'active' : ''}`}>{activeJob ? <Activity size={20} /> : <Target size={20} />}</span>
-            <div className="current-task-copy">
-              <span>当前任务</span>
-              <h2>{activeJob ? activeJob.keyword || activeJob.id : '暂无选中的任务'}</h2>
-              <p>{activeJob ? readableJobView?.headline || jobStatusText(activeJob.status) : '创建任务后，运行状态和结果会在这里持续更新。'}</p>
+          <section className="experience-command-center" aria-labelledby="product-hero-title">
+            <div className="experience-command-main">
+              <div className="experience-command-kicker">
+                <span>{activeJob ? '当前任务' : '今日下一步'}</span>
+                <b className={experienceTaskRunning ? 'is-running' : activeJob?.status === 'completed' ? 'is-ready' : ''}>
+                  {activeJob ? statusText[activeJob.status] : experienceReadyCount === experienceCoreChecks.length ? '可以开始' : `还差 ${experienceCoreChecks.length - experienceReadyCount} 项`}
+                </b>
+              </div>
+              <h2 id="product-hero-title">{experienceHomeTitle}</h2>
+              <p>{experienceHomeDescription}</p>
+              <div className="experience-command-actions">
+                <button type="button" className="primary-button" onClick={handleExperiencePrimary} disabled={submitting}>
+                  {experienceTaskRecoverable ? <RotateCcw size={17} /> : experienceTaskRunning ? <Activity size={17} /> : <ArrowUpDown size={17} />}
+                  {experiencePrimaryLabel}
+                </button>
+                <button type="button" className="secondary-button" onClick={openTaskComposer}><Search size={17} />新建任务</button>
+                {workspaceMode === 'job' && activeJob && experienceTaskHasResults && <button type="button" className="secondary-button" onClick={() => switchApplicationView('batch')}><Layers3 size={17} />批量投递</button>}
+              </div>
+              <form className="experience-quick-launch" onSubmit={(event) => { event.preventDefault(); launchFromExperienceHome() }}>
+                <label htmlFor="experience-keyword">{workspaceMode === 'general' ? '研究关键词' : '岗位关键词'}</label>
+                <div>
+                  <Search size={18} />
+                  <input id="experience-keyword" value={request.keyword} onChange={(event) => updateRequest('keyword', event.target.value)} placeholder={workspaceMode === 'general' ? '例如：AI 产品经理面试经验' : '例如：AI 产品经理实习'} />
+                  <button type="submit" disabled={submitting || experienceTaskRunning || !request.keyword.trim()}>
+                    {submitting ? <LoaderCircle className="spin" size={17} /> : experienceSetupBlocker ? <ShieldCheck size={17} /> : <Play size={17} />}
+                    {experienceTaskRunning ? '任务运行中' : experienceSetupBlocker ? '检查并继续' : '启动全流程'}
+                  </button>
+                </div>
+              </form>
             </div>
-            <dl className="current-task-facts">
-              <div><dt>任务状态</dt><dd>{activeJob ? jobStatusText(activeJob.status) : '未开始'}</dd></div>
-              <div><dt>已发现</dt><dd>{activeJob ? discoveredCount : 0}</dd></div>
-              <div><dt>已保存</dt><dd>{activeJob ? readableSavedCount : 0}</dd></div>
-              <div><dt>当前文件</dt><dd>{activeJob ? currentArtifacts.length : 0}</dd></div>
-            </dl>
+            <aside className="experience-readiness" aria-label="启动条件">
+              <header>
+                <span><small>启动条件</small><strong>{experienceReadyCount} / {experienceCoreChecks.length} 已就绪</strong></span>
+                <button type="button" onClick={() => openExperienceSettings()}><Settings2 size={16} />运行设置</button>
+              </header>
+              <div className="experience-readiness-grid">
+                {experienceCoreChecks.map((item) => <button type="button" className={item.ready ? 'is-ready' : 'needs-action'} key={item.label} onClick={() => openExperienceSettings(item.target)}>
+                  <span>{item.ready ? <Check size={15} /> : <CircleAlert size={15} />}</span>
+                  <span><strong>{item.label}</strong><small>{item.detail}</small></span>
+                  <ChevronRight size={15} />
+                </button>)}
+                {workspaceMode === 'job' && <button type="button" className={smtpConfig.verified ? 'is-ready' : 'is-optional'} onClick={() => openExperienceSettings('email-config')}>
+                  <span>{smtpConfig.verified ? <Check size={15} /> : <Mail size={15} />}</span>
+                  <span><strong>发件邮箱</strong><small>{smtpConfig.verified ? '连接已验证' : smtpConfig.configured ? '配置已保存' : '投递前再配置'}</small></span>
+                  <ChevronRight size={15} />
+                </button>}
+              </div>
+              <footer>
+                <span className={health?.ok ? 'is-ready' : ''}><Activity size={15} />{health?.ok ? '应用服务正常' : loading ? '正在检查服务' : '服务未响应'}</span>
+                <span>{runningCount} 运行 · {incompleteCount} 待续 · {completedCount} 完成</span>
+              </footer>
+            </aside>
           </section>
 
-          <section className="overview-band workflow-screen workflow-screen-start" id="product-overview" aria-label="运行概览">
-            <div className="overview-copy">
-              <p>任务概况</p>
-              <strong>{runningCount ? `${runningCount} 个任务运行中` : '当前没有运行中的任务'}</strong>
-            </div>
-            <div className="metric"><span>成功任务</span><strong>{completedCount}</strong><small>当前历史</small></div>
-            <div className="metric"><span>未完成任务</span><strong className={incompleteCount ? 'warning-text' : ''}>{incompleteCount}</strong><small>中断或主动取消</small></div>
-            <div className="metric"><span>失败任务</span><strong className={failedCount ? 'danger-text' : ''}>{failedCount}</strong><small>执行错误并保留原因</small></div>
-            <div className="metric"><span>导出文件</span><strong>{exportCount}</strong><small>JSON / CSV / XLSX / MD</small></div>
-            <div className="health-stamp">
-              <Activity size={18} />
-              <span><strong>{health?.ok ? '应用服务正常' : loading ? '正在检查服务' : '服务未响应'}</strong><small>{health?.runnerAvailable === false ? '任务执行程序尚未配置' : '任务执行程序运行正常'}</small></span>
-            </div>
-          </section>
-
-          <section className="panel relay-config-panel workflow-screen workflow-screen-setup" id="relay-config" aria-label="采集浏览器连接">
+          <section className={`experience-setup-hub ${setupOpen ? 'is-open' : ''}`} id="setup-center" aria-label="运行设置">
+            <button type="button" className="experience-setup-summary" aria-expanded={setupOpen} aria-controls="experience-setup-content" onClick={() => setSetupOpen((open) => !open)}>
+              <span className="experience-setup-icon"><Settings2 size={20} /></span>
+              <span className="experience-setup-copy"><small>低频运行设置</small><strong>浏览器、AI、个人资料与发件邮箱</strong><span>{setupOpen ? '设置已展开，完成后可收起并回到任务' : '日常使用保持收起；状态异常时再进入处理'}</span></span>
+              <span className={experienceReadyCount === experienceCoreChecks.length ? 'is-ready' : 'needs-action'}>{experienceReadyCount} / {experienceCoreChecks.length} 核心条件</span>
+              <ChevronDown className={setupOpen ? 'expanded' : ''} size={18} />
+            </button>
+            {setupOpen && <div className="experience-setup-content" id="experience-setup-content">
+          <section className="panel relay-config-panel" id="relay-config" aria-label="Relay 配置">
             <div className="panel-heading compact">
               <div><span className="step-label">采集浏览器连接</span><h2>采集浏览器</h2></div>
               <div className="relay-heading-actions">
@@ -5922,12 +6037,17 @@ function App() {
               {candidateImportStatus === 'empty' && <div className="candidate-profile-import-note"><CircleAlert size={15} /><span>简历已写入背景记忆，但未识别到完整署名信息，请手动补充。</span></div>}
             </section>}
           </section>
+            </div>}
+          </section>
 
-          <div className="primary-grid workflow-screen workflow-screen-task">
-            <section className="panel config-panel" id="task-config">
+          <div className={`primary-grid ${experienceComposerVisible ? 'has-composer' : 'task-focused'}`}>
+            {experienceComposerVisible && <section className="panel config-panel" id="task-config">
               <div className="panel-heading">
-                <div><span className="step-label">步骤 1 / 设置采集任务</span><h2>{collectionEntryMode === 'import' ? '批量采集指定正文' : request.analysisMode === 'general' ? '新建非岗位信息研究任务' : '新建采集与投递分析任务'}</h2></div>
-                <span className="local-badge">本地执行</span>
+                <div><span className="step-label">01 / CONFIGURE</span><h2>{collectionEntryMode === 'import' ? '批量采集指定正文' : request.analysisMode === 'general' ? '新建非岗位信息研究任务' : '新建采集与投递分析任务'}</h2></div>
+                <div className="config-heading-actions">
+                  <span className="local-badge">本地执行</span>
+                  {activeJob && taskComposerOpen && <button type="button" className="icon-button" title="收起新建任务" aria-label="收起新建任务" onClick={() => setTaskComposerOpen(false)}><X size={16} /></button>}
+                </div>
               </div>
               <div className="collection-entry-switch" role="tablist" aria-label="采集入口">
                 <button type="button" role="tab" aria-selected={collectionEntryMode === 'search'} className={collectionEntryMode === 'search' ? 'selected' : ''} onClick={() => setCollectionEntryMode('search')}><Search size={15} />关键词发现</button>
@@ -6074,9 +6194,9 @@ function App() {
                   <button className="secondary-button" type="button" disabled={submitting} onClick={() => void runJob({ ...request, checkOnly: true })}><Activity size={18} />只检查连接</button>
                 </div>
               </form>
-            </section>
+            </section>}
 
-            <section className="panel mission-panel">
+            <section className="panel mission-panel" id="current-task">
               <div className="panel-heading">
                 <div><span className="step-label">步骤 2 / 当前任务进度</span><h2>当前任务</h2></div>
                 {activeJob ? <StatusPill status={activeJob.status} /> : <span className="muted-badge">尚未创建</span>}
@@ -6121,7 +6241,7 @@ function App() {
               )}
             </section>
 
-            <details className="panel log-panel technical-details-panel" open>
+            <details className="panel log-panel technical-details-panel">
               <summary className="panel-heading dark-heading">
                 <div><span className="step-label">任务状态说明</span><h2>系统状态说明</h2><small>先看日常说明；原始记录只在需要排查时展开</small></div>
                 <span className="technical-details-toggle"><Info size={15} />{logs.length ? `还有 ${logs.length} 条系统记录` : '暂无系统记录'}<ChevronDown size={17} /></span>
@@ -6192,6 +6312,7 @@ function App() {
             {!batchSurfaceActive && <div className="panel-heading compact">
               <div><span className="step-label">{batchSurfaceActive ? '批量投递准备' : expansionModuleActive ? '关系数据扩展' : audienceModuleActive ? '受众与用户分析' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.eyebrow : '') || '关键词内容分析' : '逐条岗位分析'}</span><h2>{batchSurfaceActive ? '批量投递工作台' : expansionModuleActive ? '关系扩散' : audienceModuleActive ? '受众及用户界面' : activeAnalysisMode === 'general' ? (results?.insights ? results?.presentation?.title : '') || `${activeJob?.keyword || request.keyword || '关键词'}内容洞察` : '逐链接岗位与投递文案'}</h2>{batchSurfaceActive ? <p className="result-heading-description">从已保存正文中选择岗位，预检收件人、文案和附件后再分批发送。</p> : expansionModuleActive ? <p className="result-heading-description">从当前任务已保存的帖子出发，多轮采集公开用户、帖子、评论与关系，并持续写回同一任务。</p> : audienceModuleActive ? <p className="result-heading-description">逐帖采集评论、楼中楼回复、原帖主和评论者公开资料，并用严格覆盖状态标记全量程度。</p> : activeAnalysisMode === 'general' && results?.insights && results?.presentation?.description ? <p className="result-heading-description">{results.presentation.description}</p> : null}</div>
               <div className="result-heading-meta">
+                {!batchSurfaceActive && activeAnalysisMode === 'job' && activeJob && experienceTaskHasResults && <button type="button" className="experience-result-action" onClick={() => switchApplicationView('batch')}><Layers3 size={16} />批量投递</button>}
                 <span className={`runtime-badge ${batchSurfaceActive || expansionStatus === 'completed' || audienceResults?.summary.status === 'complete' || codexRuntime?.status === 'completed' ? 'passed' : ''}`}>{batchSurfaceActive ? '投递批次 · 发送前预检' : expansionModuleActive ? `多轮扩散 · ${expansionStatusText}` : audienceModuleActive ? `评论与用户信息 · ${audienceStatusLabel(audienceResults?.summary.status || 'pending')}` : `${activeAnalysisMode === 'general' ? 'AI 内容分析' : 'AI 质量检查'} · ${aiRunStatusText[aiRunStatus] || '等待结果'}`}</span>
                 <span className="count-badge">{expansionModuleActive ? Number((expansionSummary?.counters as Record<string, unknown> | undefined)?.users || 0) : audienceModuleActive ? audienceResults?.total ?? 0 : results?.total ?? activeJob?.applicationCount ?? 0}</span>
               </div>
@@ -6725,10 +6846,18 @@ function App() {
         </aside>}
         {codexShareError && <p className="codex-share-error" role="alert"><CircleAlert size={14} />{codexShareError}</p>}
         <iframe
+          ref={codexFrameRef}
           className="codex-browser-frame"
           src={codexPresentationMode === 'mirror' ? codexMirrorFrameUrl : codexSemanticFrameUrl}
           title={codexPresentationMode === 'mirror' ? 'Codex Native Mirror' : 'Codex'}
           allow={codexPresentationMode === 'mirror' ? 'autoplay; fullscreen' : 'clipboard-read; clipboard-write'}
+          onLoad={(event) => {
+            if (codexPresentationMode !== 'semantic') return
+            event.currentTarget.contentWindow?.postMessage(
+              { type: 'codex-browser-ready-probe' },
+              window.location.origin,
+            )
+          }}
         />
         {codexPresentationMode === 'semantic' && !codexFrameReady && <div className="codex-browser-loading" role="status" aria-live="polite">
           <LoaderCircle className="spin" size={18} />

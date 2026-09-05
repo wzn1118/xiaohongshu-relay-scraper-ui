@@ -508,8 +508,11 @@ export const api = {
     }),
   preflight: (payload: JobRequest) =>
     request<PreflightReport>('/api/preflight', { method: 'POST', body: JSON.stringify(payload) }),
-  createJob: (payload: JobRequest) =>
-    request<Job>('/api/jobs', { method: 'POST', body: JSON.stringify(payload) }),
+  createJob: (payload: JobRequest, options: { autoPauseActive?: boolean } = {}) =>
+    request<Job>('/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, ...options }),
+    }),
   createBodyImport: (payload: { records: Record<string, unknown>[]; sourceName: string; analysisMode: 'job' | 'general'; options: BodyImportOptions }) =>
     request<BodyImportResponse>('/api/body-imports', { method: 'POST', body: JSON.stringify(payload) }),
   resumeJob: (id: string, options: ResumeJobOptions) =>

@@ -257,6 +257,7 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
       allowedOrigins: config.codexConnectAllowedOrigins?.length
         ? config.codexConnectAllowedOrigins
         : (config.authOrigin ? [config.authOrigin] : []),
+      localRelayOrigin: config.codexConnectLocalRelayOrigin || `http://127.0.0.1:${Number(config.port) || 4317}`,
       connectorVersion: config.codexConnectConnectorVersion || '1.2.3',
     })
     : null);
@@ -1199,6 +1200,11 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (!allowed.has(method)) return json(res, 400, errorBody('CODEX_BROWSER_METHOD_INVALID', 'Codex browser request method is not allowed.'));
         return json(res, 200, await codexBrowserService.request(method, body?.params && typeof body.params === 'object' ? body.params : {}));
       }
+      if (req.method === 'POST' && url.pathname === '/api/codex-browser/workflow') {
+        if (!codexHostCommands?.workflow) return json(res, 503, errorBody('CODEX_WORKFLOW_UNAVAILABLE', 'Codex workflow service is unavailable.'));
+        const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));
+        return json(res, 200, await codexHostCommands.workflow(body && typeof body === 'object' ? body : {}));
+      }
       if (req.method === 'POST' && url.pathname === '/api/codex-model/v1/responses') {
         if (!codexModelBridgeService?.responses) {
           return json(res, 503, errorBody('CODEX_MODEL_BRIDGE_UNAVAILABLE', 'The Codex model bridge is unavailable.'));
@@ -1235,11 +1241,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
           return json(res, 400, errorBody('CODEX_BROWSER_CURSOR_INVALID', 'Codex browser event cursor is invalid.'));
         }
         const sessionId = String(url.searchParams.get('sessionId') || '').trim();
+        const page = codexBrowserService?.readEvents?.({ after, sessionId, limit: 30 });
+        if (page) return json(res, 200, page);
         const events = (codexBrowserService?.listEvents?.({ after, sessionId }) || []).slice(0, 30);
-        return json(res, 200, {
-          events,
-          cursor: events.at(-1)?.sequence ?? after,
-        });
+        return json(res, 200, { events, cursor: events.at(-1)?.sequence ?? after });
       }
       if (req.method === 'POST' && url.pathname === '/api/codex-browser/messages') {
         const body = await readJsonBody(req, Math.min(config.maxBodyBytes, 2 * 1024 * 1024));
@@ -1477,7 +1482,10 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
         if (!body || typeof body !== 'object' || Array.isArray(body)) {
           throw new ValidationError('Request body must be a JSON object.');
         }
-        const { idempotencyKey, ...runBody } = body;
+        const { idempotencyKey, autoPauseActive, ...runBody } = body;
+        if (autoPauseActive !== undefined && typeof autoPauseActive !== 'boolean') {
+          throw new ValidationError('autoPauseActive must be a boolean when provided.');
+        }
         const params = validateRunRequest(runBody);
         if (params.checkOnly) return json(res, 200, await readiness.run(params));
         const resumeScope = legacyResumeScope(params);
@@ -1504,7 +1512,9 @@ export function createApp({ manager, config, aiSessions, profileStore, relayConf
               requestedBy: 'legacy_jobs_api',
               ...(resumeCheckpointJobIds.length ? { resumeCheckpointJobIds } : {}),
             })
-          : await manager.start(params);
+          : await manager.start(params, {
+              pauseActive: autoPauseActive !== false,
+            });
         return json(res, 202, job);
       }
       if (req.method === 'POST' && url.pathname === '/api/body-imports') {

@@ -92,10 +92,12 @@ button:disabled { cursor: not-allowed; opacity: .52; }
 .copilot-launch-button { height: 34px; padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid #9dbdb3; border-radius: 4px; background: #eef7f4; color: #0f6d57; font-size: 11px; font-weight: 800; white-space: nowrap; }
 .copilot-launch-button:hover { border-color: #0f6d57; background: #e2f1ec; }
 .copilot-launch-button svg { flex: 0 0 auto; }
+.codex-runtime-button { border-color: #b9b9b4; background: #fff; color: #34363a; }
+.codex-runtime-button:hover { border-color: #74767b; background: #f0f0ed; }
 .codex-browser-launch { border-color: #202123; background: #202123; color: #fff; }
 .codex-browser-launch:hover { border-color: #000; background: #000; color: #fff; }
 .legacy-copilot-launch { color: #6b6d72; }
-.relay-indicator { min-width: 154px; display: flex; align-items: center; gap: 7px; color: var(--ink-soft); }
+.relay-indicator { min-width: 180px; display: flex; align-items: center; gap: 9px; color: var(--ink-soft); }
 .relay-indicator.ready > svg { color: var(--green); }
 .relay-indicator.offline > svg { color: var(--red); }
 .relay-indicator.connecting > svg { color: var(--amber); }
@@ -1922,31 +1924,20 @@ td:nth-child(2) small { margin-top: 3px; color: #8b8d91; font-family: Consolas, 
   .app-shell { display: block; }
   .side-rail { position: fixed; top: auto; bottom: 0; width: 100%; height: 60px; padding: 5px 6px; flex-direction: row; border-top: 1px solid #414347; }
   .expansion-interface .side-rail { display: none; }
-  .rail-brand, .rail-progress { display: none; }
-  .rail-collapse-button { display: none; }
-  .side-rail nav { width: 100%; flex: 1; height: 100%; margin: 0; flex-direction: row; }
-  .side-rail .workflow-nav { min-width: 0; overflow: hidden; gap: 2px; }
-  .workflow-nav .nav-button { width: auto; min-width: 0; min-height: 48px; padding: 3px 1px; flex: 1 1 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 1px; text-align: center; }
-  .workflow-nav .nav-step-index, .workflow-nav .nav-button-copy small, .workflow-nav .nav-button-state, .workflow-nav .nav-chevron { display: none; }
-  .workflow-nav .nav-step-icon { width: 24px; height: 24px; border: 0; background: transparent; }
-  .workflow-nav .nav-button-copy strong { font-size: 8px; line-height: 1.1; }
-  .workflow-nav .nav-button.active { box-shadow: inset 0 3px 0 var(--red); }
-  .content-interface .workflow-nav .nav-button.active { box-shadow: inset 0 3px 0 #66b89d; }
-  .workflow-nav .nav-button.active .nav-step-icon { background: transparent; color: #fff; }
-  .rail-settings { display: none; }
-  .topbar { min-height: 0; padding: 9px 12px 10px; align-items: stretch; position: relative; overflow: hidden; }
+  .brand-mark { width: 34px; height: 34px; margin-right: 12px; box-shadow: 3px 3px 0 #090909; font-size: 18px; }
+  .rail-brand, .rail-progress, .rail-collapse-button { display: none; }
+  .side-rail nav { width: 100%; min-width: 0; flex: 1; height: 100%; margin: 0; flex-direction: row; }
+  .nav-button { height: 48px; }
+  .rail-settings { width: 56px; margin: 0 0 0 5px; }
+  .topbar { min-height: 108px; padding: 9px 12px 10px; align-items: stretch; position: relative; overflow: hidden; }
   .topbar-leading { width: 100%; min-width: 0; flex-direction: column; align-items: stretch; gap: 8px; }
   .product-title { min-height: 31px; min-width: 0; padding-right: 82px; align-items: center; }
   .product-title h1 { min-width: 0; margin: 0; font-size: 19px; line-height: 1.25; white-space: normal; overflow-wrap: anywhere; }
-  .product-title-context { display: none; }
   .product-title .eyebrow, .version, .relay-indicator span, .topbar .icon-button { display: none; }
-  .workspace-switcher { width: 100%; min-width: 0; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .workspace-switcher button { min-width: 0; min-height: 35px; padding: 4px 3px; gap: 4px; font-size: 8px; line-height: 1.2; white-space: normal; }
-  .workspace-label-long { display: none; }
-  .workspace-label-short { display: inline; }
-  .topbar-status { display: flex; position: absolute; top: 8px; right: 12px; }
-  .topbar-status > :not(.copilot-launch-button):not(.legacy-copilot-launch) { display: none; }
-  .topbar .legacy-copilot-launch { display: grid; }
+  .workspace-switcher { width: 100%; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .workspace-switcher button { min-height: 35px; padding: 0 5px; font-size: 8px; }
+  .topbar-status { display: flex; gap: 6px; position: absolute; top: 8px; right: 12px; }
+  .topbar-status > :not(.copilot-launch-button) { display: none; }
   .copilot-launch-button { width: 34px; padding: 0; }
   .copilot-launch-button span { display: none; }
   .notice { margin: 10px 10px 0; }

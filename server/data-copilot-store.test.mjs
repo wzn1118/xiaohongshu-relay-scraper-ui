@@ -7,6 +7,7 @@ import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promi
 import {
   DataCopilotStore,
   resolveCopilotConversationDirectory,
+  withCopilotFileLock,
 } from './data-copilot-store.mjs';
 
 const REFERENCE = Object.freeze({
@@ -245,6 +246,29 @@ test('an old lock owned by a live process is not reclaimed by age alone', async 
   assert.equal(JSON.parse(await readFile(lockPath, 'utf8')).token, 'live-owner-token-001');
   await rm(lockPath, { force: true });
   await append;
+});
+
+test('lock release retries transient Windows filesystem contention', async (t) => {
+  const rootDir = await fixture(t);
+  const lockPath = path.join(rootDir, '.store.lock');
+  const delays = [];
+  let removalAttempts = 0;
+
+  const result = await withCopilotFileLock(lockPath, async () => 'released', {
+    remove: async (target, options) => {
+      removalAttempts += 1;
+      if (removalAttempts < 3) {
+        throw Object.assign(new Error('temporary lock contention'), { code: 'EBUSY' });
+      }
+      return rm(target, options);
+    },
+    wait: async (milliseconds) => { delays.push(milliseconds); },
+  });
+
+  assert.equal(result, 'released');
+  assert.equal(removalAttempts, 3);
+  assert.deepEqual(delays, [10, 20]);
+  await assert.rejects(readFile(lockPath), { code: 'ENOENT' });
 });
 
 test('conversation updates reject stale revisions and persisted identity mismatches', async (t) => {

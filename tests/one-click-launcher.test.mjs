@@ -60,7 +60,7 @@ test('root launchers delegate to the portable one-click scripts', async () => {
   assert.match(releasePackager, /\$entry\.Open\(\)/);
   assert.match(releasePackager, /WriteAllText\(\$checksumPath/);
   assert.match(githubReleasePackager, /git.*archive/is);
-  assert.match(githubReleasePackager, /Get-FileHash -Algorithm SHA256/);
+  assert.match(githubReleasePackager, /Security\.Cryptography\.SHA256/);
   assert.match(githubReleasePackager, /node_modules\|dist\|data\|runtime/);
   assert.match(githubReleaseVerifier, /Expand-Archive/);
   assert.match(githubReleaseVerifier, /npm.*ci/is);

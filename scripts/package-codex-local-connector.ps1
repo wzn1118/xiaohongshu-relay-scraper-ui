@@ -3,7 +3,7 @@ param(
     [string]$OutputPath = '',
     [string]$NodeExecutable = '',
     [string]$Version = '1.2.18',
-    [string[]]$DefaultAllowedOrigin = @('https://relay.hegelsalon.com', 'http://127.0.0.1:4327'),
+    [string[]]$DefaultAllowedOrigin = @('https://relay.hegelsalon.com', 'http://127.0.0.1:4327', 'http://127.0.0.1:4317'),
     [string]$DefaultLocalRelayOrigin = 'http://127.0.0.1:4327'
 )
 

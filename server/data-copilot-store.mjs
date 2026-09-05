@@ -31,8 +31,8 @@ const LOG_FILES = Object.freeze({
 const LOCK_TIMEOUT_MS = 10_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_STALE_MS = 5 * 60_000;
-const ATOMIC_RENAME_RETRY_LIMIT = process.platform === 'win32' ? 8 : 5;
-const ATOMIC_RENAME_RETRY_MAX_DELAY_MS = 250;
+const FILE_OPERATION_RETRY_LIMIT = process.platform === 'win32' ? 8 : 5;
+const FILE_OPERATION_RETRY_MAX_DELAY_MS = 250;
 
 export class DataCopilotStoreError extends Error {
   constructor(code, message, status = 400) {
@@ -396,12 +396,15 @@ export async function writeCopilotTextAtomically(filePath, text) {
   }
 }
 
-export async function withCopilotFileLock(lockPath, operation) {
+export async function withCopilotFileLock(lockPath, operation, {
+  remove = rm,
+  wait = sleep,
+} = {}) {
   const lock = await acquireLock(lockPath);
   try {
     return await operation();
   } finally {
-    await releaseLock(lock);
+    await releaseLock(lock, { remove, wait });
   }
 }
 
@@ -791,12 +794,21 @@ function lockOwnerIsAlive(value) {
   }
 }
 
-async function releaseLock({ lockPath, token }) {
-  try {
-    const current = JSON.parse(await readFile(lockPath, 'utf8'));
-    if (current?.token === token) await rm(lockPath, { force: true });
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+async function releaseLock({ lockPath, token }, { remove, wait }) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const current = JSON.parse(await readFile(lockPath, 'utf8'));
+      if (current?.token !== token) return;
+      await remove(lockPath, { force: true });
+      return;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      if (
+        !['EACCES', 'EBUSY', 'EPERM'].includes(error?.code)
+        || attempt >= FILE_OPERATION_RETRY_LIMIT
+      ) throw error;
+      await wait(Math.min(FILE_OPERATION_RETRY_MAX_DELAY_MS, 10 * (2 ** attempt)));
+    }
   }
 }
 
@@ -808,9 +820,9 @@ async function renameWithRetry(source, destination) {
     } catch (error) {
       if (
         !['EACCES', 'EBUSY', 'EPERM'].includes(error?.code)
-        || attempt >= ATOMIC_RENAME_RETRY_LIMIT
+        || attempt >= FILE_OPERATION_RETRY_LIMIT
       ) throw error;
-      await sleep(Math.min(ATOMIC_RENAME_RETRY_MAX_DELAY_MS, 10 * (2 ** attempt)));
+      await sleep(Math.min(FILE_OPERATION_RETRY_MAX_DELAY_MS, 10 * (2 ** attempt)));
     }
   }
 }

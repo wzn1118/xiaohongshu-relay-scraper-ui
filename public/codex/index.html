@@ -18,8 +18,18 @@
           <div><strong id="thread-title">新任务</strong><small id="runtime-version"></small></div>
           <button id="refresh" type="button">刷新</button>
         </header>
-        <section id="messages" aria-live="polite">
-          <div class="empty">输入任务开始使用 Codex</div>
+        <section class="workspace-grid">
+          <section id="messages" aria-live="polite">
+            <div class="empty">输入任务开始使用 Codex</div>
+          </section>
+          <aside class="workflow-panel" aria-label="工作流面板">
+            <div class="workflow-heading"><div><span class="eyebrow">WORKFLOW</span><strong>可复核工作台</strong></div><button id="workflow-refresh" type="button" title="刷新工作流">刷新</button></div>
+            <div id="workflow-state" class="workflow-state" role="status">正在读取工作区...</div>
+            <div class="workflow-section"><div class="section-title"><strong>变更文件</strong><span id="workflow-count">0</span></div><div id="workflow-files" class="workflow-files"><div class="muted">暂无工作区变更</div></div></div>
+            <div class="workflow-section"><div class="section-title"><strong>命令与测试</strong><span id="workflow-command-state">等待执行</span></div><pre id="workflow-output" class="workflow-output">尚未收到命令输出。</pre></div>
+            <div class="workflow-actions"><button id="workflow-apply" type="button" disabled>应用暂存</button><button id="workflow-rollback" type="button" disabled>回滚选中</button></div>
+            <p id="workflow-error" class="workflow-error" role="alert" hidden></p>
+          </aside>
         </section>
         <form id="composer">
           <textarea id="prompt" rows="4" placeholder="向 Codex 发送任务" required></textarea>

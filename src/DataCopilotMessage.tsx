@@ -1548,6 +1548,7 @@ function ToolCallCard({
   return (
     <section
       className="data-copilot-tool-card"
+      data-status={toolCall.status}
       style={{
         ...messageStyles.toolCard,
         ...(toolCall.status === "failed"
@@ -1557,6 +1558,7 @@ function ToolCallCard({
       aria-label={`工具调用 ${toolCall.name}`}
     >
       <button
+        className="data-copilot-tool-card-header"
         type="button"
         onClick={() => setExpanded((value) => !value)}
         aria-expanded={expanded}
@@ -1579,7 +1581,7 @@ function ToolCallCard({
         </span>
       </button>
       {expanded ? (
-        <div style={messageStyles.toolDetails}>
+        <div className="data-copilot-tool-card-details" style={messageStyles.toolDetails}>
           {!hasSemanticResult && argumentsText ? (
             <div>
               <div style={messageStyles.detailLabel}>输入</div>
@@ -1633,6 +1635,7 @@ function ToolCallSummary({
   return (
     <section className="data-copilot-tool-summary" style={messageStyles.toolSummary} aria-label="执行步骤">
       <button
+        className="data-copilot-tool-summary-button"
         type="button"
         style={messageStyles.toolSummaryButton}
         onClick={() => setExpanded((value) => !value)}
@@ -1650,7 +1653,7 @@ function ToolCallSummary({
         </span>
       </button>
       {expanded ? (
-        <div style={messageStyles.toolSummaryDetails}>
+        <div className="data-copilot-tool-summary-details" style={messageStyles.toolSummaryDetails}>
           {toolCalls.map((toolCall) => (
             <ToolCallCard key={toolCall.id} toolCall={toolCall} sessionId={sessionId} busy={busy} onAction={onAction} jobId={jobId} />
           ))}
@@ -1684,25 +1687,31 @@ function ApprovalCard({
   }[approval.status];
 
   return (
-    <section className="data-copilot-approval-card" style={messageStyles.approvalCard} aria-label="操作确认">
-      <div style={messageStyles.approvalHeader}>
-        <span style={messageStyles.approvalIdentity}>
+    <section
+      className="data-copilot-approval-card"
+      data-status={approval.status}
+      aria-label="操作确认"
+      aria-live={pending ? 'assertive' : 'polite'}
+      style={messageStyles.approvalCard}
+    >
+      <div className="data-copilot-approval-header" style={messageStyles.approvalHeader}>
+        <span className="data-copilot-approval-identity" style={messageStyles.approvalIdentity}>
           <ShieldCheck size={15} aria-hidden="true" />
           <strong>执行确认</strong>
         </span>
-        <span style={messageStyles.approvalStatus}>{statusLabel}</span>
+        <span className="data-copilot-approval-status">{statusLabel}</span>
       </div>
-      <div style={messageStyles.approvalSummary}>{approval.summary}</div>
+      <div className="data-copilot-approval-summary">{approval.summary}</div>
       {approval.toolName ? (
-        <div style={messageStyles.approvalMeta}>工具：{approval.toolName}</div>
+        <div className="data-copilot-approval-meta">执行工具：<code>{approval.toolName}</code></div>
       ) : null}
       {detail ? (
         <>
           <button
+            className="data-copilot-approval-detail-button"
             type="button"
             onClick={() => setExpanded((current) => !current)}
             aria-expanded={expanded}
-            style={messageStyles.approvalDetailButton}
           >
             {expanded ? (
               <ChevronDown size={13} aria-hidden="true" />
@@ -1712,25 +1721,26 @@ function ApprovalCard({
             {expanded ? "收起执行参数" : "核对执行参数"}
           </button>
           {expanded ? (
-            <pre style={messageStyles.codeBlock}>{detail}</pre>
+            <pre className="data-copilot-approval-code">{detail}</pre>
           ) : null}
         </>
       ) : null}
       {pending && onApproval ? (
-        <div style={messageStyles.approvalActions}>
+        <div className="data-copilot-approval-actions">
           <button
+            className="data-copilot-approval-reject"
             type="button"
             onClick={() => onApproval(message, false)}
             disabled={busy}
-            style={messageStyles.approvalRejectButton}
           >
-            取消
+            <CircleStop size={14} aria-hidden="true" />
+            取消操作
           </button>
           <button
+            className="data-copilot-approval-confirm"
             type="button"
             onClick={() => onApproval(message, true)}
             disabled={busy}
-            style={messageStyles.approvalConfirmButton}
           >
             <Check size={13} aria-hidden="true" />
             确认执行
@@ -1828,6 +1838,9 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
   return (
     <article
       className={`data-copilot-message-row${isUser ? " data-copilot-message-user" : ""}${isError ? " data-copilot-message-error" : ""}`}
+      data-role={message.role}
+      data-tone={isError ? 'error' : 'default'}
+      data-status={message.status}
       style={{
         ...messageStyles.row,
         ...(isUser ? messageStyles.userRow : undefined),
@@ -1848,11 +1861,11 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
       </div>
 
       <div className="data-copilot-message-body" style={messageStyles.body}>
-        <header style={messageStyles.messageHeader}>
-          <span style={messageStyles.author}>
+        <header className="data-copilot-message-header" style={messageStyles.messageHeader}>
+          <span className="data-copilot-message-author" style={messageStyles.author}>
             {isUser ? "你" : message.role === "tool" ? "工具" : "Data Copilot"}
           </span>
-          <time style={messageStyles.timestamp} dateTime={message.createdAt}>
+          <time className="data-copilot-message-time" style={messageStyles.timestamp} dateTime={message.createdAt}>
             {formatTime(message.createdAt)}
           </time>
           {message.status === "streaming" || message.status === "pending" ? (
@@ -1865,8 +1878,9 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
         </header>
 
         {message.kind === "analysis" ? (
-          <section className="data-copilot-analysis" style={messageStyles.analysisBlock}>
+          <section className="data-copilot-analysis data-copilot-analysis-block" style={messageStyles.analysisBlock}>
             <button
+              className="data-copilot-analysis-toggle"
               type="button"
               onClick={() => setAnalysisExpanded((value) => !value)}
               aria-expanded={analysisExpanded}
@@ -1880,7 +1894,7 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
               )}
             </button>
             {analysisExpanded ? (
-              <div style={messageStyles.analysisText}>{message.content}</div>
+              <div className="data-copilot-analysis-text" style={messageStyles.analysisText}>{message.content}</div>
             ) : null}
           </section>
         ) : message.content ? (
@@ -1908,7 +1922,7 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
         ) : null}
 
         {message.toolCalls?.length ? (
-          <div style={messageStyles.toolStack}>
+          <div className="data-copilot-tool-stack" style={messageStyles.toolStack}>
             {message.toolCalls.filter((toolCall) => isRichToolCall(toolCall)).map((toolCall) => (
               <ToolCallCard key={toolCall.id} toolCall={toolCall} sessionId={message.sessionId} busy={busy} onAction={onAction} jobId={jobId} />
             ))}
@@ -1925,9 +1939,10 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
         ) : null}
 
         {message.attachments?.length ? (
-          <div style={messageStyles.attachmentList} aria-label="消息附件">
+          <div className="data-copilot-message-attachments" style={messageStyles.attachmentList} aria-label="消息附件">
             {message.attachments.map((attachment) => (
               <button
+                className="data-copilot-message-attachment"
                 type="button"
                 key={attachment.id}
                 onClick={() => openAttachment(attachment)}
@@ -1948,10 +1963,11 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
         ) : null}
 
         {message.citations?.length ? (
-          <div style={messageStyles.citationList} aria-label="数据引用">
+          <div className="data-copilot-message-citations" style={messageStyles.citationList} aria-label="数据引用">
             {message.citations.map((citation, index) => (
               <div key={citation.id} style={messageStyles.citationItem}>
                 <button
+                  className="data-copilot-message-citation"
                   type="button"
                   onClick={() => openCitation(citation)}
                   title={citation.excerpt ?? citation.label}
@@ -1976,9 +1992,10 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
           </div>
         ) : null}
 
-        <footer style={messageStyles.actions}>
+        <footer className="data-copilot-message-actions" style={messageStyles.actions}>
           {message.content ? (
             <button
+              className="data-copilot-message-icon-action"
               type="button"
               onClick={() => void copyContent()}
               style={messageStyles.iconAction}
@@ -1994,6 +2011,7 @@ export const DataCopilotMessage = memo(function DataCopilotMessage({
           ) : null}
           {message.retryable && onRetry ? (
             <button
+              className="data-copilot-message-text-action"
               type="button"
               onClick={() => onRetry(message)}
               disabled={busy}

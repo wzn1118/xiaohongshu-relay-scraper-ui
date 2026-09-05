@@ -1216,7 +1216,7 @@ test('browses crawled records and sends an exact record section as context', asy
   await expect(detailImage).toHaveAttribute('src', new RegExp(`/api/jobs/${jobId}/media\\?url=`))
   await expect.poll(() => detailImage.evaluate((image) => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0)
   await expect(dialog.getByText('第一条采集帖子 的正文内容，用于验证记录详情与精确上下文选择。', { exact: true })).toBeVisible()
-  await dialog.getByRole('button', { name: /^正文完整正文内容$/ }).click()
+  await dialog.getByRole('button', { name: /^正文\s*完整正文内容$/ }).click()
 
   await dialog.getByRole('textbox', { name: '发送给 Data Copilot' }).fill('只分析这条帖子的正文')
   await dialog.getByRole('button', { name: '发送消息' }).click()
@@ -1270,7 +1270,7 @@ test('restores a conversation and supports approval, stop, retry, and mobile pan
   await expect(dialog.locator('.data-copilot-conversation')).toBeVisible()
   await dialog.getByRole('button', { name: '折叠 Data Copilot' }).click()
   await expect(dialog).toBeHidden()
-  await page.getByRole('button', { name: '打开旧版数据助手' }).click()
+  await page.getByRole('button', { name: '数据助手', exact: true }).click()
   await expect(dialog).toBeVisible()
 })
 

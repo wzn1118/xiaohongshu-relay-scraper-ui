@@ -252,6 +252,30 @@ test('preserves the complete thread list for history browsing', async () => {
   await service.close();
 });
 
+test('reports event window gaps and stale cursors so the browser can rebuild from thread/read', async () => {
+  const child = fakeCodexProcess();
+  const service = createCodexBrowserService({
+    executablePath: 'codex.exe',
+    workspaceRoot: 'C:\\workspace',
+    sqliteHome: 'C:\\relay-sqlite',
+    spawnProcess: () => child,
+  });
+  await service.start();
+  child.stdout.write(`${JSON.stringify({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1' } } })}\n`);
+  await nextTask();
+
+  const current = service.readEvents({ after: 0, limit: 30 });
+  assert.equal(current.resetRequired, false);
+  assert.equal(current.events.at(-1).message.method, 'turn/started');
+  assert.equal(current.cursor, current.throughCursor);
+
+  const stale = service.readEvents({ after: current.throughCursor + 100 });
+  assert.equal(stale.resetRequired, true);
+  assert.deepEqual(stale.events, []);
+  assert.equal(stale.throughCursor, current.throughCursor);
+  await service.close();
+});
+
 test('exposes direct canonical requests for browser-owned workspace tasks', async () => {
   const child = fakeCodexProcess();
   const service = createCodexBrowserService({

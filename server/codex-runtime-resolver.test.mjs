@@ -19,6 +19,20 @@ test('prefers the bundled cross-platform Codex package', () => {
   assert.equal(command.source, 'bundled-native');
 });
 
+test('prefers the packaged release runtime over npm optional packages', () => {
+  const root = path.resolve('fixture-workspace');
+  const packaged = path.join(root, 'runtime', 'codex', 'darwin-x64', 'bin', 'codex');
+  const npmBinary = path.join(root, 'node_modules', '@openai', 'codex-darwin-x64', 'vendor', 'x86_64-apple-darwin', 'bin', 'codex');
+  const command = resolveCodexAppServerCommand({
+    workspaceRoot: root,
+    platform: 'darwin',
+    architecture: 'x64',
+    exists: (candidate) => candidate === packaged || candidate === npmBinary,
+  });
+  assert.equal(command.executablePath, packaged);
+  assert.equal(command.source, 'bundled-packaged-native');
+});
+
 test('honors an explicit native executable before bundled discovery', () => {
   const command = resolveCodexAppServerCommand({
     workspaceRoot: path.resolve('fixture-workspace'),

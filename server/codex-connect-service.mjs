@@ -24,6 +24,7 @@ export class CodexConnectService {
     now = () => new Date(),
     signingSecret = randomBytes(32).toString('base64url'),
     allowedOrigins = [],
+    localRelayOrigin = 'http://127.0.0.1:4317',
     connectorVersion = CONNECTOR_VERSION,
   } = {}) {
     if (!deviceGatewayService?.createPairingIntent || !deviceGatewayService?.claimPairing) {
@@ -33,6 +34,7 @@ export class CodexConnectService {
     this.now = now;
     this.signingSecret = Buffer.from(String(signingSecret), 'utf8');
     this.allowedOrigins = new Set((allowedOrigins || []).map(normalizeOrigin));
+    this.localRelayOrigin = normalizeOrigin(localRelayOrigin);
     this.connectorVersion = normalizeVersion(connectorVersion);
     this.intents = new Map();
   }
@@ -137,7 +139,7 @@ export class CodexConnectService {
         websocketUrl: gatewayUrlForOrigin(intent.origin),
       },
       relay: {
-        localOrigin: 'http://127.0.0.1:4317',
+        localOrigin: this.localRelayOrigin,
         protocol: 'codex-relay.v1',
       },
       connector: {

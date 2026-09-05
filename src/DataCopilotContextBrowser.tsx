@@ -6,6 +6,7 @@ import {
   type CSSProperties,
 } from 'react'
 import {
+  AlertCircle,
   ArrowLeft,
   Check,
   ChevronLeft,
@@ -83,9 +84,11 @@ export function DataCopilotContextBrowser({
   const [query, setQuery] = useState('')
   const [offset, setOffset] = useState(0)
   const [summary, setSummary] = useState<DataCopilotContextCatalog | null>(null)
+  const [loadingSummary, setLoadingSummary] = useState(false)
   const [catalog, setCatalog] = useState<DataCopilotContextCatalog | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [reloadKey, setReloadKey] = useState(0)
   const taskRequestRef = useRef(0)
   const summaryRequestRef = useRef(0)
   const catalogRequestRef = useRef(0)
@@ -110,12 +113,13 @@ export function DataCopilotContextBrowser({
         })
     }, taskQuery ? 180 : 0)
     return () => window.clearTimeout(timer)
-  }, [activeTask, loadTasks, taskOffset, taskQuery])
+  }, [activeTask, loadTasks, reloadKey, taskOffset, taskQuery])
 
   useEffect(() => {
     setActiveKind(null)
     setActiveRecord(null)
     setSummary(null)
+    setLoadingSummary(false)
     setCatalog(null)
     setQuery('')
     setOffset(0)
@@ -126,12 +130,19 @@ export function DataCopilotContextBrowser({
     if (!loadRecords || !activeTask) return
     const requestId = ++summaryRequestRef.current
     setError('')
+    setLoadingSummary(true)
     void loadRecords({ jobId: activeTask.id, mode: activeTask.mode }).then((value) => {
-      if (requestId === summaryRequestRef.current) setSummary(value)
+      if (requestId === summaryRequestRef.current) {
+        setSummary(value)
+        setLoadingSummary(false)
+      }
     }).catch((reason: unknown) => {
-      if (requestId === summaryRequestRef.current) setError(errorText(reason))
+      if (requestId === summaryRequestRef.current) {
+        setError(errorText(reason))
+        setLoadingSummary(false)
+      }
     })
-  }, [activeTask, loadRecords])
+  }, [activeTask, loadRecords, reloadKey])
 
   useEffect(() => {
     if (!activeKind || !loadRecords || !activeTask) return
@@ -159,7 +170,7 @@ export function DataCopilotContextBrowser({
         })
     }, query ? 180 : 0)
     return () => window.clearTimeout(timer)
-  }, [activeKind, activeTask, loadRecords, offset, query])
+  }, [activeKind, activeTask, loadRecords, offset, query, reloadKey])
 
   const openCategory = (kind: DataCopilotRecordKind) => {
     setActiveKind(kind)
@@ -190,23 +201,23 @@ export function DataCopilotContextBrowser({
   }
 
   return (
-    <aside className={className} style={styles.root} aria-label="数据上下文">
-      <header style={styles.header}>
-        <div style={styles.headerTitleRow}>
+    <aside className={[className, 'data-copilot-context-browser'].filter(Boolean).join(' ')} aria-label="数据上下文">
+      <header className="data-copilot-context-header">
+        <div className="data-copilot-context-header-row">
           {activeTask ? (
             <button
               type="button"
               onClick={goBack}
-              style={styles.backButton}
+              className="data-copilot-context-back"
               title="返回"
               aria-label="返回上一级"
             >
               <ArrowLeft size={15} aria-hidden="true" />
             </button>
           ) : null}
-          <div style={styles.headerCopy}>
-            <strong style={styles.heading}>{title}</strong>
-            <span style={styles.meta}>
+          <div className="data-copilot-context-header-copy">
+            <strong>{title}</strong>
+            <span>
               {activeTask
                 ? `${selectedIds.length} 项已启用 · ${activeTask.modeLabel}`
                 : `${taskCatalog?.total ?? 0} 个历史任务 · 选择后关联对话`}
@@ -225,6 +236,7 @@ export function DataCopilotContextBrowser({
           onQuery={(value) => { setTaskQuery(value); setTaskOffset(0) }}
           onOffset={setTaskOffset}
           onSelect={onSelectTask}
+          onRetry={() => setReloadKey((value) => value + 1)}
         />
       ) : activeRecord ? (
         <RecordDetail
@@ -250,11 +262,13 @@ export function DataCopilotContextBrowser({
           onOffset={setOffset}
           onOpen={setActiveRecord}
           onToggle={onToggle}
+          onRetry={() => setReloadKey((value) => value + 1)}
         />
       ) : (
         <Overview
           sources={sources}
           summary={summary}
+          loading={loadingSummary}
           contextMeta={contextMeta}
           usedTools={usedTools}
           error={error}
@@ -262,6 +276,7 @@ export function DataCopilotContextBrowser({
           disabled={disabled}
           onOpen={openCategory}
           onToggle={onToggle}
+          onRetry={() => setReloadKey((value) => value + 1)}
         />
       )}
     </aside>
@@ -277,6 +292,7 @@ function TaskList({
   onQuery,
   onOffset,
   onSelect,
+  onRetry,
 }: {
   catalog: DataCopilotTaskCatalog | null
   query: string
@@ -286,59 +302,57 @@ function TaskList({
   onQuery: (value: string) => void
   onOffset: (value: number) => void
   onSelect: (task: DataCopilotTaskRecord) => void
+  onRetry: () => void
 }) {
   const total = catalog?.total ?? 0
   const items = catalog?.items ?? []
   return (
-    <div style={styles.listLayout}>
-      <label style={styles.search}>
+    <div className="data-copilot-context-list-layout">
+      <label className="data-copilot-context-search">
         <Search size={15} aria-hidden="true" />
         <input
           value={query}
           onChange={(event) => onQuery(event.target.value)}
           placeholder="搜索任务名称、状态或 Job ID"
           aria-label="搜索历史采集记录"
-          style={styles.searchInput}
+          className="data-copilot-context-search-input"
         />
       </label>
-      <div style={styles.listMeta}>
+      <div className="data-copilot-context-list-meta">
         <span>共 {total.toLocaleString('zh-CN')} 个任务</span>
         <span>{total ? `${offset + 1}-${Math.min(offset + PAGE_SIZE, total)}` : '0'}</span>
       </div>
-      <div style={styles.recordList}>
-        {loading ? <div style={styles.loading}><LoaderCircle size={18} aria-hidden="true" />正在读取历史记录</div> : null}
-        {!loading && error ? <div style={styles.error}>{error}</div> : null}
-        {!loading && !error && items.length === 0 ? <div style={styles.empty}>没有匹配的历史采集任务</div> : null}
+      <div className="data-copilot-context-record-list" aria-busy={loading}>
+        {loading ? <ContextState tone="loading" title="正在读取历史记录" /> : null}
+        {!loading && error ? <ContextState tone="error" title="历史记录读取失败" detail={error} onRetry={onRetry} /> : null}
+        {!loading && !error && items.length === 0 ? <ContextState tone="empty" title="没有匹配的历史采集任务" detail={query ? '换个关键词试试' : '完成采集后，任务会显示在这里'} /> : null}
         {!loading && !error ? items.map((task) => (
           <button
             key={task.id}
             type="button"
             onClick={() => onSelect(task)}
             aria-label={`进入任务${task.title}`}
-            style={styles.taskButton}
+            className="data-copilot-context-task"
           >
-            <span style={{
-              ...styles.taskButtonIcon,
-              ...(task.mode === 'application' ? styles.taskButtonIconApplication : styles.taskButtonIconResearch),
-            }}><FolderOpen size={17} aria-hidden="true" /></span>
-            <span style={styles.taskButtonCopy}>
-              <span style={styles.taskButtonTopline}>
-                <strong style={styles.taskButtonTitle}>{task.title}</strong>
-                <span style={styles.taskStatus}>{statusLabel(task.status)}</span>
+            <span className="data-copilot-context-task-icon" data-mode={task.mode}><FolderOpen size={18} aria-hidden="true" /></span>
+            <span className="data-copilot-context-task-copy">
+              <span className="data-copilot-context-task-topline">
+                <strong className="data-copilot-context-task-title">{task.title}</strong>
+                <span className="data-copilot-context-task-status" data-status={task.status}>{statusLabel(task.status)}</span>
               </span>
-              <span style={styles.taskIdentity}><strong>{task.modeLabel}</strong><span>{task.id}</span></span>
-              <span style={styles.taskCounts} aria-label="任务数据量">
+              <span className="data-copilot-context-task-identity"><strong>{task.modeLabel}</strong><span>{task.id}</span></span>
+              <span className="data-copilot-context-task-counts" aria-label="任务数据量">
                 原帖 {task.counts.posts.toLocaleString('zh-CN')} · 评论 {task.counts.comments.toLocaleString('zh-CN')} · 用户 {task.counts.users.toLocaleString('zh-CN')} · 产物 {task.counts.artifacts.toLocaleString('zh-CN')}
               </span>
-              <span style={styles.taskDate}>更新于 {formatDateTime(task.updatedAt)}</span>
+              <span className="data-copilot-context-task-date">更新于 {formatDateTime(task.updatedAt)}</span>
             </span>
-            <ChevronRight size={15} aria-hidden="true" style={styles.chevron} />
+            <ChevronRight size={17} aria-hidden="true" />
           </button>
         )) : null}
       </div>
-      <div style={styles.pagination}>
-        <button type="button" disabled={offset === 0 || loading} onClick={() => onOffset(Math.max(0, offset - PAGE_SIZE))} style={styles.pageButton}><ChevronLeft size={14} aria-hidden="true" />上一页</button>
-        <button type="button" disabled={offset + PAGE_SIZE >= total || loading} onClick={() => onOffset(offset + PAGE_SIZE)} style={styles.pageButton}>下一页<ChevronRight size={14} aria-hidden="true" /></button>
+      <div className="data-copilot-context-pagination">
+        <button type="button" disabled={offset === 0 || loading} onClick={() => onOffset(Math.max(0, offset - PAGE_SIZE))}><ChevronLeft size={14} aria-hidden="true" />上一页</button>
+        <button type="button" disabled={offset + PAGE_SIZE >= total || loading} onClick={() => onOffset(offset + PAGE_SIZE)}>下一页<ChevronRight size={14} aria-hidden="true" /></button>
       </div>
     </div>
   )
@@ -347,6 +361,7 @@ function TaskList({
 function Overview({
   sources,
   summary,
+  loading,
   contextMeta,
   usedTools,
   error,
@@ -354,9 +369,11 @@ function Overview({
   disabled,
   onOpen,
   onToggle,
+  onRetry,
 }: {
   sources: DataCopilotContextSource[]
   summary: DataCopilotContextCatalog | null
+  loading: boolean
   contextMeta?: DataCopilotContextMeta
   usedTools: string[]
   error: string
@@ -364,54 +381,57 @@ function Overview({
   disabled: boolean
   onOpen: (kind: DataCopilotRecordKind) => void
   onToggle: (sourceId: string) => void
+  onRetry: () => void
 }) {
   const sourceById = new Map(sources.map((source) => [source.id, source]))
   return (
-    <div style={styles.scrollBody}>
-      <section style={styles.taskSummary} aria-label="当前任务上下文">
-        <div style={styles.summaryRow}><span>当前任务</span><strong title={contextMeta?.taskId}>{contextMeta?.taskLabel || contextMeta?.taskId || '未绑定'}</strong></div>
-        <div style={styles.summaryRow}><span>任务类型</span><strong>{contextMeta?.mode || '未指定'}</strong></div>
-        <div style={styles.summaryRow}><span>数据快照</span><strong>{contextMeta?.snapshotId || '未指定'}</strong></div>
-        <div style={styles.summaryBlock}><span>筛选条件</span><div>{contextMeta?.filters?.length ? contextMeta.filters.join(' · ') : '未设置额外筛选'}</div></div>
-        <div style={styles.summaryBlock}><span>本会话已用工具</span><div>{usedTools.length ? usedTools.join(' · ') : '尚未调用工具'}</div></div>
+    <div className="data-copilot-context-scroll-body">
+      <section className="data-copilot-context-summary" aria-label="当前任务上下文">
+        <div className="data-copilot-context-summary-row"><span>当前任务</span><strong title={contextMeta?.taskId}>{contextMeta?.taskLabel || contextMeta?.taskId || '未绑定'}</strong></div>
+        <div className="data-copilot-context-summary-row"><span>任务类型</span><strong>{contextMeta?.mode || '未指定'}</strong></div>
+        <div className="data-copilot-context-summary-row"><span>数据快照</span><strong>{contextMeta?.snapshotId || '未指定'}</strong></div>
+        <div className="data-copilot-context-summary-block"><span>筛选条件</span><div>{contextMeta?.filters?.length ? contextMeta.filters.join(' · ') : '未设置额外筛选'}</div></div>
+        <div className="data-copilot-context-summary-block"><span>本会话已用工具</span><div>{usedTools.length ? usedTools.join(' · ') : '尚未调用工具'}</div></div>
       </section>
 
-      <div style={styles.sectionHeading}>
+      <div className="data-copilot-context-section-heading">
         <strong>采集记录</strong>
         <span>选择一类进入逐条浏览</span>
       </div>
-      {error ? <div style={styles.error}>{error}</div> : null}
-      <div style={styles.categoryList}>
+      {loading ? <div className="data-copilot-context-inline-status" role="status"><LoaderCircle className="data-copilot-spinner" size={15} aria-hidden="true" />正在同步数据量</div> : null}
+      {error ? <ContextState tone="error" title="上下文读取失败" detail={error} onRetry={onRetry} /> : null}
+      <div className="data-copilot-context-category-list">
         {categories.map((category) => {
           const Icon = category.icon
           const aggregate = sourceById.get(category.aggregateId)
           const selected = selectedSet.has(category.aggregateId)
           const count = summary?.counts?.[category.kind] ?? aggregate?.count ?? 0
           return (
-            <div key={category.kind} style={{ ...styles.category, ...(selected ? styles.selected : undefined) }}>
+            <div key={category.kind} className="data-copilot-context-category" data-selected={selected}>
               <button
+                className="data-copilot-context-check"
+                data-selected={selected}
                 type="button"
                 disabled={disabled}
                 onClick={() => onToggle(category.aggregateId)}
-                style={{ ...styles.check, ...(selected ? styles.checkSelected : undefined) }}
                 title={selected ? '移除整类数据' : '选择整类数据'}
                 aria-pressed={selected}
                 aria-label={`${selected ? '移除' : '选择'}${category.title}全部记录`}
               >{selected ? <Check size={13} aria-hidden="true" /> : null}</button>
-              <button type="button" onClick={() => onOpen(category.kind)} style={styles.categoryMain}>
-                <span style={styles.categoryIcon}><Icon size={16} aria-hidden="true" /></span>
-                <span style={styles.categoryCopy}>
-                  <span style={styles.categoryTitle}>{category.title}</span>
-                  <span style={styles.categoryDescription}>{category.description}</span>
+              <button type="button" onClick={() => onOpen(category.kind)} className="data-copilot-context-category-main">
+                <span className="data-copilot-context-category-icon"><Icon size={16} aria-hidden="true" /></span>
+                <span className="data-copilot-context-category-copy">
+                  <span className="data-copilot-context-category-title">{category.title}</span>
+                  <span className="data-copilot-context-category-description">{category.description}</span>
                 </span>
-                <span style={styles.categoryCount}>{count.toLocaleString('zh-CN')}</span>
-                <ChevronRight size={15} aria-hidden="true" style={styles.chevron} />
+                <span className="data-copilot-context-category-count">{count.toLocaleString('zh-CN')}</span>
+                <ChevronRight size={15} aria-hidden="true" />
               </button>
             </div>
           )
         })}
       </div>
-      <p style={styles.hint}>勾选整类会让助手读取全部记录；进入列表可只选择本轮真正需要的帖子、评论、用户或产物。</p>
+      <p className="data-copilot-context-hint">勾选整类会让助手读取全部记录；进入列表可只选择本轮真正需要的帖子、评论、用户或产物。</p>
     </div>
   )
 }
@@ -430,6 +450,7 @@ function RecordList({
   onOffset,
   onOpen,
   onToggle,
+  onRetry,
 }: {
   jobId: string
   kind: DataCopilotRecordKind
@@ -445,41 +466,42 @@ function RecordList({
   onOffset: (value: number) => void
   onOpen: (record: DataCopilotContextRecord) => void
   onToggle: (sourceId: string) => void
+  onRetry: () => void
 }) {
   return (
-    <div style={styles.listLayout}>
-      <label style={styles.search}>
+    <div className="data-copilot-context-list-layout">
+      <label className="data-copilot-context-search">
         <Search size={15} aria-hidden="true" />
-        <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索当前记录" aria-label="搜索采集记录" style={styles.searchInput} />
+        <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="搜索当前记录" aria-label="搜索采集记录" className="data-copilot-context-search-input" />
       </label>
-      <div style={styles.listMeta}><span>共 {total.toLocaleString('zh-CN')} 条</span><span>{offset + 1}-{Math.min(offset + PAGE_SIZE, total || items.length)}</span></div>
-      <div style={styles.recordList}>
-        {loading ? <div style={styles.loading}><LoaderCircle size={18} aria-hidden="true" />正在读取记录</div> : null}
-        {!loading && error ? <div style={styles.error}>{error}</div> : null}
-        {!loading && !error && items.length === 0 ? <div style={styles.empty}>当前分类没有匹配记录</div> : null}
+      <div className="data-copilot-context-list-meta"><span>共 {total.toLocaleString('zh-CN')} 条</span><span>{total ? `${offset + 1}-${Math.min(offset + PAGE_SIZE, total)}` : '0'}</span></div>
+      <div className="data-copilot-context-record-list" aria-busy={loading}>
+        {loading ? <ContextState tone="loading" title="正在读取记录" /> : null}
+        {!loading && error ? <ContextState tone="error" title="记录读取失败" detail={error} onRetry={onRetry} /> : null}
+        {!loading && !error && items.length === 0 ? <ContextState tone="empty" title="没有匹配记录" detail={query ? '换个关键词试试' : '这一分类暂时没有数据'} /> : null}
         {!loading && !error ? items.map((record) => {
           const selected = selectedSet.has(record.sourceId)
           return (
-            <div key={record.sourceId} style={{ ...styles.record, ...(selected ? styles.selected : undefined) }}>
-              <button type="button" disabled={disabled} onClick={() => onToggle(record.sourceId)} style={{ ...styles.check, ...(selected ? styles.checkSelected : undefined) }} aria-pressed={selected} aria-label={`${selected ? '移除' : '选择'}${record.title}`}>
+            <div key={record.sourceId} className="data-copilot-context-record" data-selected={selected}>
+              <button type="button" className="data-copilot-context-check" data-selected={selected} disabled={disabled} onClick={() => onToggle(record.sourceId)} aria-pressed={selected} aria-label={`${selected ? '移除' : '选择'}${record.title}`}>
                 {selected ? <Check size={13} aria-hidden="true" /> : null}
               </button>
-              <button type="button" onClick={() => onOpen(record)} style={styles.recordMain}>
+              <button type="button" onClick={() => onOpen(record)} className="data-copilot-context-record-main">
                 <RecordThumbnail jobId={jobId} record={record} />
-                <span style={styles.recordCopy}>
-                  <strong style={styles.recordTitle}>{record.title}</strong>
-                  {record.subtitle ? <span style={styles.recordSubtitle}>{record.subtitle}</span> : null}
-                  <span style={styles.recordMeta}>{[record.status, formatDate(record.timestamp)].filter(Boolean).join(' · ') || record.recordId}</span>
+                <span className="data-copilot-context-record-copy">
+                  <strong>{record.title}</strong>
+                  {record.subtitle ? <span>{record.subtitle}</span> : null}
+                  <small>{[record.status, formatDate(record.timestamp)].filter(Boolean).join(' · ') || record.recordId}</small>
                 </span>
-                <ChevronRight size={15} aria-hidden="true" style={styles.chevron} />
+                <ChevronRight size={15} aria-hidden="true" />
               </button>
             </div>
           )
         }) : null}
       </div>
-      <div style={styles.pagination}>
-        <button type="button" disabled={offset === 0 || loading} onClick={() => onOffset(Math.max(0, offset - PAGE_SIZE))} style={styles.pageButton}><ChevronLeft size={14} aria-hidden="true" />上一页</button>
-        <button type="button" disabled={offset + PAGE_SIZE >= total || loading} onClick={() => onOffset(offset + PAGE_SIZE)} style={styles.pageButton}>下一页<ChevronRight size={14} aria-hidden="true" /></button>
+      <div className="data-copilot-context-pagination">
+        <button type="button" disabled={offset === 0 || loading} onClick={() => onOffset(Math.max(0, offset - PAGE_SIZE))}><ChevronLeft size={14} aria-hidden="true" />上一页</button>
+        <button type="button" disabled={offset + PAGE_SIZE >= total || loading} onClick={() => onOffset(offset + PAGE_SIZE)}>下一页<ChevronRight size={14} aria-hidden="true" /></button>
       </div>
     </div>
   )
@@ -493,22 +515,49 @@ function RecordDetail({ jobId, record, selectedSet, disabled, onToggle }: {
   onToggle: (sourceId: string) => void
 }) {
   return (
-    <div style={styles.detail}>
+    <div className="data-copilot-context-detail">
       {record.images?.length ? (
-        <div style={styles.imageStrip}>{record.images.map((url, index) => <ContextImage key={`${url}-${index}`} jobId={jobId} src={url} alt={`${record.title} 图片 ${index + 1}`} style={styles.detailImage} />)}</div>
+        <div className="data-copilot-context-image-strip">{record.images.map((url, index) => <ContextImage key={`${url}-${index}`} jobId={jobId} src={url} alt={`${record.title} 图片 ${index + 1}`} style={styles.detailImage} />)}</div>
       ) : record.imageUrl ? <ContextImage jobId={jobId} src={record.imageUrl} alt={record.title} style={styles.heroImage} /> : null}
-      <div style={styles.detailTitleRow}>
-        <div><strong style={styles.detailTitle}>{record.title}</strong>{record.subtitle ? <p style={styles.detailSubtitle}>{record.subtitle}</p> : null}</div>
-        {record.url ? <a href={record.url} target="_blank" rel="noreferrer" style={styles.sourceLink} title="打开来源"><ExternalLink size={14} aria-hidden="true" /></a> : null}
+      <div className="data-copilot-context-detail-title-row">
+        <div><strong>{record.title}</strong>{record.subtitle ? <p>{record.subtitle}</p> : null}</div>
+        {record.url ? <a href={record.url} target="_blank" rel="noreferrer" className="data-copilot-context-source-link" title="打开来源" aria-label="在新窗口打开来源"><ExternalLink size={15} aria-hidden="true" /></a> : null}
       </div>
-      {record.fields.length ? <dl style={styles.fields}>{record.fields.map((field) => <div key={`${field.label}-${field.value}`} style={styles.field}><dt>{field.label}</dt><dd>{field.value}</dd></div>)}</dl> : null}
-      <div style={styles.sectionHeading}><strong>选择数据上下文</strong><span>可按本轮问题精确选择</span></div>
-      <div style={styles.sectionList}>{record.sections.map((section) => {
+      {record.fields.length ? <dl className="data-copilot-context-fields">{record.fields.map((field) => <div key={`${field.label}-${field.value}`}><dt>{field.label}</dt><dd>{field.value}</dd></div>)}</dl> : null}
+      <div className="data-copilot-context-section-heading"><strong>选择数据上下文</strong><span>可按本轮问题精确选择</span></div>
+      <div className="data-copilot-context-section-list">{record.sections.map((section) => {
         const selected = selectedSet.has(section.sourceId)
-        return <button key={section.sourceId} type="button" disabled={disabled} onClick={() => onToggle(section.sourceId)} aria-pressed={selected} style={{ ...styles.sectionButton, ...(selected ? styles.selected : undefined) }}><span style={{ ...styles.check, ...(selected ? styles.checkSelected : undefined) }}>{selected ? <Check size={13} aria-hidden="true" /> : null}</span><span><strong>{section.label}</strong><small>{section.description}</small></span></button>
+        return <button key={section.sourceId} type="button" className="data-copilot-context-section-button" data-selected={selected} disabled={disabled} onClick={() => onToggle(section.sourceId)} aria-pressed={selected} aria-label={`${section.label}${section.description}`}><span className="data-copilot-context-check" data-selected={selected}>{selected ? <Check size={13} aria-hidden="true" /> : null}</span><span><strong>{section.label}</strong><small>{section.description}</small></span></button>
       })}</div>
-      {record.body ? <section style={styles.contentSection}><strong>正文</strong><p>{record.body}</p></section> : null}
-      {record.analysis ? <details style={styles.analysis}><summary>已有 AI 分析</summary><pre>{formatAnalysis(record.analysis)}</pre></details> : null}
+      {record.body ? <section className="data-copilot-context-content-section"><strong>正文</strong><p>{record.body}</p></section> : null}
+      {record.analysis ? <details className="data-copilot-context-analysis"><summary>已有 AI 分析</summary><pre>{formatAnalysis(record.analysis)}</pre></details> : null}
+    </div>
+  )
+}
+
+function ContextState({
+  tone,
+  title,
+  detail,
+  onRetry,
+}: {
+  tone: 'loading' | 'empty' | 'error'
+  title: string
+  detail?: string
+  onRetry?: () => void
+}) {
+  const Icon = tone === 'loading' ? LoaderCircle : tone === 'error' ? AlertCircle : FolderOpen
+  return (
+    <div
+      className="data-copilot-context-state"
+      data-tone={tone}
+      role={tone === 'error' ? 'alert' : 'status'}
+      aria-live={tone === 'error' ? 'assertive' : 'polite'}
+    >
+      <Icon className={tone === 'loading' ? 'data-copilot-spinner' : undefined} size={20} aria-hidden="true" />
+      <strong>{title}</strong>
+      {detail ? <span>{detail}</span> : null}
+      {onRetry ? <button type="button" onClick={onRetry}>重新加载</button> : null}
     </div>
   )
 }
@@ -517,7 +566,7 @@ function RecordThumbnail({ jobId, record }: { jobId: string; record: DataCopilot
   const sources = [...new Set([record.imageUrl, ...(record.images || [])].filter((value): value is string => Boolean(value)))]
   if (sources.length) return <ContextImage jobId={jobId} src={sources} alt={`${record.title} 缩略图`} style={styles.thumbnail} compact />
   const Icon = record.kind === 'comment' ? MessageSquareText : record.kind === 'user' ? UserRound : record.kind === 'artifact' ? FolderOpen : FileText
-  return <span style={styles.thumbnailFallback}><Icon size={17} aria-hidden="true" /></span>
+  return <span className="data-copilot-context-thumbnail-fallback"><Icon size={17} aria-hidden="true" /></span>
 }
 
 function ContextImage({ jobId, src, alt, style, compact = false }: {

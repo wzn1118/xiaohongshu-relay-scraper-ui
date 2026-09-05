@@ -300,8 +300,14 @@ export class JobManager {
         resumeCheckpointJobIds: options.resumeCheckpointJobIds,
       });
     }
+    return this.#withJobLock('__active_runtime__', () => this.#startFresh(params, options));
+  }
+
+  async #startFresh(params, options = {}) {
     const {
       queueIfBusy = false,
+      pauseActive = false,
+      autoPauseActive = false,
       seedCards = null,
       initialResumeScope = 'full',
     } = options;
@@ -316,6 +322,7 @@ export class JobManager {
       error.jobs = this.recoveryBlockers.map((item) => item.id);
       throw error;
     }
+    if (pauseActive || autoPauseActive) await this.#pauseActiveRuntime();
     const queuedBehind = this.active;
     const relaySubtaskBusy = Boolean(this.relaySubtask);
     const runtimeBusy = Boolean(queuedBehind || relaySubtaskBusy);
@@ -422,6 +429,70 @@ export class JobManager {
       seedCards: cards,
       initialResumeScope: 'body_completion',
     });
+  }
+
+  async pauseActive(options = {}) {
+    return this.#withJobLock('__active_runtime__', () => this.#pauseActiveRuntime(options));
+  }
+
+  async #pauseActiveRuntime({ reason = 'new_task' } = {}) {
+    const active = this.active;
+    if (!active) {
+      if (this.relaySubtask) {
+        const error = jobError('JOB_BUSY', 'A relay subtask is already running.');
+        error.activeSubtask = { ...this.relaySubtask };
+        throw error;
+      }
+      return null;
+    }
+
+    const expansion = active.workflowSummary?.expansion;
+    const expansionRunning = ['running', 'cancelling'].includes(expansion?.runtimeStatus);
+    const activeAttempt = currentActiveAttempt(active);
+    const ownsRuntime = expansionRunning
+      || ACTIVE_ATTEMPT_STATUSES.has(active.status)
+      || ACTIVE_ATTEMPT_STATUSES.has(activeAttempt?.status)
+      || this.processes.has(active.id)
+      || this.runtimeContexts.has(active.id)
+      || this.liveCheckpointAnalyses.has(active.id);
+    if (!ownsRuntime) {
+      if (this.active?.id === active.id) this.active = null;
+      queueMicrotask(() => this.#startNextQueued());
+      return null;
+    }
+
+    const now = new Date().toISOString();
+    if (expansionRunning) {
+      active.expansionPauseRequested = true;
+      active.workflowSummary = {
+        ...(active.workflowSummary || {}),
+        expansion: {
+          ...expansion,
+          runtimeStatus: 'cancelling',
+          stopReason: 'auto_paused_for_new_task',
+          pauseRequestedAt: now,
+        },
+      };
+      active.updatedAt = now;
+      await this.persist();
+      this.#emit(active.id, 'state', publicJob(active));
+      await writeFile(expansion.cancelPath, 'pause\n', 'utf8');
+    } else {
+      active.pauseRequested = true;
+      active.pauseReason = String(reason || 'new_task');
+      active.cancelRequested = true;
+      active.progressPhase = 'pausing';
+      active.progressLabel = '正在暂停当前任务并保存检查点';
+      active.progressUpdatedAt = now;
+      active.updatedAt = now;
+      const child = this.processes.get(active.id);
+      if (child) await this.terminateImpl(child);
+      await this.persist();
+      this.#emit(active.id, 'state', publicJob(active));
+    }
+
+    await this.#waitForRuntimeRelease(active.id, { expansion: expansionRunning });
+    return publicJob(active);
   }
 
   async resume(jobId, options = {}) {
@@ -579,6 +650,8 @@ export class JobManager {
       job.pid = null;
       job.cancelRequested = false;
       job.interruptRequested = false;
+      job.pauseRequested = false;
+      job.pauseReason = null;
       job.progress = 0;
       job.progressPhase = 'resuming';
       job.progressLabel = '正在恢复原任务';
@@ -1441,6 +1514,54 @@ export class JobManager {
     });
   }
 
+  #waitForRuntimeRelease(id, { expansion = false, timeoutMs = 30_000 } = {}) {
+    const released = () => {
+      const job = this.getInternal(id);
+      const expansionStatus = job?.workflowSummary?.expansion?.runtimeStatus;
+      const jobReleased = !job
+        || (!this.processes.has(id)
+          && this.active?.id !== id
+          && (expansion
+            ? !['running', 'cancelling'].includes(expansionStatus)
+            : !ACTIVE_ATTEMPT_STATUSES.has(job.status)));
+      return jobReleased && !this.relaySubtask;
+    };
+    if (released()) return Promise.resolve();
+    const terminationRequested = new WeakSet();
+    return new Promise((resolve, reject) => {
+      let timer;
+      let pollTimer;
+      const finish = (error) => {
+        clearTimeout(timer);
+        clearInterval(pollTimer);
+        unsubscribe();
+        if (error) reject(error);
+        else resolve();
+      };
+      const unsubscribe = this.subscribe(id, () => {
+        if (released()) finish();
+      });
+      timer = setTimeout(() => {
+        const error = jobError('JOB_STOP_TIMEOUT', 'The previous task did not release its resources before the new task started.');
+        error.activeJob = this.getInternal(id) ? publicJob(this.getInternal(id)) : null;
+        if (this.relaySubtask) error.activeSubtask = { ...this.relaySubtask };
+        finish(error);
+      }, timeoutMs);
+      timer.unref?.();
+      pollTimer = setInterval(() => {
+        const job = this.getInternal(id);
+        const child = !expansion && job?.pauseRequested ? this.processes.get(id) : null;
+        if (child && !terminationRequested.has(child)) {
+          terminationRequested.add(child);
+          void this.terminateImpl(child).catch(() => {});
+        }
+        if (released()) finish();
+      }, 50);
+      pollTimer.unref?.();
+      if (released()) finish();
+    });
+  }
+
   async #commitWorkflowState(job, { expectedRevision } = {}) {
     return updateWorkflowState(job.statePath, (draft) => {
       draft.status = job.status;
@@ -1551,7 +1672,8 @@ export class JobManager {
         : {};
       const fromDisk = { ...(artifactExpansion || {}), ...workflowExpansion };
       const stopReason = String(fromDisk.stopReason || previous.stopReason || (previous.cancelRequestedAt ? 'user_cancelled' : result.error ? 'runner_error' : result.code === 2 ? 'invalid_seed' : 'runner_exit'));
-      const interrupted = Boolean(job.expansionInterruptRequested);
+      const pausedForNewTask = Boolean(job.expansionPauseRequested);
+      const interrupted = Boolean(job.expansionInterruptRequested || pausedForNewTask);
       const runtimeStatus = interrupted ? 'interrupted' : expansionRuntimeStatus(fromDisk.status, stopReason, result);
       const priorBusinessStatus = previous.status && !['running', 'cancelling'].includes(previous.status) ? previous.status : '';
       const businessStatus = String(fromDisk.status || priorBusinessStatus || (runtimeStatus === 'completed' ? 'complete' : runtimeStatus));
@@ -1564,7 +1686,7 @@ export class JobManager {
           ...fromDisk,
           runtimeStatus,
           status: businessStatus,
-          stopReason: interrupted ? 'server_shutdown' : stopReason,
+          stopReason: pausedForNewTask ? 'auto_paused_for_new_task' : (interrupted ? 'server_shutdown' : stopReason),
           finishedAt,
           updatedAt: finishedAt,
           resumable: ['partial', 'failed', 'blocked', 'cancelled', 'interrupted'].includes(runtimeStatus),
@@ -1574,13 +1696,14 @@ export class JobManager {
       };
       job.expansionPid = null;
       job.expansionInterruptRequested = false;
+      job.expansionPauseRequested = false;
       job.updatedAt = finishedAt;
       job.artifactCount = await countArtifactFiles(job.outputDir);
       this.processes.delete(job.id);
       if (this.active?.id === job.id) this.active = null;
       await this.persist();
-      this.#emit(job.id, 'state', publicJob(job));
       await closeWriteStream(log);
+      await this.#emit(job.id, 'state', publicJob(job), { durable: true });
       queueMicrotask(() => this.#startNextQueued());
     }
   }
@@ -1624,6 +1747,15 @@ export class JobManager {
         job.status = 'interrupted';
         job.error = 'Server shutdown interrupted the task; resume is available from its checkpoint.';
         append('system', `Task ${job.id} was interrupted by server shutdown before it started.\n`);
+        return;
+      }
+      if (job.pauseRequested) {
+        job.status = 'interrupted';
+        job.error = '任务已自动暂停，检查点已保存，可从原任务恢复。';
+        job.progressPhase = 'paused';
+        job.progressLabel = '任务已暂停，检查点已保存，可继续恢复';
+        job.progressUpdatedAt = new Date().toISOString();
+        append('system', `Task ${job.id} was automatically paused before the runner started.\n`);
         return;
       }
       if (job.cancelRequested) {
@@ -1680,7 +1812,13 @@ export class JobManager {
         append('system', `Runner process isolation failed: ${job.cleanupError}\n`);
       }
       job.exitCode = result.code;
-      if (job.interruptRequested) {
+      if (job.pauseRequested) {
+        job.status = 'interrupted';
+        job.error = '任务已自动暂停，检查点已保存，可从原任务恢复。';
+        job.progressPhase = 'paused';
+        job.progressLabel = '任务已暂停，检查点已保存，可继续恢复';
+        job.progressUpdatedAt = new Date().toISOString();
+      } else if (job.interruptRequested) {
         job.status = 'interrupted';
         job.error = 'Server shutdown interrupted the task; resume is available from its checkpoint.';
       } else if (job.cancelRequested) {
@@ -1719,8 +1857,19 @@ export class JobManager {
         append('system', `${job.error}\n`);
       }
     } catch (error) {
-      job.status = job.interruptRequested ? 'interrupted' : job.cancelRequested ? 'cancelled' : 'failed';
-      job.error = String(error?.message || error);
+      job.status = job.pauseRequested || job.interruptRequested
+        ? 'interrupted'
+        : job.cancelRequested
+          ? 'cancelled'
+          : 'failed';
+      job.error = job.pauseRequested
+        ? '任务已自动暂停，检查点已保存，可从原任务恢复。'
+        : String(error?.message || error);
+      if (job.pauseRequested) {
+        job.progressPhase = 'paused';
+        job.progressLabel = '任务已暂停，检查点已保存，可继续恢复';
+        job.progressUpdatedAt = new Date().toISOString();
+      }
       append('system', `${job.error}\n`);
     } finally {
       let flushedProgress = false;
@@ -1738,18 +1887,22 @@ export class JobManager {
       const liveAnalysis = this.liveCheckpointAnalyses.get(job.id);
       if (liveAnalysis) await liveAnalysis;
       await reconcileJobCheckpoint(job);
-      try {
-        const materialized = await this.#materializeCheckpointApplications(job, append);
-        if (materialized) {
-          job.progressPhase = 'analyzing';
-          job.progressLabel = job.params?.analysisMode === 'general'
-            ? '已解析当前检查点中的全部内容，等待 AI 动态栏目补全'
-            : '已解析当前检查点中的全部岗位并生成投递语';
-          job.progressUpdatedAt = new Date().toISOString();
+      if (!job.pauseRequested) {
+        try {
+          const materialized = await this.#materializeCheckpointApplications(job, append);
+          if (materialized) {
+            job.progressPhase = 'analyzing';
+            job.progressLabel = job.params?.analysisMode === 'general'
+              ? '已解析当前检查点中的全部内容，等待 AI 动态栏目补全'
+              : '已解析当前检查点中的全部岗位并生成投递语';
+            job.progressUpdatedAt = new Date().toISOString();
+          }
+        } catch (error) {
+          job.checkpointAnalysisError = String(error?.message || error);
+          append('system', `Checkpoint analysis failed: ${job.checkpointAnalysisError}\n`);
         }
-      } catch (error) {
-        job.checkpointAnalysisError = String(error?.message || error);
-        append('system', `Checkpoint analysis failed: ${job.checkpointAnalysisError}\n`);
+      } else {
+        append('system', 'Checkpoint analysis deferred until the paused task is resumed.\n');
       }
       this.runtimeContexts.delete(job.id);
       let latestState;
@@ -2823,6 +2976,7 @@ function mergeAttempts(existing, incoming) {
 }
 
 function stopReasonForJob(job) {
+  if (job.pauseRequested) return 'auto_paused_for_new_task';
   if (job.interruptRequested) return 'server_shutdown';
   if (job.cancelRequested || job.status === 'cancelled') return 'user_cancelled';
   if (job.securityRestriction?.status === 'timed_out') return 'security_verification';
@@ -2848,6 +3002,7 @@ function finalizeRunningAudienceStage(job, stopReason, timestamp = new Date().to
 
 function errorCodeForJob(job) {
   if (job.status === 'succeeded' || job.status === 'cancelled') return null;
+  if (job.pauseRequested) return 'AUTO_PAUSED_FOR_NEW_TASK';
   if (job.securityRestriction?.status === 'timed_out') return 'SECURITY_VERIFICATION_TIMEOUT';
   if (RATE_LIMIT_RECOVERY_STATUSES.has(job.rateLimit?.status)) return 'RATE_LIMITED';
   if (job.status === 'incomplete' && job.progressPhase === 'body_completion_incomplete') {

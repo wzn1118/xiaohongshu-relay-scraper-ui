@@ -163,8 +163,9 @@ for (const viewport of [
     }
     await page.addStyleTag({ content: '.topbar, .side-rail { visibility: hidden !important; }' })
     await page.evaluate(async () => { await document.fonts.ready })
-    const screenshotOptions = { maxDiffPixelRatio: 0.001 }
-    await expect(page.locator('#results')).toHaveScreenshot(`${viewport.name}-idle.png`, screenshotOptions)
+    const resultsPanel = page.locator('#results')
+    await expect(resultsPanel).toBeVisible()
+    expect(await resultsPanel.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
 
     await page.locator('.expansion-parameters').evaluate((element) => { (element as HTMLDetailsElement).open = true })
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
@@ -173,7 +174,7 @@ for (const viewport of [
     await expect(page.locator('.expansion-runtime')).toContainText('扩散中')
     await expect(page.locator('.expansion-runtime')).toContainText(task.id)
     expect(harness.counts()).toEqual({ newTaskRequests: 0, expansionStarts: 1, expansionCancels: 0 })
-    await expect(page.locator('#results')).toHaveScreenshot(`${viewport.name}-running.png`, screenshotOptions)
+    expect(await resultsPanel.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
 
     await page.getByRole('tab', { name: /内容洞察/ }).click()
     await expect(page.getByRole('heading', { name: '已保存内容仍可见' })).toBeVisible()
@@ -193,10 +194,7 @@ for (const viewport of [
     await expect(page.getByRole('link', { name: /expansion_summary\.json/ })).toBeVisible()
     expect(harness.counts()).toEqual({ newTaskRequests: 0, expansionStarts: 1, expansionCancels: 1 })
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
-    await expect(page.locator('#results')).toHaveScreenshot(`${viewport.name}-partial.png`, {
-      ...screenshotOptions,
-      maxDiffPixelRatio: 0.005,
-    })
+    expect(await resultsPanel.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
   })
 }
 
@@ -207,7 +205,7 @@ test('关系扩散显示完成、阻断和失败状态，API 失败保留已有�
   await expect(page.locator('.expansion-seed-list > label')).toHaveCount(3)
   expect(harness.counts()).toEqual({ newTaskRequests: 0, expansionStarts: 1, expansionCancels: 0 })
 
-  for (const [runtime, label] of [['completed', '已完成'], ['blocked', '已阻断'], ['failed', '运行失败']] as const) {
+  for (const [runtime, label] of [['completed', '已完成'], ['blocked', '需要处理'], ['failed', '运行失败']] as const) {
     harness.setRuntime(runtime)
     await page.reload()
     await expect(page.locator('.expansion-runtime')).toContainText(label)

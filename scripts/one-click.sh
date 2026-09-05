@@ -180,6 +180,7 @@ npm start &
 SERVER_PID=$!
 cleanup() {
   kill "$SERVER_PID" >/dev/null 2>&1 || true
+  wait "$SERVER_PID" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 

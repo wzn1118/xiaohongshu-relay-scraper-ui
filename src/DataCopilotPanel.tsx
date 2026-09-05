@@ -75,6 +75,7 @@ import { TaskInspector, type TaskInspectorTab } from './copilot/TaskInspector'
 import { TaskRunHeader } from './copilot/TaskRunHeader'
 import { McpAccessPanel } from './McpAccessPanel'
 import { useCopilotEventProjection } from './copilot/useCopilotEventProjection'
+import './DataCopilotExperience.css'
 
 type PendingFile = {
   id: string
@@ -285,18 +286,18 @@ function isActiveStatus(status: DataCopilotRunStatus) {
 
 function runStatusLabel(status: DataCopilotRunStatus) {
   const labels: Record<DataCopilotRunStatus, string> = {
-    idle: '就绪',
+    idle: '空闲',
     planning: '规划中',
-    executing: '执行中',
+    executing: '运行中',
     waiting_input: '等待输入',
     waiting_approval: '等待确认',
-    stopping: '停止中',
+    stopping: '正在停止',
     paused: '已暂停',
     completed: '已完成',
     partial: '部分完成',
-    failed: '失败',
+    failed: '运行失败',
     cancelled: '已取消',
-    resumable: '可恢复',
+    resumable: '可继续',
   }
   return labels[status]
 }
@@ -456,10 +457,26 @@ export function DataCopilotPanel({
   const composerRef = useRef<HTMLTextAreaElement>(null)
   const messageAreaRef = useRef<HTMLDivElement>(null)
   const messageEndRef = useRef<HTMLDivElement>(null)
+  const panelRef = useRef<HTMLElement>(null)
+  const modelDialogRef = useRef<HTMLElement>(null)
+  const modelReturnFocusRef = useRef<HTMLElement | null>(null)
   const messageScrollFrameRef = useRef<number | null>(null)
   const utilityMenuRef = useRef<HTMLDivElement>(null)
 
+  const restoreModelFocus = useCallback(() => {
+    window.requestAnimationFrame(() => modelReturnFocusRef.current?.focus())
+  }, [])
+
+  const closeModelConnector = useCallback(() => {
+    if (modelConnectorBusy) return
+    setModelConnectorOpen(false)
+    restoreModelFocus()
+  }, [modelConnectorBusy, restoreModelFocus])
+
   const openModelConnector = useCallback(() => {
+    modelReturnFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
     const preferredProvider = modelProviders.find((provider) => provider.id === defaultModelProviderId)
       ?? modelProviders.find((provider) => provider.configured)
       ?? modelProviders[0]
@@ -529,13 +546,14 @@ export function DataCopilotPanel({
       setModelDraft((current) => ({ ...current, apiKey: '' }))
       setModelConnectorStatus({ tone: 'success', message: `${connectedModel.label} 已连接。` })
       setModelConnectorOpen(false)
+      restoreModelFocus()
       setLocalError(null)
     } catch (error) {
       setModelConnectorStatus({ tone: 'error', message: toError(error).message })
     } finally {
       setModelConnectorBusy(null)
     }
-  }, [modelDraft, modelProviders, onConnectModel])
+  }, [modelDraft, modelProviders, onConnectModel, restoreModelFocus])
 
   useEffect(() => {
     onErrorRef.current = onError
@@ -896,19 +914,59 @@ export function DataCopilotPanel({
   }, [open, selectedSessionId])
 
   useEffect(() => {
+    if (!open || !modelConnectorOpen) return
+    const timeoutId = window.setTimeout(() => {
+      const target = modelDialogRef.current?.querySelector<HTMLElement>(
+        'input:not([disabled]), select:not([disabled]), button:not([disabled])',
+      )
+      target?.focus()
+    }, 40)
+    return () => window.clearTimeout(timeoutId)
+  }, [modelConnectorOpen, open])
+
+  useEffect(() => {
     if (!open) return
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      if (projectWorkspaceOpen) setProjectWorkspaceOpen(false)
-      else if (mcpSettingsOpen) setMcpSettingsOpen(false)
-      else if (fullscreen) setFullscreen(false)
-      else if (globalThis.innerWidth <= 680 && mobilePane !== 'conversation') setMobilePane('conversation')
-      else if (!contextCollapsed) setContextCollapsed(true)
-      else onClose()
+      if (event.key === 'Escape') {
+        if (modelConnectorOpen) {
+          event.preventDefault()
+          closeModelConnector()
+        } else if (projectWorkspaceOpen) setProjectWorkspaceOpen(false)
+        else if (mcpSettingsOpen) setMcpSettingsOpen(false)
+        else if (fullscreen) setFullscreen(false)
+        else if (globalThis.innerWidth <= 680 && mobilePane !== 'conversation') setMobilePane('conversation')
+        else if (!contextCollapsed) setContextCollapsed(true)
+        else onClose()
+        return
+      }
+
+      if (event.key !== 'Tab') return
+      const scope = modelConnectorOpen ? modelDialogRef.current : panelRef.current
+      if (!scope) return
+      const focusable = Array.from(scope.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )).filter((element) => element.getClientRects().length > 0 && element.getAttribute('aria-hidden') !== 'true')
+      if (!focusable.length) {
+        event.preventDefault()
+        scope.focus()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (!scope.contains(document.activeElement)) {
+        event.preventDefault()
+        first.focus()
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [contextCollapsed, fullscreen, mcpSettingsOpen, mobilePane, onClose, open, projectWorkspaceOpen])
+  }, [closeModelConnector, contextCollapsed, fullscreen, mcpSettingsOpen, mobilePane, modelConnectorOpen, onClose, open, projectWorkspaceOpen])
 
   useEffect(() => {
     const onPointerMove = (event: globalThis.PointerEvent) => {
@@ -1364,16 +1422,19 @@ export function DataCopilotPanel({
   return (
     <DataCopilotContextProvider value={runtimeContext}>
       <section
+        ref={panelRef}
         className="data-copilot-panel"
         data-layout="codex"
         data-mobile-pane={mobilePane}
         data-compact={compactWorkspace}
         data-sessions-collapsed={sessionsCollapsed}
         data-context-collapsed={contextCollapsed}
+        data-run-status={effectiveStatus}
         style={{ ...panelStyles.panel, ...panelPosition }}
         aria-label={title}
         aria-modal="true"
         role="dialog"
+        tabIndex={-1}
       >
         <style>{`
           @keyframes data-copilot-spin{to{transform:rotate(360deg)}}
@@ -1435,20 +1496,20 @@ export function DataCopilotPanel({
           />
         ) : null}
 
-        <header className="data-copilot-topbar" style={panelStyles.header}>
+        <header className="data-copilot-header data-copilot-topbar" style={panelStyles.header}>
           <div className="data-copilot-brand" style={panelStyles.brand}>
             <span className="data-copilot-brand-icon" style={panelStyles.brandIcon}>
               <Bot size={17} aria-hidden="true" />
             </span>
             <div className="data-copilot-brand-text" style={panelStyles.brandText}>
-              <strong style={panelStyles.title}>{title}</strong>
-              <span style={panelStyles.subtitle}>
+              <strong className="data-copilot-title" style={panelStyles.title}>{title}</strong>
+              <span className="data-copilot-subtitle" style={panelStyles.subtitle}>
                 {selectedSession?.title ?? (selectedContextTask ? `${selectedContextTask.title} · 新会话` : '请选择历史采集任务')} · {runStatusLabel(effectiveStatus)}
               </span>
             </div>
           </div>
 
-          <div className="data-copilot-topbar-actions" style={panelStyles.headerActions}>
+          <div className="data-copilot-header-actions data-copilot-topbar-actions" style={panelStyles.headerActions}>
             <div className="data-copilot-utility-menu" ref={utilityMenuRef}>
               <button
                 type="button"
@@ -1513,16 +1574,18 @@ export function DataCopilotPanel({
                 </div>
               ) : null}
             </div>
-            <div className="data-copilot-mobile-nav" style={panelStyles.mobileNav}>
+            <div className="data-copilot-mobile-nav" style={panelStyles.mobileNav} role="group" aria-label="移动端面板">
               {([
-                ['sessions', '显示会话列表', <MessageSquareText key="sessions" size={15} aria-hidden="true" />],
-                ['conversation', '显示对话', <Bot key="conversation" size={15} aria-hidden="true" />],
-                ['context', '显示数据上下文', <Database key="context" size={15} aria-hidden="true" />],
-              ] as const).map(([pane, label, icon]) => (
+                ['sessions', '显示会话列表', '会话', <MessageSquareText key="sessions" size={15} aria-hidden="true" />],
+                ['conversation', '显示对话', '对话', <Bot key="conversation" size={15} aria-hidden="true" />],
+                ['context', '显示数据上下文', '上下文', <Database key="context" size={15} aria-hidden="true" />],
+              ] as const).map(([pane, accessibleLabel, visibleLabel, icon]) => (
                 <button
                   key={pane}
+                  className="data-copilot-mobile-nav-button"
+                  data-active={mobilePane === pane}
                   type="button"
-                  aria-label={label}
+                  aria-label={accessibleLabel}
                   aria-pressed={mobilePane === pane}
                   onClick={() => setMobilePane(pane)}
                   style={{
@@ -1531,11 +1594,12 @@ export function DataCopilotPanel({
                   }}
                 >
                   {icon}
+                  <span className="data-copilot-mobile-nav-label" aria-hidden="true">{visibleLabel}</span>
                 </button>
               ))}
             </div>
             <button
-              className="data-copilot-desktop-pane-button"
+              className="data-copilot-icon-button data-copilot-desktop-pane-button"
               type="button"
               onClick={() => setSessionsCollapsed((value) => !value)}
               title={sessionsCollapsed ? '展开会话列表' : '收起会话列表'}
@@ -1546,7 +1610,7 @@ export function DataCopilotPanel({
               {sessionsCollapsed ? <PanelLeftOpen size={17} aria-hidden="true" /> : <PanelLeftClose size={17} aria-hidden="true" />}
             </button>
             <button
-              className="data-copilot-desktop-pane-button"
+              className="data-copilot-icon-button data-copilot-desktop-pane-button"
               type="button"
               onClick={() => setContextCollapsed((value) => !value)}
               title={contextCollapsed ? '展开任务检查器' : '收起任务检查器'}
@@ -1558,7 +1622,7 @@ export function DataCopilotPanel({
             </button>
             {models.length ? (
               <div className="data-copilot-model-control" style={panelStyles.modelControl}>
-                <label style={panelStyles.modelSelectLabel}>
+                <label className="data-copilot-model-select-label" style={panelStyles.modelSelectLabel}>
                   <span style={panelStyles.visuallyHidden}>模型</span>
                   <select
                     className="data-copilot-model-select"
@@ -1602,6 +1666,7 @@ export function DataCopilotPanel({
             )}
             {running && transport.stopGeneration ? (
               <button
+                className="data-copilot-icon-button data-copilot-stop-icon-button"
                 type="button"
                 onClick={() => void stopGeneration()}
                 disabled={effectiveStatus === 'stopping'}
@@ -1613,17 +1678,17 @@ export function DataCopilotPanel({
               </button>
             ) : null}
             <button
-              className="data-copilot-close-button"
+              className="data-copilot-icon-button data-copilot-collapse-button"
               type="button"
               onClick={onClose}
-              title="折叠"
+              title="收起面板"
               aria-label="折叠 Data Copilot"
               style={panelStyles.headerButton}
             >
               <PanelRightClose size={17} aria-hidden="true" />
             </button>
             <button
-              className="data-copilot-fullscreen-button"
+              className="data-copilot-icon-button data-copilot-fullscreen-button"
               type="button"
               onClick={() => setFullscreen((value) => !value)}
               title={fullscreen ? '退出全屏' : '全屏'}
@@ -1637,6 +1702,7 @@ export function DataCopilotPanel({
               )}
             </button>
             <button
+              className="data-copilot-icon-button data-copilot-close-button"
               type="button"
               onClick={onClose}
               title="关闭"
@@ -1650,29 +1716,33 @@ export function DataCopilotPanel({
 
         {modelConnectorOpen ? (
           <div
+            className="data-copilot-model-scrim"
             role="presentation"
-            style={panelStyles.modelDialogScrim}
             onMouseDown={(event) => {
-              if (event.target === event.currentTarget && !modelConnectorBusy) setModelConnectorOpen(false)
+              if (event.target === event.currentTarget) closeModelConnector()
             }}
           >
             <section
+              ref={modelDialogRef}
+              className="data-copilot-model-dialog"
               role="dialog"
               aria-modal="true"
               aria-labelledby="data-copilot-model-dialog-title"
-              style={panelStyles.modelDialog}
+              aria-describedby="data-copilot-model-dialog-description"
+              tabIndex={-1}
             >
-              <header style={panelStyles.modelDialogHeader}>
-                <div style={panelStyles.modelDialogHeading}>
-                  <span style={panelStyles.modelDialogIcon}><PlugZap size={18} aria-hidden="true" /></span>
+              <header className="data-copilot-model-dialog-header">
+                <div className="data-copilot-model-dialog-heading">
+                  <span className="data-copilot-model-dialog-icon"><PlugZap size={18} aria-hidden="true" /></span>
                   <span>
-                    <strong id="data-copilot-model-dialog-title" style={panelStyles.modelDialogTitle}>连接 AI 模型</strong>
-                    <small style={panelStyles.modelDialogSubtitle}>配置仅用于本机模型会话，不会写入对话消息。</small>
+                    <strong id="data-copilot-model-dialog-title" className="data-copilot-model-dialog-title">连接 AI 模型</strong>
+                    <small id="data-copilot-model-dialog-description" className="data-copilot-model-dialog-subtitle">配置仅用于本机模型会话，不会写入对话消息。</small>
                   </span>
                 </div>
                 <button
+                  className="data-copilot-icon-button data-copilot-model-dialog-close"
                   type="button"
-                  onClick={() => setModelConnectorOpen(false)}
+                  onClick={closeModelConnector}
                   disabled={Boolean(modelConnectorBusy)}
                   title="关闭模型连接"
                   aria-label="关闭模型连接"
@@ -1682,15 +1752,15 @@ export function DataCopilotPanel({
                 </button>
               </header>
 
-              <div className="data-copilot-model-dialog-body" style={panelStyles.modelDialogBody}>
-                <label style={panelStyles.modelField}>
-                  <span style={panelStyles.modelFieldLabel}>提供方</span>
+              <div className="data-copilot-model-dialog-body">
+                <label className="data-copilot-model-field">
+                  <span className="data-copilot-model-field-label">提供方</span>
                   <select
+                    className="data-copilot-model-field-control"
                     aria-label="AI 提供方"
                     value={modelDraft.provider}
                     onChange={(event) => selectModelProvider(event.target.value as AiProviderOption['id'])}
                     disabled={Boolean(modelConnectorBusy)}
-                    style={panelStyles.modelFieldControl}
                   >
                     {modelProviders.map((provider) => (
                       <option key={provider.id} value={provider.id}>{provider.label}</option>
@@ -1698,9 +1768,10 @@ export function DataCopilotPanel({
                   </select>
                 </label>
 
-                <label style={{ ...panelStyles.modelField, ...panelStyles.modelFieldWide }}>
-                  <span style={panelStyles.modelFieldLabel}><Link2 size={13} aria-hidden="true" />API Base URL</span>
+                <label className="data-copilot-model-field data-copilot-model-field-wide">
+                  <span className="data-copilot-model-field-label"><Link2 size={13} aria-hidden="true" />API Base URL</span>
                   <input
+                    className="data-copilot-model-field-control"
                     aria-label="API Base URL"
                     value={modelDraft.baseUrl}
                     onChange={(event) => {
@@ -1710,13 +1781,13 @@ export function DataCopilotPanel({
                     disabled={Boolean(modelConnectorBusy)}
                     placeholder="https://gateway.example/v1"
                     spellCheck={false}
-                    style={panelStyles.modelFieldControl}
                   />
                 </label>
 
-                <label style={{ ...panelStyles.modelField, ...panelStyles.modelFieldWide }}>
-                  <span style={panelStyles.modelFieldLabel}><KeyRound size={13} aria-hidden="true" />API Key</span>
+                <label className="data-copilot-model-field data-copilot-model-field-wide">
+                  <span className="data-copilot-model-field-label"><KeyRound size={13} aria-hidden="true" />API Key</span>
                   <input
+                    className="data-copilot-model-field-control"
                     aria-label="API Key"
                     type="password"
                     autoComplete="off"
@@ -1731,13 +1802,13 @@ export function DataCopilotPanel({
                       : modelDraftProvider?.hasApiKey
                         ? '已保存，留空即可复用'
                         : '输入模型服务 API Key'}
-                    style={panelStyles.modelFieldControl}
                   />
                 </label>
 
-                <label style={panelStyles.modelField}>
-                  <span style={panelStyles.modelFieldLabel}>协议</span>
+                <label className="data-copilot-model-field">
+                  <span className="data-copilot-model-field-label">协议</span>
                   <select
+                    className="data-copilot-model-field-control"
                     aria-label="AI 接口协议"
                     value={modelDraft.wireApi}
                     onChange={(event) => setModelDraft((current) => ({
@@ -1745,16 +1816,16 @@ export function DataCopilotPanel({
                       wireApi: event.target.value as 'responses' | 'chat_completions',
                     }))}
                     disabled={Boolean(modelConnectorBusy)}
-                    style={panelStyles.modelFieldControl}
                   >
                     <option value="chat_completions">Chat Completions</option>
                     <option value="responses">Responses API</option>
                   </select>
                 </label>
 
-                <label style={{ ...panelStyles.modelField, ...panelStyles.modelFieldWide }}>
-                  <span style={panelStyles.modelFieldLabel}>模型 ID</span>
+                <label className="data-copilot-model-field data-copilot-model-field-wide">
+                  <span className="data-copilot-model-field-label">模型 ID</span>
                   <input
+                    className="data-copilot-model-field-control"
                     aria-label="模型 ID"
                     list="data-copilot-model-options"
                     value={modelDraft.model}
@@ -1762,7 +1833,6 @@ export function DataCopilotPanel({
                     disabled={Boolean(modelConnectorBusy)}
                     placeholder="检测后选择，或直接填写模型 ID"
                     spellCheck={false}
-                    style={panelStyles.modelFieldControl}
                   />
                   <datalist id="data-copilot-model-options">
                     {modelDraft.models.map((model) => <option key={model} value={model} />)}
@@ -1771,12 +1841,10 @@ export function DataCopilotPanel({
 
                 {modelConnectorStatus ? (
                   <div
+                    className="data-copilot-model-status"
+                    data-tone={modelConnectorStatus.tone}
                     role={modelConnectorStatus.tone === 'error' ? 'alert' : 'status'}
-                    style={{
-                      ...panelStyles.modelStatus,
-                      ...(modelConnectorStatus.tone === 'success' ? panelStyles.modelStatusSuccess : undefined),
-                      ...(modelConnectorStatus.tone === 'error' ? panelStyles.modelStatusError : undefined),
-                    }}
+                    aria-live="polite"
                   >
                     {modelConnectorStatus.tone === 'success'
                       ? <CheckCircle2 size={15} aria-hidden="true" />
@@ -1786,19 +1854,19 @@ export function DataCopilotPanel({
                     <span>{modelConnectorStatus.message}</span>
                   </div>
                 ) : (
-                  <p style={panelStyles.modelHint}>更换 Base URL 后需要重新输入 Key。检测模型会验证地址、凭据和兼容协议。</p>
+                  <p className="data-copilot-model-hint">更换 Base URL 后需要重新输入 Key。检测模型会验证地址、凭据和兼容协议。</p>
                 )}
               </div>
 
-              <footer style={panelStyles.modelDialogFooter}>
+              <footer className="data-copilot-model-dialog-footer">
                 <button
+                  className="data-copilot-action-button data-copilot-action-button-secondary"
                   type="button"
                   onClick={() => void discoverModels()}
                   disabled={Boolean(modelConnectorBusy)
                     || !onDiscoverModels
                     || !modelDraft.baseUrl.trim()
                     || Boolean(modelDraftProvider?.requiresKey && !modelDraftProvider.hasApiKey && !modelDraft.apiKey.trim())}
-                  style={panelStyles.secondaryActionButton}
                 >
                   {modelConnectorBusy === 'discover'
                     ? <LoaderCircle size={15} aria-hidden="true" style={panelStyles.spinningIcon} />
@@ -1806,10 +1874,10 @@ export function DataCopilotPanel({
                   检测模型
                 </button>
                 <button
+                  className="data-copilot-action-button data-copilot-action-button-primary"
                   type="button"
                   onClick={() => void connectModel()}
                   disabled={Boolean(modelConnectorBusy) || !onConnectModel}
-                  style={panelStyles.primaryActionButton}
                 >
                   {modelConnectorBusy === 'connect'
                     ? <LoaderCircle size={15} aria-hidden="true" style={panelStyles.spinningIcon} />
@@ -1851,7 +1919,6 @@ export function DataCopilotPanel({
         <div
           className="data-copilot-workspace"
           style={{
-            ...panelStyles.workspace,
             '--copilot-rail-track': sessionsCollapsed ? '0px' : `${railWidth}px`,
             '--copilot-context-track': contextCollapsed ? '0px' : `${contextWidth}px`,
             gridTemplateColumns: 'var(--copilot-rail-track) minmax(380px, 1fr) var(--copilot-context-track)',
@@ -1862,15 +1929,18 @@ export function DataCopilotPanel({
             style={panelStyles.sessionRail}
             aria-label="Data Copilot 会话"
           >
-            <div className="data-copilot-session-rail-header" style={panelStyles.sessionRailHeader}>
-              <strong className="data-copilot-session-heading" style={panelStyles.sectionHeading}>会话</strong>
+            <div className="data-copilot-session-header data-copilot-session-rail-header" style={panelStyles.sessionRailHeader}>
+              <div className="data-copilot-section-heading">
+                <strong className="data-copilot-session-heading" style={panelStyles.sectionHeading}>会话</strong>
+                <span>{filteredSessions.length}</span>
+              </div>
               <button
+                className="data-copilot-small-icon-button"
                 type="button"
                 onClick={() => void createSession()}
                 disabled={creatingSession || running || submitting || !modelId || !selectedContextTask}
                 title="新建会话"
                 aria-label="新建会话"
-                style={panelStyles.smallIconButton}
               >
                 {creatingSession ? (
                   <LoaderCircle size={15} style={panelStyles.spinningIcon} aria-hidden="true" />
@@ -1879,24 +1949,29 @@ export function DataCopilotPanel({
                 )}
               </button>
             </div>
-            <label className="data-copilot-session-search" style={panelStyles.sessionSearch}>
+            <label className="data-copilot-search-field data-copilot-session-search" style={panelStyles.sessionSearch}>
               <Search size={14} aria-hidden="true" />
               <input
                 value={sessionQuery}
                 onChange={(event) => setSessionQuery(event.target.value)}
                 placeholder="搜索任务"
                 aria-label="搜索任务"
+                className="data-copilot-search-input"
                 style={panelStyles.sessionSearchInput}
               />
             </label>
             <div className="data-copilot-session-list" style={panelStyles.sessionList}>
               {loadingSessions ? (
-                <div style={panelStyles.centerState}>
+                <div className="data-copilot-state data-copilot-state-compact" role="status" aria-live="polite">
                   <LoaderCircle size={16} style={panelStyles.spinningIcon} aria-hidden="true" />
-                  正在读取
+                  正在读取会话
                 </div>
               ) : filteredSessions.length === 0 ? (
-                <div style={panelStyles.centerState}>暂无会话</div>
+                <div className="data-copilot-state data-copilot-state-compact" role="status">
+                  <MessageSquareText size={18} aria-hidden="true" />
+                  <strong>{sessionQuery ? '没有匹配的会话' : '尚无会话'}</strong>
+                  <span>{sessionQuery ? '换个关键词试试' : '选择数据任务后即可开始'}</span>
+                </div>
               ) : (
                 filteredSessions.map((session) => {
                   const selected = session.id === selectedSessionId
@@ -1906,45 +1981,36 @@ export function DataCopilotPanel({
                       role="button"
                       tabIndex={0}
                       key={session.id}
-                      onClick={() => selectSession(session)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault()
-                          selectSession(session)
-                        }
-                      }}
-                      aria-current={selected ? 'true' : undefined}
-                      style={{
-                        ...panelStyles.sessionItem,
-                        ...(selected ? panelStyles.sessionItemSelected : undefined),
-                      }}
+                      data-selected={selected}
                     >
-                      <span style={panelStyles.sessionIcon}>
-                        <MessageSquareText size={14} aria-hidden="true" />
-                      </span>
-                      <span style={panelStyles.sessionBody}>
-                        <span style={panelStyles.sessionTitle}>{session.title}</span>
-                        <span style={panelStyles.sessionPreview}>
-                          {session.preview || `${session.messageCount} 条消息`}
+                      <button
+                        type="button"
+                        className="data-copilot-session-select"
+                        onClick={() => selectSession(session)}
+                        aria-current={selected ? 'true' : undefined}
+                      >
+                        <span className="data-copilot-session-icon">
+                          <MessageSquareText size={15} aria-hidden="true" />
                         </span>
-                      </span>
-                      <span style={panelStyles.sessionTail}>
-                        <span>{formatSessionTime(session.updatedAt)}</span>
-                        {transport.deleteSession ? (
-                          <button
-                            type="button"
-                            aria-label={`删除${session.title}`}
-                            title="删除会话"
-                            onClick={(event) => {
-                              event.stopPropagation()
-                              void deleteSession(session)
-                            }}
-                            style={panelStyles.deleteSessionButton}
-                          >
-                            <Trash2 size={12} aria-hidden="true" />
-                          </button>
-                        ) : null}
-                      </span>
+                        <span className="data-copilot-session-body">
+                          <span className="data-copilot-session-title">{session.title}</span>
+                          <span className="data-copilot-session-preview">
+                            {session.preview || `${session.messageCount} 条消息`}
+                          </span>
+                        </span>
+                        <time className="data-copilot-session-time" dateTime={session.updatedAt}>{formatSessionTime(session.updatedAt)}</time>
+                      </button>
+                      {transport.deleteSession ? (
+                        <button
+                          className="data-copilot-delete-session-button"
+                          type="button"
+                          aria-label={`删除${session.title}`}
+                          title="删除会话"
+                          onClick={() => void deleteSession(session)}
+                        >
+                          <Trash2 size={14} aria-hidden="true" />
+                        </button>
+                      ) : null}
                     </div>
                   )
                 })
@@ -1953,29 +2019,30 @@ export function DataCopilotPanel({
           </aside>
 
           <main className="data-copilot-conversation" style={panelStyles.conversation}>
-            <div className="data-copilot-conversation-header" style={panelStyles.conversationHeader}>
+            <div className="data-copilot-conversation-header">
               <div className="data-copilot-conversation-meta" style={panelStyles.conversationMeta}>
-                <strong style={panelStyles.conversationTitle}>
+                <strong className="data-copilot-conversation-title" style={panelStyles.conversationTitle}>
                   {selectedSession?.title ?? (selectedContextTask ? `${selectedContextTask.title} · 新会话` : '请选择历史采集任务')}
                 </strong>
                 <span>
                   {selectedContextSourceIds.length} 个数据源 · {activeMessages.length} 条消息
                 </span>
               </div>
-              <div className="data-copilot-conversation-header-actions" style={panelStyles.conversationHeaderActions}>
+              <div className="data-copilot-conversation-actions data-copilot-conversation-header-actions" style={panelStyles.conversationHeaderActions}>
                 <button
+                  className="data-copilot-small-icon-button"
                   type="button"
                   onClick={() => void createSession()}
                   disabled={creatingSession || running || submitting || !modelId || !selectedContextTask}
                   title="新建会话"
                   aria-label="新建会话"
-                  style={panelStyles.conversationIconButton}
                 >
                   {creatingSession
                     ? <LoaderCircle size={14} style={panelStyles.spinningIcon} aria-hidden="true" />
                     : <Plus size={15} aria-hidden="true" />}
                 </button>
                 <button
+                  className="data-copilot-context-toggle"
                   type="button"
                   onClick={() => {
                     if (globalThis.innerWidth <= 680) {
@@ -1984,15 +2051,23 @@ export function DataCopilotPanel({
                       setContextCollapsed((value) => !value)
                     }
                   }}
-                  aria-label={contextCollapsed ? '展开任务检查器' : '收起任务检查器'}
-                  title={contextCollapsed ? '展开任务检查器' : '收起任务检查器'}
+                  aria-label={contextCollapsed ? '展开数据上下文' : '收起数据上下文'}
+                  title={contextCollapsed ? '展开数据上下文' : '收起数据上下文'}
                   style={panelStyles.contextToggleButton}
                 >
                   <Database size={14} aria-hidden="true" />
                   检查器 {workbenchProjection.nodes.length}
                 </button>
-                <div className="data-copilot-conversation-header-status" style={panelStyles.statusIndicator}>
+                <div
+                  className="data-copilot-conversation-header-status"
+                  data-status={effectiveStatus}
+                  role="status"
+                  aria-live="polite"
+                  style={panelStyles.statusIndicator}
+                >
                   <span
+                    className="data-copilot-status-dot"
+                    aria-hidden="true"
                     style={{
                       ...panelStyles.statusDot,
                       ...(running ? panelStyles.statusDotRunning : undefined),
@@ -2042,27 +2117,28 @@ export function DataCopilotPanel({
               <div
                 className="data-copilot-message-area"
                 ref={messageAreaRef}
-                style={panelStyles.messageArea}
                 aria-live="polite"
+                aria-busy={loadingMessages}
                 onScroll={(event) => {
                   const area = event.currentTarget
                   setShowScrollToLatest(area.scrollHeight - area.scrollTop - area.clientHeight > 140)
                 }}
               >
                 {loadingMessages ? (
-                <div style={panelStyles.emptyConversation}>
-                  <LoaderCircle size={19} style={panelStyles.spinningIcon} aria-hidden="true" />
-                  正在读取消息
+                <div className="data-copilot-state data-copilot-conversation-state" role="status">
+                  <LoaderCircle className="data-copilot-spinner" size={22} aria-hidden="true" />
+                  <strong>正在读取对话</strong>
+                  <span>消息与执行记录即将就绪</span>
                 </div>
               ) : activeMessages.length === 0 ? (
-                <div style={panelStyles.emptyConversation}>
-                  <span style={panelStyles.emptyIcon}>
+                <div className="data-copilot-state data-copilot-conversation-state" role="status">
+                  <span className="data-copilot-empty-icon">
                     <Sparkles size={20} aria-hidden="true" />
                   </span>
-                  <strong style={panelStyles.emptyTitle}>{selectedContextTask ? selectedContextTask.title : '先选择历史采集任务'}</strong>
+                  <strong>{selectedContextTask ? selectedContextTask.title : '先选择历史采集任务'}</strong>
                   <span>{selectedContextTask ? `${selectedContextSourceIds.length} 个数据源已连接` : '从数据上下文中打开一条历史记录'}</span>
                   {selectedContextTask ? (
-                    <div style={panelStyles.starterGrid} aria-label="常用操作">
+                    <div className="data-copilot-starter-grid" aria-label="常用操作">
                       {(selectedContextTask.mode === 'application' ? [
                         { label: '筛选可投递岗位', prompt: '结合当前任务全部岗位原帖、招聘要求和已有资料，筛选仍可投递的岗位并按匹配度排序。', icon: <Search size={15} aria-hidden="true" /> },
                         { label: '生成投递邮件', prompt: '基于当前选中岗位的原帖、招聘要求和候选人资料，撰写自然、具体的投递邮件。', icon: <Mail size={15} aria-hidden="true" /> },
@@ -2075,10 +2151,10 @@ export function DataCopilotPanel({
                         { label: '整理可引用证据', prompt: '从当前任务的原帖和评论中整理可引用的关键证据，并标明来源。', icon: <MessageSquareText size={15} aria-hidden="true" /> },
                       ]).map((action) => (
                         <button
+                          className="data-copilot-starter-button"
                           key={action.label}
                           type="button"
                           onClick={() => insertShortcut(action.prompt)}
-                          style={panelStyles.starterButton}
                         >
                           {action.icon}
                           {action.label}
@@ -2120,6 +2196,7 @@ export function DataCopilotPanel({
 
             <div
               className="data-copilot-composer-zone"
+              data-dragging={draggingFiles}
               style={{
                 ...panelStyles.composerZone,
                 ...(draggingFiles ? panelStyles.composerZoneDragging : undefined),
@@ -2137,40 +2214,40 @@ export function DataCopilotPanel({
               onDrop={handleDrop}
             >
               {draggingFiles ? (
-                <div style={panelStyles.dropOverlay}>
+                <div className="data-copilot-drop-overlay" role="status">
                   <UploadCloud size={21} aria-hidden="true" />
                   松开以上传附件
                 </div>
               ) : null}
               {localError ? (
-                <div style={panelStyles.errorBanner} role="alert">
+                <div className="data-copilot-error-banner" role="alert">
                   <AlertCircle size={14} aria-hidden="true" />
                   <span>{localError}</span>
                   <button
+                    className="data-copilot-dismiss-button"
                     type="button"
                     onClick={() => setLocalError(null)}
                     aria-label="关闭错误提示"
-                    style={panelStyles.dismissError}
                   >
                     <X size={13} aria-hidden="true" />
                   </button>
                 </div>
               ) : null}
               {pendingFiles.length ? (
-                <div style={panelStyles.pendingFiles} aria-label="待上传附件">
+                <div className="data-copilot-pending-files" aria-label="待上传附件" role="list">
                   {pendingFiles.map(({ id, file }) => (
-                    <div key={id} style={panelStyles.pendingFile}>
+                    <div key={id} className="data-copilot-pending-file" role="listitem">
                       <Paperclip size={13} aria-hidden="true" />
-                      <span style={panelStyles.pendingFileName}>{file.name}</span>
-                      <span style={panelStyles.pendingFileSize}>{fileSizeLabel(file.size)}</span>
+                      <span className="data-copilot-pending-file-name">{file.name}</span>
+                      <span className="data-copilot-pending-file-size">{fileSizeLabel(file.size)}</span>
                       <button
+                        className="data-copilot-remove-file-button"
                         type="button"
                         onClick={() =>
                           setPendingFiles((current) => current.filter((item) => item.id !== id))
                         }
                         title="移除附件"
                         aria-label={`移除${file.name}`}
-                        style={panelStyles.removePendingFile}
                       >
                         <X size={12} aria-hidden="true" />
                       </button>
@@ -2214,11 +2291,11 @@ export function DataCopilotPanel({
                     },
                   ]).map((shortcut) => (
                     <button
+                      className="data-copilot-shortcut-button"
                       key={shortcut.label}
                       type="button"
                       onClick={() => insertShortcut(shortcut.prompt)}
                       disabled={running || submitting}
-                      style={panelStyles.shortcutButton}
                     >
                       {shortcut.icon}
                       {shortcut.label}
@@ -2226,6 +2303,7 @@ export function DataCopilotPanel({
                   ))}
                 </div>
                 <textarea
+                  className="data-copilot-textarea"
                   ref={composerRef}
                   value={composerValue}
                   onChange={(event) => setComposerValue(event.target.value)}
@@ -2234,7 +2312,6 @@ export function DataCopilotPanel({
                   aria-label="发送给 Data Copilot"
                   rows={3}
                   disabled={effectiveStatus === 'stopping'}
-                  style={panelStyles.textarea}
                 />
                 <div className="data-copilot-composer-toolbar" style={panelStyles.composerToolbar}>
                   <div className="data-copilot-composer-tools" style={panelStyles.composerTools}>
@@ -2245,16 +2322,14 @@ export function DataCopilotPanel({
                         { id: 'build', label: '构建' },
                       ] as const).map((mode) => (
                         <button
+                          className="data-copilot-mode-button"
+                          data-active={workspaceMode === mode.id}
                           key={mode.id}
                           type="button"
                           onClick={() => setWorkspaceMode(mode.id)}
                           aria-pressed={workspaceMode === mode.id}
                           disabled={running || submitting}
                           title={`${mode.label}模式`}
-                          style={{
-                            ...panelStyles.modeButton,
-                            ...(workspaceMode === mode.id ? panelStyles.modeButtonActive : undefined),
-                          }}
                         >
                           {mode.label}
                         </button>
@@ -2293,6 +2368,7 @@ export function DataCopilotPanel({
                       style={panelStyles.hiddenInput}
                     />
                     <button
+                      className="data-copilot-composer-icon-button"
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
                       disabled={
@@ -2303,18 +2379,17 @@ export function DataCopilotPanel({
                       }
                       title="上传附件"
                       aria-label="上传附件"
-                      className="data-copilot-composer-icon-button"
                       style={panelStyles.composerIconButton}
                     >
                       <Paperclip size={16} aria-hidden="true" />
                     </button>
                     <button
+                      className="data-copilot-context-count-button"
                       type="button"
                       onClick={openContextPane}
                       disabled={running || submitting}
                       title="选择数据上下文"
                       aria-label={`选择数据上下文，已选 ${selectedContextSourceIds.length} 项`}
-                      className="data-copilot-context-count-button"
                       style={panelStyles.contextCountButton}
                     >
                       {selectedContextSourceIds.length > 0 ? (
@@ -2325,11 +2400,11 @@ export function DataCopilotPanel({
                   </div>
                   {running ? (
                     <button
+                      className="data-copilot-stop-button"
                       type="button"
                       onClick={() => void stopGeneration()}
                       disabled={!transport.stopGeneration || effectiveStatus === 'stopping'}
                       title="停止生成"
-                      className="data-copilot-stop-button"
                       style={panelStyles.stopButton}
                     >
                       <Square size={12} fill="currentColor" aria-hidden="true" />
@@ -2337,6 +2412,7 @@ export function DataCopilotPanel({
                     </button>
                   ) : (
                     <button
+                      className="data-copilot-send-button"
                       type="button"
                       onClick={() => void sendMessage()}
                       disabled={
@@ -2348,7 +2424,6 @@ export function DataCopilotPanel({
                       }
                       title="发送"
                       aria-label="发送消息"
-                      className="data-copilot-send-button"
                       style={panelStyles.sendButton}
                     >
                       <Send size={14} aria-hidden="true" />
@@ -2450,26 +2525,26 @@ function ApplicationWorkflowSummary({
   const stage = !batch ? 0 : ['draft', 'ready'].includes(batch.status) ? 1 : batch.status === 'approved' ? 2 : 3
 
   return (
-    <section style={panelStyles.applicationWorkflow} aria-label="批量投递状态">
-      <div style={panelStyles.applicationWorkflowHeader}>
-        <span style={panelStyles.applicationWorkflowTitle}><Layers3 size={14} aria-hidden="true" /><strong>批量投递准备</strong></span>
-        <span style={panelStyles.applicationWorkflowStatus}>{loading ? '读取中' : statusLabel}</span>
+    <section className="data-copilot-application-workflow" aria-label="批量投递状态">
+      <div className="data-copilot-application-workflow-header">
+        <span className="data-copilot-application-workflow-title"><Layers3 size={15} aria-hidden="true" /><strong>批量投递准备</strong></span>
+        <span className="data-copilot-application-workflow-status" role="status">{loading ? '读取中' : statusLabel}</span>
       </div>
-      <div style={panelStyles.applicationWorkflowSteps}>
+      <div className="data-copilot-application-workflow-steps">
         {[
           { label: '附件准备', detail: attachmentCount ? `${attachmentCount} 个附件` : '待检查' },
           { label: '批量预览', detail: total ? `${prepared}/${total} 可发送` : '待生成' },
           { label: '审批发送', detail: batch?.status === 'running' ? '发送中' : batch?.status === 'completed' ? '已完成' : '需确认' },
         ].map((item, index) => (
-          <div key={item.label} style={{ ...panelStyles.applicationWorkflowStep, ...(index < stage ? panelStyles.applicationWorkflowStepDone : undefined) }}>
-            <span style={panelStyles.applicationWorkflowStepIndex}>{index < stage ? '✓' : String(index + 1)}</span>
+          <div key={item.label} className="data-copilot-application-workflow-step" data-complete={index < stage}>
+            <span className="data-copilot-application-workflow-step-index">{index < stage ? '✓' : String(index + 1)}</span>
             <span><strong>{item.label}</strong><small>{item.detail}</small></span>
           </div>
         ))}
       </div>
-      <div style={panelStyles.applicationWorkflowFooter}>
+      <div className="data-copilot-application-workflow-footer">
         <span>附件说明会在预览中列出原名、最终投递名、大小和 SHA-256。</span>
-        <span style={panelStyles.applicationWorkflowActions}>
+        <span className="data-copilot-application-workflow-actions">
           <button type="button" onClick={onPrepare} disabled={loading}>准备批量投递</button>
           <button type="button" onClick={() => document.getElementById('batch-application-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>打开工作台</button>
         </span>
