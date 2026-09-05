@@ -1702,8 +1702,8 @@ export class JobManager {
       this.processes.delete(job.id);
       if (this.active?.id === job.id) this.active = null;
       await this.persist();
-      this.#emit(job.id, 'state', publicJob(job));
       await closeWriteStream(log);
+      await this.#emit(job.id, 'state', publicJob(job), { durable: true });
       queueMicrotask(() => this.#startNextQueued());
     }
   }
