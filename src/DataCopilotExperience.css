@@ -2114,6 +2114,7 @@
   }
 
   .data-copilot-header-actions {
+    position: static !important;
     gap: 4px !important;
   }
 
@@ -2123,6 +2124,8 @@
   }
 
   .data-copilot-model-control {
+    position: relative;
+    z-index: 1;
     height: 40px !important;
   }
 
@@ -2137,12 +2140,15 @@
   }
 
   .data-copilot-mobile-nav {
-    position: absolute;
-    right: 10px;
-    bottom: 8px;
-    left: 10px;
+    position: absolute !important;
+    z-index: 4;
+    right: 10px !important;
+    bottom: 8px !important;
+    left: 10px !important;
+    width: auto !important;
     display: grid !important;
     grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-auto-flow: row !important;
     gap: 3px !important;
     padding: 3px !important;
     border: 1px solid #42564b !important;
@@ -2166,6 +2172,11 @@
     font-size: 12px;
     font-weight: 650;
     cursor: pointer;
+  }
+
+  .data-copilot-mobile-nav .data-copilot-mobile-nav-button {
+    width: 100% !important;
+    height: 38px !important;
   }
 
   .data-copilot-mobile-nav-button[data-active="true"] {

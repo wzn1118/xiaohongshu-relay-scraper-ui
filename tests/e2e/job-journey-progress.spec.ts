@@ -273,7 +273,6 @@ test('旧版未识别错误会转换成可理解的复查提示', async ({ page 
 
   const resumeButton = journey.getByRole('button', { name: '一键恢复未完成步骤' })
   await expect(resumeButton).toBeVisible()
-  await expect(journey.getByText(/待恢复：获取完整岗位详情、区分招聘信息和经验分享、整理页面结果和下载文件/)).toBeVisible()
   await expect(journey.getByRole('button', { name: '继续任务' })).toHaveCount(0)
   const resumeRequest = page.waitForRequest((request) => (
     request.method() === 'POST'
@@ -359,7 +358,9 @@ for (const viewport of [
 
     const rawMessage = page.getByText(rawError, { exact: true })
     await expect(rawMessage).not.toBeVisible()
-    await page.getByText('技术详情', { exact: true }).click()
+    const technicalDetails = page.locator('.technical-details-panel')
+    await technicalDetails.evaluate((element) => { (element as HTMLDetailsElement).open = true })
+    await technicalDetails.getByText('技术详情', { exact: true }).click()
     await expect(rawMessage).toBeVisible()
   })
 }

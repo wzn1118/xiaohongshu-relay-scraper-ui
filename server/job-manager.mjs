@@ -1887,18 +1887,22 @@ export class JobManager {
       const liveAnalysis = this.liveCheckpointAnalyses.get(job.id);
       if (liveAnalysis) await liveAnalysis;
       await reconcileJobCheckpoint(job);
-      try {
-        const materialized = await this.#materializeCheckpointApplications(job, append);
-        if (materialized) {
-          job.progressPhase = 'analyzing';
-          job.progressLabel = job.params?.analysisMode === 'general'
-            ? '已解析当前检查点中的全部内容，等待 AI 动态栏目补全'
-            : '已解析当前检查点中的全部岗位并生成投递语';
-          job.progressUpdatedAt = new Date().toISOString();
+      if (!job.pauseRequested) {
+        try {
+          const materialized = await this.#materializeCheckpointApplications(job, append);
+          if (materialized) {
+            job.progressPhase = 'analyzing';
+            job.progressLabel = job.params?.analysisMode === 'general'
+              ? '已解析当前检查点中的全部内容，等待 AI 动态栏目补全'
+              : '已解析当前检查点中的全部岗位并生成投递语';
+            job.progressUpdatedAt = new Date().toISOString();
+          }
+        } catch (error) {
+          job.checkpointAnalysisError = String(error?.message || error);
+          append('system', `Checkpoint analysis failed: ${job.checkpointAnalysisError}\n`);
         }
-      } catch (error) {
-        job.checkpointAnalysisError = String(error?.message || error);
-        append('system', `Checkpoint analysis failed: ${job.checkpointAnalysisError}\n`);
+      } else {
+        append('system', 'Checkpoint analysis deferred until the paused task is resumed.\n');
       }
       this.runtimeContexts.delete(job.id);
       let latestState;

@@ -87,9 +87,12 @@ test('codex-product exposes internal product data and validated workflow actions
   assert.equal(started.job.status, 'queued');
   assert.equal(calls[0][1].searchSort, 'latest');
   assert.equal(calls[0][2].requestedBy, 'codex_product_mcp');
+  assert.equal(calls[0][2].pauseActive, false);
+  await service.startCollection({ params: { keyword: 'New task' }, idempotencyKey: 'codex-start-2' });
+  assert.equal(calls[1][2].pauseActive, true);
   const resumed = await service.resumeJob({ jobId: JOB_ID, scope: 'analysis', idempotencyKey: 'codex-resume-1' });
   assert.equal(resumed.job.status, 'resuming');
-  assert.equal(calls[1][2].scope, 'analysis');
+  assert.equal(calls[2][2].scope, 'analysis');
   const cancelled = await service.cancelJob({ jobId: JOB_ID });
   assert.equal(cancelled.changed, true);
 

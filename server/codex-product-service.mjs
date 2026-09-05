@@ -259,7 +259,15 @@ export class CodexProductService {
     } catch (error) {
       throw new CodexProductServiceError('CODEX_PRODUCT_REQUEST_INVALID', error.message, 400, error.details);
     }
-    return { action: 'started', job: await this.manager.start(validated, { queueIfBusy: Boolean(queueIfBusy), requestedBy: 'codex_product_mcp', idempotencyKey: String(idempotencyKey || '').trim() || undefined }) };
+    return {
+      action: 'started',
+      job: await this.manager.start(validated, {
+        queueIfBusy: Boolean(queueIfBusy),
+        pauseActive: !queueIfBusy,
+        requestedBy: 'codex_product_mcp',
+        idempotencyKey: String(idempotencyKey || '').trim() || undefined,
+      }),
+    };
   }
 
   async resumeJob({ jobId, scope = 'full', aiSessionId, idempotencyKey = '' } = {}) {

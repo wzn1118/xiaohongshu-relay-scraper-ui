@@ -224,12 +224,14 @@ export function JobJourneyPanel({
   const actionableProblem = displayState === 'retrying'
     ? null
     : visibleIssues.find((problem) => {
-    const actionId = normalizeProblemActionId(problem.action?.id)
-    return Boolean(actionId && actionId !== 'resume' && onProblemAction)
-      }) || null
+      const actionId = normalizeProblemActionId(problem.action?.id)
+      return Boolean(actionId && actionId !== 'resume' && onProblemAction)
+    }) || null
   const actionableProblemId = actionableProblem ? normalizeProblemActionId(actionableProblem.action?.id) : null
   const recommendationTitle = displayState === 'retrying'
     ? '系统正在恢复当前步骤'
+    : primaryProblemCopy?.title === currentHeadline
+    ? '下一步处理建议'
     : primaryProblemCopy?.title || (displayState === 'completed'
     ? '查看已整理结果'
     : displayState === 'failed' && !canResume
@@ -399,7 +401,7 @@ export function JobJourneyPanel({
         {(actionableProblemId || canResume) && (
           <button
             type="button"
-            className="journey-primary-action"
+            className={`journey-primary-action${canResume ? ' journey-recovery-action' : ''}`}
             onClick={runRecommendedAction}
             disabled={actionDisabled}
             aria-describedby="journey-recommendation-heading"

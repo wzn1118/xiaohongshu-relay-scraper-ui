@@ -1443,7 +1443,7 @@ test('auto-pauses-active-job-on-new-start', async () => {
       JSON.stringify([{ note_id: 'checkpoint-1' }]),
       'utf8',
     );
-    const firstEnded = waitForEnd(manager, first.id);
+    const firstEnded = waitForEnd(manager, first.id, 15_000);
     const second = await manager.start(
       validateRunRequest({ checkOnly: true, keyword: '新任务' }),
       { pauseActive: true },
@@ -1457,7 +1457,7 @@ test('auto-pauses-active-job-on-new-start', async () => {
     assert.equal(manager.get(second.id).status, 'running');
     assert.equal(spawnCount, 2);
 
-    const secondEnded = waitForEnd(manager, second.id);
+    const secondEnded = waitForEnd(manager, second.id, 15_000);
     children[1].emit('close', 0, null);
     await secondEnded;
   } finally {

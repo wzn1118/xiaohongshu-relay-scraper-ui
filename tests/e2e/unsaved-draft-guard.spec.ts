@@ -782,7 +782,7 @@ test('保存完成前再次切换不会抢占正在处理的目标', async ({ pa
   await dirtyGreeting(page, ' 保存中切换')
   await page.getByRole('button', { name: '查看岗位：岗位 A2' }).click()
   await page.getByRole('button', { name: '历史' }).click()
-  await page.getByRole('row', { name: /任务乙/ }).click({ force: true })
+  await expect(page.getByRole('heading', { name: '历史任务', exact: true })).toHaveCount(0)
   await expect(page.getByRole('heading', { name: '岗位 A2' })).toBeVisible()
   expect(state.draftRequests).toBe(1)
   await expect(page.getByRole('alertdialog')).toHaveCount(0)

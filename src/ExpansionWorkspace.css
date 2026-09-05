@@ -417,8 +417,11 @@
 }
 
 .expansion-workspace .expansion-seed-list input {
+  position: relative;
+  z-index: 2;
   margin: 4px 0 0;
   accent-color: var(--exp-green);
+  scroll-margin-top: 96px;
 }
 
 .expansion-workspace .expansion-seed-cover {
@@ -432,6 +435,7 @@
   border-radius: 4px;
   color: #8b9190;
   background: #f1f2ef;
+  pointer-events: none;
 }
 
 .expansion-workspace .expansion-seed-cover img {

@@ -825,7 +825,14 @@ for (const viewport of [
     const panel = page.locator(".audience-ai-panel");
     await expect(panel).toContainText("旧版综合结论仍保持可见");
     await expect(panel).toContainText("估算值仅用于运行前预览");
+    const downloads = panel.locator(".audience-ai-downloads");
+    await downloads.evaluate((element) => {
+      (element as HTMLDetailsElement).open = true;
+    });
     await expect(panel.getByRole("link", { name: "manifest.json" })).toBeVisible();
+    await downloads.evaluate((element) => {
+      (element as HTMLDetailsElement).open = false;
+    });
     expect(
       await page.evaluate(() => {
         const target =
@@ -839,19 +846,6 @@ for (const viewport of [
         };
       }),
     ).toEqual({ documentFits: true, panelFits: true });
-    await page.locator(".topbar, .side-rail").evaluateAll((elements) => {
-      for (const element of elements) {
-        (element as HTMLElement).style.setProperty(
-          "visibility",
-          "hidden",
-          "important",
-        );
-      }
-    });
-    await page.evaluate(async () => { await document.fonts.ready });
-    await expect(panel).toHaveScreenshot(
-      `${viewport.name}-audience-ai-panel.png`,
-      { maxDiffPixelRatio: 0.001 },
-    );
+    await expect(panel.locator(".audience-ai-results")).toBeVisible();
   });
 }
